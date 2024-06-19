@@ -1,0 +1,3475 @@
+
+// File: src/PaymentProcessor.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+import "./Constants.sol";
+import "./Errors.sol";
+import "./interfaces/IPaymentProcessorConfiguration.sol";
+import "./interfaces/IPaymentProcessorEvents.sol";
+import "./interfaces/IModuleDefaultPaymentMethods.sol";
+import "./storage/PaymentProcessorStorageAccess.sol";
+import "@openzeppelin/contracts/utils/cryptography/draft-EIP712.sol";
+
+/*
+                                                     @@@@@@@@@@@@@@             
+                                                    @@@@@@@@@@@@@@@@@@(         
+                                                   @@@@@@@@@@@@@@@@@@@@@        
+                                                  @@@@@@@@@@@@@@@@@@@@@@@@      
+                                                           #@@@@@@@@@@@@@@      
+                                                               @@@@@@@@@@@@     
+                            @@@@@@@@@@@@@@*                    @@@@@@@@@@@@     
+                           @@@@@@@@@@@@@@@     @               @@@@@@@@@@@@     
+                          @@@@@@@@@@@@@@@     @                @@@@@@@@@@@      
+                         @@@@@@@@@@@@@@@     @@               @@@@@@@@@@@@      
+                        @@@@@@@@@@@@@@@     #@@             @@@@@@@@@@@@/       
+                        @@@@@@@@@@@@@@.     @@@@@@@@@@@@@@@@@@@@@@@@@@@         
+                       @@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@            
+                      @@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@             
+                     @@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@@@@           
+                    @@@@@@@@@@@@@@@     @@@@@&%%%%%%%%&&@@@@@@@@@@@@@@          
+                    @@@@@@@@@@@@@@      @@@@@               @@@@@@@@@@@         
+                   @@@@@@@@@@@@@@@     @@@@@                 @@@@@@@@@@@        
+                  @@@@@@@@@@@@@@@     @@@@@@                 @@@@@@@@@@@        
+                 @@@@@@@@@@@@@@@     @@@@@@@                 @@@@@@@@@@@        
+                @@@@@@@@@@@@@@@     @@@@@@@                 @@@@@@@@@@@&        
+                @@@@@@@@@@@@@@     *@@@@@@@               (@@@@@@@@@@@@         
+               @@@@@@@@@@@@@@@     @@@@@@@@             @@@@@@@@@@@@@@          
+              @@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           
+             @@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@            
+            @@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@              
+           .@@@@@@@@@@@@@@     @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                 
+           @@@@@@@@@@@@@@%     @@@@@@@@@@@@@@@@@@@@@@@@(                        
+          @@@@@@@@@@@@@@@                                                       
+         @@@@@@@@@@@@@@@                                                        
+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                                         
+       @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                                          
+       @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@&                                          
+      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                                           
+ 
+* @title Payment Processor
+* @custom:version 2.0.0
+* @author Limit Break, Inc.
+*/ 
+
+contract PaymentProcessor is EIP712, PaymentProcessorStorageAccess, IPaymentProcessorEvents {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    /// @dev The Payment Settings module implements of all payment configuration-related functionality.
+    address private immutable _modulePaymentSettings;
+
+    /// @dev The On-Chain Cancellation module implements of all on-chain cancellation-related functionality.
+    address private immutable _moduleOnChainCancellation;
+
+    /// @dev The Trades module implements all trade-related functionality.
+    address private immutable _moduleTrades;
+
+    /// @dev The Trades module implements all advanced trade-related functionality.
+    address private immutable _moduleTradesAdvanced;
+
+    constructor(address configurationContract) EIP712("PaymentProcessor", "2") {
+        (
+            address defaultContractOwner_,
+            PaymentProcessorModules memory paymentProcessorModules
+        ) = IPaymentProcessorConfiguration(configurationContract).getPaymentProcessorDeploymentParams();
+        
+        
+        if (defaultContractOwner_ == address(0) ||
+            paymentProcessorModules.modulePaymentSettings == address(0) ||
+            paymentProcessorModules.moduleOnChainCancellation == address(0) ||
+            paymentProcessorModules.moduleTrades == address(0) ||
+            paymentProcessorModules.moduleTradesAdvanced == address(0)) {
+            revert PaymentProcessor__InvalidConstructorArguments();
+        }
+
+        _modulePaymentSettings = paymentProcessorModules.modulePaymentSettings;
+        _moduleOnChainCancellation = paymentProcessorModules.moduleOnChainCancellation;
+        _moduleTrades = paymentProcessorModules.moduleTrades;
+        _moduleTradesAdvanced = paymentProcessorModules.moduleTradesAdvanced;
+
+        unchecked {
+            uint32 paymentMethodWhitelistId = appStorage().lastPaymentMethodWhitelistId++;
+            appStorage().paymentMethodWhitelistOwners[paymentMethodWhitelistId] = defaultContractOwner_;
+            emit CreatedPaymentMethodWhitelist(paymentMethodWhitelistId, defaultContractOwner_, "Default Payment Methods");
+        }
+    }
+
+    /**************************************************************/
+    /*                         MODIFIERS                          */
+    /**************************************************************/
+
+    /**
+     * @dev Function modifier that generates a delegatecall to `module` with `selector` as the calldata
+     * @dev This delegatecall is for functions that do not have parameters. The only calldata added is
+     * @dev the extra calldata from a trusted forwarder, when present.
+     * 
+     * @param module The contract address being called in the delegatecall.
+     * @param selector The 4 byte function selector for the function to call in `module`.
+     */
+    modifier delegateCallNoData(address module, bytes4 selector) {
+        assembly {
+            // This protocol is designed to work both via direct calls and calls from a trusted forwarder that
+            // preserves the original msg.sender by appending an extra 20 bytes to the calldata.  
+            // The following code supports both cases.  The magic number of 68 is:
+            // 4 bytes for the selector
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            mstore(0x40, add(ptr, calldatasize()))
+            calldatacopy(add(ptr, 0x04), 0x04, sub(calldatasize(), 0x04))
+            let result := delegatecall(gas(), module, ptr, add(sub(calldatasize(), 4), 4), 0, 0)
+            if iszero(result) {
+                // Call has failed, retrieve the error message and revert
+                let size := returndatasize()
+                returndatacopy(0, 0, size)
+                revert(0, size)
+            }
+        }
+        _;
+    }
+
+    /**
+     * @dev Function modifier that generates a delegatecall to `module` with `selector` and `data` as the 
+     * @dev calldata. This delegatecall is for functions that have parameters but **DO NOT** take domain
+     * @dev separator as a parameter. Additional calldata from a trusted forwarder is appended to the end, when present.
+     * 
+     * @param module The contract address being called in the delegatecall.
+     * @param selector The 4 byte function selector for the function to call in `module`.
+     * @param data The calldata to send to the `module`.
+     */
+    modifier delegateCall(address module, bytes4 selector, bytes calldata data) {
+        assembly {
+            // This protocol is designed to work both via direct calls and calls from a trusted forwarder that
+            // preserves the original msg.sender by appending an extra 20 bytes to the calldata.  
+            // The following code supports both cases.  The magic number of 68 is:
+            // 4 bytes for the selector
+            // 32 bytes calldata offset to the data parameter
+            // 32 bytes for the length of the data parameter
+            let lengthWithAppendedCalldata := sub(calldatasize(), 68)
+
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            calldatacopy(add(ptr,0x04), data.offset, lengthWithAppendedCalldata)
+            mstore(0x40, add(ptr,add(0x04, lengthWithAppendedCalldata)))
+
+            let result := delegatecall(gas(), module, ptr, add(lengthWithAppendedCalldata, 4), 0, 0)
+            if iszero(result) {
+                // Call has failed, retrieve the error message and revert
+                let size := returndatasize()
+                returndatacopy(0, 0, size)
+                revert(0, size)
+            }
+        }        
+        _;
+    }
+
+    /**
+     * @dev Function modifier that generates a delegatecall to `module` with `selector` and `data` as the 
+     * @dev calldata. This delegatecall is for functions that have parameters **AND** take domain
+     * @dev separator as the first parameter. Any domain separator that has been included in `data`
+     * @dev will be replaced with the Payment Processor domain separator.  Additional calldata from a 
+     * @dev trusted forwarder is appended to the end, when present.
+     * 
+     * @param module The contract address being called in the delegatecall.
+     * @param selector The 4 byte function selector for the function to call in `module`.
+     * @param data The calldata to send to the `module`.
+     */
+    modifier delegateCallReplaceDomainSeparator(address module, bytes4 selector, bytes calldata data) {
+        bytes32 domainSeparator = _domainSeparatorV4();
+        assembly {
+            // This protocol is designed to work both via direct calls and calls from a trusted forwarder that
+            // preserves the original msg.sender by appending an extra 20 bytes to the calldata.  
+            // The following code supports both cases.  The magic number of 68 is:
+            // 4 bytes for the selector
+            // 32 bytes calldata offset to the data parameter
+            // 32 bytes for the length of the data parameter
+            let lengthWithAppendedCalldata := sub(calldatasize(), 68)
+
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            calldatacopy(add(ptr,0x04), data.offset, lengthWithAppendedCalldata)
+            mstore(0x40, add(ptr,add(0x04, lengthWithAppendedCalldata)))
+            mstore(add(ptr, 0x04), domainSeparator)
+        
+            let result := delegatecall(gas(), module, ptr, add(lengthWithAppendedCalldata, 4), 0, 0)
+            if iszero(result) {
+                // Call has failed, retrieve the error message and revert
+                let size := returndatasize()
+                returndatacopy(0, 0, size)
+                revert(0, size)
+            }
+        }
+        _;
+    }
+
+    /**************************************************************/
+    /*                    READ ONLY ACCESSORS                     */
+    /**************************************************************/
+
+    /**
+     * @notice Returns the EIP-712 domain separator for this contract.
+     */
+    function getDomainSeparator() public view returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    /**
+     * @notice Returns the user-specific master nonce that allows order makers to efficiently cancel all listings or offers
+     *         they made previously. The master nonce for a user only changes when they explicitly request to revoke all
+     *         existing listings and offers.
+     *
+     * @dev    When prompting makers to sign a listing or offer, marketplaces must query the current master nonce of
+     *         the user and include it in the listing/offer signature data.
+     */
+    function masterNonces(address account) public view returns (uint256) {
+        return appStorage().masterNonces[account];
+    }
+
+    /**
+     * @notice Returns true if the nonce for the given account has been used or cancelled. In comparison to a master nonce for
+     *         a user, this nonce value is specific to a single order and may only be used or cancelled a single time.
+     *
+     * @dev    When prompting makers to sign a listing or offer, marketplaces must generate a unique nonce value that
+     *         has not been previously used for filled, unfilled or cancelled orders. User nonces are unique to each
+     *         user but common to that user across all marketplaces that utilize Payment Processor and do not reset
+     *         when the master nonce is incremented. Nonces are stored in a BitMap for gas efficiency so it is recommended
+     *         to utilize sequential numbers that do not overlap with other marketplaces.
+     */
+    function isNonceUsed(address account, uint256 nonce) public view returns (bool isUsed) {
+        // The following code is equivalent to, but saves gas:
+        //
+        // uint256 slot = nonce / 256;
+        // uint256 offset = nonce % 256;
+        // uint256 slotValue = appStorage().invalidatedSignatures[account][slot];
+        // isUsed = ((slotValue >> offset) & ONE) == ONE;
+
+        isUsed = ((appStorage().invalidatedSignatures[account][uint248(nonce >> 8)] >> uint8(nonce)) & ONE) == ONE;
+    }
+
+    /**
+     * @notice Returns the state and remaining fillable quantity of an order digest given the maker address.
+     */
+    function remainingFillableQuantity(
+        address account, 
+        bytes32 orderDigest
+    ) external view returns (PartiallyFillableOrderStatus memory) {
+        return appStorage().partiallyFillableOrderStatuses[account][orderDigest];
+    }
+
+    /**
+     * @notice Returns the payment settings for a given collection.
+     *
+     * @notice paymentSettings: The payment setting type for a given collection 
+     *         (DefaultPaymentMethodWhitelist|AllowAnyPaymentMethod|CustomPaymentMethodWhitelist|PricingConstraints)
+     * @notice paymentMethodWhitelistId: The payment method whitelist id for a given collection.  
+     *         Applicable only when paymentSettings is CustomPaymentMethodWhitelist
+     * @notice constrainedPricingPaymentMethod: The payment method that min/max priced collections are priced in.
+     *         Applicable only when paymentSettings is PricingConstraints.
+     * @notice royaltyBackfillNumerator: The royalty backfill percentage for a given collection.  Used only as a
+     *         fallback when a collection does not implement EIP-2981.
+     * @notice royaltyBountyNumerator: The royalty bounty percentage for a given collection.  When set, this percentage
+     *         is applied to the creator's royalty amount and paid to the maker marketplace as a bounty.
+     * @notice isRoyaltyBountyExclusive: When true, only the designated marketplace is eligible for royalty bounty.
+     * @notice blockTradesFromUntrustedChannels: When true, only transactions from channels that the collection 
+     *         authorizes will be allowed to execute.
+     */
+    function collectionPaymentSettings(address tokenAddress) external view returns (CollectionPaymentSettings memory) {
+        return appStorage().collectionPaymentSettings[tokenAddress];
+    }
+
+    /**
+     * @notice Returns the optional creator-defined royalty bounty settings for a given collection.
+     * 
+     * @return royaltyBountyNumerator  The royalty bounty percentage for a given collection.  When set, this percentage
+     *         is applied to the creator's royalty amount and paid to the maker marketplace as a bounty.
+     * @return exclusiveBountyReceiver When non-zero, only the designated marketplace is eligible for royalty bounty.
+     */
+    function collectionBountySettings(
+        address tokenAddress
+    ) external view returns (uint16 royaltyBountyNumerator, address exclusiveBountyReceiver) {
+        CollectionPaymentSettings memory collectionPaymentSettings = 
+            appStorage().collectionPaymentSettings[tokenAddress];
+
+        return (
+            collectionPaymentSettings.royaltyBountyNumerator, 
+            collectionPaymentSettings.isRoyaltyBountyExclusive ? 
+                appStorage().collectionExclusiveBountyReceivers[tokenAddress] : 
+                address(0));
+    }
+
+    /**
+     * @notice Returns the optional creator-defined royalty backfill settings for a given collection.
+     *         This is useful for legacy collection lacking EIP-2981 support, as the collection owner can instruct
+     *         PaymentProcessor to backfill missing on-chain royalties.
+     * 
+     * @return royaltyBackfillNumerator  The creator royalty percentage for a given collection.  
+     *         When set, this percentage is applied to the item sale price and paid to the creator if the attempt
+     *         to query EIP-2981 royalties fails.
+     * @return royaltyBackfillReceiver When non-zero, this is the destination address for backfilled creator royalties.
+     */
+    function collectionRoyaltyBackfillSettings(
+        address tokenAddress
+    ) external view returns (uint16 royaltyBackfillNumerator, address royaltyBackfillReceiver) {
+        CollectionPaymentSettings memory collectionPaymentSettings = 
+            appStorage().collectionPaymentSettings[tokenAddress];
+
+        return (
+            collectionPaymentSettings.royaltyBackfillNumerator, 
+            collectionPaymentSettings.royaltyBackfillNumerator > 0 ?
+                appStorage().collectionRoyaltyBackfillReceivers[tokenAddress] : 
+                address(0));
+    }
+
+    /**
+     * @notice Returns the address of the account that owns the specified payment method whitelist id.
+     */
+    function paymentMethodWhitelistOwners(uint32 paymentMethodWhitelistId) external view returns (address) {
+        return appStorage().paymentMethodWhitelistOwners[paymentMethodWhitelistId];
+    }
+
+    /**
+     * @notice Returns true if the specified payment method is whitelisted for the specified payment method whitelist.
+     */
+    function isPaymentMethodWhitelisted(uint32 paymentMethodWhitelistId, address paymentMethod) external view returns (bool) {
+        return appStorage().collectionPaymentMethodWhitelists[paymentMethodWhitelistId].contains(paymentMethod);
+    }
+
+    /**
+     * @notice Returns the pricing bounds floor price for a given collection and token id, when applicable.
+     *
+     * @dev    The pricing bounds floor price is only enforced when the collection payment settings are set to
+     *         the PricingContraints type.
+     */
+    function getFloorPrice(address tokenAddress, uint256 tokenId) external view returns (uint256) {
+        PricingBounds memory tokenLevelPricingBounds = appStorage().tokenPricingBounds[tokenAddress][tokenId];
+        if (tokenLevelPricingBounds.isSet) {
+            return tokenLevelPricingBounds.floorPrice;
+        } else {
+            PricingBounds memory collectionLevelPricingBounds = appStorage().collectionPricingBounds[tokenAddress];
+            if (collectionLevelPricingBounds.isSet) {
+                return collectionLevelPricingBounds.floorPrice;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * @notice Returns the pricing bounds ceiling price for a given collection and token id, when applicable.
+     *
+     * @dev    The pricing bounds ceiling price is only enforced when the collection payment settings are set to
+     *         the PricingConstraints type.
+     */
+    function getCeilingPrice(address tokenAddress, uint256 tokenId) external view returns (uint256) {
+        PricingBounds memory tokenLevelPricingBounds = appStorage().tokenPricingBounds[tokenAddress][tokenId];
+        if (tokenLevelPricingBounds.isSet) {
+            return tokenLevelPricingBounds.ceilingPrice;
+        } else {
+            PricingBounds memory collectionLevelPricingBounds = appStorage().collectionPricingBounds[tokenAddress];
+            if (collectionLevelPricingBounds.isSet) {
+                return collectionLevelPricingBounds.ceilingPrice;
+            }
+        }
+
+        return type(uint256).max;
+    }
+
+    /**
+     * @notice Returns the last created payment method whitelist id.
+     */
+    function lastPaymentMethodWhitelistId() external view returns (uint32) {
+        return appStorage().lastPaymentMethodWhitelistId;
+    }
+
+    /**
+     * @notice Returns the set of payment methods for a given payment method whitelist.
+     */
+    function getWhitelistedPaymentMethods(uint32 paymentMethodWhitelistId) external view returns (address[] memory) {
+        return appStorage().collectionPaymentMethodWhitelists[paymentMethodWhitelistId].values();
+    }
+
+    /**
+     * @notice Returns the set of trusted channels for a given collection.
+     */
+    function getTrustedChannels(address tokenAddress) external view returns (address[] memory) {
+        return appStorage().collectionTrustedChannels[tokenAddress].values();
+    }
+
+    /**
+     * @notice Returns the set of banned accounts for a given collection.
+     */
+    function getBannedAccounts(address tokenAddress) external view returns (address[] memory) {
+        return appStorage().collectionBannedAccounts[tokenAddress].values();
+    }
+
+    /**************************************************************/
+    /*           PAYMENT SETTINGS MANAGEMENT OPERATIONS           */
+    /**************************************************************/
+
+    /**
+     * @notice Returns true if the specified payment method is on the deploy-time default payment method whitelist
+     *         or post-deploy default payment method whitelist (id 0).
+     */
+    function isDefaultPaymentMethod(address paymentMethod) external view returns (bool) {
+        address[] memory defaultPaymentMethods = 
+            IModuleDefaultPaymentMethods(_modulePaymentSettings).getDefaultPaymentMethods();
+
+        for (uint256 i = 0; i < defaultPaymentMethods.length;) {
+            if (paymentMethod == defaultPaymentMethods[i]) {
+                return true;
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        return appStorage().collectionPaymentMethodWhitelists[DEFAULT_PAYMENT_METHOD_WHITELIST_ID].contains(paymentMethod);
+    }
+
+    /**
+     * @notice Returns an array of the immutable default payment methods specified at deploy time.  
+     *         However, if any post-deployment default payment methods have been added, they are
+     *         not returned here because using an enumerable payment method whitelist would make trades
+     *         less gas efficient.  For post-deployment default payment methods, exchanges should index
+     *         the `PaymentMethodAddedToWhitelist` and `PaymentMethodRemovedFromWhitelist` events.
+     */
+    function getDefaultPaymentMethods() external view returns (address[] memory) {
+        return IModuleDefaultPaymentMethods(_modulePaymentSettings).getDefaultPaymentMethods();
+    }
+
+    /**
+     * @notice Allows any user to create a new custom payment method whitelist.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The payment method whitelist id tracker has been incremented by `1`.
+     * @dev    2. The caller has been assigned as the owner of the payment method whitelist.
+     * @dev    3. A `CreatedPaymentMethodWhitelist` event has been emitted.
+     *
+     * @param  data  Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *               `createPaymentMethodWhitelist(string calldata whitelistName)`
+     * @return paymentMethodWhitelistId  The id of the newly created payment method whitelist.
+     */
+    function createPaymentMethodWhitelist(bytes calldata data) external returns (uint32 paymentMethodWhitelistId) {
+        address module = _modulePaymentSettings;
+        assembly {
+            // This protocol is designed to work both via direct calls and calls from a trusted forwarder that
+            // preserves the original msg.sender by appending an extra 20 bytes to the calldata.  
+            // The following code supports both cases.  The magic number of 68 is:
+            // 4 bytes for the selector
+            // 32 bytes calldata offset to the data parameter
+            // 32 bytes for the length of the data parameter
+            let lengthWithAppendedCalldata := sub(calldatasize(), 68)
+
+            let ptr := mload(0x40)
+            mstore(ptr, hex"f83116c9")
+            calldatacopy(add(ptr, 0x04), data.offset, lengthWithAppendedCalldata)
+            mstore(0x40, add(ptr, add(0x04, lengthWithAppendedCalldata)))
+
+            let result := delegatecall(gas(), module, ptr, add(lengthWithAppendedCalldata, 4), 0x00, 0x20)
+
+            switch result case 0 {
+                let size := returndatasize()
+                returndatacopy(0, 0, size)
+                revert(0, size)
+            } default {
+                return (0x00, 0x20)
+            }
+        }
+    }
+
+    /**
+     * @notice Transfer ownership of a payment method whitelist list to a new owner.
+     *
+     * @dev Throws when the new owner is the zero address.
+     * @dev Throws when the caller does not own the specified list.
+     *
+     * @dev <h4>Postconditions:</h4>
+     *      1. The payment method whitelist list ownership is transferred to the new owner.
+     *      2. A `ReassignedPaymentMethodWhitelistOwnership` event is emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `reassignOwnershipOfPaymentMethodWhitelist(uint32 id, address newOwner)`
+     */
+    function reassignOwnershipOfPaymentMethodWhitelist(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_REASSIGN_OWNERSHIP_OF_PAYMENT_METHOD_WHITELIST, data) {}
+
+    /**
+     * @notice Renounce the ownership of a payment method whitelist, rendering the list immutable.
+     *
+     * @dev Throws when the caller does not own the specified list.
+     *
+     * @dev <h4>Postconditions:</h4>
+     *      1. The ownership of the specified payment method whitelist is renounced.
+     *      2. A `ReassignedPaymentMethodWhitelistOwnership` event is emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `renounceOwnershipOfPaymentMethodWhitelist(uint32 id)`
+     */
+    function renounceOwnershipOfPaymentMethodWhitelist(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_RENOUNCE_OWNERSHIP_OF_PAYMENT_METHOD_WHITELIST, data) {}
+
+    /**
+     * @notice Allows custom payment method whitelist owners to approve a new coin for use as a payment currency.
+     *
+     * @dev    Throws when caller is not the owner of the specified payment method whitelist.
+     * @dev    Throws when the specified coin is already whitelisted under the specified whitelist id.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. `paymentMethod` has been approved in `paymentMethodWhitelist` mapping.
+     * @dev    2. A `PaymentMethodAddedToWhitelist` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `whitelistPaymentMethod(uint32 paymentMethodWhitelistId, address paymentMethod)`
+     */
+    function whitelistPaymentMethod(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_WHITELIST_PAYMENT_METHOD, data) {}
+
+    /**
+     * @notice Allows custom payment method whitelist owners to remove a coin from the list of approved payment currencies.
+     *
+     * @dev    Throws when caller is not the owner of the specified payment method whitelist.
+     * @dev    Throws when the specified coin is not currently whitelisted under the specified whitelist id.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. `paymentMethod` has been removed from the `paymentMethodWhitelist` mapping.
+     * @dev    2. A `PaymentMethodRemovedFromWhitelist` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `unwhitelistPaymentMethod(uint32 paymentMethodWhitelistId, address paymentMethod)`
+     */
+    function unwhitelistPaymentMethod(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_UNWHITELIST_PAYMENT_METHOD, data) {}
+
+    /**
+     * @notice Allows the smart contract, the contract owner, or the contract admin of any NFT collection to 
+     *         specify the payment settings for their collections.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     * @dev    Throws when the royalty backfill numerator is greater than 10,000.
+     * @dev    Throws when the royalty bounty numerator is greater than 10,000.
+     * @dev    Throws when the specified payment method whitelist id does not exist.
+     * 
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The `PaymentSettings` type for the collection has been set.
+     * @dev    2. The `paymentMethodWhitelistId` for the collection has been set, if applicable.
+     * @dev    3. The `constrainedPricingPaymentMethod` for the collection has been set, if applicable.
+     * @dev    4. The `royaltyBackfillNumerator` for the collection has been set.
+     * @dev    5. The `royaltyBackfillReceiver` for the collection has been set.
+     * @dev    6. The `royaltyBountyNumerator` for the collection has been set.
+     * @dev    7. The `exclusiveBountyReceiver` for the collection has been set.
+     * @dev    8. The `blockTradesFromUntrustedChannels` for the collection has been set.
+     * @dev    9. An `UpdatedCollectionPaymentSettings` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `setCollectionPaymentSettings(
+                        address tokenAddress, 
+                        PaymentSettings paymentSettings,
+                        uint32 paymentMethodWhitelistId,
+                        address constrainedPricingPaymentMethod,
+                        uint16 royaltyBackfillNumerator,
+                        address royaltyBackfillReceiver,
+                        uint16 royaltyBountyNumerator,
+                        address exclusiveBountyReceiver,
+                        bool blockTradesFromUntrustedChannels)`
+     */
+    function setCollectionPaymentSettings(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_SET_COLLECTION_PAYMENT_SETTINGS, data) {}
+
+    /**
+     * @notice Allows the smart contract, the contract owner, or the contract admin of any NFT collection to 
+     *         specify their own bounded price at the collection level.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     * @dev    Throws when the specified floor price is greater than the ceiling price.
+     * 
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The collection-level pricing bounds for the specified tokenAddress has been set.
+     * @dev    2. An `UpdatedCollectionLevelPricingBoundaries` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `setCollectionPricingBounds(address tokenAddress, PricingBounds calldata pricingBounds)`
+     */
+    function setCollectionPricingBounds(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_SET_COLLECTION_PRICING_BOUNDS, data) {}
+
+    /**
+     * @notice Allows the smart contract, the contract owner, or the contract admin of any NFT collection to 
+     *         specify their own bounded price at the individual token level.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     * @dev    Throws when the lengths of the tokenIds and pricingBounds array don't match.
+     * @dev    Throws when the tokenIds or pricingBounds array length is zero. 
+     * @dev    Throws when the any of the specified floor prices is greater than the ceiling price for that token id.
+     * 
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The token-level pricing bounds for the specified tokenAddress and token ids has been set.
+     * @dev    2. An `UpdatedTokenLevelPricingBoundaries` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `setTokenPricingBounds(
+                        address tokenAddress, 
+                        uint256[] calldata tokenIds, 
+                        PricingBounds[] calldata pricingBounds)`
+     */
+    function setTokenPricingBounds(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_SET_TOKEN_PRICING_BOUNDS, data) {}
+
+    /**
+     * @notice Allows trusted channels to be added to a collection.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     * @dev    Throws when the specified address is not a trusted forwarder.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. `channel` has been approved for trusted forwarding of trades on a collection.
+     * @dev    2. A `TrustedChannelAddedForCollection` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `addTrustedChannelForCollection(
+     *                  address tokenAddress, 
+     *                  address channel)`
+     */
+    function addTrustedChannelForCollection(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_ADD_TRUSTED_CHANNEL_FOR_COLLECTION, data) {}
+
+    /**
+     * @notice Allows trusted channels to be removed from a collection.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. `channel` has been dis-approved for trusted forwarding of trades on a collection.
+     * @dev    2. A `TrustedChannelRemovedForCollection` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `removeTrustedChannelForCollection(
+     *                  address tokenAddress, 
+     *                  address channel)`
+     */
+    function removeTrustedChannelForCollection(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_REMOVE_TRUSTED_CHANNEL_FOR_COLLECTION, data) {}
+
+    /**
+     * @notice Allows creator to ban accounts from a collection.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. `account` has been banned from trading on a collection.
+     * @dev    2. A `BannedAccountAddedForCollection` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `addBannedAccountForCollection(
+     *                  address tokenAddress, 
+     *                  address account)`
+     */
+    function addBannedAccountForCollection(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_ADD_BANNED_ACCOUNT_FOR_COLLECTION, data) {}
+
+    /**
+     * @notice Allows creator to un-ban accounts from a collection.
+     *
+     * @dev    Throws when the specified tokenAddress is address(0).
+     * @dev    Throws when the caller is not the contract, the owner or the administrator of the specified tokenAddress.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. `account` ban has been lifted for trades on a collection.
+     * @dev    2. A `BannedAccountRemovedForCollection` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `removeBannedAccountForCollection(
+     *                  address tokenAddress, 
+     *                  address account)`
+     */
+    function removeBannedAccountForCollection(bytes calldata data) external 
+    delegateCall(_modulePaymentSettings, SELECTOR_REMOVE_BANNED_ACCOUNT_FOR_COLLECTION, data) {}
+
+    /**************************************************************/
+    /*              ON-CHAIN CANCELLATION OPERATIONS              */
+    /**************************************************************/
+
+    /**
+     * @notice Allows a cosigner to destroy itself, never to be used again.  This is a fail-safe in case of a failure
+     *         to secure the co-signer private key in a Web2 co-signing service.  In case of suspected cosigner key
+     *         compromise, or when a co-signer key is rotated, the cosigner MUST destroy itself to prevent past listings 
+     *         that were cancelled off-chain from being used by a malicious actor.
+     *
+     * @dev    Throws when the cosigner did not sign an authorization to self-destruct.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The cosigner can never be used to co-sign orders again.
+     * @dev    2. A `DestroyedCosigner` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `destroyCosigner(address cosigner, SignatureECDSA signature)`
+     */
+    function destroyCosigner(bytes calldata data) external
+    delegateCall(_moduleOnChainCancellation, SELECTOR_DESTROY_COSIGNER, data) {}
+
+    /**
+     * @notice Allows a maker to revoke/cancel all prior signatures of their listings and offers.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The maker's master nonce has been incremented by `1` in contract storage, rendering all signed
+     *            approvals using the prior nonce unusable.
+     * @dev    2. A `MasterNonceInvalidated` event has been emitted.
+     */
+    function revokeMasterNonce() external 
+    delegateCallNoData(_moduleOnChainCancellation, SELECTOR_REVOKE_MASTER_NONCE) {}
+
+    /**
+     * @notice Allows a maker to revoke/cancel a single, previously signed listing or offer by specifying the
+     *         nonce of the listing or offer.
+     *
+     * @dev    Throws when the maker has already revoked the nonce.
+     * @dev    Throws when the nonce was already used by the maker to successfully buy or sell an NFT.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The specified `nonce` for the `_msgSender()` has been revoked and can
+     *            no longer be used to execute a sale or purchase.
+     * @dev    2. A `NonceInvalidated` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `revokeSingleNonce(uint256 nonce)`
+     */
+    function revokeSingleNonce(bytes calldata data) external 
+    delegateCall(_moduleOnChainCancellation, SELECTOR_REVOKE_SINGLE_NONCE, data) {}
+
+    /**
+     * @notice Allows a maker to revoke/cancel a partially fillable order by specifying the order digest hash.
+     *
+     * @dev    Throws when the maker has already revoked the order digest.
+     * @dev    Throws when the order digest was already used by the maker and has been fully filled.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. The specified `orderDigest` for the `_msgSender()` has been revoked and can
+     *            no longer be used to execute a sale or purchase.
+     * @dev    2. An `OrderDigestInvalidated` event has been emitted.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `revokeOrderDigest(bytes32 orderDigest)`
+     */
+    function revokeOrderDigest(bytes calldata data) external 
+    delegateCall(_moduleOnChainCancellation, SELECTOR_REVOKE_ORDER_DIGEST, data) {}
+
+    /**************************************************************/
+    /*                      TAKER OPERATIONS                      */
+    /**************************************************************/
+
+    /**
+     * @notice Executes a buy listing transaction for a single order item.
+     *
+     * @dev    Throws when the maker's nonce has already been used or has been cancelled.
+     * @dev    Throws when the order has expired.
+     * @dev    Throws when the combined marketplace and royalty fee exceeds 100%.
+     * @dev    Throws when the taker fee on top exceeds 100% of the item sale price.
+     * @dev    Throws when the maker's master nonce does not match the order details.
+     * @dev    Throws when the order does not comply with the collection payment settings.
+     * @dev    Throws when the maker's signature is invalid.
+     * @dev    Throws when the order is a cosigned order and the cosignature is invalid.
+     * @dev    Throws when the transaction originates from an untrusted channel if untrusted channels are blocked.
+     * @dev    Throws when the maker or taker is a banned account for the collection.
+     * @dev    Throws when the taker does not have or did not send sufficient funds to complete the purchase.
+     * @dev    Throws when the token transfer fails for any reason such as lack of approvals or token no longer owned by maker.
+     * @dev    Throws when the maker has revoked the order digest on a ERC1155_PARTIAL_FILL order.
+     * @dev    Throws when the order is an ERC1155_PARTIAL_FILL order and the item price is not evenly divisible by the amount.
+     * @dev    Throws when the order is an ERC1155_PARTIAL_FILL order and the remaining fillable quantity is less than the requested minimum fill amount.
+     * @dev    Any unused native token payment will be returned to the taker as wrapped native token.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. Payment amounts and fees are sent to their respective recipients.
+     * @dev    2. Purchased tokens are sent to the beneficiary.
+     * @dev    3. Maker's nonce is marked as used for ERC721_FILL_OR_KILL and ERC1155_FILL_OR_KILL orders.
+     * @dev    4. Maker's partially fillable order state is updated for ERC1155_PARTIAL_FILL orders.
+     * @dev    5. An `BuyListingERC721` event has been emitted for a ERC721 purchase.
+     * @dev    6. An `BuyListingERC1155` event has been emitted for a ERC1155 purchase.
+     * @dev    7. A `NonceInvalidated` event has been emitted for a ERC721_FILL_OR_KILL or ERC1155_FILL_OR_KILL order.
+     * @dev    8. A `OrderDigestInvalidated` event has been emitted for a ERC1155_PARTIAL_FILL order, if fully filled.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `function buyListing(
+     *                  bytes32 domainSeparator, 
+     *                  Order memory saleDetails, 
+     *                  SignatureECDSA memory sellerSignature,
+     *                  Cosignature memory cosignature,
+     *                  FeeOnTop memory feeOnTop)`
+     */
+    function buyListing(bytes calldata data) external payable 
+    delegateCallReplaceDomainSeparator(_moduleTrades, SELECTOR_BUY_LISTING, data) {}
+
+    /**
+     * @notice Executes an offer accept transaction for a single order item.
+     *
+     * @dev    Throws when the maker's nonce has already been used or has been cancelled.
+     * @dev    Throws when the order has expired.
+     * @dev    Throws when the combined marketplace and royalty fee exceeds 100%.
+     * @dev    Throws when the taker fee on top exceeds 100% of the item sale price.
+     * @dev    Throws when the maker's master nonce does not match the order details.
+     * @dev    Throws when the order does not comply with the collection payment settings.
+     * @dev    Throws when the maker's signature is invalid.
+     * @dev    Throws when the order is a cosigned order and the cosignature is invalid.
+     * @dev    Throws when the transaction originates from an untrusted channel if untrusted channels are blocked.
+     * @dev    Throws when the maker or taker is a banned account for the collection.
+     * @dev    Throws when the maker does not have sufficient funds to complete the purchase.
+     * @dev    Throws when the token transfer fails for any reason such as lack of approvals or token not owned by the taker.
+     * @dev    Throws when the token the offer is being accepted for does not match the conditions set by the maker.
+     * @dev    Throws when the maker has revoked the order digest on a ERC1155_PARTIAL_FILL order.
+     * @dev    Throws when the order is an ERC1155_PARTIAL_FILL order and the item price is not evenly divisible by the amount.
+     * @dev    Throws when the order is an ERC1155_PARTIAL_FILL order and the remaining fillable quantity is less than the requested minimum fill amount.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. Payment amounts and fees are sent to their respective recipients.
+     * @dev    2. Purchased tokens are sent to the beneficiary.
+     * @dev    3. Maker's nonce is marked as used for ERC721_FILL_OR_KILL and ERC1155_FILL_OR_KILL orders.
+     * @dev    4. Maker's partially fillable order state is updated for ERC1155_PARTIAL_FILL orders.
+     * @dev    5. An `AcceptOfferERC721` event has been emitted for a ERC721 sale.
+     * @dev    6. An `AcceptOfferERC1155` event has been emitted for a ERC1155 sale.
+     * @dev    7. A `NonceInvalidated` event has been emitted for a ERC721_FILL_OR_KILL or ERC1155_FILL_OR_KILL order.
+     * @dev    8. A `OrderDigestInvalidated` event has been emitted for a ERC1155_PARTIAL_FILL order, if fully filled.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `function acceptOffer(
+     *                  bytes32 domainSeparator, 
+     *                  bool isCollectionLevelOffer, 
+     *                  Order memory saleDetails, 
+     *                  SignatureECDSA memory buyerSignature,
+     *                  TokenSetProof memory tokenSetProof,
+     *                  Cosignature memory cosignature,
+     *                  FeeOnTop memory feeOnTop)`
+     */
+    function acceptOffer(bytes calldata data) external payable 
+    delegateCallReplaceDomainSeparator(_moduleTrades, SELECTOR_ACCEPT_OFFER, data) {}
+
+    /**
+     * @notice Executes a buy listing transaction for multiple order items.
+     *
+     * @dev    Throws when a maker's nonce has already been used or has been cancelled.
+     * @dev    Throws when any order has expired.
+     * @dev    Throws when any combined marketplace and royalty fee exceeds 100%.
+     * @dev    Throws when any taker fee on top exceeds 100% of the item sale price.
+     * @dev    Throws when a maker's master nonce does not match the order details.
+     * @dev    Throws when an order does not comply with the collection payment settings.
+     * @dev    Throws when a maker's signature is invalid.
+     * @dev    Throws when an order is a cosigned order and the cosignature is invalid.
+     * @dev    Throws when the transaction originates from an untrusted channel if untrusted channels are blocked.
+     * @dev    Throws when any maker or taker is a banned account for the collection.
+     * @dev    Throws when the taker does not have or did not send sufficient funds to complete the purchase.
+     * @dev    Throws when a maker has revoked the order digest on a ERC1155_PARTIAL_FILL order.
+     * @dev    Throws when an order is an ERC1155_PARTIAL_FILL order and the item price is not evenly divisible by the amount.
+     * @dev    Throws when an order is an ERC1155_PARTIAL_FILL order and the remaining fillable quantity is less than the requested minimum fill amount.
+     * @dev    Will NOT throw when a token fails to transfer but also will not disperse payments for failed items.
+     * @dev    Any unused native token payment will be returned to the taker as wrapped native token.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. Payment amounts and fees are sent to their respective recipients.
+     * @dev    2. Purchased tokens are sent to the beneficiary.
+     * @dev    3. Makers nonces are marked as used for ERC721_FILL_OR_KILL and ERC1155_FILL_OR_KILL orders.
+     * @dev    4. Makers partially fillable order states are updated for ERC1155_PARTIAL_FILL orders.
+     * @dev    5. `BuyListingERC721` events have been emitted for each ERC721 purchase.
+     * @dev    6. `BuyListingERC1155` events have been emitted for each ERC1155 purchase.
+     * @dev    7. A `NonceInvalidated` event has been emitted for each ERC721_FILL_OR_KILL or ERC1155_FILL_OR_KILL order.
+     * @dev    8. A `OrderDigestInvalidated` event has been emitted for each ERC1155_PARTIAL_FILL order, if fully filled.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `function bulkBuyListings(
+     *                  bytes32 domainSeparator, 
+     *                  Order[] calldata saleDetailsArray,
+     *                  SignatureECDSA[] calldata sellerSignatures,
+     *                  Cosignature[] calldata cosignatures,
+     *                  FeeOnTop[] calldata feesOnTop)`
+     */
+    function bulkBuyListings(bytes calldata data) external payable 
+    delegateCallReplaceDomainSeparator(_moduleTrades, SELECTOR_BULK_BUY_LISTINGS, data) {}
+
+    /**
+     * @notice Executes an accept offer transaction for multiple order items.
+     *
+     * @dev    Throws when a maker's nonce has already been used or has been cancelled.
+     * @dev    Throws when any order has expired.
+     * @dev    Throws when any combined marketplace and royalty fee exceeds 100%.
+     * @dev    Throws when any taker fee on top exceeds 100% of the item sale price.
+     * @dev    Throws when a maker's master nonce does not match the order details.
+     * @dev    Throws when an order does not comply with the collection payment settings.
+     * @dev    Throws when a maker's signature is invalid.
+     * @dev    Throws when an order is a cosigned order and the cosignature is invalid.
+     * @dev    Throws when the transaction originates from an untrusted channel if untrusted channels are blocked.
+     * @dev    Throws when any maker or taker is a banned account for the collection.
+     * @dev    Throws when a maker does not have sufficient funds to complete the purchase.
+     * @dev    Throws when the token an offer is being accepted for does not match the conditions set by the maker.
+     * @dev    Throws when a maker has revoked the order digest on a ERC1155_PARTIAL_FILL order.
+     * @dev    Throws when an order is an ERC1155_PARTIAL_FILL order and the item price is not evenly divisible by the amount.
+     * @dev    Throws when an order is an ERC1155_PARTIAL_FILL order and the remaining fillable quantity is less than the requested minimum fill amount.
+     * @dev    Will NOT throw when a token fails to transfer but also will not disperse payments for failed items.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. Payment amounts and fees are sent to their respective recipients.
+     * @dev    2. Purchased tokens are sent to the beneficiary.
+     * @dev    3. Makers nonces are marked as used for ERC721_FILL_OR_KILL and ERC1155_FILL_OR_KILL orders.
+     * @dev    4. Makers partially fillable order states are updated for ERC1155_PARTIAL_FILL orders.
+     * @dev    5. `AcceptOfferERC721` events have been emitted for each ERC721 sale.
+     * @dev    6. `AcceptOfferERC1155` events have been emitted for each ERC1155 sale.
+     * @dev    7. A `NonceInvalidated` event has been emitted for each ERC721_FILL_OR_KILL or ERC1155_FILL_OR_KILL order.
+     * @dev    8. A `OrderDigestInvalidated` event has been emitted for each ERC1155_PARTIAL_FILL order, if fully filled.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `function bulkAcceptOffers(
+     *                  bytes32 domainSeparator, 
+     *                  BulkAcceptOffersParams memory params)`
+     */
+    function bulkAcceptOffers(bytes calldata data) external payable 
+    delegateCallReplaceDomainSeparator(_moduleTrades, SELECTOR_BULK_ACCEPT_OFFERS, data) {}
+
+    /**
+     * @notice Executes a sweep transaction for buying multiple items from the same collection.
+     *
+     * @dev    Throws when the sweep order protocol is ERC1155_PARTIAL_FILL (unsupported).
+     * @dev    Throws when a maker's nonce has already been used or has been cancelled.
+     * @dev    Throws when any order has expired.
+     * @dev    Throws when any combined marketplace and royalty fee exceeds 100%.
+     * @dev    Throws when the taker fee on top exceeds 100% of the combined item sale prices.
+     * @dev    Throws when a maker's master nonce does not match the order details.
+     * @dev    Throws when an order does not comply with the collection payment settings.
+     * @dev    Throws when a maker's signature is invalid.
+     * @dev    Throws when an order is a cosigned order and the cosignature is invalid.
+     * @dev    Throws when the transaction originates from an untrusted channel if untrusted channels are blocked.
+     * @dev    Throws when any maker or taker is a banned account for the collection.
+     * @dev    Throws when the taker does not have or did not send sufficient funds to complete the purchase.
+     * @dev    Will NOT throw when a token fails to transfer but also will not disperse payments for failed items.
+     * @dev    Any unused native token payment will be returned to the taker as wrapped native token.
+     *
+     * @dev    <h4>Postconditions:</h4>
+     * @dev    1. Payment amounts and fees are sent to their respective recipients.
+     * @dev    2. Purchased tokens are sent to the beneficiary.
+     * @dev    3. Makers nonces are marked as used for ERC721_FILL_OR_KILL and ERC1155_FILL_OR_KILL orders.
+     * @dev    4. Makers partially fillable order states are updated for ERC1155_PARTIAL_FILL orders.
+     * @dev    5. `BuyListingERC721` events have been emitted for each ERC721 purchase.
+     * @dev    6. `BuyListingERC1155` events have been emitted for each ERC1155 purchase.
+     * @dev    7. A `NonceInvalidated` event has been emitted for each ERC721_FILL_OR_KILL or ERC1155_FILL_OR_KILL order.
+     *
+     * @param  data Calldata encoded with PaymentProcessorEncoder.  Matches calldata for:
+     *              `function sweepCollection(
+     *                  bytes32 domainSeparator, 
+     *                  FeeOnTop memory feeOnTop,
+     *                  SweepOrder memory sweepOrder,
+     *                  SweepItem[] calldata items,
+     *                  SignatureECDSA[] calldata signedSellOrders,
+     *                  Cosignature[] memory cosignatures)`
+     */
+    function sweepCollection(bytes calldata data) external payable 
+    delegateCallReplaceDomainSeparator(_moduleTradesAdvanced, SELECTOR_SWEEP_COLLECTION, data) {}
+}
+
+// File: src/Constants.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+// keccack256("Cosignature(uint8 v,bytes32 r,bytes32 s,uint256 expiration,address taker)")
+bytes32 constant COSIGNATURE_HASH = 0x347b7818601b168f6faadc037723496e9130b057c1ffef2ec4128311e19142f2;
+
+// keccack256("CollectionOfferApproval(uint8 protocol,address cosigner,address buyer,address beneficiary,address marketplace,address fallbackRoyaltyRecipient,address paymentMethod,address tokenAddress,uint256 amount,uint256 itemPrice,uint256 expiration,uint256 marketplaceFeeNumerator,uint256 nonce,uint256 masterNonce)")
+bytes32 constant COLLECTION_OFFER_APPROVAL_HASH = 0x8fe9498e93fe26b30ebf76fac07bd4705201c8609227362697082288e3b4af9c;
+
+// keccack256("ItemOfferApproval(uint8 protocol,address cosigner,address buyer,address beneficiary,address marketplace,address fallbackRoyaltyRecipient,address paymentMethod,address tokenAddress,uint256 tokenId,uint256 amount,uint256 itemPrice,uint256 expiration,uint256 marketplaceFeeNumerator,uint256 nonce,uint256 masterNonce)")
+bytes32 constant ITEM_OFFER_APPROVAL_HASH = 0xce2e9706d63e89ddf7ee16ce0508a1c3c9bd1904c582db2e647e6f4690a0bf6b;
+
+//   keccack256("TokenSetOfferApproval(uint8 protocol,address cosigner,address buyer,address beneficiary,address marketplace,address fallbackRoyaltyRecipient,address paymentMethod,address tokenAddress,uint256 amount,uint256 itemPrice,uint256 expiration,uint256 marketplaceFeeNumerator,uint256 nonce,uint256 masterNonce,bytes32 tokenSetMerkleRoot)")
+bytes32 constant TOKEN_SET_OFFER_APPROVAL_HASH = 0x244905ade6b0e455d12fb539a4b17d7f675db14797d514168d09814a09c70e70;
+
+// keccack256("SaleApproval(uint8 protocol,address cosigner,address seller,address marketplace,address fallbackRoyaltyRecipient,address paymentMethod,address tokenAddress,uint256 tokenId,uint256 amount,uint256 itemPrice,uint256 expiration,uint256 marketplaceFeeNumerator,uint256 maxRoyaltyFeeNumerator,uint256 nonce,uint256 masterNonce)")
+bytes32 constant SALE_APPROVAL_HASH = 0x938786a8256d04dc45d6d5b997005aa07c0c9e3e4925d0d6c33128d240096ebc;
+
+// The denominator used when calculating the marketplace fee.
+// 0.5% fee numerator is 50, 1% fee numerator is 100, 10% fee numerator is 1,000 and so on.
+uint256 constant FEE_DENOMINATOR = 100_00;
+
+// Default Payment Method Whitelist Id
+uint32 constant DEFAULT_PAYMENT_METHOD_WHITELIST_ID = 0;
+
+// Convenience to avoid magic number in bitmask get/set logic.
+uint256 constant ZERO = uint256(0);
+uint256 constant ONE = uint256(1);
+
+// The default admin role for NFT collections using Access Control.
+bytes32 constant DEFAULT_ACCESS_CONTROL_ADMIN_ROLE = 0x00;
+
+/// @dev The plain text message to sign for cosigner self-destruct signature verification
+string constant COSIGNER_SELF_DESTRUCT_MESSAGE_TO_SIGN = "COSIGNER_SELF_DESTRUCT";
+
+/**************************************************************/
+/*                   PRECOMPUTED SELECTORS                    */
+/**************************************************************/
+
+bytes4 constant SELECTOR_REASSIGN_OWNERSHIP_OF_PAYMENT_METHOD_WHITELIST= hex"a1e6917e";
+bytes4 constant SELECTOR_RENOUNCE_OWNERSHIP_OF_PAYMENT_METHOD_WHITELIST= hex"0886702e";
+bytes4 constant SELECTOR_WHITELIST_PAYMENT_METHOD = hex"bb39ce91";
+bytes4 constant SELECTOR_UNWHITELIST_PAYMENT_METHOD = hex"e9d4c14e";
+bytes4 constant SELECTOR_SET_COLLECTION_PAYMENT_SETTINGS = hex"fc5d8393";
+bytes4 constant SELECTOR_SET_COLLECTION_PRICING_BOUNDS = hex"7141ae10";
+bytes4 constant SELECTOR_SET_TOKEN_PRICING_BOUNDS = hex"22146d70";
+bytes4 constant SELECTOR_ADD_TRUSTED_CHANNEL_FOR_COLLECTION = hex"ab559c14";
+bytes4 constant SELECTOR_REMOVE_TRUSTED_CHANNEL_FOR_COLLECTION = hex"282e89f8";
+bytes4 constant SELECTOR_ADD_BANNED_ACCOUNT_FOR_COLLECTION = hex"e21dde50";
+bytes4 constant SELECTOR_REMOVE_BANNED_ACCOUNT_FOR_COLLECTION = hex"adf14a76";
+
+bytes4 constant SELECTOR_DESTROY_COSIGNER = hex"2aebdefe";
+bytes4 constant SELECTOR_REVOKE_MASTER_NONCE = hex"226d4adb";
+bytes4 constant SELECTOR_REVOKE_SINGLE_NONCE = hex"b6d7dc33";
+bytes4 constant SELECTOR_REVOKE_ORDER_DIGEST = hex"96ae0380";
+
+bytes4 constant SELECTOR_BUY_LISTING = hex"a9272951";
+bytes4 constant SELECTOR_ACCEPT_OFFER = hex"e35bb9b7";
+bytes4 constant SELECTOR_BULK_BUY_LISTINGS = hex"27add047";
+bytes4 constant SELECTOR_BULK_ACCEPT_OFFERS = hex"b3cdebdb";
+bytes4 constant SELECTOR_SWEEP_COLLECTION = hex"206576f6";
+
+/**************************************************************/
+/*                   EXPECTED BASE msg.data LENGTHS           */
+/**************************************************************/
+
+uint256 constant PROOF_ELEMENT_SIZE = 32;
+
+// | 4        | 32              | 512         | 96              | 192         | 64       | = 900 bytes
+// | selector | domainSeparator | saleDetails | sellerSignature | cosignature | feeOnTop |
+uint256 constant BASE_MSG_LENGTH_BUY_LISTING = 900;
+
+// | 4        | 32              | 32                     | 512         |  96             | 32 + (96 + (32 * proof.length)) | 192         | 64       | = 1060 bytes + (32 * proof.length)
+// | selector | domainSeparator | isCollectionLevelOffer | saleDetails |  buyerSignature | tokenSetProof                   | cosignature | feeOnTop |
+uint256 constant BASE_MSG_LENGTH_ACCEPT_OFFER = 1060;
+
+// | 4        | 32              | 64              | 512 * length      | 64              | 96 * length      | 64              | 192 * length | 64              | 64 * length | = 292 bytes + (864 * saleDetailsArray.length)
+// | selector | domainSeparator | length + offset | saleDetailsArray  | length + offset | sellerSignatures | length + offset | cosignatures | length + offset | feesOnTop   |
+uint256 constant BASE_MSG_LENGTH_BULK_BUY_LISTINGS = 292;
+uint256 constant BASE_MSG_LENGTH_BULK_BUY_LISTINGS_PER_ITEM = 864;
+
+// | 4        | 32              | 32           | 64              | 32 * length                 | 64              | 512 * length      | 64              | 96 * length          | 64              | 32 + (96 + (32 * proof.length)) | 64              | 192 * length | 64              | 64 * length | = 452 bytes + (1024 * saleDetailsArray.length) + (32 * proof.length [for each element])
+// | selector | domainSeparator | struct info? | length + offset | isCollectionLevelOfferArray | length + offset | saleDetailsArray  | length + offset | buyerSignaturesArray | length + offset | tokenSetProof                   | length + offset | cosignatures | length + offset | feesOnTop   |
+uint256 constant BASE_MSG_LENGTH_BULK_ACCEPT_OFFERS = 452;
+uint256 constant BASE_MSG_LENGTH_BULK_ACCEPT_OFFERS_PER_ITEM = 1024;
+
+// | 4        | 32              | 64       | 128        | 64              | 320 * length | 64              | 96 * length      | 64              | 192 * length | = 420 bytes + (608 * items.length)
+// | selector | domainSeparator | feeOnTop | sweepOrder | length + offset | items        | length + offset | signedSellOrders | length + offset | cosignatures |
+uint256 constant BASE_MSG_LENGTH_SWEEP_COLLECTION = 420;
+uint256 constant BASE_MSG_LENGTH_SWEEP_COLLECTION_PER_ITEM = 608;
+
+// File: src/Errors.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+/// @dev Thrown when an order is an ERC721 order and the amount is not one.
+error PaymentProcessor__AmountForERC721SalesMustEqualOne();
+
+/// @dev Thrown when an order is an ERC1155 order and the amount is zero.
+error PaymentProcessor__AmountForERC1155SalesGreaterThanZero();
+
+/// @dev Thrown when an offer is being accepted and the payment method is the chain native token.
+error PaymentProcessor__BadPaymentMethod();
+
+/// @dev Thrown when adding or removing a payment method from a whitelist that the caller does not own.
+error PaymentProcessor__CallerDoesNotOwnPaymentMethodWhitelist();
+
+/**
+ * @dev Thrown when modifying collection payment settings, pricing bounds, or trusted channels on a collection
+ * @dev that the caller is not the owner of or a member of the default admin role for.
+ */
+error PaymentProcessor__CallerMustHaveElevatedPermissionsForSpecifiedNFT();
+
+/// @dev Thrown when setting a collection or token pricing constraint with a floor price greater than ceiling price.
+error PaymentProcessor__CeilingPriceMustBeGreaterThanFloorPrice();
+
+/// @dev Thrown when adding a trusted channel that is not a trusted forwarder deployed by the trusted forwarder factory.
+error PaymentProcessor__ChannelIsNotTrustedForwarder();
+
+/// @dev Thrown when removing a payment method from a whitelist when that payment method is not on the whitelist.
+error PaymentProcessor__CoinIsNotApproved();
+
+/// @dev Thrown when the current block time is greater than the expiration time for the cosignature.
+error PaymentProcessor__CosignatureHasExpired();
+
+/// @dev Thrown when the cosigner has self destructed.
+error PaymentProcessor__CosignerHasSelfDestructed();
+
+/// @dev Thrown when a token failed to transfer to the beneficiary and partial fills are disabled.
+error PaymentProcessor__DispensingTokenWasUnsuccessful();
+
+/// @dev Thrown when a maker is a contract and the contract does not return the correct EIP1271 response to validate the signature.
+error PaymentProcessor__EIP1271SignatureInvalid();
+
+/// @dev Thrown when a native token transfer call fails to transfer the tokens.
+error PaymentProcessor__FailedToTransferProceeds();
+
+/// @dev Thrown when the additional fee on top exceeds the item price.
+error PaymentProcessor__FeeOnTopCannotBeGreaterThanItemPrice();
+
+/// @dev Thrown when the supplied root hash, token and proof do not match.
+error PaymentProcessor__IncorrectTokenSetMerkleProof();
+
+/// @dev Thrown when an input array has zero items in a location where it must have items.
+error PaymentProcessor__InputArrayLengthCannotBeZero();
+
+/// @dev Thrown when multiple input arrays have different lengths but are required to be the same length.
+error PaymentProcessor__InputArrayLengthMismatch();
+
+/// @dev Thrown when Payment Processor or a module is being deployed with invalid constructor arguments.
+error PaymentProcessor__InvalidConstructorArguments();
+
+/// @dev Thrown when the maker or taker is a banned account on the collection being traded.
+error PaymentProcessor__MakerOrTakerIsBannedAccount();
+
+/// @dev Thrown when the combined marketplace and royalty fees will exceed the item price.
+error PaymentProcessor__MarketplaceAndRoyaltyFeesWillExceedSalePrice();
+
+/// @dev Thrown when the recovered address from a cosignature does not match the order cosigner.
+error PaymentProcessor__NotAuthorizedByCosigner();
+
+/// @dev Thrown when the ERC2981 or backfilled royalties exceed the maximum fee specified by the order maker.
+error PaymentProcessor__OnchainRoyaltiesExceedMaximumApprovedRoyaltyFee();
+
+/// @dev Thrown when the current block timestamp is greater than the order expiration time.
+error PaymentProcessor__OrderHasExpired();
+
+/// @dev Thrown when attempting to fill a partially fillable order that has already been filled or cancelled.
+error PaymentProcessor__OrderIsEitherCancelledOrFilled();
+
+/// @dev Thrown when attempting to execute a sweep order for partially fillable orders.
+error PaymentProcessor__OrderProtocolERC1155FillPartialUnsupportedInSweeps();
+
+/// @dev Thrown when attempting to partially fill an order where the item price is not equally divisible by the amount of tokens.
+error PaymentProcessor__PartialFillsNotSupportedForNonDivisibleItems();
+
+/// @dev Thrown when attempting to execute an order with a payment method that is not allowed by the collection payment settings.
+error PaymentProcessor__PaymentCoinIsNotAnApprovedPaymentMethod();
+
+/// @dev Thrown when adding a payment method to a whitelist when that payment method is already on the list.
+error PaymentProcessor__PaymentMethodIsAlreadyApproved();
+
+/// @dev Thrown when setting collection payment settings with a whitelist id that does not exist.
+error PaymentProcessor__PaymentMethodWhitelistDoesNotExist();
+
+/// @dev Thrown when attempting to transfer ownership of a payment method whitelist to the zero address.
+error PaymentProcessor__PaymentMethodWhitelistOwnershipCannotBeTransferredToZeroAddress();
+
+/// @dev Thrown when distributing payments and fees in native token and the amount remaining is less than the amount to distribute.
+error PaymentProcessor__RanOutOfNativeFunds();
+
+/// @dev Thrown when attempting to set a royalty backfill numerator that would result in royalties greater than 100%.
+error PaymentProcessor__RoyaltyBackfillNumeratorCannotExceedFeeDenominator();
+
+/// @dev Thrown when attempting to set a royalty bounty numerator that would result in royalty bounties greater than 100%.
+error PaymentProcessor__RoyaltyBountyNumeratorCannotExceedFeeDenominator();
+
+/// @dev Thrown when a collection is set to pricing constraints and the item price exceeds the defined maximum price.
+error PaymentProcessor__SalePriceAboveMaximumCeiling();
+
+/// @dev Thrown when a collection is set to pricing constraints and the item price is below the defined minimum price.
+error PaymentProcessor__SalePriceBelowMinimumFloor();
+
+/// @dev Thrown when a maker's nonce has already been used for an executed order or cancelled by the maker.
+error PaymentProcessor__SignatureAlreadyUsedOrRevoked();
+
+/**
+ * @dev Thrown when a collection is set to block untrusted channels and the order execution originates from a channel 
+ * @dev that is not in the collection's trusted channel list.
+ */ 
+error PaymentProcessor__TradeOriginatedFromUntrustedChannel();
+
+/// @dev Thrown when a trading of a specific collection has been paused by the collection owner or admin.
+error PaymentProcessor__TradingIsPausedForCollection();
+
+/**
+ * @dev Thrown when attempting to fill a partially fillable order and the amount available to fill 
+ * @dev is less than the specified minimum to fill.
+ */
+error PaymentProcessor__UnableToFillMinimumRequestedQuantity();
+
+/// @dev Thrown when the recovered signer for an order does not match the order maker.
+error PaymentProcessor__UnauthorizedOrder();
+
+/// @dev Thrown when the taker on a cosigned order does not match the taker on the cosignature.
+error PaymentProcessor__UnauthorizedTaker();
+
+/// @dev Thrown when the Payment Processor or a module is being deployed with uninitialized configuration values.
+error PaymentProcessor__UninitializedConfiguration();
+
+// File: src/interfaces/IPaymentProcessorConfiguration.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+import "../DataTypes.sol";
+
+/** 
+* @title PaymentProcessor
+* @custom:version 2.0.0
+* @author Limit Break, Inc.
+*/ 
+interface IPaymentProcessorConfiguration {
+
+    /**
+     * @notice Returns the ERC2771 context setup params for payment processor modules.
+     */
+    function getPaymentProcessorModuleERC2771ContextParams() 
+        external 
+        view 
+        returns (
+            address /*trustedForwarderFactory*/
+        );
+
+    /**
+     * @notice Returns the setup params for payment processor modules.
+     */
+    function getPaymentProcessorModuleDeploymentParams() 
+        external 
+        view 
+        returns (
+            uint32, /*defaultPushPaymentGasLimit*/
+            address, /*wrappedNativeCoin*/
+            DefaultPaymentMethods memory /*defaultPaymentMethods*/
+        );
+
+    /**
+     * @notice Returns the setup params for payment processor.
+     */
+    function getPaymentProcessorDeploymentParams()
+        external
+        view
+        returns (
+            address, /*defaultContractOwner*/
+            PaymentProcessorModules memory /*paymentProcessorModules*/
+        );
+}
+
+// File: src/interfaces/IPaymentProcessorEvents.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+import "../DataTypes.sol";
+
+/** 
+* @title Payment Processor
+* @custom:version 2.0.0
+* @author Limit Break, Inc.
+*/ 
+interface IPaymentProcessorEvents {
+    /// @notice Emitted when an account is banned from trading a collection
+    event BannedAccountAddedForCollection(
+        address indexed tokenAddress, 
+        address indexed account);
+
+    /// @notice Emitted when an account ban has been lifted on a collection
+    event BannedAccountRemovedForCollection(
+        address indexed tokenAddress, 
+        address indexed account);
+
+    /// @notice Emitted when an ERC721 listing is purchased.
+    event BuyListingERC721(
+        address indexed buyer,
+        address indexed seller,
+        address indexed tokenAddress,
+        address beneficiary,
+        address paymentCoin,
+        uint256 tokenId,
+        uint256 salePrice);
+
+    /// @notice Emitted when an ERC1155 listing is purchased.
+    event BuyListingERC1155(
+        address indexed buyer,
+        address indexed seller,
+        address indexed tokenAddress,
+        address beneficiary,
+        address paymentCoin,
+        uint256 tokenId,
+        uint256 amount,
+        uint256 salePrice);
+
+    /// @notice Emitted when an ERC721 offer is accepted.
+    event AcceptOfferERC721(
+        address indexed seller,
+        address indexed buyer,
+        address indexed tokenAddress,
+        address beneficiary,
+        address paymentCoin,
+        uint256 tokenId,
+        uint256 salePrice);
+
+    /// @notice Emitted when an ERC1155 offer is accepted.
+    event AcceptOfferERC1155(
+        address indexed seller,
+        address indexed buyer,
+        address indexed tokenAddress,
+        address beneficiary,
+        address paymentCoin,
+        uint256 tokenId,
+        uint256 amount,
+        uint256 salePrice);
+
+    /// @notice Emitted when a new payment method whitelist is created.
+    event CreatedPaymentMethodWhitelist(
+        uint32 indexed paymentMethodWhitelistId, 
+        address indexed whitelistOwner,
+        string whitelistName);
+
+    /// @notice Emitted when a cosigner destroys itself.
+    event DestroyedCosigner(address indexed cosigner);
+
+    /// @notice Emitted when a user revokes all of their existing listings or offers that share the master nonce.
+    event MasterNonceInvalidated(address indexed account, uint256 nonce);
+
+    /// @notice Emitted when a user revokes a single listing or offer nonce for a specific marketplace.
+    event NonceInvalidated(
+        uint256 indexed nonce, 
+        address indexed account, 
+        bool wasCancellation);
+
+    /// @notice Emitted when a user revokes a single listing or offer nonce for a specific marketplace.
+    event OrderDigestInvalidated(
+        bytes32 indexed orderDigest, 
+        address indexed account, 
+        bool wasCancellation);
+
+    /// @notice Emitted when a coin is added to the approved coins mapping for a security policy
+    event PaymentMethodAddedToWhitelist(
+        uint32 indexed paymentMethodWhitelistId, 
+        address indexed paymentMethod);
+
+    /// @notice Emitted when a coin is removed from the approved coins mapping for a security policy
+    event PaymentMethodRemovedFromWhitelist(
+        uint32 indexed paymentMethodWhitelistId, 
+        address indexed paymentMethod);
+
+    /// @notice Emitted when a payment method whitelist is reassigned to a new owner
+    event ReassignedPaymentMethodWhitelistOwnership(uint32 indexed id, address indexed newOwner);
+
+    /// @notice Emitted when a trusted channel is added for a collection
+    event TrustedChannelAddedForCollection(
+        address indexed tokenAddress, 
+        address indexed channel);
+
+    /// @notice Emitted when a trusted channel is removed for a collection
+    event TrustedChannelRemovedForCollection(
+        address indexed tokenAddress, 
+        address indexed channel);
+
+    /// @notice Emitted whenever pricing bounds change at a collection level for price-constrained collections.
+    event UpdatedCollectionLevelPricingBoundaries(
+        address indexed tokenAddress, 
+        uint256 floorPrice, 
+        uint256 ceilingPrice);
+
+    /// @notice Emitted whenever the supported ERC-20 payment is set for price-constrained collections.
+    event UpdatedCollectionPaymentSettings(
+        address indexed tokenAddress, 
+        PaymentSettings paymentSettings, 
+        uint32 indexed paymentMethodWhitelistId, 
+        address indexed constrainedPricingPaymentMethod,
+        uint16 royaltyBackfillNumerator,
+        address royaltyBackfillReceiver,
+        uint16 royaltyBountyNumerator,
+        address exclusiveBountyReceiver,
+        bool blockTradesFromUntrustedChannels,
+        bool blockBannedAccounts);
+
+    /// @notice Emitted whenever pricing bounds change at a token level for price-constrained collections.
+    event UpdatedTokenLevelPricingBoundaries(
+        address indexed tokenAddress, 
+        uint256 indexed tokenId, 
+        uint256 floorPrice, 
+        uint256 ceilingPrice);
+}
+
+// File: src/interfaces/IModuleDefaultPaymentMethods.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+/** 
+* @title Payment Processor
+* @custom:version 2.0.0
+* @author Limit Break, Inc.
+*/ 
+interface IModuleDefaultPaymentMethods {
+
+    /**
+     * @notice Returns the list of default payment methods that Payment Processor supports.
+     */
+    function getDefaultPaymentMethods() external view returns (address[] memory);
+}
+
+// File: src/storage/PaymentProcessorStorageAccess.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+import "../DataTypes.sol";
+
+/** 
+* @title Payment Processor
+* @custom:version 2.0.0
+* @author Limit Break, Inc.
+*/ 
+contract PaymentProcessorStorageAccess {
+
+    /// @dev The base storage slot for Payment Processor contract storage items.
+    bytes32 constant DIAMOND_STORAGE_PAYMENT_PROCESSOR = 
+        keccak256("diamond.storage.payment.processor");
+
+    /**
+     * @dev Returns a storage object that follows the Diamond standard storage pattern for
+     * @dev contract storage across multiple module contracts.
+     */
+    function appStorage() internal pure returns (PaymentProcessorStorage storage diamondStorage) {
+        bytes32 slot = DIAMOND_STORAGE_PAYMENT_PROCESSOR;
+        assembly {
+            diamondStorage.slot := slot
+        }
+    }
+}
+
+// File: lib/openzeppelin-contracts/contracts/utils/cryptography/draft-EIP712.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/cryptography/draft-EIP712.sol)
+
+pragma solidity ^0.8.0;
+
+// EIP-712 is Final as of 2022-08-11. This file is deprecated.
+
+import "./EIP712.sol";
+
+
+// File: src/DataTypes.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
+/**
+ * @dev Used internally to indicate which side of the order the taker is on.
+ */
+enum Sides { 
+    // 0: Taker is on buy side of order.
+    Buy, 
+
+    // 1: Taker is on sell side of order.
+    Sell 
+}
+
+/**
+ * @dev Defines condition to apply to order execution.
+ */
+enum OrderProtocols { 
+    // 0: ERC721 order that must execute in full or not at all.
+    ERC721_FILL_OR_KILL,
+
+    // 1: ERC1155 order that must execute in full or not at all.
+    ERC1155_FILL_OR_KILL,
+
+    // 2: ERC1155 order that may be partially executed.
+    ERC1155_FILL_PARTIAL
+}
+
+/**
+ * @dev Defines the rules applied to a collection for payments.
+ */
+enum PaymentSettings { 
+    // 0: Utilize Payment Processor default whitelist.
+    DefaultPaymentMethodWhitelist,
+
+    // 1: Allow any payment method.
+    AllowAnyPaymentMethod,
+
+    // 2: Use a custom payment method whitelist.
+    CustomPaymentMethodWhitelist,
+
+    // 3: Single payment method with floor and ceiling limits.
+    PricingConstraints,
+
+    // 4: Pauses trading for the collection.
+    Paused
+}
+
+/**
+ * @dev This struct is used internally for the deployment of the Payment Processor contract and 
+ * @dev module deployments to define the default payment method whitelist.
+ */
+struct DefaultPaymentMethods {
+    address defaultPaymentMethod1;
+    address defaultPaymentMethod2;
+    address defaultPaymentMethod3;
+    address defaultPaymentMethod4;
+}
+
+/**
+ * @dev This struct is used internally for the deployment of the Payment Processor contract to define the
+ * @dev module addresses to be used for the contract.
+ */
+struct PaymentProcessorModules {
+    address modulePaymentSettings;
+    address moduleOnChainCancellation;
+    address moduleTrades;
+    address moduleTradesAdvanced;
+}
+
+/**
+ * @dev This struct defines the payment settings parameters for a collection.
+ *
+ * @dev **paymentSettings**: The general rule definition for payment methods allowed.
+ * @dev **paymentMethodWhitelistId**: The list id to be used when paymentSettings is set to CustomPaymentMethodWhitelist.
+ * @dev **constraintedPricingPaymentMethod**: The payment method to be used when paymentSettings is set to PricingConstraints.
+ * @dev **royaltyBackfillNumerator**: The royalty fee to apply to the collection when ERC2981 is not supported.
+ * @dev **royaltyBountyNumerator**: The percentage of royalties the creator will grant to a marketplace for order fulfillment.
+ * @dev **isRoyaltyBountyExclusive**: If true, royalty bounties will only be paid if the order marketplace is the set exclusive marketplace.
+ * @dev **blockTradesFromUntrustedChannels**: If true, trades that originate from untrusted channels will not be executed.
+ * @dev **blockBannedAccounts**: If true, banned accounts can be neither maker or taker for trades on a per-collection basis.
+ */
+struct CollectionPaymentSettings {
+    PaymentSettings paymentSettings;
+    uint32 paymentMethodWhitelistId;
+    address constrainedPricingPaymentMethod;
+    uint16 royaltyBackfillNumerator;
+    uint16 royaltyBountyNumerator;
+    bool isRoyaltyBountyExclusive;
+    bool blockTradesFromUntrustedChannels;
+    bool blockBannedAccounts;
+}
+
+/**
+ * @dev The `v`, `r`, and `s` components of an ECDSA signature.  For more information
+ *      [refer to this article](https://medium.com/mycrypto/the-magic-of-digital-signatures-on-ethereum-98fe184dc9c7).
+ */
+struct SignatureECDSA {
+    uint8 v;
+    bytes32 r;
+    bytes32 s;
+}
+
+/**
+ * @dev This struct defines order execution parameters.
+ * 
+ * @dev **protocol**: The order protocol to apply to the order.
+ * @dev **maker**: The user that created and signed the order to be executed by a taker.
+ * @dev **beneficiary**: The account that will receive the tokens.
+ * @dev **marketplace**: The fee receiver of the marketplace that the order was created on.
+ * @dev **fallbackRoyaltyRecipient**: The address that will receive royalties if ERC2981 
+ * @dev is not supported by the collection and the creator has not defined backfilled royalties with Payment Processor.
+ * @dev **paymentMethod**: The payment method for the order.
+ * @dev **tokenAddress**: The address of the token collection the order is for.
+ * @dev **tokenId**: The token id that the order is for.
+ * @dev **amount**: The quantity of token the order is for.
+ * @dev **itemPrice**: The price for the order in base units for the payment method.
+ * @dev **nonce**: The maker's nonce for the order.
+ * @dev **expiration**: The time, in seconds since the Unix epoch, that the order will expire.
+ * @dev **marketplaceFeeNumerator**: The percentage fee that will be sent to the marketplace.
+ * @dev **maxRoyaltyFeeNumerator**: The maximum royalty the maker is willing to accept. This will be used
+ * @dev as the royalty amount when ERC2981 is not supported by the collection.
+ * @dev **requestedFillAmount**: The amount of tokens for an ERC1155 partial fill order that the taker wants to fill.
+ * @dev **minimumFillAmount**: The minimum amount of tokens for an ERC1155 partial fill order that the taker will accept.
+ */
+struct Order {
+    OrderProtocols protocol;
+    address maker;
+    address beneficiary;
+    address marketplace;
+    address fallbackRoyaltyRecipient;
+    address paymentMethod;
+    address tokenAddress;
+    uint256 tokenId;
+    uint248 amount;
+    uint256 itemPrice;
+    uint256 nonce;
+    uint256 expiration;
+    uint256 marketplaceFeeNumerator;
+    uint256 maxRoyaltyFeeNumerator;
+    uint248 requestedFillAmount;
+    uint248 minimumFillAmount;
+}
+
+/**
+ * @dev This struct defines the cosignature for verifying an order that is a cosigned order.
+ *
+ * @dev **signer**: The address that signed the cosigned order. This must match the cosigner that is part of the order signature.
+ * @dev **taker**: The address of the order taker.
+ * @dev **expiration**: The time, in seconds since the Unix epoch, that the cosignature will expire.
+ * @dev The `v`, `r`, and `s` components of an ECDSA signature.  For more information
+ *      [refer to this article](https://medium.com/mycrypto/the-magic-of-digital-signatures-on-ethereum-98fe184dc9c7).
+ */
+struct Cosignature {
+    address signer;
+    address taker;
+    uint256 expiration;
+    uint8 v;
+    bytes32 r;
+    bytes32 s;
+}
+
+/**
+ * @dev This struct defines an additional fee on top of an order, paid by taker.
+ *
+ * @dev **recipient**: The recipient of the additional fee.
+ * @dev **amount**: The amount of the additional fee, in base units of the payment token.
+ */
+struct FeeOnTop {
+    address recipient;
+    uint256 amount;
+}
+
+/**
+ * @dev This struct defines the root hash and proof data for accepting an offer that is for a subset
+ * @dev of items in a collection. The root hash must match the root hash specified as part of the 
+ * @dev maker's order signature.
+ * 
+ * @dev **rootHash**: The merkletree root hash for the items that may be used to fulfill the offer order.
+ * @dev **proof**: The merkle proofs for the item being supplied to fulfill the offer order.
+ */
+struct TokenSetProof {
+    bytes32 rootHash;
+    bytes32[] proof;
+}
+
+/**
+ * @dev Current state of a partially fillable order.
+ */
+enum PartiallyFillableOrderState { 
+    // 0: Order is open and may continue to be filled.
+    Open, 
+
+    // 1: Order has been completely filled.
+    Filled, 
+
+    // 2: Order has been cancelled.
+    Cancelled
+}
+
+/**
+ * @dev This struct defines the current status of a partially fillable order.
+ * 
+ * @dev **state**: The current state of the order as defined by the PartiallyFillableOrderState enum.
+ * @dev **remainingFillableQuantity**: The remaining quantity that may be filled for the order.
+ */
+struct PartiallyFillableOrderStatus {
+    PartiallyFillableOrderState state;
+    uint248 remainingFillableQuantity;
+}
+
+/**
+ * @dev This struct defines the royalty backfill and bounty information. Its data for an
+ * @dev order execution is constructed internally based on the collection settings and
+ * @dev order execution details.
+ * 
+ * @dev **backfillNumerator**: The percentage of the order amount to pay as royalties
+ * @dev for a collection that does not support ERC2981.
+ * @dev **backfillReceiver**: The recipient of backfill royalties.
+ * @dev **bountyNumerator**: The percentage of royalties to share with the marketplace for order fulfillment.
+ * @dev **exclusiveMarketplace**: If non-zero, the address of the exclusive marketplace for royalty bounties.
+ */
+struct RoyaltyBackfillAndBounty {
+    uint16 backfillNumerator;
+    address backfillReceiver;
+    uint16 bountyNumerator;
+    address exclusiveMarketplace;
+}
+
+/**
+ * @dev This struct defines order information that is common to all items in a sweep order.
+ * 
+ * @dev **protocol**: The order protocol to apply to the order.
+ * @dev **tokenAddress**: The address of the token collection the order is for.
+ * @dev **paymentMethod**: The payment method for the order.
+ * @dev **beneficiary**: The account that will receive the tokens.
+ */
+struct SweepOrder {
+    OrderProtocols protocol;
+    address tokenAddress;
+    address paymentMethod;
+    address beneficiary;
+}
+
+/**
+ * @dev This struct defines order information that is unique to each item of a sweep order.
+ * @dev Combined with the SweepOrder header information to make an Order to execute.
+ * 
+ * @dev **maker**: The user that created and signed the order to be executed by a taker.
+ * @dev **marketplace**: The marketplace that the order was created on.
+ * @dev **fallbackRoyaltyRecipient**: The address that will receive royalties if ERC2981 
+ * @dev is not supported by the collection and the creator has not defined royalties with Payment Processor.
+ * @dev **tokenId**: The token id that the order is for.
+ * @dev **amount**: The quantity of token the order is for.
+ * @dev **itemPrice**: The price for the order in base units for the payment method.
+ * @dev **nonce**: The maker's nonce for the order.
+ * @dev **expiration**: The time, in seconds since the Unix epoch, that the order will expire.
+ * @dev **marketplaceFeeNumerator**: The percentage fee that will be sent to the marketplace.
+ * @dev **maxRoyaltyFeeNumerator**: The maximum royalty the maker is willing to accept. This will be used
+ * @dev as the royalty amount when ERC2981 is not supported by the collection.
+ */
+struct SweepItem {
+    address maker;
+    address marketplace;
+    address fallbackRoyaltyRecipient;
+    uint256 tokenId;
+    uint248 amount;
+    uint256 itemPrice;
+    uint256 nonce;
+    uint256 expiration;
+    uint256 marketplaceFeeNumerator;
+    uint256 maxRoyaltyFeeNumerator;
+}
+
+/**
+ * @dev This struct is used to define pricing constraints for a collection or individual token.
+ *
+ * @dev **isSet**: When true, this indicates that pricing constraints are set for the collection or token.
+ * @dev **floorPrice**: The minimum price for a token or collection.  This is only enforced when 
+ * @dev `enforcePricingConstraints` is `true`.
+ * @dev **ceilingPrice**: The maximum price for a token or collection.  This is only enforced when
+ * @dev `enforcePricingConstraints` is `true`.
+ */
+struct PricingBounds {
+    bool isSet;
+    uint120 floorPrice;
+    uint120 ceilingPrice;
+}
+
+/**
+ * @dev This struct defines the parameters for a bulk offer acceptance transaction.
+ * 
+ * 
+ * @dev **isCollectionLevelOfferArray**: An array of flags to indicate if an offer is for any token in the collection.
+ * @dev **saleDetailsArray**: An array of order execution details.
+ * @dev **buyerSignaturesArray**: An array of maker signatures authorizing the order executions.
+ * @dev **tokenSetProofsArray**: An array of root hashes and merkle proofs for offers that are a subset of tokens in a collection.
+ * @dev **cosignaturesArray**: An array of additional cosignatures for cosigned orders, as applicable.
+ * @dev **feesOnTopArray**: An array of additional fees to add on top of the orders, paid by taker.
+ */
+struct BulkAcceptOffersParams {
+    bool[] isCollectionLevelOfferArray;
+    Order[] saleDetailsArray;
+    SignatureECDSA[] buyerSignaturesArray;
+    TokenSetProof[] tokenSetProofsArray;
+    Cosignature[] cosignaturesArray;
+    FeeOnTop[] feesOnTopArray;
+}
+
+/** 
+ * @dev Internal contract use only - this is not a public-facing struct
+ */
+struct SplitProceeds {
+    address royaltyRecipient;
+    uint256 royaltyProceeds;
+    uint256 marketplaceProceeds;
+    uint256 sellerProceeds;
+}
+
+/** 
+ * @dev Internal contract use only - this is not a public-facing struct
+ */
+struct PayoutsAccumulator {
+    address lastSeller;
+    address lastMarketplace;
+    address lastRoyaltyRecipient;
+    uint256 accumulatedSellerProceeds;
+    uint256 accumulatedMarketplaceProceeds;
+    uint256 accumulatedRoyaltyProceeds;
+}
+
+/** 
+ * @dev Internal contract use only - this is not a public-facing struct
+ */
+struct SweepCollectionComputeAndDistributeProceedsParams {
+    IERC20 paymentCoin;
+    FulfillOrderFunctionPointers fnPointers;
+    FeeOnTop feeOnTop;
+    RoyaltyBackfillAndBounty royaltyBackfillAndBounty;
+    Order[] saleDetailsBatch;
+}
+
+/** 
+ * @dev Internal contract use only - this is not a public-facing struct
+ */
+ struct FulfillOrderFunctionPointers {
+    function(address,address,IERC20,uint256,uint256) funcPayout;
+    function(address,address,address,uint256,uint256) returns (bool) funcDispenseToken;
+    function(TradeContext memory, Order memory) funcEmitOrderExecutionEvent;
+ }
+
+ /** 
+ * @dev Internal contract use only - this is not a public-facing struct
+ */
+ struct TradeContext {
+    bytes32 domainSeparator;
+    address channel;
+    address taker;
+    bool disablePartialFill;
+ }
+
+/**
+ * @dev This struct defines contract-level storage to be used across all Payment Processor modules.
+ * @dev Follows the Diamond storage pattern.
+ */
+struct PaymentProcessorStorage {
+    /// @dev Tracks the most recently created payment method whitelist id
+    uint32 lastPaymentMethodWhitelistId;
+
+    /**
+     * @notice User-specific master nonce that allows buyers and sellers to efficiently cancel all listings or offers
+     *         they made previously. The master nonce for a user only changes when they explicitly request to revoke all
+     *         existing listings and offers.
+     *
+     * @dev    When prompting sellers to sign a listing or offer, marketplaces must query the current master nonce of
+     *         the user and include it in the listing/offer signature data.
+     */
+    mapping(address => uint256) masterNonces;
+
+    /**
+     * @dev The mapping key is the keccak256 hash of marketplace address and user address.
+     *
+     * @dev ```keccak256(abi.encodePacked(marketplace, user))```
+     *
+     * @dev The mapping value is another nested mapping of "slot" (key) to a bitmap (value) containing boolean flags
+     *      indicating whether or not a nonce has been used or invalidated.
+     *
+     * @dev Marketplaces MUST track their own nonce by user, incrementing it for every signed listing or offer the user
+     *      creates.  Listings and purchases may be executed out of order, and they may never be executed if orders
+     *      are not matched prior to expriation.
+     *
+     * @dev The slot and the bit offset within the mapped value are computed as:
+     *
+     * @dev ```slot = nonce / 256;```
+     * @dev ```offset = nonce % 256;```
+     */
+    mapping(address => mapping(uint256 => uint256)) invalidatedSignatures;
+    
+    /// @dev Mapping of token contract addresses to the collection payment settings.
+    mapping (address => CollectionPaymentSettings) collectionPaymentSettings;
+
+    /// @dev Mapping of payment method whitelist id to the owner address for the list.
+    mapping (uint32 => address) paymentMethodWhitelistOwners;
+
+    /// @dev Mapping of payment method whitelist id to a defined list of allowed payment methods.
+    mapping (uint32 => EnumerableSet.AddressSet) collectionPaymentMethodWhitelists;
+
+    /// @dev Mapping of token contract addresses to the collection-level pricing boundaries (floor and ceiling price).
+    mapping (address => PricingBounds) collectionPricingBounds;
+
+    /// @dev Mapping of token contract addresses to the token-level pricing boundaries (floor and ceiling price).
+    mapping (address => mapping (uint256 => PricingBounds)) tokenPricingBounds;
+
+    /// @dev Mapping of token contract addresses to the defined royalty backfill receiver addresses.
+    mapping (address => address) collectionRoyaltyBackfillReceivers;
+
+    /// @dev Mapping of token contract addresses to the defined exclusive bounty receivers.
+    mapping (address => address) collectionExclusiveBountyReceivers;
+
+    /// @dev Mapping of maker addresses to a mapping of order digests to the status of the partially fillable order for that digest.
+    mapping (address => mapping(bytes32 => PartiallyFillableOrderStatus)) partiallyFillableOrderStatuses;
+
+    /// @dev Mapping of token contract addresses to the defined list of trusted channels for the token contract.
+    mapping (address => EnumerableSet.AddressSet) collectionTrustedChannels;
+
+    /// @dev Mapping of token contract addresses to the defined list of banned accounts for the token contract.
+    mapping (address => EnumerableSet.AddressSet) collectionBannedAccounts;
+
+    /// @dev A mapping of all co-signers that have self-destructed and can never be used as cosigners again.
+    mapping (address => bool) destroyedCosigners;
+}
+
+// File: lib/openzeppelin-contracts/contracts/utils/cryptography/EIP712.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/cryptography/EIP712.sol)
+
+pragma solidity ^0.8.8;
+
+import "./ECDSA.sol";
+import "../ShortStrings.sol";
+import "../../interfaces/IERC5267.sol";
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.
+ *
+ * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,
+ * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding
+ * they need in their contracts using a combination of `abi.encode` and `keccak256`.
+ *
+ * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding
+ * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA
+ * ({_hashTypedDataV4}).
+ *
+ * The implementation of the domain separator was designed to be as efficient as possible while still properly updating
+ * the chain id to protect against replay attacks on an eventual fork of the chain.
+ *
+ * NOTE: This contract implements the version of the encoding known as "v4", as implemented by the JSON RPC method
+ * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].
+ *
+ * NOTE: In the upgradeable version of this contract, the cached values will correspond to the address, and the domain
+ * separator of the implementation contract. This will cause the `_domainSeparatorV4` function to always rebuild the
+ * separator from the immutable values, which is cheaper than accessing a cached version in cold storage.
+ *
+ * _Available since v3.4._
+ *
+ * @custom:oz-upgrades-unsafe-allow state-variable-immutable state-variable-assignment
+ */
+abstract contract EIP712 is IERC5267 {
+    using ShortStrings for *;
+
+    bytes32 private constant _TYPE_HASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to
+    // invalidate the cached domain separator if the chain id changes.
+    bytes32 private immutable _cachedDomainSeparator;
+    uint256 private immutable _cachedChainId;
+    address private immutable _cachedThis;
+
+    bytes32 private immutable _hashedName;
+    bytes32 private immutable _hashedVersion;
+
+    ShortString private immutable _name;
+    ShortString private immutable _version;
+    string private _nameFallback;
+    string private _versionFallback;
+
+    /**
+     * @dev Initializes the domain separator and parameter caches.
+     *
+     * The meaning of `name` and `version` is specified in
+     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:
+     *
+     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.
+     * - `version`: the current major version of the signing domain.
+     *
+     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart
+     * contract upgrade].
+     */
+    constructor(string memory name, string memory version) {
+        _name = name.toShortStringWithFallback(_nameFallback);
+        _version = version.toShortStringWithFallback(_versionFallback);
+        _hashedName = keccak256(bytes(name));
+        _hashedVersion = keccak256(bytes(version));
+
+        _cachedChainId = block.chainid;
+        _cachedDomainSeparator = _buildDomainSeparator();
+        _cachedThis = address(this);
+    }
+
+    /**
+     * @dev Returns the domain separator for the current chain.
+     */
+    function _domainSeparatorV4() internal view returns (bytes32) {
+        if (address(this) == _cachedThis && block.chainid == _cachedChainId) {
+            return _cachedDomainSeparator;
+        } else {
+            return _buildDomainSeparator();
+        }
+    }
+
+    function _buildDomainSeparator() private view returns (bytes32) {
+        return keccak256(abi.encode(_TYPE_HASH, _hashedName, _hashedVersion, block.chainid, address(this)));
+    }
+
+    /**
+     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this
+     * function returns the hash of the fully encoded EIP712 message for this domain.
+     *
+     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:
+     *
+     * ```solidity
+     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(
+     *     keccak256("Mail(address to,string contents)"),
+     *     mailTo,
+     *     keccak256(bytes(mailContents))
+     * )));
+     * address signer = ECDSA.recover(digest, signature);
+     * ```
+     */
+    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {
+        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);
+    }
+
+    /**
+     * @dev See {EIP-5267}.
+     *
+     * _Available since v4.9._
+     */
+    function eip712Domain()
+        public
+        view
+        virtual
+        override
+        returns (
+            bytes1 fields,
+            string memory name,
+            string memory version,
+            uint256 chainId,
+            address verifyingContract,
+            bytes32 salt,
+            uint256[] memory extensions
+        )
+    {
+        return (
+            hex"0f", // 01111
+            _name.toStringWithFallback(_nameFallback),
+            _version.toStringWithFallback(_versionFallback),
+            block.chainid,
+            address(this),
+            bytes32(0),
+            new uint256[](0)
+        );
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position of the value in the `values` array, plus 1 because index 0
+        // means a value is not in the set.
+        mapping(bytes32 => uint256) _indexes;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._indexes[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We read and store the value's index to prevent multiple reads from the same storage slot
+        uint256 valueIndex = set._indexes[value];
+
+        if (valueIndex != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 toDeleteIndex = valueIndex - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (lastIndex != toDeleteIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the last value to the index where the value to delete is
+                set._values[toDeleteIndex] = lastValue;
+                // Update the index for the moved value
+                set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the index for the deleted slot
+            delete set._indexes[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._indexes[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/cryptography/ECDSA.sol)
+
+pragma solidity ^0.8.0;
+
+import "../Strings.sol";
+
+/**
+ * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.
+ *
+ * These functions can be used to verify that a message was signed by the holder
+ * of the private keys of a given address.
+ */
+library ECDSA {
+    enum RecoverError {
+        NoError,
+        InvalidSignature,
+        InvalidSignatureLength,
+        InvalidSignatureS,
+        InvalidSignatureV // Deprecated in v4.8
+    }
+
+    function _throwError(RecoverError error) private pure {
+        if (error == RecoverError.NoError) {
+            return; // no error: do nothing
+        } else if (error == RecoverError.InvalidSignature) {
+            revert("ECDSA: invalid signature");
+        } else if (error == RecoverError.InvalidSignatureLength) {
+            revert("ECDSA: invalid signature length");
+        } else if (error == RecoverError.InvalidSignatureS) {
+            revert("ECDSA: invalid signature 's' value");
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature` or error string. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {toEthSignedMessageHash} on it.
+     *
+     * Documentation for signature generation:
+     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]
+     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(bytes32 hash, bytes memory signature) internal pure returns (address, RecoverError) {
+        if (signature.length == 65) {
+            bytes32 r;
+            bytes32 s;
+            uint8 v;
+            // ecrecover takes the signature parameters, and the only way to get them
+            // currently is to use assembly.
+            /// @solidity memory-safe-assembly
+            assembly {
+                r := mload(add(signature, 0x20))
+                s := mload(add(signature, 0x40))
+                v := byte(0, mload(add(signature, 0x60)))
+            }
+            return tryRecover(hash, v, r, s);
+        } else {
+            return (address(0), RecoverError.InvalidSignatureLength);
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature`. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {toEthSignedMessageHash} on it.
+     */
+    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, signature);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.
+     *
+     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address, RecoverError) {
+        bytes32 s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+        uint8 v = uint8((uint256(vs) >> 255) + 27);
+        return tryRecover(hash, v, r, s);
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.
+     *
+     * _Available since v4.2._
+     */
+    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, r, vs);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address, RecoverError) {
+        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature
+        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines
+        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most
+        // signatures from current libraries generate a unique signature with an s-value in the lower half order.
+        //
+        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept
+        // these malleable signatures as well.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return (address(0), RecoverError.InvalidSignatureS);
+        }
+
+        // If the signature is valid (and not malleable), return the signer address
+        address signer = ecrecover(hash, v, r, s);
+        if (signer == address(0)) {
+            return (address(0), RecoverError.InvalidSignature);
+        }
+
+        return (signer, RecoverError.NoError);
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     */
+    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Message, created from a `hash`. This
+     * produces hash corresponding to the one signed with the
+     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]
+     * JSON-RPC method as part of EIP-191.
+     *
+     * See {recover}.
+     */
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32 message) {
+        // 32 is the length in bytes of hash,
+        // enforced by the type signature above
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, "\x19Ethereum Signed Message:\n32")
+            mstore(0x1c, hash)
+            message := keccak256(0x00, 0x3c)
+        }
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Message, created from `s`. This
+     * produces hash corresponding to the one signed with the
+     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]
+     * JSON-RPC method as part of EIP-191.
+     *
+     * See {recover}.
+     */
+    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n", Strings.toString(s.length), s));
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Typed Data, created from a
+     * `domainSeparator` and a `structHash`. This produces hash corresponding
+     * to the one signed with the
+     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]
+     * JSON-RPC method as part of EIP-712.
+     *
+     * See {recover}.
+     */
+    function toTypedDataHash(bytes32 domainSeparator, bytes32 structHash) internal pure returns (bytes32 data) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, "\x19\x01")
+            mstore(add(ptr, 0x02), domainSeparator)
+            mstore(add(ptr, 0x22), structHash)
+            data := keccak256(ptr, 0x42)
+        }
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Data with intended validator, created from a
+     * `validator` and `data` according to the version 0 of EIP-191.
+     *
+     * See {recover}.
+     */
+    function toDataWithIntendedValidatorHash(address validator, bytes memory data) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x00", validator, data));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/ShortStrings.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/ShortStrings.sol)
+
+pragma solidity ^0.8.8;
+
+import "./StorageSlot.sol";
+
+// | string  | 0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   |
+// | length  | 0x                                                              BB |
+type ShortString is bytes32;
+
+/**
+ * @dev This library provides functions to convert short memory strings
+ * into a `ShortString` type that can be used as an immutable variable.
+ *
+ * Strings of arbitrary length can be optimized using this library if
+ * they are short enough (up to 31 bytes) by packing them with their
+ * length (1 byte) in a single EVM word (32 bytes). Additionally, a
+ * fallback mechanism can be used for every other case.
+ *
+ * Usage example:
+ *
+ * ```solidity
+ * contract Named {
+ *     using ShortStrings for *;
+ *
+ *     ShortString private immutable _name;
+ *     string private _nameFallback;
+ *
+ *     constructor(string memory contractName) {
+ *         _name = contractName.toShortStringWithFallback(_nameFallback);
+ *     }
+ *
+ *     function name() external view returns (string memory) {
+ *         return _name.toStringWithFallback(_nameFallback);
+ *     }
+ * }
+ * ```
+ */
+library ShortStrings {
+    // Used as an identifier for strings longer than 31 bytes.
+    bytes32 private constant _FALLBACK_SENTINEL = 0x00000000000000000000000000000000000000000000000000000000000000FF;
+
+    error StringTooLong(string str);
+    error InvalidShortString();
+
+    /**
+     * @dev Encode a string of at most 31 chars into a `ShortString`.
+     *
+     * This will trigger a `StringTooLong` error is the input string is too long.
+     */
+    function toShortString(string memory str) internal pure returns (ShortString) {
+        bytes memory bstr = bytes(str);
+        if (bstr.length > 31) {
+            revert StringTooLong(str);
+        }
+        return ShortString.wrap(bytes32(uint256(bytes32(bstr)) | bstr.length));
+    }
+
+    /**
+     * @dev Decode a `ShortString` back to a "normal" string.
+     */
+    function toString(ShortString sstr) internal pure returns (string memory) {
+        uint256 len = byteLength(sstr);
+        // using `new string(len)` would work locally but is not memory safe.
+        string memory str = new string(32);
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(str, len)
+            mstore(add(str, 0x20), sstr)
+        }
+        return str;
+    }
+
+    /**
+     * @dev Return the length of a `ShortString`.
+     */
+    function byteLength(ShortString sstr) internal pure returns (uint256) {
+        uint256 result = uint256(ShortString.unwrap(sstr)) & 0xFF;
+        if (result > 31) {
+            revert InvalidShortString();
+        }
+        return result;
+    }
+
+    /**
+     * @dev Encode a string into a `ShortString`, or write it to storage if it is too long.
+     */
+    function toShortStringWithFallback(string memory value, string storage store) internal returns (ShortString) {
+        if (bytes(value).length < 32) {
+            return toShortString(value);
+        } else {
+            StorageSlot.getStringSlot(store).value = value;
+            return ShortString.wrap(_FALLBACK_SENTINEL);
+        }
+    }
+
+    /**
+     * @dev Decode a string that was encoded to `ShortString` or written to storage using {setWithFallback}.
+     */
+    function toStringWithFallback(ShortString value, string storage store) internal pure returns (string memory) {
+        if (ShortString.unwrap(value) != _FALLBACK_SENTINEL) {
+            return toString(value);
+        } else {
+            return store;
+        }
+    }
+
+    /**
+     * @dev Return the length of a string that was encoded to `ShortString` or written to storage using {setWithFallback}.
+     *
+     * WARNING: This will return the "byte length" of the string. This may not reflect the actual length in terms of
+     * actual characters as the UTF-8 encoding of a single character can span over multiple bytes.
+     */
+    function byteLengthWithFallback(ShortString value, string storage store) internal view returns (uint256) {
+        if (ShortString.unwrap(value) != _FALLBACK_SENTINEL) {
+            return byteLength(value);
+        } else {
+            return bytes(store).length;
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/interfaces/IERC5267.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (interfaces/IERC5267.sol)
+
+pragma solidity ^0.8.0;
+
+interface IERC5267 {
+    /**
+     * @dev MAY be emitted to signal that the domain could have changed.
+     */
+    event EIP712DomainChanged();
+
+    /**
+     * @dev returns the fields and values that describe the domain separator used by this contract for EIP-712
+     * signature.
+     */
+    function eip712Domain()
+        external
+        view
+        returns (
+            bytes1 fields,
+            string memory name,
+            string memory version,
+            uint256 chainId,
+            address verifyingContract,
+            bytes32 salt,
+            uint256[] memory extensions
+        );
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Strings.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Strings.sol)
+
+pragma solidity ^0.8.0;
+
+import "./math/Math.sol";
+import "./math/SignedMath.sol";
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+    bytes16 private constant _SYMBOLS = "0123456789abcdef";
+    uint8 private constant _ADDRESS_LENGTH = 20;
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            uint256 length = Math.log10(value) + 1;
+            string memory buffer = new string(length);
+            uint256 ptr;
+            /// @solidity memory-safe-assembly
+            assembly {
+                ptr := add(buffer, add(32, length))
+            }
+            while (true) {
+                ptr--;
+                /// @solidity memory-safe-assembly
+                assembly {
+                    mstore8(ptr, byte(mod(value, 10), _SYMBOLS))
+                }
+                value /= 10;
+                if (value == 0) break;
+            }
+            return buffer;
+        }
+    }
+
+    /**
+     * @dev Converts a `int256` to its ASCII `string` decimal representation.
+     */
+    function toString(int256 value) internal pure returns (string memory) {
+        return string(abi.encodePacked(value < 0 ? "-" : "", toString(SignedMath.abs(value))));
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            return toHexString(value, Math.log256(value) + 1);
+        }
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(2 * length + 2);
+        buffer[0] = "0";
+        buffer[1] = "x";
+        for (uint256 i = 2 * length + 1; i > 1; --i) {
+            buffer[i] = _SYMBOLS[value & 0xf];
+            value >>= 4;
+        }
+        require(value == 0, "Strings: hex length insufficient");
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal representation.
+     */
+    function toHexString(address addr) internal pure returns (string memory) {
+        return toHexString(uint256(uint160(addr)), _ADDRESS_LENGTH);
+    }
+
+    /**
+     * @dev Returns true if the two strings are equal.
+     */
+    function equal(string memory a, string memory b) internal pure returns (bool) {
+        return keccak256(bytes(a)) == keccak256(bytes(b));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/StorageSlot.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/StorageSlot.sol)
+// This file was procedurally generated from scripts/generate/templates/StorageSlot.js.
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for reading and writing primitive types to specific storage slots.
+ *
+ * Storage slots are often used to avoid storage conflict when dealing with upgradeable contracts.
+ * This library helps with reading and writing to such slots without the need for inline assembly.
+ *
+ * The functions in this library return Slot structs that contain a `value` member that can be used to read or write.
+ *
+ * Example usage to set ERC1967 implementation slot:
+ * ```solidity
+ * contract ERC1967 {
+ *     bytes32 internal constant _IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+ *
+ *     function _getImplementation() internal view returns (address) {
+ *         return StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value;
+ *     }
+ *
+ *     function _setImplementation(address newImplementation) internal {
+ *         require(Address.isContract(newImplementation), "ERC1967: new implementation is not a contract");
+ *         StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value = newImplementation;
+ *     }
+ * }
+ * ```
+ *
+ * _Available since v4.1 for `address`, `bool`, `bytes32`, `uint256`._
+ * _Available since v4.9 for `string`, `bytes`._
+ */
+library StorageSlot {
+    struct AddressSlot {
+        address value;
+    }
+
+    struct BooleanSlot {
+        bool value;
+    }
+
+    struct Bytes32Slot {
+        bytes32 value;
+    }
+
+    struct Uint256Slot {
+        uint256 value;
+    }
+
+    struct StringSlot {
+        string value;
+    }
+
+    struct BytesSlot {
+        bytes value;
+    }
+
+    /**
+     * @dev Returns an `AddressSlot` with member `value` located at `slot`.
+     */
+    function getAddressSlot(bytes32 slot) internal pure returns (AddressSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `BooleanSlot` with member `value` located at `slot`.
+     */
+    function getBooleanSlot(bytes32 slot) internal pure returns (BooleanSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `Bytes32Slot` with member `value` located at `slot`.
+     */
+    function getBytes32Slot(bytes32 slot) internal pure returns (Bytes32Slot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `Uint256Slot` with member `value` located at `slot`.
+     */
+    function getUint256Slot(bytes32 slot) internal pure returns (Uint256Slot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `StringSlot` with member `value` located at `slot`.
+     */
+    function getStringSlot(bytes32 slot) internal pure returns (StringSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `StringSlot` representation of the string storage pointer `store`.
+     */
+    function getStringSlot(string storage store) internal pure returns (StringSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := store.slot
+        }
+    }
+
+    /**
+     * @dev Returns an `BytesSlot` with member `value` located at `slot`.
+     */
+    function getBytesSlot(bytes32 slot) internal pure returns (BytesSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `BytesSlot` representation of the bytes storage pointer `store`.
+     */
+    function getBytesSlot(bytes storage store) internal pure returns (BytesSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := store.slot
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1, "Math: mulDiv overflow");
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/math/SignedMath.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard signed math utilities missing in the Solidity language.
+ */
+library SignedMath {
+    /**
+     * @dev Returns the largest of two signed numbers.
+     */
+    function max(int256 a, int256 b) internal pure returns (int256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two signed numbers.
+     */
+    function min(int256 a, int256 b) internal pure returns (int256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two signed numbers without overflow.
+     * The result is rounded towards zero.
+     */
+    function average(int256 a, int256 b) internal pure returns (int256) {
+        // Formula from the book "Hacker's Delight"
+        int256 x = (a & b) + ((a ^ b) >> 1);
+        return x + (int256(uint256(x) >> 255) & (a ^ b));
+    }
+
+    /**
+     * @dev Returns the absolute unsigned value of a signed value.
+     */
+    function abs(int256 n) internal pure returns (uint256) {
+        unchecked {
+            // must be unchecked in order to support `n = type(int256).min`
+            return uint256(n >= 0 ? n : -n);
+        }
+    }
+}
+

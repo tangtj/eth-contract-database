@@ -1,0 +1,526 @@
+
+// File: contracts/Bridge.sol
+// SPDX-License-Identifier: MIT
+/*
+#########################################################
+# ____    _    ____  _____ ____    _    ___    __   __  #
+#| __ )  / \  / ___|| ____|  _ \  / \  |_ _|  / /___\ \ #
+#|  _ \ / _ \ \___ \|  _| | | | |/ _ \  | |  / /_____\ \#
+#| |_) / ___ \ ___) | |___| |_| / ___ \ | |  \ \_____/ /#
+#|____/_/___\_\____/|_____|____/_/_  \_\___|  \_\   /_/ #
+#| __ )|  _ \|_ _|  _ \ / ___| ____|                    #
+#|  _ \| |_) || || | | | |  _|  _|                      #
+#| |_) |  _ < | || |_| | |_| | |___                     #
+#|____/|_| \_\___|____/ \____|_____|                    #
+#########################################################   
+# BRIDGE REWARDS - Bridge.sol - www.getbased.ai         #
+#########################################################
+*/
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+interface IERC20 {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC721 {
+    function transferFrom(address from, address to, uint256 tokenId) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
+contract BasedAIBridge is ReentrancyGuard, Pausable {
+    IERC20 public pepeCoin;
+    IERC721 public brainNFT;
+    address public owner;
+    address public pepeCoinAddress;
+    bool public mainnetLive;
+    uint256 public startTime;
+
+    struct Stake {
+        address tokenAddress;
+        uint256 amount;
+        uint256 timestamp;
+        uint256 rate;
+        uint256[] brainIds;
+    }
+
+    struct TokenConfig {
+        uint256 initialRate;
+        uint256 rateIncreaseAmount;
+        uint256 rateIncreaseInterval;
+        bool isSupported;
+    }
+
+    mapping(address => Stake[]) public stakes;
+    mapping(address => uint256) public credits;
+    mapping(address => bool) public hasStaked;
+    mapping(address => uint256) public lastKnownCredits;
+    address[] public stakers;
+    mapping(address => TokenConfig) public tokenConfigs;
+    mapping(address => uint256) public finalScores; 
+
+    event Staked(address indexed user, address tokenAddress, uint256 amount, uint256 timestamp, uint256 rate);
+    event BrainStaked(address indexed user, uint256 tokenId, uint256 timestamp, uint256 rate);
+    event MainnetActivated();
+    event Withdrawn(address indexed user, uint256 amount);
+    event BrainWithdrawn(address indexed user, uint256 tokenId);
+    event CreditsUpdated(address indexed user, uint256 credits);
+    event FinalScoreRecorded(address indexed user, uint256 finalScore);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function.");
+        _;
+    }
+
+    constructor() {
+        pepeCoinAddress = 0xA9E8aCf069C58aEc8825542845Fd754e41a9489A;
+        pepeCoin = IERC20(0xA9E8aCf069C58aEc8825542845Fd754e41a9489A);
+        brainNFT = IERC721(0xA9E8aCf069C58aEc8825542845Fd754e41a9489A);
+        owner = msg.sender;
+        mainnetLive = false;
+        startTime = block.timestamp;
+
+        tokenConfigs[0xA9E8aCf069C58aEc8825542845Fd754e41a9489A] = TokenConfig({
+            initialRate: 500,
+            rateIncreaseAmount: 0,
+            rateIncreaseInterval: 30 days,
+            isSupported: true
+        });
+    }
+
+    // For user with TFT Enforcer
+    function getCurrentRate(address tokenAddress) public view returns (uint256) {
+        TokenConfig storage config = tokenConfigs[tokenAddress];
+        uint256 timeElapsed = block.timestamp - startTime;
+        uint256 periods = timeElapsed / config.rateIncreaseInterval;
+        return config.initialRate + (config.rateIncreaseAmount * periods);
+    }
+
+    function setBasedBrainNFT(address tokenAddress) external onlyOwner {
+        brainNFT = IERC721(tokenAddress);
+    }
+
+    function addOrUpdateToken(address tokenAddress, uint256 _initialRate, uint256 _rateIncreaseAmount, uint256 _rateIncreaseInterval) external onlyOwner {
+        tokenConfigs[tokenAddress] = TokenConfig({
+            initialRate: _initialRate, // 500 for Pepecoin, 5000 for Brain Specific Token, 5 for Brain Credits, 5800 for $BASED, 1000 for FHE-ORDERBOOK Brain Token
+            rateIncreaseAmount: _rateIncreaseAmount,
+            rateIncreaseInterval: _rateIncreaseInterval,
+            isSupported: true
+        });
+    }
+
+    function removeToken(address tokenAddress) external onlyOwner {
+        tokenConfigs[tokenAddress].isSupported = false;
+    }
+
+    function stake(address tokenAddress, uint256 _amount) external whenNotPaused nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero");
+        require(tokenConfigs[tokenAddress].isSupported, "Token is not supported for staking");
+        require(!mainnetLive, "Mainnet is live!");
+
+        IERC20(tokenAddress).transferFrom(msg.sender, address(this), _amount);
+        uint256 currentRate = tokenConfigs[tokenAddress].initialRate;
+
+        // Empty brain array
+        uint256[] memory brainIds = new uint256[](0);
+        
+        // Recover all credits if in the first 30 days
+        if (block.timestamp - startTime <= 30 days) {
+            credits[msg.sender] += lastKnownCredits[msg.sender];
+            lastKnownCredits[msg.sender] = 0;
+        }
+        
+        _addStake(msg.sender, tokenAddress, _amount, brainIds, currentRate);
+    }
+
+    function _addStake(address _staker, address _tokenAddress, uint256 _amount, uint256[] memory _brainIds, uint256 _rate) private {
+        if (!hasStaked[_staker]) {
+            hasStaked[_staker] = true;
+            stakers.push(_staker);
+        }
+
+        stakes[_staker].push(Stake({
+            tokenAddress: _tokenAddress,
+            amount: _amount,
+            timestamp: block.timestamp,
+            rate: _rate,
+            brainIds: _brainIds
+        }));
+        emit Staked(_staker, _tokenAddress, _amount, block.timestamp, _rate);
+    }
+
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyOwner {
+        require(tokenAddress != pepeCoinAddress, "Unable to remove prebriged PepeCoin");
+        IERC20(tokenAddress).transfer(owner, tokenAmount);
+    }
+
+    function recoverERC721(address tokenAddress, uint256 tokenId) external onlyOwner {
+        IERC721(tokenAddress).transferFrom(address(this), owner, tokenId);
+    }
+
+    function stakeBrain(uint256 _tokenId) external whenNotPaused nonReentrant {
+        require(brainNFT.ownerOf(_tokenId) == msg.sender, "Not the owner of the Brain");
+        require(!mainnetLive, "Mainnet is live!");
+        brainNFT.transferFrom(msg.sender, address(this), _tokenId);
+        uint256 currentRate = tokenConfigs[address(pepeCoin)].initialRate;
+
+        uint256[] memory brainIds = new uint256[](1);
+        brainIds[0] = _tokenId;
+
+        _addStake(msg.sender, address(pepeCoin), 100000 * (10 ** 18), brainIds, currentRate);
+        emit BrainStaked(msg.sender, _tokenId, block.timestamp, currentRate);
+    }
+
+    function withdraw() external whenNotPaused nonReentrant {
+        uint256 totalStaked = 0;
+        uint256 stakeCount = stakes[msg.sender].length;
+        
+        // make sure the users credits are calculated.
+        if (block.timestamp - startTime <= 30 days) {
+            // Store any previous credit balances
+            lastKnownCredits[msg.sender] = credits[msg.sender];
+            // Update the credit table to the latest
+            updateCredits(msg.sender);
+            // Combine the old and new updated credits
+            lastKnownCredits[msg.sender] += credits[msg.sender];
+        }
+
+        for (uint i = stakeCount; i > 0; i--) {
+            uint index = i - 1;
+            Stake storage stake = stakes[msg.sender][index];
+            totalStaked += stake.amount;
+
+            // If it is a Brain they can only withdraw the Brain
+            if (stake.brainIds.length == 0) {
+                IERC20(stake.tokenAddress).transfer(msg.sender, stake.amount);
+                emit Withdrawn(msg.sender, stake.amount);
+            }
+            
+            // Transfer any Brain NFTs back to the user
+            for (uint j = 0; j < stake.brainIds.length; j++) {
+                brainNFT.transferFrom(address(this), msg.sender, stake.brainIds[j]);
+                emit BrainWithdrawn(msg.sender, stake.brainIds[j]);
+            }
+            
+            stakes[msg.sender][index] = stakes[msg.sender][stakes[msg.sender].length - 1];
+            stakes[msg.sender].pop();
+        }
+
+        require(totalStaked > 0, "Nothing to remove from BasedAI bridge");
+        credits[msg.sender] = 0;
+
+    }
+
+    function triggerMainnetLive() external onlyOwner {
+        mainnetLive = true;
+        for (uint i = 0; i < stakers.length; i++) {
+            finalScores[stakers[i]] = getCredits(stakers[i]) + credits[stakers[i]];
+            finalScores[stakers[i]] += lastKnownCredits[stakers[i]];
+            emit FinalScoreRecorded(stakers[i], finalScores[stakers[i]]);
+        }
+        emit MainnetActivated();
+    }
+
+    function getFinalScore(address staker) public view returns (uint256) {
+        require(mainnetLive, "BasedAI Mainnet is not live yet");
+        return finalScores[staker];
+    }
+
+    function getCredits(address staker) private view returns (uint256) {
+        uint256 totalCredits = 0;
+        for (uint i = 0; i < stakes[staker].length; i++) {
+            totalCredits += calculateCredits(stakes[staker][i]);
+        }
+        return totalCredits;
+    }
+
+    function updateCredits(address staker) private {
+        uint256 totalCredits = 0;
+        for (uint i = 0; i < stakes[staker].length; i++) {
+            totalCredits += calculateCredits(stakes[staker][i]);
+        }
+        credits[staker] = totalCredits;
+    }
+
+    function calculateCredits(Stake memory stake) private view returns (uint256) {
+        uint256 durationInSeconds = block.timestamp - stake.timestamp;
+        uint256 accruedCredits = (stake.amount / stake.rate) * durationInSeconds / 86400; 
+        return accruedCredits;
+    }
+
+    function calculateTotalCredits(address staker) public view returns (uint256) {
+        if (mainnetLive) return finalScores[staker];
+        uint256 totalCredits = 0;
+        for (uint i = 0; i < stakes[staker].length; i++) {
+            totalCredits += calculateCredits(stakes[staker][i]);
+        }
+        // add any leftover credits collected if they participated in Brain burn or Brain credits
+        totalCredits += lastKnownCredits[staker];
+        totalCredits += credits[staker];
+        return totalCredits;
+    }
+
+    // Credits the user recovers if they restake. 
+    function calculateReturnCredits(address staker) public view returns (uint256) {
+        if (mainnetLive) return finalScores[staker];
+        return lastKnownCredits[staker];
+    }
+
+    // calculates from a current stake how much a user has earned 
+    function calculateCreditsPerToken(address staker, address _tokenAddress) public view returns (uint256) {
+        require(!mainnetLive, "Mainnet is live, claim all rewards.");
+        uint256 totalCredits = 0;
+        for (uint i = 0; i < stakes[staker].length; i++) {
+            if (stakes[staker][i].tokenAddress == _tokenAddress) {
+                totalCredits += calculateCredits(stakes[staker][i]);
+            }
+        }
+        return totalCredits;
+    }
+
+    function setCreditsForAddress(address _user, uint256 _credits) external onlyOwner {
+        credits[_user] = _credits;
+        emit CreditsUpdated(_user, _credits);
+    }
+
+    function getStakedAmount(address user, address tokenAddress) public view returns (uint256) {
+        uint256 totalStaked = 0;
+        for (uint i = 0; i < stakes[user].length; i++) {
+            if (stakes[user][i].tokenAddress == tokenAddress) {
+                totalStaked += stakes[user][i].amount;
+            }
+        }
+        return totalStaked;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+}
+
+
+
+
+// File: @openzeppelin/contracts/security/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (security/Pausable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    bool private _paused;
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        require(!paused(), "Pausable: paused");
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        require(paused(), "Pausable: not paused");
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: @openzeppelin/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
