@@ -1,0 +1,609 @@
+/**   
+-------------------------------------------------------------------------------- 
+                             *                  (              (    (        
+      { --.\  |            (  `    (     (      )\ )           )\ ) )\ )     
+       '-._\\ | (\___     )\))(   )\    )\ )  (()/((   (  (  (()/((()/((    
+           `\\|{/ ^ _)--((_)()((((_)( (()/(   /(_))\  )\ )\  /(_))/(_))\   
+       .'^^^^^^^  /`    (_()((_)\ _ )\ /(_))_(_))((_)((_|(_)(_)) (_))((_)  
+      //\   ) ,  /      |  \/  (_)_\(_|_)) __|_ _\ \ / /| __| _ \/ __| __| 
+,  _.'/  `\<-- \<       | |\/| |/ _ \   | (_ || | \ V / | _||   /\__ \ _|  
+ `^^^`     ^^   ^^      |_|  |_/_/ \_\   \___|___| \_/  |___|_|_\|___/___| 
+--------------------------------------------------------------------------------
+
+Step into the enchanted realm of Magiverse, a Play to Earn MMORPG where magic and adventure await at every turn.
+
+Website: https://magiverse.online/
+Whitepaper: https://info.magiverse.online/welcome
+X: https://x.com/Magiverse_ERC
+TG: https://t.me/magiverse 
+
+                                                                       
+*/
+
+// SPDX-License-Identifier: UNLICENSE
+
+pragma solidity 0.8.23;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        return c;
+    }
+}
+
+contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    constructor() {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+}
+
+interface IUniswapV2Factory {
+    function createPair(
+        address tokenA,
+        address tokenB
+    ) external returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    )
+        external
+        payable
+        returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+contract MAGIVERSE is Context, IERC20, Ownable {
+    using SafeMath for uint256;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => bool) private _isExcludedFromFee;
+    address payable private _taxWallet;
+    address payable private _devWallet;
+    address public _stakingContract;
+
+    uint256 private _initialBuyTax = 25;
+    uint256 private _initialSellTax = 35;
+    uint256 private _finalBuyTax = 5;
+    uint256 private _finalSellTax = 5;
+    uint256 private _reduceBuyTaxAt = 20;
+    uint256 private _reduceSellTaxAt = 25;
+    uint256 private _preventSwapBefore = 20;
+    uint256 private _buyCount = 0;
+    uint256 private _txCount = 0;
+
+    uint256 private _marketingFee = 2;
+    uint256 private _devFee = 1;
+    uint256 private _LpFee = 1;
+    uint256 private _stakingFee = 1;
+    uint256 private _totalFee =
+        _marketingFee.add(_devFee).add(_LpFee).add(_stakingFee);
+
+    uint8 private constant _decimals = 9;
+    uint256 private constant _tTotal = 1_000_000_000 * 10 ** _decimals;
+    string private constant _name = "Magiverse";
+    string private constant _symbol = "MAGI";
+
+    uint256 public _maxTxAmount = 2 * (_tTotal / 100);
+    uint256 public _maxWalletSize = 2 * (_tTotal / 100);
+    uint256 public _taxSwapThreshold = 5 * (_tTotal / 1000);
+
+    uint256 private _minimumTaxSwapThreshold = 15 * (_tTotal / 10000);
+    uint256 private _thresholdReduction = 5 * (_tTotal / 10000);
+    uint256 private _reduceThresholdAfter = 100;
+
+    uint256 public _stakingFeeTokens = 0;
+
+    IUniswapV2Router02 private uniswapV2Router;
+    address private uniswapV2Pair;
+    bool private tradingOpen;
+    bool private inSwap = false;
+    bool private swapEnabled = false;
+    bool public _stakingFeeActive = false;
+
+    event MaxTxAmountUpdated(uint _maxTxAmount);
+    modifier lockTheSwap() {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor() {
+        _taxWallet = payable(0x6E9B8A05aA14E445fd0f3EE5566B2C387F9be469);
+        _devWallet = payable(_msgSender());
+        _balances[_msgSender()] = _tTotal;
+        _isExcludedFromFee[owner()] = true;
+        _isExcludedFromFee[address(this)] = true;
+        _isExcludedFromFee[_taxWallet] = true;
+
+        emit Transfer(address(0), _msgSender(), _tTotal);
+    }
+
+    receive() external payable {}
+
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public pure override returns (uint256) {
+        return _tTotal;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(
+        address owner,
+        address spender
+    ) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(
+        address spender,
+        uint256 amount
+    ) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(
+            sender,
+            _msgSender(),
+            _allowances[sender][_msgSender()].sub(
+                amount,
+                "ERC20: transfer amount exceeds allowance"
+            )
+        );
+        return true;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _transfer(address from, address to, uint256 amount) private {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+        uint256 taxAmount = 0;
+        uint256 stakingAmount = 0;
+        if (from != owner() && to != owner()) {
+            if (
+                from == uniswapV2Pair &&
+                to != address(uniswapV2Router) &&
+                !_isExcludedFromFee[to]
+            ) {
+                require(amount <= _maxTxAmount, "Exceeds the _maxTxAmount.");
+                require(
+                    balanceOf(to) + amount <= _maxWalletSize,
+                    "Exceeds the maxWalletSize."
+                );
+                taxAmount = amount
+                    .mul(
+                        (_buyCount > _reduceBuyTaxAt)
+                            ? _finalBuyTax
+                            : _initialBuyTax
+                    )
+                    .div(100);
+                _buyCount++;
+                _txCount++;
+            }
+
+            if (to == uniswapV2Pair && from != address(this)) {
+                taxAmount = amount
+                    .mul(
+                        (_buyCount > _reduceSellTaxAt)
+                            ? _finalSellTax
+                            : _initialSellTax
+                    )
+                    .div(100);
+                _txCount++;
+            }
+
+            uint256 contractTokenBalance = balanceOf(address(this)).sub(
+                _stakingFeeTokens
+            );
+            if (
+                !inSwap &&
+                to == uniswapV2Pair &&
+                swapEnabled &&
+                contractTokenBalance > _taxSwapThreshold &&
+                _buyCount > _preventSwapBefore
+            ) {
+                swapAndLiquify(
+                    min(amount, min(contractTokenBalance, _maxTxAmount))
+                );
+            }
+        }
+
+        if (_stakingFeeActive) {
+            stakingAmount = amount.mul(_stakingFee).div(100);
+            _stakingFeeTokens = _stakingFeeTokens + stakingAmount;
+            _balances[address(this)] = _balances[address(this)].add(
+                stakingAmount
+            );
+            emit Transfer(from, address(this), stakingAmount);
+            if (taxAmount > 0) {
+                taxAmount = taxAmount - stakingAmount;
+            }
+        }
+
+        if (taxAmount > 0) {
+            _balances[address(this)] = _balances[address(this)].add(taxAmount);
+            emit Transfer(from, address(this), taxAmount);
+        }
+        uint256 totalTax = taxAmount.add(stakingAmount);
+        _balances[from] = _balances[from].sub(amount);
+        _balances[to] = _balances[to].add(amount.sub(totalTax));
+        emit Transfer(from, to, amount.sub(totalTax));
+
+        if (
+            _txCount > _reduceThresholdAfter &&
+            _taxSwapThreshold > _minimumTaxSwapThreshold
+        ) {
+            _taxSwapThreshold = _taxSwapThreshold - _thresholdReduction;
+            _txCount = 0;
+        }
+    }
+
+    function min(uint256 a, uint256 b) private pure returns (uint256) {
+        return (a > b) ? b : a;
+    }
+
+    function swapAndLiquify(uint256 tokenBalance) private lockTheSwap {
+        uint256 actualMarketingFee = _marketingFee;
+        if (!_stakingFeeActive) {
+            actualMarketingFee = _marketingFee.add(_stakingFee);
+        }
+        uint256 tokens_to_M = (tokenBalance * actualMarketingFee) / _totalFee;
+        uint256 tokens_to_D = (tokenBalance * _devFee) / _totalFee;
+        uint256 tokens_to_LP = (tokenBalance * _LpFee) / _totalFee;
+
+        uint256 totalTokensToSwap = tokens_to_M + tokens_to_D + tokens_to_LP;
+
+        uint256 liquidityTokens = (tokenBalance * tokens_to_LP) /
+            totalTokensToSwap /
+            2;
+
+        uint256 balanceBeforeSwap = address(this).balance;
+
+        swapTokensForEth(tokenBalance - liquidityTokens);
+
+        uint256 ETH_Total = address(this).balance - balanceBeforeSwap;
+        uint256 ETH_M = (ETH_Total * actualMarketingFee) / _totalFee;
+        uint256 ETH_D = (ETH_Total * _devFee) / _totalFee;
+        uint256 ETH_L = ETH_Total - ETH_M - ETH_D;
+
+        if (liquidityTokens > 0 && ETH_L > 0) {
+            addLiquidity(liquidityTokens, ETH_L);
+        }
+
+        sendToWallet(_taxWallet, ETH_M);
+
+        ETH_Total = address(this).balance;
+        sendToWallet(_devWallet, ETH_Total);
+    }
+
+    function addLiquidity(uint256 tokenAmount, uint256 ETHAmount) private {
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.addLiquidityETH{value: ETHAmount}(
+            address(this),
+            tokenAmount,
+            0,
+            0,
+            _devWallet,
+            block.timestamp
+        );
+    }
+
+    function sendToWallet(address payable wallet, uint256 amount) private {
+        wallet.transfer(amount);
+    }
+
+    function swapTokensForEth(uint256 tokenAmount) private {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    /**
+     * @dev Removes limits on transaction amounts and wallet sizes.
+     * Can only be called by the contract owner.
+     */
+    function removeLimits() external onlyOwner {
+        _maxTxAmount = _tTotal;
+        _maxWalletSize = _tTotal;
+        emit MaxTxAmountUpdated(_tTotal);
+    }
+
+    /**
+     * @dev Opens trading by setting up the Uniswap pair and adding initial liquidity.
+     * Can only be called by the contract owner.
+     */
+    function openTrading() external onlyOwner {
+        require(!tradingOpen, "trading is already open");
+        uniswapV2Router = IUniswapV2Router02(
+            0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+        );
+        _approve(address(this), address(uniswapV2Router), _tTotal);
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(
+                address(this),
+                uniswapV2Router.WETH()
+            );
+        uniswapV2Router.addLiquidityETH{value: address(this).balance}(
+            address(this),
+            balanceOf(address(this)),
+            0,
+            0,
+            owner(),
+            block.timestamp
+        );
+        IERC20(uniswapV2Pair).approve(address(uniswapV2Router), type(uint).max);
+        swapEnabled = true;
+        tradingOpen = true;
+    }
+
+    /**
+     * @dev Reduces the transaction fees for buying and selling.
+     * Can only be called by the tax wallet, doesn't allow to rise fees.
+     * @param _newFee The new fee percentage to be set for both buying and selling.
+     */
+    function reduceFee(uint256 _newFee) external {
+        require(_msgSender() == _taxWallet);
+        require(_newFee <= _finalBuyTax && _newFee <= _finalSellTax);
+        _finalBuyTax = _newFee;
+        _finalSellTax = _newFee;
+    }
+
+    /**
+     * @dev Transfers tokens held by the contract to the tax wallet.
+     * Can only be called by the tax wallet.
+     */
+    function unclogContract() external {
+        require(_msgSender() == _taxWallet);
+        uint256 tokenBalance = balanceOf(address(this));
+        if (tokenBalance > 0) {
+            _transfer(address(this), _taxWallet, tokenBalance);
+            _stakingFeeTokens = 0;
+        }
+    }
+
+    /**
+     * @dev Transfers ETH held by the contract to the tax wallet.
+     * Can only be called by the tax wallet.
+     */
+    function clearStuckBalance() external {
+        require(_msgSender() == _taxWallet);
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            _taxWallet.transfer(ethBalance);
+        }
+    }
+
+    /**
+     * @dev Swaps tokens held by the contract for ETH and transfers it to the tax wallet.
+     * Can only be called by the tax wallet.
+     */
+    function manualSwap() external {
+        require(_msgSender() == _taxWallet);
+        uint256 tokenBalance = balanceOf(address(this));
+        if (tokenBalance > 0) {
+            swapTokensForEth(tokenBalance);
+        }
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            sendToWallet(_taxWallet, ethBalance);
+        }
+        _stakingFeeTokens = 0;
+    }
+
+    /**
+     * @dev Sets the address of the staking contract.
+     * Can only be called by the tax wallet.
+     * @param stakingContract The address of the staking contract.
+     */
+    function setStakingAddress(address stakingContract) external {
+        require(_msgSender() == _taxWallet);
+        require(stakingContract != address(0));
+        _stakingContract = stakingContract;
+    }
+
+    /**
+     * @dev Toggles the staking fee on or off.
+     * Can only be called by the staking contract.
+     */
+    function toggleStakingFee() external {
+        require(_msgSender() == _stakingContract);
+        _stakingFeeActive = !_stakingFeeActive;
+    }
+
+    /**
+     * @dev Sends a percentage of the staking fee tokens to the staking contract.
+     * Can only be called by the tax wallet.
+     * @param percentage The percentage of staking fee tokens to send.
+     */
+    function sendTokensToStakingContract(uint256 percentage) external {
+        require(_msgSender() == _taxWallet);
+        require(percentage > 0 && percentage <= 100);
+        if (_stakingFeeTokens > 0) {
+            uint256 tokensToSend = _stakingFeeTokens.mul(percentage).div(100);
+            _balances[address(this)] = _balances[address(this)].sub(
+                tokensToSend
+            );
+            _balances[_stakingContract] = _balances[_stakingContract].add(
+                tokensToSend
+            );
+            _stakingFeeTokens = _stakingFeeTokens.sub(tokensToSend);
+            emit Transfer(address(this), _stakingContract, tokensToSend);
+        }
+    }
+
+    /**
+     * @dev Sends a percentage of the staking fee tokens to a specified P2E wallet.
+     * Can only be called by the tax wallet.
+     * @param percentage The percentage of staking fee tokens to send.
+     * @param p2eWallet The address of the P2E wallet.
+     */
+    function sendTokensToP2E(uint256 percentage, address p2eWallet) external {
+        require(_msgSender() == _taxWallet);
+        require(percentage > 0 && percentage <= 100);
+        if (_stakingFeeTokens > 0) {
+            uint256 tokensToSend = _stakingFeeTokens.mul(percentage).div(100);
+            _balances[address(this)] = _balances[address(this)].sub(
+                tokensToSend
+            );
+            _balances[p2eWallet] = _balances[p2eWallet].add(tokensToSend);
+            _stakingFeeTokens = _stakingFeeTokens.sub(tokensToSend);
+            emit Transfer(address(this), p2eWallet, tokensToSend);
+        }
+    }
+}

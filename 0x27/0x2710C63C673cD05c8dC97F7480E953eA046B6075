@@ -1,0 +1,726 @@
+
+// File: src/Distribution.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.21;
+
+import {MerkleProofLib} from "solady/src/utils/MerkleProofLib.sol";
+import {Ownable} from "solady/src/auth/Ownable.sol";
+import {IERC20} from "forge-std/interfaces/IERC20.sol";
+
+contract Distribution is Ownable {
+    error InvalidProof();
+    error ZeroClaimable();
+    error ClaimStillActive();
+
+    bytes32 private _root;
+    mapping(address => uint256) public previouslyClaimedAmount;
+
+    uint256 private immutable _CLAIM_START;
+    uint256 private immutable _VESTING_START;
+    uint256 private constant _CLIFF = 60 days;
+    uint256 private constant _VESTING_DURATION = 547.92 days; // ~18 months
+    uint256 private constant _GRACE_PERIOD = 365 days; // 1 year
+
+    address public constant INSPECT_TOKEN = 0x186eF81fd8E77EEC8BfFC3039e7eC41D5FC0b457;
+
+    constructor(bytes32 root, uint256 claimStart) {
+        _initializeOwner(tx.origin);
+        _root = root;
+        _CLAIM_START = claimStart;
+        unchecked { _VESTING_START = claimStart + _CLIFF; }
+    }
+
+    function setRoot(bytes32 _newRoot) external onlyOwner {
+        _root = _newRoot;
+    }
+
+    function withdrawUnclaimedTokens() external onlyOwner {
+        uint256 claimExpiry;
+
+        unchecked {
+            claimExpiry = _VESTING_START + _VESTING_DURATION + _GRACE_PERIOD;
+        }
+
+        if (block.timestamp < claimExpiry) revert ClaimStillActive();
+
+        uint256 balance = IERC20(INSPECT_TOKEN).balanceOf(address(this));
+        IERC20(INSPECT_TOKEN).transfer(msg.sender, balance);
+    }
+
+    function claim(address _recipient, uint256 _totalAllocation, bytes32[] calldata _proof) external {
+        bytes32 leaf = keccak256(abi.encode(_recipient, _totalAllocation));
+        if (!MerkleProofLib.verifyCalldata(_proof, _root, leaf)) revert InvalidProof();
+
+        uint256 _previouslyClaimed = previouslyClaimedAmount[_recipient];
+        uint256 _claimableAmount = _totalClaimable(_totalAllocation, _previouslyClaimed);
+
+        if (_claimableAmount == 0) revert ZeroClaimable();
+        unchecked { previouslyClaimedAmount[_recipient] += _claimableAmount; }
+
+        IERC20(INSPECT_TOKEN).transfer(_recipient, _claimableAmount);
+    }
+
+    function claimableAmount(address _recipient, uint256 _totalAllocation) external view returns (uint256) {
+        uint256 _previouslyClaimed = previouslyClaimedAmount[_recipient];
+
+        return _totalClaimable(_totalAllocation, _previouslyClaimed);
+    }
+
+    function _totalClaimable(uint256 _totalAllocation, uint256 _previouslyClaimed) internal view returns (uint256) {
+        if (block.timestamp < _CLAIM_START) return 0;
+        if (block.timestamp <= _VESTING_START) return _totalAllocation / 10 - _previouslyClaimed;
+        if (block.timestamp > _VESTING_START + _VESTING_DURATION) return _totalAllocation - _previouslyClaimed;
+
+        uint256 _initialClaimableAmount;
+        uint256 _vestingBalance;
+        uint256 _timeElapsed;
+
+        unchecked {
+            _initialClaimableAmount = _totalAllocation / 10;
+            _vestingBalance = _totalAllocation - _initialClaimableAmount;
+            _timeElapsed = block.timestamp - _VESTING_START;
+        }
+
+        return _initialClaimableAmount + (_timeElapsed * _vestingBalance / _VESTING_DURATION) - _previouslyClaimed;
+    }
+}
+
+
+// File: lib/solady/src/utils/MerkleProofLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Gas optimized verification of proof of inclusion for a leaf in a Merkle tree.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/MerkleProofLib.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/MerkleProofLib.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/MerkleProof.sol)
+library MerkleProofLib {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*            MERKLE PROOF VERIFICATION OPERATIONS            */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns whether `leaf` exists in the Merkle tree with `root`, given `proof`.
+    function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf)
+        internal
+        pure
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if mload(proof) {
+                // Initialize `offset` to the offset of `proof` elements in memory.
+                let offset := add(proof, 0x20)
+                // Left shift by 5 is equivalent to multiplying by 0x20.
+                let end := add(offset, shl(5, mload(proof)))
+                // Iterate over proof elements to compute root hash.
+                for {} 1 {} {
+                    // Slot of `leaf` in scratch space.
+                    // If the condition is true: 0x20, otherwise: 0x00.
+                    let scratch := shl(5, gt(leaf, mload(offset)))
+                    // Store elements to hash contiguously in scratch space.
+                    // Scratch space is 64 bytes (0x00 - 0x3f) and both elements are 32 bytes.
+                    mstore(scratch, leaf)
+                    mstore(xor(scratch, 0x20), mload(offset))
+                    // Reuse `leaf` to store the hash to reduce stack operations.
+                    leaf := keccak256(0x00, 0x40)
+                    offset := add(offset, 0x20)
+                    if iszero(lt(offset, end)) { break }
+                }
+            }
+            isValid := eq(leaf, root)
+        }
+    }
+
+    /// @dev Returns whether `leaf` exists in the Merkle tree with `root`, given `proof`.
+    function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf)
+        internal
+        pure
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if proof.length {
+                // Left shift by 5 is equivalent to multiplying by 0x20.
+                let end := add(proof.offset, shl(5, proof.length))
+                // Initialize `offset` to the offset of `proof` in the calldata.
+                let offset := proof.offset
+                // Iterate over proof elements to compute root hash.
+                for {} 1 {} {
+                    // Slot of `leaf` in scratch space.
+                    // If the condition is true: 0x20, otherwise: 0x00.
+                    let scratch := shl(5, gt(leaf, calldataload(offset)))
+                    // Store elements to hash contiguously in scratch space.
+                    // Scratch space is 64 bytes (0x00 - 0x3f) and both elements are 32 bytes.
+                    mstore(scratch, leaf)
+                    mstore(xor(scratch, 0x20), calldataload(offset))
+                    // Reuse `leaf` to store the hash to reduce stack operations.
+                    leaf := keccak256(0x00, 0x40)
+                    offset := add(offset, 0x20)
+                    if iszero(lt(offset, end)) { break }
+                }
+            }
+            isValid := eq(leaf, root)
+        }
+    }
+
+    /// @dev Returns whether all `leaves` exist in the Merkle tree with `root`,
+    /// given `proof` and `flags`.
+    ///
+    /// Note:
+    /// - Breaking the invariant `flags.length == (leaves.length - 1) + proof.length`
+    ///   will always return false.
+    /// - The sum of the lengths of `proof` and `leaves` must never overflow.
+    /// - Any non-zero word in the `flags` array is treated as true.
+    /// - The memory offset of `proof` must be non-zero
+    ///   (i.e. `proof` is not pointing to the scratch space).
+    function verifyMultiProof(
+        bytes32[] memory proof,
+        bytes32 root,
+        bytes32[] memory leaves,
+        bool[] memory flags
+    ) internal pure returns (bool isValid) {
+        // Rebuilds the root by consuming and producing values on a queue.
+        // The queue starts with the `leaves` array, and goes into a `hashes` array.
+        // After the process, the last element on the queue is verified
+        // to be equal to the `root`.
+        //
+        // The `flags` array denotes whether the sibling
+        // should be popped from the queue (`flag == true`), or
+        // should be popped from the `proof` (`flag == false`).
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cache the lengths of the arrays.
+            let leavesLength := mload(leaves)
+            let proofLength := mload(proof)
+            let flagsLength := mload(flags)
+
+            // Advance the pointers of the arrays to point to the data.
+            leaves := add(0x20, leaves)
+            proof := add(0x20, proof)
+            flags := add(0x20, flags)
+
+            // If the number of flags is correct.
+            for {} eq(add(leavesLength, proofLength), add(flagsLength, 1)) {} {
+                // For the case where `proof.length + leaves.length == 1`.
+                if iszero(flagsLength) {
+                    // `isValid = (proof.length == 1 ? proof[0] : leaves[0]) == root`.
+                    isValid := eq(mload(xor(leaves, mul(xor(proof, leaves), proofLength))), root)
+                    break
+                }
+
+                // The required final proof offset if `flagsLength` is not zero, otherwise zero.
+                let proofEnd := add(proof, shl(5, proofLength))
+                // We can use the free memory space for the queue.
+                // We don't need to allocate, since the queue is temporary.
+                let hashesFront := mload(0x40)
+                // Copy the leaves into the hashes.
+                // Sometimes, a little memory expansion costs less than branching.
+                // Should cost less, even with a high free memory offset of 0x7d00.
+                leavesLength := shl(5, leavesLength)
+                for { let i := 0 } iszero(eq(i, leavesLength)) { i := add(i, 0x20) } {
+                    mstore(add(hashesFront, i), mload(add(leaves, i)))
+                }
+                // Compute the back of the hashes.
+                let hashesBack := add(hashesFront, leavesLength)
+                // This is the end of the memory for the queue.
+                // We recycle `flagsLength` to save on stack variables (sometimes save gas).
+                flagsLength := add(hashesBack, shl(5, flagsLength))
+
+                for {} 1 {} {
+                    // Pop from `hashes`.
+                    let a := mload(hashesFront)
+                    // Pop from `hashes`.
+                    let b := mload(add(hashesFront, 0x20))
+                    hashesFront := add(hashesFront, 0x40)
+
+                    // If the flag is false, load the next proof,
+                    // else, pops from the queue.
+                    if iszero(mload(flags)) {
+                        // Loads the next proof.
+                        b := mload(proof)
+                        proof := add(proof, 0x20)
+                        // Unpop from `hashes`.
+                        hashesFront := sub(hashesFront, 0x20)
+                    }
+
+                    // Advance to the next flag.
+                    flags := add(flags, 0x20)
+
+                    // Slot of `a` in scratch space.
+                    // If the condition is true: 0x20, otherwise: 0x00.
+                    let scratch := shl(5, gt(a, b))
+                    // Hash the scratch space and push the result onto the queue.
+                    mstore(scratch, a)
+                    mstore(xor(scratch, 0x20), b)
+                    mstore(hashesBack, keccak256(0x00, 0x40))
+                    hashesBack := add(hashesBack, 0x20)
+                    if iszero(lt(hashesBack, flagsLength)) { break }
+                }
+                isValid :=
+                    and(
+                        // Checks if the last value in the queue is same as the root.
+                        eq(mload(sub(hashesBack, 0x20)), root),
+                        // And whether all the proofs are used, if required.
+                        eq(proofEnd, proof)
+                    )
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether all `leaves` exist in the Merkle tree with `root`,
+    /// given `proof` and `flags`.
+    ///
+    /// Note:
+    /// - Breaking the invariant `flags.length == (leaves.length - 1) + proof.length`
+    ///   will always return false.
+    /// - Any non-zero word in the `flags` array is treated as true.
+    /// - The calldata offset of `proof` must be non-zero
+    ///   (i.e. `proof` is from a regular Solidity function with a 4-byte selector).
+    function verifyMultiProofCalldata(
+        bytes32[] calldata proof,
+        bytes32 root,
+        bytes32[] calldata leaves,
+        bool[] calldata flags
+    ) internal pure returns (bool isValid) {
+        // Rebuilds the root by consuming and producing values on a queue.
+        // The queue starts with the `leaves` array, and goes into a `hashes` array.
+        // After the process, the last element on the queue is verified
+        // to be equal to the `root`.
+        //
+        // The `flags` array denotes whether the sibling
+        // should be popped from the queue (`flag == true`), or
+        // should be popped from the `proof` (`flag == false`).
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the number of flags is correct.
+            for {} eq(add(leaves.length, proof.length), add(flags.length, 1)) {} {
+                // For the case where `proof.length + leaves.length == 1`.
+                if iszero(flags.length) {
+                    // `isValid = (proof.length == 1 ? proof[0] : leaves[0]) == root`.
+                    // forgefmt: disable-next-item
+                    isValid := eq(
+                        calldataload(
+                            xor(leaves.offset, mul(xor(proof.offset, leaves.offset), proof.length))
+                        ),
+                        root
+                    )
+                    break
+                }
+
+                // The required final proof offset if `flagsLength` is not zero, otherwise zero.
+                let proofEnd := add(proof.offset, shl(5, proof.length))
+                // We can use the free memory space for the queue.
+                // We don't need to allocate, since the queue is temporary.
+                let hashesFront := mload(0x40)
+                // Copy the leaves into the hashes.
+                // Sometimes, a little memory expansion costs less than branching.
+                // Should cost less, even with a high free memory offset of 0x7d00.
+                calldatacopy(hashesFront, leaves.offset, shl(5, leaves.length))
+                // Compute the back of the hashes.
+                let hashesBack := add(hashesFront, shl(5, leaves.length))
+                // This is the end of the memory for the queue.
+                // We recycle `flagsLength` to save on stack variables (sometimes save gas).
+                flags.length := add(hashesBack, shl(5, flags.length))
+
+                // We don't need to make a copy of `proof.offset` or `flags.offset`,
+                // as they are pass-by-value (this trick may not always save gas).
+
+                for {} 1 {} {
+                    // Pop from `hashes`.
+                    let a := mload(hashesFront)
+                    // Pop from `hashes`.
+                    let b := mload(add(hashesFront, 0x20))
+                    hashesFront := add(hashesFront, 0x40)
+
+                    // If the flag is false, load the next proof,
+                    // else, pops from the queue.
+                    if iszero(calldataload(flags.offset)) {
+                        // Loads the next proof.
+                        b := calldataload(proof.offset)
+                        proof.offset := add(proof.offset, 0x20)
+                        // Unpop from `hashes`.
+                        hashesFront := sub(hashesFront, 0x20)
+                    }
+
+                    // Advance to the next flag offset.
+                    flags.offset := add(flags.offset, 0x20)
+
+                    // Slot of `a` in scratch space.
+                    // If the condition is true: 0x20, otherwise: 0x00.
+                    let scratch := shl(5, gt(a, b))
+                    // Hash the scratch space and push the result onto the queue.
+                    mstore(scratch, a)
+                    mstore(xor(scratch, 0x20), b)
+                    mstore(hashesBack, keccak256(0x00, 0x40))
+                    hashesBack := add(hashesBack, 0x20)
+                    if iszero(lt(hashesBack, flags.length)) { break }
+                }
+                isValid :=
+                    and(
+                        // Checks if the last value in the queue is same as the root.
+                        eq(mload(sub(hashesBack, 0x20)), root),
+                        // And whether all the proofs are used, if required.
+                        eq(proofEnd, proof.offset)
+                    )
+                break
+            }
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EMPTY CALLDATA HELPERS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an empty calldata bytes32 array.
+    function emptyProof() internal pure returns (bytes32[] calldata proof) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            proof.length := 0
+        }
+    }
+
+    /// @dev Returns an empty calldata bytes32 array.
+    function emptyLeaves() internal pure returns (bytes32[] calldata leaves) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            leaves.length := 0
+        }
+    }
+
+    /// @dev Returns an empty calldata bool array.
+    function emptyFlags() internal pure returns (bool[] calldata flags) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            flags.length := 0
+        }
+    }
+}
+
+
+// File: lib/solady/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+///
+/// @dev Note:
+/// This implementation does NOT auto-initialize the owner to `msg.sender`.
+/// You MUST call the `_initializeOwner` in the constructor / initializer.
+///
+/// While the ownable portion follows
+/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,
+/// the nomenclature for the 2-step ownership handover may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /// @dev Cannot double-initialize.
+    error AlreadyInitialized();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by:
+    /// `bytes32(~uint256(uint32(bytes4(keccak256("_OWNER_SLOT_NOT")))))`.
+    /// It is intentionally chosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    bytes32 internal constant _OWNER_SLOT =
+        0xffffffffffffffffffffffffffffffffffffffffffffffffffffffff74873927;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Override to return true to make `_initializeOwner` prevent double-initialization.
+    function _guardInitializeOwner() internal pure virtual returns (bool guard) {}
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        if (_guardInitializeOwner()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                if sload(ownerSlot) {
+                    mstore(0x00, 0x0dc149f0) // `AlreadyInitialized()`.
+                    revert(0x1c, 0x04)
+                }
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Store the new value.
+                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+            }
+        } else {
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Store the new value.
+                sstore(_OWNER_SLOT, newOwner)
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+            }
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        if (_guardInitializeOwner()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+                // Store the new value.
+                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))
+            }
+        } else {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+                // Store the new value.
+                sstore(ownerSlot, newOwner)
+            }
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(_OWNER_SLOT))) {
+                mstore(0x00, 0x82b42900) // `Unauthorized()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    /// Override to return a different value if needed.
+    /// Made internal to conserve bytecode. Wrap it in a public function if needed.
+    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + _ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(_OWNER_SLOT)
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+
+
+// File: lib/forge-std/src/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2;
+
+/// @dev Interface of the ERC20 standard as defined in the EIP.
+/// @dev This includes the optional name, symbol, and decimals metadata.
+interface IERC20 {
+    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`
+    /// is the new allowance.
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /// @notice Returns the amount of tokens in existence.
+    function totalSupply() external view returns (uint256);
+
+    /// @notice Returns the amount of tokens owned by `account`.
+    function balanceOf(address account) external view returns (uint256);
+
+    /// @notice Moves `amount` tokens from the caller's account to `to`.
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /// @notice Returns the remaining number of tokens that `spender` is allowed
+    /// to spend on behalf of `owner`
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.
+    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.
+    /// `amount` is then deducted from the caller's allowance.
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+    /// @notice Returns the name of the token.
+    function name() external view returns (string memory);
+
+    /// @notice Returns the symbol of the token.
+    function symbol() external view returns (string memory);
+
+    /// @notice Returns the decimals places of the token.
+    function decimals() external view returns (uint8);
+}
+

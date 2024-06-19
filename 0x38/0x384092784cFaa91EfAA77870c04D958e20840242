@@ -1,0 +1,3054 @@
+
+// File: src/TLStacks721.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.22;
+
+import {Ownable} from "openzeppelin/access/Ownable.sol";
+import {Pausable} from "openzeppelin/utils/Pausable.sol";
+import {ReentrancyGuard} from "openzeppelin/utils/ReentrancyGuard.sol";
+import {MerkleProof} from "openzeppelin/utils/cryptography/MerkleProof.sol";
+import {Strings} from "openzeppelin/utils/Strings.sol";
+import {IERC721TL} from "tl-creator-contracts/erc-721/IERC721TL.sol";
+import {TransferHelper} from "tl-sol-tools/payments/TransferHelper.sol";
+import {SanctionsCompliance} from "tl-sol-tools/payments/SanctionsCompliance.sol";
+import {OwnableAccessControl} from "tl-sol-tools/access/OwnableAccessControl.sol";
+import {DropPhase, DropType, DropErrors} from "./utils/CommonUtils.sol";
+import {Drop, ITLStacks721Events} from "./utils/TLStacks721Utils.sol";
+
+/*//////////////////////////////////////////////////////////////////////////
+                            TL Stacks 1155
+//////////////////////////////////////////////////////////////////////////*/
+
+/// @title TLStacks721
+/// @notice Transient Labs Stacks mint contract for ERC721TL-based contracts
+/// @author transientlabs.xyz
+/// @custom:version-last-updated 2.3.1
+contract TLStacks721 is
+    Ownable,
+    Pausable,
+    ReentrancyGuard,
+    TransferHelper,
+    SanctionsCompliance,
+    ITLStacks721Events,
+    DropErrors
+{
+    /*//////////////////////////////////////////////////////////////////////////
+                                  Constants
+    //////////////////////////////////////////////////////////////////////////*/
+
+    using Strings for uint256;
+
+    string public constant VERSION = "2.3.1";
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant APPROVED_MINT_CONTRACT = keccak256("APPROVED_MINT_CONTRACT");
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                State Variables
+    //////////////////////////////////////////////////////////////////////////*/
+
+    address public protocolFeeReceiver; // the payout receiver for the protocol fee
+    uint256 public protocolFee; // the protocol fee, in eth, to charge the buyer
+    address public weth; // weth address
+    mapping(address => Drop) internal _drops; // nft address -> Drop
+    mapping(address => mapping(uint256 => mapping(address => uint256))) internal _numberMinted; // nft address -> round -> user -> number minted
+    mapping(address => uint256) internal _rounds; // nft address -> round
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Constructor
+    //////////////////////////////////////////////////////////////////////////*/
+
+    constructor(
+        address initOwner,
+        address initSanctionsOracle,
+        address initWethAddress,
+        address initProtocolFeeReceiver,
+        uint256 initProtocolFee
+    ) Ownable(initOwner) Pausable() ReentrancyGuard() SanctionsCompliance(initSanctionsOracle) {
+        _setWethAddress(initWethAddress);
+        _setProtocolFeeSettings(initProtocolFeeReceiver, initProtocolFee);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Owner Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to set a new weth address
+    /// @dev Requires owner
+    /// @param newWethAddress The new weth address
+    function setWethAddress(address newWethAddress) external onlyOwner {
+        _setWethAddress(newWethAddress);
+    }
+
+    /// @notice Function to set the protocol fee settings
+    /// @dev Requires owner
+    /// @param newProtocolFeeReceiver The new protocol fee receiver
+    /// @param newProtocolFee The new protocol fee in ETH
+    function setProtocolFeeSettings(address newProtocolFeeReceiver, uint256 newProtocolFee) external onlyOwner {
+        _setProtocolFeeSettings(newProtocolFeeReceiver, newProtocolFee);
+    }
+
+    /// @notice Function to pause the contract
+    /// @dev Requires owner
+    /// @param status The boolean to set the internal pause variable
+    function pause(bool status) external onlyOwner {
+        if (status) {
+            _pause();
+        } else {
+            _unpause();
+        }
+    }
+
+    /// @notice Function to set the sanctions oracle
+    /// @dev Requires owner
+    /// @param newOracle The new oracle address
+    function setSanctionsOracle(address newOracle) external onlyOwner {
+        _updateSanctionsOracle(newOracle);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                            Drop Configuration Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to configure a drop
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @dev Reverts if
+    ///     - the payout receiver is the zero address
+    ///     - a drop is already configured and live
+    ///     - the `intialSupply` does not equal the `supply`
+    ///     - the `decayRate` is non-zero and there is a presale configured
+    /// @param nftAddress The nft contract address
+    /// @param drop The drop to configure
+    function configureDrop(address nftAddress, Drop calldata drop) external whenNotPaused nonReentrant {
+        // sanctions
+        _isSanctioned(msg.sender, true);
+        _isSanctioned(drop.payoutReceiver, true);
+
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        if (!_isApprovedMintContract(nftAddress)) revert NotApprovedMintContract();
+        if (!_checkPayoutReceiver(drop.payoutReceiver)) revert InvalidPayoutReceiver();
+        if (drop.initialSupply != drop.supply) revert InvalidDropSupply();
+        if (drop.decayRate != 0 && drop.dropType != DropType.VELOCITY) revert InvalidDropType();
+        if (drop.dropType == DropType.VELOCITY && drop.presaleDuration != 0) revert NotAllowedForVelocityDrops();
+
+        // check if drop is already configured and live
+        Drop memory mDrop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(mDrop);
+        if (mDrop.dropType != DropType.NOT_CONFIGURED && mPhase != DropPhase.ENDED) {
+            revert DropAlreadyConfigured();
+        }
+
+        // store drop
+        _drops[nftAddress] = drop;
+
+        // increment drop round if drop was previously set
+        if (mDrop.dropType != DropType.NOT_CONFIGURED) {
+            _rounds[nftAddress] += 1;
+        }
+
+        emit DropConfigured(nftAddress, drop);
+    }
+
+    /// @notice Function to update the payout receiver of a drop
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @param payoutReceiver The recipient of the funds from the mint
+    function updateDropPayoutReceiver(address nftAddress, address payoutReceiver) external whenNotPaused nonReentrant {
+        // sanctions
+        _isSanctioned(payoutReceiver, true);
+
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        Drop memory drop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(drop);
+        if (mPhase == DropPhase.NOT_CONFIGURED || mPhase == DropPhase.ENDED) revert DropUpdateNotAllowed();
+        if (!_checkPayoutReceiver(payoutReceiver)) revert InvalidPayoutReceiver();
+
+        // set new payout receiver
+        drop.payoutReceiver = payoutReceiver;
+        _drops[nftAddress].payoutReceiver = drop.payoutReceiver;
+
+        emit DropUpdated(nftAddress, drop);
+    }
+
+    /// @notice Function to update the drop public allowance
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @param allowance The number of tokens allowed to be minted per wallet during the public phase of the drop
+    function updateDropAllowance(address nftAddress, uint256 allowance) external whenNotPaused nonReentrant {
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        Drop memory drop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(drop);
+        if (mPhase == DropPhase.NOT_CONFIGURED || mPhase == DropPhase.ENDED) revert DropUpdateNotAllowed();
+
+        // set new allowance
+        drop.allowance = allowance;
+        _drops[nftAddress].allowance = drop.allowance;
+
+        emit DropUpdated(nftAddress, drop);
+    }
+
+    /// @notice Function to update the drop prices and currency
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @param currencyAddress The currency address (zero address represents ETH)
+    /// @param presaleCost The cost of each token during the presale phase
+    /// @param publicCost The cost of each token during the presale phase
+    function updateDropPrices(address nftAddress, address currencyAddress, uint256 presaleCost, uint256 publicCost)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        Drop memory drop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(drop);
+        if (mPhase == DropPhase.NOT_CONFIGURED || mPhase == DropPhase.ENDED) revert DropUpdateNotAllowed();
+
+        // set currency address and prices
+        drop.currencyAddress = currencyAddress;
+        drop.presaleCost = presaleCost;
+        drop.publicCost = publicCost;
+        _drops[nftAddress].currencyAddress = drop.currencyAddress;
+        _drops[nftAddress].presaleCost = drop.presaleCost;
+        _drops[nftAddress].publicCost = drop.publicCost;
+
+        emit DropUpdated(nftAddress, drop);
+    }
+
+    /// @notice Function to adjust drop durations
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @param startTime The timestamp at which the drop starts
+    /// @param presaleDuration The duration of the presale phase of the drop, in seconds
+    /// @param publicDuration The duration of the public phase
+    function updateDropDuration(address nftAddress, uint256 startTime, uint256 presaleDuration, uint256 publicDuration)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        Drop memory drop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(drop);
+        if (mPhase == DropPhase.NOT_CONFIGURED || mPhase == DropPhase.ENDED) revert DropUpdateNotAllowed();
+        if (drop.dropType == DropType.VELOCITY && presaleDuration != 0) revert NotAllowedForVelocityDrops();
+
+        // update durations
+        drop.startTime = startTime;
+        drop.presaleDuration = presaleDuration;
+        drop.publicDuration = publicDuration;
+        _drops[nftAddress].startTime = drop.startTime;
+        _drops[nftAddress].presaleDuration = drop.presaleDuration;
+        _drops[nftAddress].publicDuration = drop.publicDuration;
+
+        emit DropUpdated(nftAddress, drop);
+    }
+
+    /// @notice Function to alter a drop merkle root
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @param presaleMerkleRoot The merkle root for the presale phase (each leaf is abi encoded with the recipient and number they can mint during presale)
+    function updateDropPresaleMerkleRoot(address nftAddress, bytes32 presaleMerkleRoot)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        Drop memory drop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(drop);
+        if (mPhase == DropPhase.NOT_CONFIGURED || mPhase == DropPhase.ENDED) revert DropUpdateNotAllowed();
+        if (drop.dropType == DropType.VELOCITY) revert NotAllowedForVelocityDrops();
+
+        // update merkle root
+        drop.presaleMerkleRoot = presaleMerkleRoot;
+        _drops[nftAddress].presaleMerkleRoot = drop.presaleMerkleRoot;
+
+        emit DropUpdated(nftAddress, drop);
+    }
+
+    /// @notice Function to adjust the drop decay rate
+    /// @dev Caller must be the nft contract owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @param decayRate The merkle root for the presale phase (each leaf is abi encoded with the recipient and number they can mint during presale)
+    function updateDropDecayRate(address nftAddress, int256 decayRate) external whenNotPaused nonReentrant {
+        // check pre-conditions
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+        Drop memory drop = _drops[nftAddress];
+        DropPhase mPhase = _getDropPhase(drop);
+        if (mPhase == DropPhase.NOT_CONFIGURED || mPhase == DropPhase.ENDED) revert DropUpdateNotAllowed();
+        if (drop.dropType != DropType.VELOCITY) revert NotAllowedForVelocityDrops();
+
+        // update decay rate
+        drop.decayRate = decayRate;
+        _drops[nftAddress].decayRate = drop.decayRate;
+
+        emit DropUpdated(nftAddress, drop);
+    }
+
+    function closeDrop(address nftAddress) external nonReentrant {
+        if (!_isDropAdmin(nftAddress)) revert NotDropAdmin();
+
+        // delete the drop
+        delete _drops[nftAddress];
+
+        // clear the number minted round
+        _rounds[nftAddress]++;
+
+        emit DropClosed(nftAddress);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Purchase Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to purchase tokens on a drop
+    /// @dev Reverts on any of the following conditions
+    ///     - Drop isn't active or configured
+    ///     - numberToMint is 0
+    ///     - Invalid merkle proof during the presale phase
+    ///     - Insufficent protocol fee
+    ///     - Insufficient funds
+    ///     - Already minted the allowance for the recipient
+    /// @param nftAddress The nft contract address
+    /// @param recipient The receiver of the nft (msg.sender is the payer but this allows delegation)
+    /// @param numberToMint The number of tokens to mint
+    /// @param presaleNumberCanMint The number of tokens the recipient can mint during presale
+    /// @param proof The merkle proof for the presale page
+    /// @return refundAmount The amount of eth refunded to the caller
+    function purchase(
+        address nftAddress,
+        address recipient,
+        uint256 numberToMint,
+        uint256 presaleNumberCanMint,
+        bytes32[] calldata proof
+    ) external payable whenNotPaused nonReentrant returns (uint256 refundAmount) {
+        _isSanctioned(msg.sender, true);
+        _isSanctioned(recipient, true);
+
+        // cache drop
+        Drop memory drop = _drops[nftAddress];
+        DropPhase dropPhase = _getDropPhase(drop);
+        uint256 round = _rounds[nftAddress];
+        uint256 numberMinted = _numberMinted[nftAddress][round][recipient];
+        uint256 numberCanMint = numberToMint; // cache and then update depending on phase
+        uint256 cost = drop.presaleCost;
+
+        // pre-conditions - revert for safety and expected behavior from users - UX for batch purchases needs to be smart in order to avoid reverting conditions
+        if (numberToMint == 0) revert MintZeroTokens();
+        if (dropPhase == DropPhase.PRESALE) {
+            bytes32 hashedRecipient = keccak256(abi.encode(recipient));
+            bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(hashedRecipient, presaleNumberCanMint)))); // double hash to prevent second preimage attack: https://github.com/OpenZeppelin/openzeppelin-contracts/issues/3091
+            if (!MerkleProof.verify(proof, drop.presaleMerkleRoot, leaf)) revert NotOnAllowlist();
+            numberCanMint = _getNumberCanMint(presaleNumberCanMint, numberMinted, drop.supply);
+        } else if (dropPhase == DropPhase.PUBLIC_SALE) {
+            numberCanMint = _getNumberCanMint(drop.allowance, numberMinted, drop.supply);
+            cost = drop.publicCost;
+        } else {
+            revert YouShallNotMint();
+        }
+        if (numberCanMint == 0) revert AlreadyReachedMintAllowance();
+
+        // limit numberToMint to numberCanMint
+        if (numberToMint > numberCanMint) {
+            numberToMint = numberCanMint;
+        }
+
+        // adjust drop state
+        _updateDropState(nftAddress, round, recipient, numberToMint, drop);
+
+        // settle funds
+        refundAmount = _settleUp(numberToMint, cost, drop);
+
+        // mint
+        _mintToken(nftAddress, recipient, numberToMint, drop);
+
+        emit Purchase(
+            nftAddress,
+            recipient,
+            drop.currencyAddress,
+            numberToMint,
+            cost,
+            drop.decayRate,
+            dropPhase == DropPhase.PRESALE
+        );
+
+        return refundAmount;
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                            External View Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to get a drop
+    /// @param nftAddress The nft contract address
+    /// @return Drop The drop for the nft contract and token id
+    function getDrop(address nftAddress) external view returns (Drop memory) {
+        return _drops[nftAddress];
+    }
+
+    /// @notice Function to get number minted on a drop for an address
+    /// @param nftAddress The nft contract address
+    /// @param recipient The recipient of the nft
+    /// @return uint256 The number of tokens minted
+    function getNumberMinted(address nftAddress, address recipient) external view returns (uint256) {
+        uint256 round = _rounds[nftAddress];
+        return _numberMinted[nftAddress][round][recipient];
+    }
+
+    /// @notice Function to get the drop phase
+    /// @param nftAddress The nft contract address
+    /// @return DropPhase The drop phase
+    function getDropPhase(address nftAddress) external view returns (DropPhase) {
+        Drop memory drop = _drops[nftAddress];
+        return _getDropPhase(drop);
+    }
+
+    /// @notice Function to get the drop round
+    /// @param nftAddress The nft contract address
+    /// @return uint256 The round for the drop based on the nft contract and token id
+    function getDropRound(address nftAddress) external view returns (uint256) {
+        return _rounds[nftAddress];
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                            Internal Helper Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Internal function to set the weth address
+    /// @param newWethAddress The new weth address
+    function _setWethAddress(address newWethAddress) internal {
+        address prevWethAddress = weth;
+        weth = newWethAddress;
+
+        emit WethUpdated(prevWethAddress, newWethAddress);
+    }
+
+    /// @notice Internal function to set the protocol fee settings
+    /// @param newProtocolFeeReceiver The new protocol fee receiver
+    /// @param newProtocolFee The new protocol fee in ETH
+    function _setProtocolFeeSettings(address newProtocolFeeReceiver, uint256 newProtocolFee) internal {
+        protocolFeeReceiver = newProtocolFeeReceiver;
+        protocolFee = newProtocolFee;
+
+        emit ProtocolFeeUpdated(newProtocolFeeReceiver, newProtocolFee);
+    }
+
+    /// @notice Internal function to check if msg.sender is the owner or an admin on the contract
+    /// @param nftAddress The nft contract address
+    /// @return bool Boolean indicating if msg.sender is the owner or an admin on the nft contract
+    function _isDropAdmin(address nftAddress) internal view returns (bool) {
+        return (
+            msg.sender == OwnableAccessControl(nftAddress).owner()
+                || OwnableAccessControl(nftAddress).hasRole(ADMIN_ROLE, msg.sender)
+        );
+    }
+
+    /// @notice Intenral function to check if this contract is an approved mint contract
+    /// @param nftAddress The nft contract address
+    /// @return bool Boolean indicating if this contract is approved or not
+    function _isApprovedMintContract(address nftAddress) internal view returns (bool) {
+        return OwnableAccessControl(nftAddress).hasRole(APPROVED_MINT_CONTRACT, address(this));
+    }
+
+    /// @notice Internal function to check if a payout address is a valid address
+    /// @param payoutReceiver The payout address to check
+    /// @return bool Indication of if the payout address is not the zero address
+    function _checkPayoutReceiver(address payoutReceiver) internal pure returns (bool) {
+        return payoutReceiver != address(0);
+    }
+
+    /// @notice Internal function to get the drop phase
+    /// @param drop The drop in question
+    /// @return DropPhase The drop phase enum value
+    function _getDropPhase(Drop memory drop) internal view returns (DropPhase) {
+        if (drop.payoutReceiver == address(0)) return DropPhase.NOT_CONFIGURED;
+        if (drop.supply == 0) return DropPhase.ENDED;
+        if (block.timestamp < drop.startTime) return DropPhase.NOT_STARTED;
+        if (block.timestamp >= drop.startTime && block.timestamp < drop.startTime + drop.presaleDuration) {
+            return DropPhase.PRESALE;
+        }
+        if (
+            block.timestamp >= drop.startTime + drop.presaleDuration
+                && block.timestamp < drop.startTime + drop.presaleDuration + drop.publicDuration
+        ) return DropPhase.PUBLIC_SALE;
+        return DropPhase.ENDED;
+    }
+
+    /// @notice Internal function to determine how many tokens can be minted by an address
+    /// @param allowance The amount allowed to mint
+    /// @param numberMinted The amount already minted
+    /// @param supply The drop supply
+    /// @return numberCanMint The number of tokens allowed to mint
+    function _getNumberCanMint(uint256 allowance, uint256 numberMinted, uint256 supply)
+        internal
+        pure
+        returns (uint256 numberCanMint)
+    {
+        if (numberMinted < allowance) {
+            numberCanMint = allowance - numberMinted;
+            if (numberCanMint > supply) {
+                numberCanMint = supply;
+            }
+        } else {
+            numberCanMint = 0;
+        }
+    }
+
+    /// @notice Function to update the state of the drop
+    /// @param nftAddress The nft contract address
+    /// @param round The drop round for number minted
+    /// @param recipient The receiver of the nft (msg.sender is the payer but this allows delegation)
+    /// @param numberToMint The number of tokens to mint
+    /// @param drop The Drop cached in memory
+    function _updateDropState(
+        address nftAddress,
+        uint256 round,
+        address recipient,
+        uint256 numberToMint,
+        Drop memory drop
+    ) internal {
+        // velocity mint
+        if (drop.dropType == DropType.VELOCITY) {
+            uint256 durationAdjust = drop.decayRate < 0
+                ? uint256(-1 * drop.decayRate) * numberToMint
+                : uint256(drop.decayRate) * numberToMint;
+            if (drop.decayRate < 0) {
+                if (durationAdjust > drop.publicDuration) {
+                    _drops[nftAddress].publicDuration = 0;
+                } else {
+                    _drops[nftAddress].publicDuration -= durationAdjust;
+                }
+            } else {
+                _drops[nftAddress].publicDuration += durationAdjust;
+            }
+        }
+
+        // regular state (applicable to all types of drops)
+        _drops[nftAddress].supply -= numberToMint;
+        _numberMinted[nftAddress][round][recipient] += numberToMint;
+    }
+
+    /// @notice Internal function to distribute funds for a _purchase
+    /// @param numberToMint The number of tokens that can be minted
+    /// @param cost The cost per token
+    /// @param drop The drop
+    /// @return refundAmount The amount of eth refunded to msg.sender
+    function _settleUp(uint256 numberToMint, uint256 cost, Drop memory drop) internal returns (uint256 refundAmount) {
+        uint256 totalProtocolFee = numberToMint * protocolFee;
+        uint256 totalSale = numberToMint * cost;
+        if (drop.currencyAddress == address(0)) {
+            uint256 totalCost = totalSale + totalProtocolFee;
+            if (msg.value < totalCost) revert InsufficientFunds();
+            _safeTransferETH(drop.payoutReceiver, totalSale, weth);
+            refundAmount = msg.value - totalCost;
+        } else {
+            if (msg.value < totalProtocolFee) revert InsufficientFunds();
+            _safeTransferFromERC20(msg.sender, drop.payoutReceiver, drop.currencyAddress, totalSale);
+            refundAmount = msg.value - totalProtocolFee;
+        }
+        _safeTransferETH(protocolFeeReceiver, totalProtocolFee, weth);
+        if (refundAmount > 0) {
+            _safeTransferETH(msg.sender, refundAmount, weth);
+        }
+        return refundAmount;
+    }
+
+    /// @notice Internal function to mint the token
+    /// @param nftAddress The nft contract address
+    /// @param recipient The receiver of the nft (msg.sender is the payer but this allows delegation)
+    /// @param numberToMint The number of tokens to mint
+    /// @param drop The drop cached in memory (not read from storage again)
+    function _mintToken(address nftAddress, address recipient, uint256 numberToMint, Drop memory drop) internal {
+        uint256 uriCounter = drop.initialSupply - drop.supply;
+        for (uint256 i = 0; i < numberToMint; i++) {
+            IERC721TL(nftAddress).externalMint(
+                recipient, string(abi.encodePacked(drop.baseUri, "/", (uriCounter + i).toString()))
+            );
+        }
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Pausable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    bool private _paused;
+
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    /**
+     * @dev The operation failed because the contract is paused.
+     */
+    error EnforcedPause();
+
+    /**
+     * @dev The operation failed because the contract is not paused.
+     */
+    error ExpectedPause();
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        if (paused()) {
+            revert EnforcedPause();
+        }
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        if (!paused()) {
+            revert ExpectedPause();
+        }
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/MerkleProof.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev These functions deal with verification of Merkle Tree proofs.
+ *
+ * The tree and the proofs can be generated using our
+ * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].
+ * You will find a quickstart guide in the readme.
+ *
+ * WARNING: You should avoid using leaf values that are 64 bytes long prior to
+ * hashing, or use a hash function other than keccak256 for hashing leaves.
+ * This is because the concatenation of a sorted pair of internal nodes in
+ * the Merkle tree could be reinterpreted as a leaf value.
+ * OpenZeppelin's JavaScript library generates Merkle trees that are safe
+ * against this attack out of the box.
+ */
+library MerkleProof {
+    /**
+     *@dev The multiproof provided is not valid.
+     */
+    error MerkleProofInvalidMultiproof();
+
+    /**
+     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree
+     * defined by `root`. For this, a `proof` must be provided, containing
+     * sibling hashes on the branch from the leaf to the root of the tree. Each
+     * pair of leaves and each pair of pre-images are assumed to be sorted.
+     */
+    function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+        return processProof(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Calldata version of {verify}
+     */
+    function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+        return processProofCalldata(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up
+     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt
+     * hash matches the root of the tree. When processing the proof, the pairs
+     * of leafs & pre-images are assumed to be sorted.
+     */
+    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            computedHash = _hashPair(computedHash, proof[i]);
+        }
+        return computedHash;
+    }
+
+    /**
+     * @dev Calldata version of {processProof}
+     */
+    function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            computedHash = _hashPair(computedHash, proof[i]);
+        }
+        return computedHash;
+    }
+
+    /**
+     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by
+     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+    function multiProofVerify(
+        bytes32[] memory proof,
+        bool[] memory proofFlags,
+        bytes32 root,
+        bytes32[] memory leaves
+    ) internal pure returns (bool) {
+        return processMultiProof(proof, proofFlags, leaves) == root;
+    }
+
+    /**
+     * @dev Calldata version of {multiProofVerify}
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+    function multiProofVerifyCalldata(
+        bytes32[] calldata proof,
+        bool[] calldata proofFlags,
+        bytes32 root,
+        bytes32[] memory leaves
+    ) internal pure returns (bool) {
+        return processMultiProofCalldata(proof, proofFlags, leaves) == root;
+    }
+
+    /**
+     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction
+     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another
+     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false
+     * respectively.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree
+     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the
+     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).
+     */
+    function processMultiProof(
+        bytes32[] memory proof,
+        bool[] memory proofFlags,
+        bytes32[] memory leaves
+    ) internal pure returns (bytes32 merkleRoot) {
+        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by
+        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+        // the Merkle tree.
+        uint256 leavesLen = leaves.length;
+        uint256 proofLen = proof.length;
+        uint256 totalHashes = proofFlags.length;
+
+        // Check proof validity.
+        if (leavesLen + proofLen != totalHashes + 1) {
+            revert MerkleProofInvalidMultiproof();
+        }
+
+        // The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+        bytes32[] memory hashes = new bytes32[](totalHashes);
+        uint256 leafPos = 0;
+        uint256 hashPos = 0;
+        uint256 proofPos = 0;
+        // At each step, we compute the next hash using two values:
+        // - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+        //   get the next hash.
+        // - depending on the flag, either another value from the "main queue" (merging branches) or an element from the
+        //   `proof` array.
+        for (uint256 i = 0; i < totalHashes; i++) {
+            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+            bytes32 b = proofFlags[i]
+                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])
+                : proof[proofPos++];
+            hashes[i] = _hashPair(a, b);
+        }
+
+        if (totalHashes > 0) {
+            if (proofPos != proofLen) {
+                revert MerkleProofInvalidMultiproof();
+            }
+            unchecked {
+                return hashes[totalHashes - 1];
+            }
+        } else if (leavesLen > 0) {
+            return leaves[0];
+        } else {
+            return proof[0];
+        }
+    }
+
+    /**
+     * @dev Calldata version of {processMultiProof}.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+    function processMultiProofCalldata(
+        bytes32[] calldata proof,
+        bool[] calldata proofFlags,
+        bytes32[] memory leaves
+    ) internal pure returns (bytes32 merkleRoot) {
+        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by
+        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+        // the Merkle tree.
+        uint256 leavesLen = leaves.length;
+        uint256 proofLen = proof.length;
+        uint256 totalHashes = proofFlags.length;
+
+        // Check proof validity.
+        if (leavesLen + proofLen != totalHashes + 1) {
+            revert MerkleProofInvalidMultiproof();
+        }
+
+        // The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+        bytes32[] memory hashes = new bytes32[](totalHashes);
+        uint256 leafPos = 0;
+        uint256 hashPos = 0;
+        uint256 proofPos = 0;
+        // At each step, we compute the next hash using two values:
+        // - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+        //   get the next hash.
+        // - depending on the flag, either another value from the "main queue" (merging branches) or an element from the
+        //   `proof` array.
+        for (uint256 i = 0; i < totalHashes; i++) {
+            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+            bytes32 b = proofFlags[i]
+                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])
+                : proof[proofPos++];
+            hashes[i] = _hashPair(a, b);
+        }
+
+        if (totalHashes > 0) {
+            if (proofPos != proofLen) {
+                revert MerkleProofInvalidMultiproof();
+            }
+            unchecked {
+                return hashes[totalHashes - 1];
+            }
+        } else if (leavesLen > 0) {
+            return leaves[0];
+        } else {
+            return proof[0];
+        }
+    }
+
+    /**
+     * @dev Sorts the pair (a, b) and hashes the result.
+     */
+    function _hashPair(bytes32 a, bytes32 b) private pure returns (bytes32) {
+        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);
+    }
+
+    /**
+     * @dev Implementation of keccak256(abi.encode(a, b)) that doesn't allocate or expand memory.
+     */
+    function _efficientHash(bytes32 a, bytes32 b) private pure returns (bytes32 value) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            value := keccak256(0x00, 0x40)
+        }
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/Strings.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Strings.sol)
+
+pragma solidity ^0.8.20;
+
+import {Math} from "./math/Math.sol";
+import {SignedMath} from "./math/SignedMath.sol";
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+    bytes16 private constant HEX_DIGITS = "0123456789abcdef";
+    uint8 private constant ADDRESS_LENGTH = 20;
+
+    /**
+     * @dev The `value` string doesn't fit in the specified `length`.
+     */
+    error StringsInsufficientHexLength(uint256 value, uint256 length);
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            uint256 length = Math.log10(value) + 1;
+            string memory buffer = new string(length);
+            uint256 ptr;
+            /// @solidity memory-safe-assembly
+            assembly {
+                ptr := add(buffer, add(32, length))
+            }
+            while (true) {
+                ptr--;
+                /// @solidity memory-safe-assembly
+                assembly {
+                    mstore8(ptr, byte(mod(value, 10), HEX_DIGITS))
+                }
+                value /= 10;
+                if (value == 0) break;
+            }
+            return buffer;
+        }
+    }
+
+    /**
+     * @dev Converts a `int256` to its ASCII `string` decimal representation.
+     */
+    function toStringSigned(int256 value) internal pure returns (string memory) {
+        return string.concat(value < 0 ? "-" : "", toString(SignedMath.abs(value)));
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            return toHexString(value, Math.log256(value) + 1);
+        }
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+        uint256 localValue = value;
+        bytes memory buffer = new bytes(2 * length + 2);
+        buffer[0] = "0";
+        buffer[1] = "x";
+        for (uint256 i = 2 * length + 1; i > 1; --i) {
+            buffer[i] = HEX_DIGITS[localValue & 0xf];
+            localValue >>= 4;
+        }
+        if (localValue != 0) {
+            revert StringsInsufficientHexLength(value, length);
+        }
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal
+     * representation.
+     */
+    function toHexString(address addr) internal pure returns (string memory) {
+        return toHexString(uint256(uint160(addr)), ADDRESS_LENGTH);
+    }
+
+    /**
+     * @dev Returns true if the two strings are equal.
+     */
+    function equal(string memory a, string memory b) internal pure returns (bool) {
+        return bytes(a).length == bytes(b).length && keccak256(bytes(a)) == keccak256(bytes(b));
+    }
+}
+
+
+// File: lib/tl-creator-contracts/src/erc-721/IERC721TL.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.22;
+
+/// @title IERC721TL.sol
+/// @notice Interface for ERC721TL
+/// @dev Interface id = 0xc74089ae
+/// @author transientlabs.xyz
+/// @custom:version 3.0.0
+interface IERC721TL {
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to mint a single token
+    /// @dev Requires owner or admin
+    /// @param recipient The recipient of the token - assumed as able to receive 721 tokens
+    /// @param uri The token uri to mint
+    function mint(address recipient, string calldata uri) external;
+
+    /// @notice Function to mint a single token with specific token royalty
+    /// @dev Requires owner or admin
+    /// @param recipient The recipient of the token - assumed as able to receive 721 tokens
+    /// @param uri The token uri to mint
+    /// @param royaltyAddress Royalty payout address for this new token
+    /// @param royaltyPercent Royalty percentage for this new token
+    function mint(address recipient, string calldata uri, address royaltyAddress, uint256 royaltyPercent) external;
+
+    /// @notice Function to batch mint tokens
+    /// @dev Requires owner or admin
+    /// @dev The `baseUri` folder should have the same number of json files in it as `numTokens`
+    /// @dev The `baseUri` folder should have files named without any file extension
+    /// @param recipient The recipient of the token - assumed as able to receive 721 tokens
+    /// @param numTokens Number of tokens in the batch mint
+    /// @param baseUri The base uri for the batch, expecting json to be in order, starting at file name 0, and SHOULD NOT have a trailing `/`
+    function batchMint(address recipient, uint128 numTokens, string calldata baseUri) external;
+
+    /// @notice Function to airdrop tokens to addresses
+    /// @dev Requires owner or admin
+    /// @dev Utilizes batch mint token uri values to save some gas but still ultimately mints individual tokens to people
+    /// @dev The `baseUri` folder should have the same number of json files in it as addresses in `addresses`
+    /// @dev The `baseUri` folder should have files named without any file extension
+    /// @param addresses Dynamic array of addresses to mint to
+    /// @param baseUri The base uri for the batch, expecting json to be in order, starting at file name 0, and SHOULD NOT have a trailing `/`
+    function airdrop(address[] calldata addresses, string calldata baseUri) external;
+
+    /// @notice Function to allow an approved mint contract to mint
+    /// @dev Requires the caller to be an approved mint contract
+    /// @param recipient The recipient of the token - assumed as able to receive 721 tokens
+    /// @param uri The token uri to mint
+    function externalMint(address recipient, string calldata uri) external;
+
+    /// @notice Function to burn a token
+    /// @dev Caller must be approved or owner of the token
+    /// @param tokenId The token to burn
+    function burn(uint256 tokenId) external;
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/src/payments/TransferHelper.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import {IWETH, IERC20} from "./IWETH.sol";
+
+/// @title Transfer Helper
+/// @notice Abstract contract that has helper function for sending ETH and ERC20's safely
+/// @author transientlabs.xyz
+/// @custom:version 3.0.0
+abstract contract TransferHelper {
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Types
+    //////////////////////////////////////////////////////////////////////////*/
+
+    using SafeERC20 for IERC20;
+    using SafeERC20 for IWETH;
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Errors
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @dev ETH transfer failed
+    error ETHTransferFailed();
+
+    /// @dev Transferred too few ERC-20 tokens
+    error InsufficentERC20Transfer();
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                   ETH Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to force transfer ETH, defaulting to forwarding 100k gas
+    /// @dev On failure to send the ETH, the ETH is converted to WETH and sent
+    /// @dev Care should be taken to always pass the proper WETH address that adheres to IWETH
+    /// @param recipient The recipient of the ETH
+    /// @param amount The amount of ETH to send
+    /// @param weth The WETH token address
+    function _safeTransferETH(address recipient, uint256 amount, address weth) internal {
+        _safeTransferETH(recipient, amount, weth, 1e5);
+    }
+
+    /// @notice Function to force transfer ETH, with a gas limit
+    /// @dev On failure to send the ETH, the ETH is converted to WETH and sent
+    /// @dev Care should be taken to always pass the proper WETH address that adheres to IWETH
+    /// @dev If the `amount` is zero, the function returns in order to save gas
+    /// @param recipient The recipient of the ETH
+    /// @param amount The amount of ETH to send
+    /// @param weth The WETH token address
+    /// @param gasLimit The gas to forward
+    function _safeTransferETH(address recipient, uint256 amount, address weth, uint256 gasLimit) internal {
+        if (amount == 0) return;
+        (bool success,) = recipient.call{value: amount, gas: gasLimit}("");
+        if (!success) {
+            IWETH token = IWETH(weth);
+            token.deposit{value: amount}();
+            token.safeTransfer(recipient, amount);
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                  ERC-20 Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to safely transfer ERC-20 tokens from the contract, without checking for token tax
+    /// @dev Does not check if the sender has enough balance as that is handled by the token contract
+    /// @dev Does not check for token tax as that could lock up funds in the contract
+    /// @dev Reverts on failure to transfer
+    /// @dev If the `amount` is zero, the function returns in order to save gas
+    /// @param recipient The recipient of the ERC-20 token
+    /// @param currency The address of the ERC-20 token
+    /// @param amount The amount of ERC-20 to send
+    function _safeTransferERC20(address recipient, address currency, uint256 amount) internal {
+        if (amount == 0) return;
+        IERC20(currency).safeTransfer(recipient, amount);
+    }
+
+    /// @notice Function to safely transfer ERC-20 tokens from another address to a recipient
+    /// @dev Does not check if the sender has enough balance or allowance for this contract as that is handled by the token contract
+    /// @dev Reverts on failure to transfer
+    /// @dev Reverts if there is a token tax taken out
+    /// @dev Returns and doesn't do anything if the sender and recipient are the same address
+    /// @dev If the `amount` is zero, the function returns in order to save gas
+    /// @param sender The sender of the tokens
+    /// @param recipient The recipient of the ERC-20 token
+    /// @param currency The address of the ERC-20 token
+    /// @param amount The amount of ERC-20 to send
+    function _safeTransferFromERC20(address sender, address recipient, address currency, uint256 amount) internal {
+        if (amount == 0) return;
+        if (sender == recipient) return;
+        IERC20 token = IERC20(currency);
+        uint256 intialBalance = token.balanceOf(recipient);
+        token.safeTransferFrom(sender, recipient, amount);
+        uint256 finalBalance = token.balanceOf(recipient);
+        if (finalBalance - intialBalance < amount) revert InsufficentERC20Transfer();
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/src/payments/SanctionsCompliance.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IChainalysisSanctionsOracle} from "./IChainalysisSanctionsOracle.sol";
+
+/// @title Sanctions Compliance
+/// @notice Abstract contract to comply with U.S. sanctioned addresses
+/// @dev Uses the Chainalysis Sanctions Oracle for checking sanctions
+/// @author transientlabs.xyz
+/// @custom:version 3.0.0
+contract SanctionsCompliance {
+    /*//////////////////////////////////////////////////////////////////////////
+                                State Variables
+    //////////////////////////////////////////////////////////////////////////*/
+
+    IChainalysisSanctionsOracle public oracle;
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Errors
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @dev Sanctioned address by OFAC
+    error SanctionedAddress();
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Events
+    //////////////////////////////////////////////////////////////////////////*/
+
+    event SanctionsOracleUpdated(address indexed prevOracle, address indexed newOracle);
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Constructor
+    //////////////////////////////////////////////////////////////////////////*/
+
+    constructor(address initOracle) {
+        _updateSanctionsOracle(initOracle);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Internal Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Internal function to change the sanctions oracle
+    /// @param newOracle The new sanctions oracle address
+    function _updateSanctionsOracle(address newOracle) internal {
+        address prevOracle = address(oracle);
+        oracle = IChainalysisSanctionsOracle(newOracle);
+
+        emit SanctionsOracleUpdated(prevOracle, newOracle);
+    }
+
+    /// @notice Internal function to check the sanctions oracle for an address
+    /// @dev Disable sanction checking by setting the oracle to the zero address
+    /// @param sender The address that is trying to send money
+    /// @param shouldRevertIfSanctioned A flag indicating if the call should revert if the sender is sanctioned. Set to false if wanting to get a result.
+    /// @return isSanctioned Boolean indicating if the sender is sanctioned
+    function _isSanctioned(address sender, bool shouldRevertIfSanctioned) internal view returns (bool isSanctioned) {
+        if (address(oracle) == address(0)) {
+            return false;
+        }
+        isSanctioned = oracle.isSanctioned(sender);
+        if (shouldRevertIfSanctioned && isSanctioned) revert SanctionedAddress();
+        return isSanctioned;
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/src/access/OwnableAccessControl.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {Ownable} from "openzeppelin/access/Ownable.sol";
+import {EnumerableSet} from "openzeppelin/utils/structs/EnumerableSet.sol";
+
+/// @title OwnableAccessControl.sol
+/// @notice Single owner, flexible access control mechanics
+/// @dev Can easily be extended by inheriting and applying additional roles
+/// @dev By default, only the owner can grant roles but by inheriting, but you
+///      may allow other roles to grant roles by using the internal helper.
+/// @author transientlabs.xyz
+/// @custom:version 3.0.0
+abstract contract OwnableAccessControl is Ownable {
+    /*//////////////////////////////////////////////////////////////////////////
+                                State Variables
+    //////////////////////////////////////////////////////////////////////////*/
+
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    uint256 private _c; // counter to be able to revoke all priviledges
+    mapping(uint256 => mapping(bytes32 => mapping(address => bool))) private _roleStatus;
+    mapping(uint256 => mapping(bytes32 => EnumerableSet.AddressSet)) private _roleMembers;
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Events
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @param from Address that authorized the role change
+    /// @param user The address who's role has been changed
+    /// @param approved Boolean indicating the user's status in role
+    /// @param role The bytes32 role created in the inheriting contract
+    event RoleChange(address indexed from, address indexed user, bool indexed approved, bytes32 role);
+
+    /// @param from Address that authorized the revoke
+    event AllRolesRevoked(address indexed from);
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Errors
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @dev Does not have specified role
+    error NotSpecifiedRole(bytes32 role);
+
+    /// @dev Is not specified role or owner
+    error NotRoleOrOwner(bytes32 role);
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Modifiers
+    //////////////////////////////////////////////////////////////////////////*/
+
+    modifier onlyRole(bytes32 role) {
+        if (!hasRole(role, msg.sender)) {
+            revert NotSpecifiedRole(role);
+        }
+        _;
+    }
+
+    modifier onlyRoleOrOwner(bytes32 role) {
+        if (!hasRole(role, msg.sender) && owner() != msg.sender) {
+            revert NotRoleOrOwner(role);
+        }
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Constructor
+    //////////////////////////////////////////////////////////////////////////*/
+
+    constructor() Ownable(msg.sender) {}
+
+    /*//////////////////////////////////////////////////////////////////////////
+                            External Role Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to revoke all roles currently present
+    /// @dev Increments the `_c` variables
+    /// @dev Requires owner privileges
+    function revokeAllRoles() external onlyOwner {
+        _c++;
+        emit AllRolesRevoked(msg.sender);
+    }
+
+    /// @notice Function to renounce role
+    /// @param role Bytes32 role created in inheriting contracts
+    function renounceRole(bytes32 role) external {
+        address[] memory members = new address[](1);
+        members[0] = msg.sender;
+        _setRole(role, members, false);
+    }
+
+    /// @notice Function to grant/revoke a role to an address
+    /// @dev Requires owner to call this function but this may be further
+    ///      extended using the internal helper function in inheriting contracts
+    /// @param role Bytes32 role created in inheriting contracts
+    /// @param roleMembers List of addresses that should have roles attached to them based on `status`
+    /// @param status Bool whether to remove or add `roleMembers` to the `role`
+    function setRole(bytes32 role, address[] memory roleMembers, bool status) external onlyOwner {
+        _setRole(role, roleMembers, status);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                External View Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to see if an address is the owner
+    /// @param role Bytes32 role created in inheriting contracts
+    /// @param potentialRoleMember Address to check for role membership
+    function hasRole(bytes32 role, address potentialRoleMember) public view returns (bool) {
+        return _roleStatus[_c][role][potentialRoleMember];
+    }
+
+    /// @notice Function to get role members
+    /// @param role Bytes32 role created in inheriting contracts
+    function getRoleMembers(bytes32 role) public view returns (address[] memory) {
+        return _roleMembers[_c][role].values();
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Internal Helper Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Helper function to set addresses for a role
+    /// @param role Bytes32 role created in inheriting contracts
+    /// @param roleMembers List of addresses that should have roles attached to them based on `status`
+    /// @param status Bool whether to remove or add `roleMembers` to the `role`
+    function _setRole(bytes32 role, address[] memory roleMembers, bool status) internal {
+        for (uint256 i = 0; i < roleMembers.length; i++) {
+            _roleStatus[_c][role][roleMembers[i]] = status;
+            if (status) {
+                _roleMembers[_c][role].add(roleMembers[i]);
+            } else {
+                _roleMembers[_c][role].remove(roleMembers[i]);
+            }
+            emit RoleChange(msg.sender, roleMembers[i], status, role);
+        }
+    }
+}
+
+
+// File: src/utils/CommonUtils.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.22;
+
+/// @dev Enum to encapsulate drop phases
+enum DropPhase {
+    NOT_CONFIGURED,
+    NOT_STARTED,
+    PRESALE,
+    PUBLIC_SALE,
+    ENDED
+}
+
+/// @dev Enum to encapsulate drop types
+enum DropType {
+    NOT_CONFIGURED,
+    REGULAR,
+    VELOCITY
+}
+
+/// @dev Errors for Drops
+interface DropErrors {
+    error NotDropAdmin();
+    error NotApprovedMintContract();
+    error InvalidPayoutReceiver();
+    error InvalidDropSupply();
+    error DropAlreadyConfigured();
+    error DropUpdateNotAllowed();
+    error InvalidDropType();
+    error NotAllowedForVelocityDrops();
+    error MintZeroTokens();
+    error NotOnAllowlist();
+    error YouShallNotMint();
+    error AlreadyReachedMintAllowance();
+    error InvalidBatchArguments();
+    error InsufficientFunds();
+}
+
+/// @dev Errors for the Auction House
+interface AuctionHouseErrors {
+    error PercentageTooLarge();
+    error CallerNotTokenOwner();
+    error AuctionHouseNotApproved();
+    error PayoutToZeroAddress();
+    error NftNotOwnedBySeller();
+    error NftNotTransferred();
+    error AuctionNotConfigured();
+    error AuctionNotStarted();
+    error AuctionStarted();
+    error AuctionNotOpen();
+    error BidTooLow();
+    error AuctionEnded();
+    error AuctionNotEnded();
+    error InsufficientMsgValue();
+    error SaleNotConfigured();
+    error SaleNotOpen();
+}
+
+
+// File: src/utils/TLStacks721Utils.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.22;
+
+import {DropType} from "./CommonUtils.sol";
+
+/// @dev stacks drop struct
+/// @param initialSupply The initial supply of the drop
+/// @param supply The current supply left in the drop
+/// @param allowance The allowance to mint per wallet during public mint
+/// @param currencyAddress The currency address
+/// @param payoutReceiver The address that receives the payout of the mint
+/// @param startTime The time at which the drop opens
+/// @param presaleDuration The duration for the presale phase of the drop
+/// @param presaleCost The cost for each token in the presale phase
+/// @param presaleMerkleRoot The merkle root for the presale phase of the drop
+/// @param publicDuration The duration of the public sale phase
+/// @param publicCost The cost of each token during the public sale phase
+/// @param baseUri The base uri for the folder to use for mint (NO TRAILING SLASH "/")
+struct Drop {
+    DropType dropType;
+    address payoutReceiver;
+    uint256 initialSupply;
+    uint256 supply;
+    uint256 allowance;
+    address currencyAddress;
+    uint256 startTime;
+    uint256 presaleDuration;
+    uint256 presaleCost;
+    bytes32 presaleMerkleRoot;
+    uint256 publicDuration;
+    uint256 publicCost;
+    int256 decayRate;
+    string baseUri;
+}
+
+interface ITLStacks721Events {
+    event WethUpdated(address indexed prevWeth, address indexed newWeth);
+    event ProtocolFeeUpdated(address indexed newProtocolFeeReceiver, uint256 indexed newProtocolFee);
+
+    event DropConfigured(address indexed nftAddress, Drop drop);
+    event DropUpdated(address indexed nftAddress, Drop drop);
+    event DropClosed(address indexed nftAddress);
+
+    event Purchase(
+        address indexed nftAddress,
+        address nftReceiver,
+        address currencyAddress,
+        uint256 amount,
+        uint256 price,
+        int256 decayRate,
+        bool isPresale
+    );
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    /**
+     * @dev Muldiv operation overflow.
+     */
+    error MathOverflowedMulDiv();
+
+    enum Rounding {
+        Floor, // Toward negative infinity
+        Ceil, // Toward positive infinity
+        Trunc, // Toward zero
+        Expand // Away from zero
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds towards infinity instead
+     * of rounding towards zero.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (b == 0) {
+            // Guarantee the same behavior as in a regular Solidity division.
+            return a / b;
+        }
+
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or
+     * denominator == 0.
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv) with further edits by
+     * Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0 = x * y; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            if (denominator <= prod1) {
+                revert MathOverflowedMulDiv();
+            }
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator.
+            // Always >= 1. See https://cs.stackexchange.com/q/138556/92363.
+
+            uint256 twos = denominator & (0 - denominator);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also
+            // works in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (unsignedRoundsUp(rounding) && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded
+     * towards zero.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (unsignedRoundsUp(rounding) && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (unsignedRoundsUp(rounding) && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (unsignedRoundsUp(rounding) && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (unsignedRoundsUp(rounding) && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Returns whether a provided rounding mode is considered rounding up for unsigned integers.
+     */
+    function unsignedRoundsUp(Rounding rounding) internal pure returns (bool) {
+        return uint8(rounding) % 2 == 1;
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/SignedMath.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Standard signed math utilities missing in the Solidity language.
+ */
+library SignedMath {
+    /**
+     * @dev Returns the largest of two signed numbers.
+     */
+    function max(int256 a, int256 b) internal pure returns (int256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two signed numbers.
+     */
+    function min(int256 a, int256 b) internal pure returns (int256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two signed numbers without overflow.
+     * The result is rounded towards zero.
+     */
+    function average(int256 a, int256 b) internal pure returns (int256) {
+        // Formula from the book "Hacker's Delight"
+        int256 x = (a & b) + ((a ^ b) >> 1);
+        return x + (int256(uint256(x) >> 255) & (a ^ b));
+    }
+
+    /**
+     * @dev Returns the absolute unsigned value of a signed value.
+     */
+    function abs(int256 n) internal pure returns (uint256) {
+        unchecked {
+            // must be unchecked in order to support `n = type(int256).min`
+            return uint256(n >= 0 ? n : -n);
+        }
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../IERC20.sol";
+import {IERC20Permit} from "../extensions/IERC20Permit.sol";
+import {Address} from "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev An operation with an ERC20 token failed.
+     */
+    error SafeERC20FailedOperation(address token);
+
+    /**
+     * @dev Indicates a failed `decreaseAllowance` request.
+     */
+    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        forceApprove(token, spender, oldAllowance + value);
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no
+     * value, non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {
+        unchecked {
+            uint256 currentAllowance = token.allowance(address(this), spender);
+            if (currentAllowance < requestedDecrease) {
+                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);
+            }
+            forceApprove(token, spender, currentAllowance - requestedDecrease);
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data);
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20FailedOperation(address(token));
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return success && (returndata.length == 0 || abi.decode(returndata, (bool))) && address(token).code.length > 0;
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/src/payments/IWETH.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/src/payments/IChainalysisSanctionsOracle.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IChainalysisSanctionsOracle {
+    function isSanctioned(address addr) external view returns (bool);
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position is the index of the value in the `values` array plus 1.
+        // Position 0 is used to mean a value is not in the set.
+        mapping(bytes32 value => uint256) _positions;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._positions[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We cache the value's position to prevent multiple reads from the same storage slot
+        uint256 position = set._positions[value];
+
+        if (position != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 valueIndex = position - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (valueIndex != lastIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the lastValue to the index where the value to delete is
+                set._values[valueIndex] = lastValue;
+                // Update the tracked position of the lastValue (that was just moved)
+                set._positions[lastValue] = position;
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the tracked position for the deleted slot
+            delete set._positions[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._positions[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/tl-creator-contracts/lib/tl-sol-tools/lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error AddressInsufficientBalance(address account);
+
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedInnerCall();
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert AddressInsufficientBalance(address(this));
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert FailedInnerCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {FailedInnerCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert AddressInsufficientBalance(address(this));
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {FailedInnerCall}) in case of an
+     * unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {FailedInnerCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {FailedInnerCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert FailedInnerCall();
+        }
+    }
+}
+

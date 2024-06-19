@@ -1,0 +1,3693 @@
+
+// File: src/LiquidityVault.sol
+// SPDX-License-Identifier: Business license
+
+pragma solidity ^0.8.26;
+
+import {Ownable} from "solady/src/auth/Ownable.sol";
+import {SafeTransferLib} from "solady/src/utils/SafeTransferLib.sol";
+import {ERC721Extended} from "shared/src/tokens/ERC721Extended.sol";
+import {Permit} from "shared/src/structs/Permit.sol";
+import {Math} from "openzeppelin/utils/math/Math.sol";
+
+import {IWETH9} from "shared/src/tokens/IWETH9.sol";
+import {IPermitERC20, IERC20} from "shared/src/interfaces/IERC20Extended.sol";
+import {IUniswapV2Factory} from "v2-core/interfaces/IUniswapV2Factory.sol";
+import {IUniswapV2Pair} from "v2-core/interfaces/IUniswapV2Pair.sol";
+import {IPayMaster} from "./interfaces/IPayMaster.sol";
+import {ILiquidityVault} from "./interfaces/ILiquidityVault.sol";
+import {Token} from "./MigrationToken.sol";
+import {ISuccessor} from "./interfaces/ISuccessor.sol";
+
+
+/// @notice A Liquidity Locker for Uniswap V2 that allows for fee collection without
+///         compromising token traders safety.
+/// @author Blockinside (https://github.com/0xblockinside/LiquidityVault/blob/master/src/LiquidityVault.sol)
+contract LiquidityVault is ILiquidityVault, ERC721Extended, Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          EVENTS                            */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    event Minted(
+        uint256 indexed id,
+        address indexed referrer,
+        address token0,
+        address token1,
+        uint40 lockTime,
+        uint256 snapshotLiquidity,
+        uint256 snapshotAmountIn0,
+        uint256 snapshotAmountIn1,
+        bytes referralFee
+    );
+    event Increased(
+        uint256 indexed id, 
+        uint256 snapshotLiquidity,
+        uint256 snapshotAmountIn0,
+        uint256 snapshotAmountIn1
+    );
+    event Collected(
+        uint256 indexed id, 
+        uint256 fee0,
+        uint256 fee1,
+        uint256 snapshotLiquidity,
+        uint256 snapshotAmountIn0,
+        uint256 snapshotAmountIn1,
+        bytes referralFee0,
+        bytes referralFee1
+    );
+    event Redeemed(uint256 indexed id);
+    event Extended(uint256 indexed id, uint32 additionalTime);
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CONSTANTS                            */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    IUniswapV2Factory public constant V2_FACTORY = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address public constant ETH = address(0);
+    uint32 public constant LOCK_FOREVER = type(uint32).max;
+    uint40 public constant LOCKED_FOREVER = type(uint40).max;
+    uint16 public constant FEE_DIVISOR = 10_000;
+    IPayMaster immutable payMaster;
+
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          ERRORS                            */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    error IdenticalTokens();
+    error ZeroTokenAmount();
+    error InvalidLiquiditySnapshot();
+    error NotUnlocked();
+    error InsufficientFunds();
+    error NotPayMaster();
+    error NotRegisteredRefferer();
+    error InvalidFee();
+    error InvalidLiquidityAdditionalAmounts();
+    error InsufficientLiquidityBurned();
+
+    function name() public pure override returns (string memory) { return "Liquidity Vault"; }
+    function symbol() public pure override returns (string memory) { return "LPVault"; }
+
+    function tokenURI(uint256 id) public pure override returns (string memory) {
+        return "";
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    uint256 private _idTracker;
+
+    /// Bits Layout of '_feeSlot':
+    /// - [0..239]    240 bits   `mintFee`
+    /// - [240..256]   16 bits   `referralMintFeePercent`
+    uint256 _feeSlot = 0.1 ether << 16 | 2_000;
+    uint256 _collectFeePercent = 3_333; // 33.33%
+
+    ISuccessor _successor;
+
+
+    /// Bits Layout of 'hashInfoForCertificateID.slot':
+    /// - [0..159]     160 bits  `snapshotHash: keccak256(abi.encodePacked(token0, token1, snapshotIn0, snapshotIn1, liquidity))`
+    /// - [160..256]    96 bits  `referralHash`
+    mapping(uint256 => bytes32) public hashInfoForCertificateID;
+
+    mapping(address => bool) public registeredReferrers;
+
+
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     STORAGE HITCHHIKING                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// Bits Layout of 'extraData':
+    /// - [0..39]    40 bits   `lockExpiry`
+
+    constructor(IPayMaster pm) {
+        payMaster = pm;
+        _initializeOwner(msg.sender);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PRIVATE FUNCTIONS                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    
+    function _decodeFeeSlot(uint256 slot) internal pure returns (uint256 mintFee, uint256 referralMintFeePercent) {
+        referralMintFeePercent = slot & ((1 << 16) - 1); // Extract the first 16 bits
+        mintFee = slot >> 16; // Extract the last 240 bits
+    }
+
+    function _encodeFeeSlot(uint256 mintFee, uint256 referralMintFeePercent) internal pure returns (uint256 slot) {
+        slot = (referralMintFeePercent & ((1 << 16) - 1)) | (mintFee << 16);
+    }
+
+    function _encodeHashInfo(uint160 snapshotHash, uint96 referralHash) internal pure returns (bytes32) {
+        return bytes32((uint256(referralHash) << 160) | uint256(snapshotHash));
+    }
+
+    function _decodeHashInfo(bytes32 hashInfo) internal pure returns (uint160 snapshotHash, uint96 referralHash) {
+        referralHash = uint96(uint256(hashInfo) >> 160);
+        snapshotHash = uint160(uint256(hashInfo));
+    }
+
+    function _encodeSnapshotID(Snapshot memory snapshot) pure internal returns (uint160) {
+        return uint160(uint256(keccak256(
+            abi.encodePacked(
+                snapshot.token0,
+                snapshot.token1,
+                snapshot.amountIn0,
+                snapshot.amountIn1,
+                snapshot.liquidity
+            )
+        )));
+    }
+
+    function _convertToWETH(uint256 b, uint256 wethNeeded) internal returns (uint256 refundETH) {
+        uint wethB = IERC20(WETH).balanceOf(address(this));
+
+        uint ethToConvert = wethNeeded > wethB ? wethNeeded - wethB : 0;
+        if (wethB > wethNeeded) {
+            IWETH9(WETH).withdraw(wethB - wethNeeded);
+            refundETH += wethB - wethNeeded;
+        }
+        if (ethToConvert > 0) {
+            if (b < ethToConvert) revert InsufficientFunds();
+            IWETH9(WETH).deposit{value: ethToConvert}();
+        }
+        refundETH += b - ethToConvert;
+    }
+
+
+    function _resolveAndPermitIfNecessary(address token, Permit memory permit, uint256 amount) internal returns (address) {
+        if (permit.enable && token != WETH) IPermitERC20(token).permit(msg.sender, address(this), amount, permit.deadline, permit.v, permit.r, permit.s);
+        return token;
+    }
+
+    function _getAndValidateCertificateInfo(uint256 id) internal view returns (uint40 unlockTime, address owner) {
+        uint96 data;
+        (owner, data) = _getOwnershipSlot(id);
+        if (!_isApprovedOrOwner(msg.sender, id, owner)) revert NotOwnerNorApproved();
+        if (owner == address(0)) revert TokenDoesNotExist(); 
+
+        unlockTime = uint40(data);
+    }
+
+    function _getWETHNeeded(address tokenA, address tokenB, uint256 amountA, uint256 amountB) internal pure returns (uint256) {
+        if (tokenA == ETH || tokenA == WETH) return amountA;
+        if (tokenB == ETH || tokenB == WETH) return amountB;
+        return 0;
+    }
+
+    function _validateFunds(uint256 mintFee, uint256 wethNeeded) internal returns (uint256 remainingBal) {
+        remainingBal = msg.value;
+        if (msg.value < mintFee) revert InsufficientFunds();
+        remainingBal -= mintFee;
+
+        if (wethNeeded > 0) remainingBal = _convertToWETH(remainingBal, wethNeeded);
+    }
+
+
+    /////////////    Uniswap v2 related functions   /////////////////////////
+    function _orderTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
+        (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+    }
+
+    function _pairFor(address tokenA, address tokenB) internal pure returns (address pair) {
+        (address token0, address token1) = _orderTokens(tokenA, tokenB);
+        pair = address(uint160(uint256(keccak256(abi.encodePacked(
+            hex'ff',
+            address(V2_FACTORY),
+            keccak256(abi.encodePacked(token0, token1)),
+            hex'96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f' // init code hash
+        )))));
+    }
+
+    function _removeLiquidity(address pool, uint liquidity, address to) internal returns (uint amount0, uint amount1) {
+        IUniswapV2Pair pair = IUniswapV2Pair(pool);
+        SafeTransferLib.safeTransfer(pool, pool, liquidity); // send liquidity to pair (caller -> pair)
+        (amount0, amount1) = pair.burn(to); 
+    }
+
+    /// @dev  input assumptions, amounts non zero, token0 & token1 are valid to the pair
+    function _addLiquidityV2(address pool, address token0, address token1, uint256 amount0, uint256 amount1, bool transferFrom0, bool transferFrom1) internal returns (uint256 liquidity, uint256 actualAmount0, uint256 actualAmount1, uint256 refundETH) {
+        IUniswapV2Pair pair = IUniswapV2Pair(pool);
+
+        (actualAmount0, actualAmount1) = (amount0, amount1);
+        (uint reserve0, uint reserve1, ) = pair.getReserves();
+
+        // Quote price only if and the pool has reserves
+        if (!(reserve0 == 0 && reserve1 == 0)) {
+            (actualAmount0, actualAmount1) = (amount0, amount0 * reserve1 / reserve0);
+            if (actualAmount1 == 0 || actualAmount1 > amount1) 
+                (actualAmount0, actualAmount1) = (amount1 * reserve0 / reserve1, amount1);
+            if (actualAmount0 == 0 || actualAmount1 == 0 || actualAmount0 > amount0 || actualAmount1 > amount1) 
+                revert InvalidLiquidityAdditionalAmounts();
+        }
+
+        // sent directly from the sender
+        if (transferFrom0) SafeTransferLib.safeTransferFrom(token0, msg.sender, pool, actualAmount0);
+        if (transferFrom1) SafeTransferLib.safeTransferFrom(token1, msg.sender, pool, actualAmount1);
+        // sent from the contract [only used for NATIVE ETH -> WETH] and we should refund
+        if (!transferFrom0) {
+            SafeTransferLib.safeTransfer(token0, pool, actualAmount0);
+            if (token0 == WETH && amount0 > actualAmount0) refundETH = amount0 - actualAmount0;
+        }
+        if (!transferFrom1) {
+            SafeTransferLib.safeTransfer(token1, pool, actualAmount1);
+            if (token1 == WETH && amount1 > actualAmount1) refundETH = amount1 - actualAmount1;
+        } 
+
+        if (refundETH > 0) IWETH9(WETH).withdraw(refundETH);
+
+        liquidity = pair.mint(address(this));
+
+        // Amount from liquidity
+        uint totalLiquidity = pair.totalSupply();
+        actualAmount0 = liquidity * (reserve0 + actualAmount0) / totalLiquidity;
+        actualAmount1 = liquidity * (reserve1 + actualAmount1) / totalLiquidity;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  EXTERNAL FUNCTIONS                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    
+    /// @dev Only allows ETH from entry point functions & WETH.withdraws
+    receive() external payable { 
+        if (msg.sender != WETH) revert();
+    }
+    fallback() external payable { 
+        if (msg.sender != WETH) revert();
+    }
+
+    //////////            GETTERS           //////////////
+    function fees() external view returns (uint256 mintFee, uint256 referalMintFeePercent, uint256 collectFeePercent) { 
+        (mintFee, referalMintFeePercent) = _decodeFeeSlot(_feeSlot);
+        collectFeePercent = _collectFeePercent;
+    }
+
+    function unlockTime(uint256 id) view external returns (uint256) {
+        return uint256(uint40(_getExtraData(id)));
+    }
+
+    //////////            SETTERS             //////////////
+    function setFees(uint256 mintFee, uint256 referralMintFeePercent, uint256 collectFeePercent) external onlyOwner {
+        if (collectFeePercent > _collectFeePercent) revert InvalidFee();
+        if (referralMintFeePercent > FEE_DIVISOR) revert InvalidFee();
+
+        _feeSlot = _encodeFeeSlot(mintFee, referralMintFeePercent);
+        _collectFeePercent = collectFeePercent;
+    }
+
+    function setSuccessor(address successor) external onlyOwner {
+        _successor = ISuccessor(successor);
+    }
+
+    function setReferrer(address referrer, bool value) external onlyOwner {
+        registeredReferrers[referrer] = value;
+    }
+
+
+    //////////            MIGRATION         //////////////
+    function verifySnapshot(uint256 id, Snapshot calldata snapshot) public view returns (uint160 snapshotHash, uint96 referralHash) {
+        (snapshotHash, referralHash) = _decodeHashInfo(hashInfoForCertificateID[id]);
+        if (snapshotHash != _encodeSnapshotID(snapshot)) revert InvalidLiquiditySnapshot();
+    }
+
+    function resetReferralHash(uint256 id, address referrer) external {
+        if (msg.sender != address(payMaster)) revert NotPayMaster();
+
+        (uint160 snapshotHash, uint96 referralHash) = _decodeHashInfo(hashInfoForCertificateID[id]);
+        referralHash = uint96(uint256(keccak256(abi.encodePacked(referrer, uint256(0)))));
+        hashInfoForCertificateID[id] = _encodeHashInfo(
+            snapshotHash,
+            referralHash   
+        );
+    }
+
+
+    /**
+     * @notice Launches a v2 liquidity position that is locked and allows owners to collect their swap fees.
+     * @dev Never transfer ERC20 tokens directly to this contract only native ETH.
+     * @param recipient The recipient and owner of the resulting locked liquidity position.
+     * @param referrer The recipient and owner of the resulting locked liquidity position.
+     * @param params The required arguments within a struct needed to allow permit transfer, structured as follows:
+     *        - address tokenA: The address of the first token.
+     *        - address tokenB: The address of the second token.
+     *        - Permit permitA: A struct containing the permit details for tokenA.
+     *        - Permit permitB: A struct containing the permit details for tokenB.
+     *        - uint256 amountA: The amount of tokenA to add to the pool.
+     *        - uint256 amountB: The amount of tokenB to add to the pool.
+     *        - uint32 lockDuration: The duration for which the liquidity should be locked.
+     * @return id The ID of the minted liquidity position.
+     * @return snapshot A data structure representing the snapshot of the users liquidity position 
+    **/
+    function mint(address recipient, address referrer, MintParams calldata params) public payable returns (uint256 id, Snapshot memory snapshot) {
+        if (referrer != address(0) && !registeredReferrers[referrer]) revert NotRegisteredRefferer();
+
+        (uint256 mintFee, uint256 referralMintFeePercent) = _decodeFeeSlot(_feeSlot);
+        uint256 remainingBalance = _validateFunds(mintFee, _getWETHNeeded(params.tokenA, params.tokenB, params.amountA, params.amountB));
+        uint40 unlockTime = params.lockDuration == LOCK_FOREVER || (block.timestamp + params.lockDuration) > type(uint40).max ? LOCKED_FOREVER : uint40(block.timestamp + uint256(params.lockDuration));
+
+        // Pay Fee
+        uint256 devMintFee = referrer == address(0) ? mintFee : mintFee - mintFee * referralMintFeePercent / FEE_DIVISOR;
+        payMaster.payFees{ value: mintFee }(devMintFee);
+
+        // Token Validation & Address Resolvement
+        if (params.tokenA == params.tokenB) revert IdenticalTokens();
+        if (params.tokenA == WETH && params.tokenB == ETH) revert IdenticalTokens();
+        if (params.tokenB == WETH && params.tokenA == ETH) revert IdenticalTokens();
+        if (params.amountA == 0 || params.amountB == 0) revert ZeroTokenAmount();
+        (address tokenA, address tokenB) = (
+            (params.tokenA == ETH || params.tokenA == WETH) ? WETH : _resolveAndPermitIfNecessary(params.tokenA, params.permitA, params.amountA),
+            (params.tokenB == ETH || params.tokenB == WETH) ? WETH : _resolveAndPermitIfNecessary(params.tokenB, params.permitB, params.amountB)
+        );
+
+        (snapshot.token0, snapshot.token1) = _orderTokens(tokenA, tokenB);
+        (uint256 desiredAmount0, uint256 desiredAmount1) = snapshot.token0 == tokenA ? (params.amountA, params.amountB) : 
+                                                                              (params.amountB, params.amountA);
+
+        address pool = V2_FACTORY.getPair(tokenA, tokenB);
+        pool = pool == address(0) ? V2_FACTORY.createPair(tokenA, tokenB) : pool;
+
+        (bool isNativeETH0, bool isNativeETH1) = snapshot.token0 == tokenA ? (params.tokenA == ETH, params.tokenB == ETH) : 
+                                                                    (params.tokenB == ETH, params.tokenA == ETH);
+        uint256 refundETH;
+        (snapshot.liquidity, snapshot.amountIn0, snapshot.amountIn1, refundETH) = _addLiquidityV2(
+            pool, 
+            snapshot.token0,
+            snapshot.token1,
+            desiredAmount0, 
+            desiredAmount1, 
+            !isNativeETH0, 
+            !isNativeETH1
+        );
+
+        // Refund
+        if (remainingBalance + refundETH > 0) payable(msg.sender).transfer(remainingBalance + refundETH);
+
+        uint256 referralFee = mintFee * referralMintFeePercent / FEE_DIVISOR;
+        uint96 referrerHash = referrer != address(0) ? uint96(uint256(keccak256(abi.encodePacked(referrer, referralFee)))) : 0;
+
+        hashInfoForCertificateID[_idTracker] = _encodeHashInfo(
+            _encodeSnapshotID(snapshot),
+            referrerHash
+        );
+
+        id = _idTracker;
+        emit Transfer(address(0), recipient, _idTracker);
+        emit Minted(
+            _idTracker, 
+            referrer,
+            snapshot.token0,
+            snapshot.token1,
+            params.lockDuration,
+            snapshot.liquidity, 
+            snapshot.amountIn0,
+            snapshot.amountIn1,
+            referrer != address(0) ? abi.encode(uint256(referralFee)) : bytes("")
+        );
+
+        _setOwnershipSlot(_idTracker, recipient, uint96(unlockTime));
+        _incrementBalance(recipient, 1);
+        _idTracker++;
+    }
+
+    function mint(MintParams calldata params) payable external returns (uint256 id, Snapshot memory snapshot) {
+        return mint(msg.sender, address(0), params);
+    }
+
+    /**
+     * @notice Collects owed fees from a Uniswap V2 liquidity pool without compromising the security and properties of the lock.
+     * @dev Anyone can call this on behalf of a vaulted position, but fees will only be collected by the owner of the position.
+     * @param id The ID of the vaulted liquidity position.
+     * @param snapshot A struct containing the necessary data to collect fees from a Uniswap V2 liquidity pool:
+     *        - address token0: The address of the first token in the liquidity pool.
+     *        - address token1: The address of the second token in the liquidity pool.
+     *        - uint256 amountIn0: The amount of the first token currently in the pool.
+     *        - uint256 amountIn1: The amount of the second token currently in the pool.
+     *        - uint256 liquidity: The total liquidity of the pool at the time of the snapshot.
+     * @return fee0 The amount of fee collected in token0.
+     * @return fee1 The amount of fee collected in token1.
+    **/
+    function collect(uint256 id, Snapshot calldata snapshot) external returns (uint256 fee0, uint256 fee1) {
+        (, uint96 referralHash) = verifySnapshot(id, snapshot);
+        (address owner, ) = _getOwnershipSlot(id);
+
+        address pool = _pairFor(snapshot.token0, snapshot.token1);
+        uint256 balance0 = IERC20(snapshot.token0).balanceOf(pool);
+        uint256 balance1 = IERC20(snapshot.token1).balanceOf(pool);
+        uint256 totalLiquidity = IERC20(pool).totalSupply();
+
+        uint256 wouldBeRemoved0 = snapshot.liquidity * balance0 / totalLiquidity;
+        uint256 wouldBeRemoved1 = snapshot.liquidity * balance1 / totalLiquidity;
+
+        uint256 feeLiquidity0 = totalLiquidity * wouldBeRemoved0 / balance0 - Math.mulDiv(totalLiquidity, Math.sqrt(Math.mulDiv(wouldBeRemoved0, snapshot.amountIn0 * snapshot.amountIn1, wouldBeRemoved1)), balance0);
+        uint256 feeLiquidity1 = totalLiquidity * wouldBeRemoved1 / balance1 - Math.mulDiv(totalLiquidity, Math.sqrt(Math.mulDiv(wouldBeRemoved1, snapshot.amountIn0 * snapshot.amountIn1, wouldBeRemoved0)), balance1);
+
+        uint256 feeLiquidity = feeLiquidity0 <= feeLiquidity1 ? feeLiquidity1 : feeLiquidity0;
+
+        if (feeLiquidity == 0) revert InsufficientLiquidityBurned();
+        (fee0, fee1) = _removeLiquidity(pool, feeLiquidity, address(this));
+
+        (uint256 referralFee0, uint256 referralFee1) = (fee0 * _collectFeePercent / FEE_DIVISOR, fee1 * _collectFeePercent / FEE_DIVISOR);
+
+        // Prep WETH -> ETH
+        if (snapshot.token0 == WETH) IWETH9(WETH).withdraw(fee0);
+        if (snapshot.token1 == WETH) IWETH9(WETH).withdraw(fee1);
+
+        // Payout the referrer or dev
+        if (referralFee0 > 0) {
+            if (snapshot.token0 == WETH) {
+                payMaster.payFees{ value: referralFee0 }(referralHash == 0 ? referralFee0 : 0);
+            }
+            else SafeTransferLib.safeTransfer(snapshot.token0, referralHash == 0 ? payMaster.OWNER() : address(payMaster), referralFee0);
+        }
+        if (referralFee1 > 0) {
+            if (snapshot.token1 == WETH) {
+                payMaster.payFees{ value: referralFee1 }(referralHash == 0 ? referralFee1 : 0);
+            }
+            else SafeTransferLib.safeTransfer(snapshot.token1, referralHash == 0 ? payMaster.OWNER() : address(payMaster), referralFee1);
+        }
+
+        // Payout the liquidity owner
+        if (snapshot.token0 == WETH) payable(owner).transfer(fee0 - referralFee0);
+        else SafeTransferLib.safeTransfer(snapshot.token0, owner, fee0 - referralFee0);
+        if (snapshot.token1 == WETH) payable(owner).transfer(fee1 - referralFee1);
+        else SafeTransferLib.safeTransfer(snapshot.token1, owner, fee1 - referralFee1);
+
+        // Update the Payout Merkle root
+        if (referralHash != 0) {
+            referralHash = uint96(uint256(keccak256(abi.encodePacked(
+                uint96(uint256(keccak256(abi.encodePacked(referralHash, referralFee0)))),
+                referralFee1
+            ))));
+        }
+
+        uint256 liquidity = snapshot.liquidity - feeLiquidity;
+        // Inlined amountsFromLiquidityV2 since not used else where
+        totalLiquidity = IUniswapV2Pair(pool).totalSupply();
+        uint256 amountIn0 = liquidity * IERC20(snapshot.token0).balanceOf(pool) / totalLiquidity;
+        uint256 amountIn1 = liquidity * IERC20(snapshot.token1).balanceOf(pool) / totalLiquidity;
+
+        hashInfoForCertificateID[id] = _encodeHashInfo(
+            _encodeSnapshotID(Snapshot({
+                token0: snapshot.token0,
+                token1: snapshot.token1,
+                amountIn0: amountIn0,
+                amountIn1: amountIn1,
+                liquidity: liquidity
+            })),
+            referralHash
+        );
+
+        emit Collected(
+            id, 
+            fee0,
+            fee1, 
+            liquidity,
+            amountIn0,
+            amountIn1,
+            referralHash != 0 ? abi.encode(uint256(referralFee0)) : bytes(""),
+            referralHash != 0 ? abi.encode(uint256(referralFee1)) : bytes("")
+        );
+    }
+
+    /**
+     * @notice Redeems a locked liquidity position once its lock time is up.
+     * @param id The ID of the liquidity position.
+     * @param snapshot The required arguments within a struct needed to allow permit transfer, structured as follows:
+     *        - address token0: The address of the first token.
+     *        - address token1: The address of the second token.
+     *        - uint256 amountIn0: The amount of the first token in the pool.
+     *        - uint256 amountIn1: The amount of the second token in the pool.
+     *        - uint256 liquidity: The current liquidity of the pool.
+     * @param removeLP If true, sends underlying tokens of the pool to the owner; if false, liquidity tokens are sent.
+    **/
+    function redeem(uint256 id, Snapshot calldata snapshot, bool removeLP) external {
+        verifySnapshot(id, snapshot);
+        (uint40 unlockTime, address owner) = _getAndValidateCertificateInfo(id);
+        if (unlockTime == LOCKED_FOREVER || block.timestamp <= unlockTime) revert NotUnlocked();
+
+        address pool = _pairFor(snapshot.token0, snapshot.token1);
+        if (removeLP) _removeLiquidity(pool, snapshot.liquidity, owner);
+        else IERC20(pool).transfer(owner, snapshot.liquidity);
+
+        hashInfoForCertificateID[id] = 0;
+        _burn(address(0), id, owner, true);
+    }
+
+    /**
+     * @notice Extend the lock time of a locked liquidity position.
+     * @param id The id of the liquidity position.
+     * @param additionalTime The additional time to extend the lock duration. If set to LOCK_FOREVER, the position will be locked forever.
+     */
+    function extend(uint256 id, uint32 additionalTime) external {
+        (uint40 unlockTime, ) = _getAndValidateCertificateInfo(id);
+        if (unlockTime == LOCKED_FOREVER) return;
+        if (additionalTime == LOCK_FOREVER || LOCKED_FOREVER - unlockTime <= additionalTime) unlockTime = LOCKED_FOREVER;
+        else unlockTime += additionalTime;
+
+        _setExtraData(id, uint96(unlockTime));
+    }
+
+    /**
+     * @notice Increases the liquidity of an already locked liquidity position
+     * @param id The id of the liquidity position
+     * @param params The required arguments within a struct needed to allow permit transfer, structured as follows:
+     *        - uint256 additional0: The additional amount of the first token to add to the pool.
+     *        - uint256 additional1: The additional amount of the second token to add to the pool.
+     *        - Permit permit0: A struct containing the permit details for the first token.
+     *        - Permit permit1: A struct containing the permit details for the second token.
+     * @param snapshot The required arguments within a struct needed to allow permit transfer, structured as follows:
+     *        - address token0: The address of the first token.
+     *        - address token1: The address of the second token.
+     *        - uint256 amountIn0: The amount of the first token in the pool.
+     *        - uint256 amountIn1: The amount of the second token in the pool.
+     *        - uint256 liquidity: The current liquidity of the pool.
+     * @return added0 The amount of the first token added to the pool.
+     * @return added1 The amount of the second token added to the pool.
+    **/
+    function increase(uint256 id, IncreaseParams calldata params, Snapshot calldata snapshot) payable external returns (uint256 added0, uint256 added1) {
+        (, uint96 referralHash) = verifySnapshot(id, snapshot);
+        _getAndValidateCertificateInfo(id);
+        uint256 remainingBalance = _validateFunds(0, _getWETHNeeded(snapshot.token0, snapshot.token1, params.additional0, params.additional1));
+
+        address pair = _pairFor(snapshot.token0, snapshot.token1);
+        if (snapshot.token0 != WETH) _resolveAndPermitIfNecessary(snapshot.token0, params.permit0, params.additional0);
+        if (snapshot.token1 != WETH) _resolveAndPermitIfNecessary(snapshot.token1, params.permit1, params.additional1);
+        
+        (bool isNativeETH0, bool isNativeETH1) = (snapshot.token0 == WETH, snapshot.token1 == WETH);
+
+        // Collect to ensure accurate updated snapshot
+        try this.collect(id, snapshot) {}
+        catch {}
+
+        // Need to get current amount from 
+        (uint256 additionalLiquidity, uint256 refundETH) = (0, 0);
+        (additionalLiquidity, added0, added1, refundETH) = _addLiquidityV2(
+            pair, 
+            snapshot.token0,
+            snapshot.token1,
+            params.additional0, 
+            params.additional1, 
+            !isNativeETH0, 
+            !isNativeETH1 
+        );
+
+        // Refund
+        if (remainingBalance + refundETH > 0) payable(msg.sender).transfer(remainingBalance + refundETH);
+
+
+        uint256 snapshotLiquidity = snapshot.liquidity + additionalLiquidity;
+
+        // Inlined amountsFromLiquidityV2 since not used else where
+        uint256 totalLiquidity = IUniswapV2Pair(pair).totalSupply();
+        uint256 snapshotAmountIn0 = snapshotLiquidity * IERC20(snapshot.token0).balanceOf(pair) / totalLiquidity;
+        uint256 snapshotAmountIn1 = snapshotLiquidity * IERC20(snapshot.token1).balanceOf(pair) / totalLiquidity;
+
+        hashInfoForCertificateID[id] = _encodeHashInfo(
+            _encodeSnapshotID(Snapshot({
+                token0: snapshot.token0, 
+                token1: snapshot.token1,
+                amountIn0: snapshotAmountIn0,
+                amountIn1: snapshotAmountIn1,
+                liquidity: snapshotLiquidity
+            })),
+            referralHash
+        );
+
+        emit Increased(
+            id, 
+            snapshotLiquidity,
+            snapshotAmountIn0,
+            snapshotAmountIn1
+        );
+    }
+
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          MIGRATION                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    mapping(address => bool) _migrated;
+    error MigrateNotAvailable();
+    error AlreadyMigrated();
+    error NotMajorityLiquidityHolder();
+    error NonETHPair();
+
+    /**
+     * @notice Safely upgrades an existing liquidity vault to our new vault technology.
+            Note that an upgrade is not forced on any user. Users will be able to inspect the new contract
+            and make that decision on their own.
+     * @param id The ID of the liquidity position.
+     * @param snapshot The required arguments within a struct needed to allow permit transfer, structured as follows:
+     *        - address token0: The address of the first token.
+     *        - address token1: The address of the second token.
+     *        - uint256 amountIn0: The amount of the first token in the pool.
+     *        - uint256 amountIn1: The amount of the second token in the pool.
+     *        - uint256 liquidity: The current liquidity of the pool.
+     * @param successorParams The encoded params to be sent to the new vault
+    **/
+    function migrate(uint256 id, Snapshot calldata snapshot, bytes calldata successorParams) external returns (address token) {
+        if (address(_successor) == address(0)) revert MigrateNotAvailable();
+        verifySnapshot(id, snapshot);
+        (uint40 unlockTime, address owner) = _getAndValidateCertificateInfo(id);
+
+        address pool = _pairFor(snapshot.token0, snapshot.token1);
+        if (_migrated[pool]) revert AlreadyMigrated();
+
+        // Neccessary Conditions
+        uint256 totalLiquidity = IERC20(pool).totalSupply();
+        if (snapshot.liquidity < totalLiquidity / 2) revert NotMajorityLiquidityHolder();
+        if (snapshot.token0 != WETH && snapshot.token1 != WETH) revert NonETHPair();
+        _migrated[pool] = true;
+
+        try this.collect(id, snapshot) {}
+        catch {}
+
+        (uint256 amount0, uint256 amount1) = _removeLiquidity(
+            pool,
+            snapshot.liquidity,
+            address(this) 
+        );
+
+
+        address targetToken = snapshot.token0 != WETH ? snapshot.token0 : snapshot.token1; 
+        (uint256 ethAmount, uint256 tokenAmount) = snapshot.token0 == WETH ? (amount0, amount1) : (amount1, amount0);
+        IWETH9(WETH).withdraw(ethAmount);
+
+        IERC20 oldToken = IERC20(targetToken);
+        Token newToken = new Token(targetToken);
+        token = address(newToken);
+        SafeTransferLib.safeTransfer(token, address(_successor), tokenAmount);
+        SafeTransferLib.safeTransfer(token, token, oldToken.totalSupply() - tokenAmount);
+        SafeTransferLib.safeTransfer(targetToken, 0x000000000000000000000000000000000000dEaD, tokenAmount);
+
+        _successor.mint{ value: ethAmount }(msg.sender, _successor.encodeParams(unlockTime, successorParams));
+
+        hashInfoForCertificateID[id] = 0;
+        _burn(address(0), id, owner, true);
+    }
+}
+
+// File: lib/solady/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+///
+/// @dev Note:
+/// This implementation does NOT auto-initialize the owner to `msg.sender`.
+/// You MUST call the `_initializeOwner` in the constructor / initializer.
+///
+/// While the ownable portion follows
+/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,
+/// the nomenclature for the 2-step ownership handover may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by: `not(_OWNER_SLOT_NOT)`.
+    /// It is intentionally chosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    uint256 private constant _OWNER_SLOT_NOT = 0x8b78c6d8;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Store the new value.
+            sstore(not(_OWNER_SLOT_NOT), newOwner)
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ownerSlot := not(_OWNER_SLOT_NOT)
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+            // Store the new value.
+            sstore(ownerSlot, newOwner)
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(not(_OWNER_SLOT_NOT)))) {
+                mstore(0x00, 0x82b42900) // `Unauthorized()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    /// Override to return a different value if needed.
+    /// Made internal to conserve bytecode. Wrap it in a public function if needed.
+    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + _ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(not(_OWNER_SLOT_NOT))
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+
+
+// File: lib/solady/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/SafeTransferLib.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+///
+/// @dev Note:
+/// - For ETH transfers, please use `forceSafeTransferETH` for DoS protection.
+/// - For ERC20s, this implementation won't check that a token has code,
+///   responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ETH transfer has failed.
+    error ETHTransferFailed();
+
+    /// @dev The ERC20 `transferFrom` has failed.
+    error TransferFromFailed();
+
+    /// @dev The ERC20 `transfer` has failed.
+    error TransferFailed();
+
+    /// @dev The ERC20 `approve` has failed.
+    error ApproveFailed();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Suggested gas stipend for contract receiving ETH that disallows any storage writes.
+    uint256 internal constant GAS_STIPEND_NO_STORAGE_WRITES = 2300;
+
+    /// @dev Suggested gas stipend for contract receiving ETH to perform a few
+    /// storage reads and writes, but low enough to prevent griefing.
+    uint256 internal constant GAS_STIPEND_NO_GRIEF = 100000;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       ETH OPERATIONS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // If the ETH transfer MUST succeed with a reasonable gas budget, use the force variants.
+    //
+    // The regular variants:
+    // - Forwards all remaining gas to the target.
+    // - Reverts if the target reverts.
+    // - Reverts if the current contract has insufficient balance.
+    //
+    // The force variants:
+    // - Forwards with an optional gas stipend
+    //   (defaults to `GAS_STIPEND_NO_GRIEF`, which is sufficient for most cases).
+    // - If the target reverts, or if the gas stipend is exhausted,
+    //   creates a temporary contract to force send the ETH via `SELFDESTRUCT`.
+    //   Future compatible with `SENDALL`: https://eips.ethereum.org/EIPS/eip-4758.
+    // - Reverts if the current contract has insufficient balance.
+    //
+    // The try variants:
+    // - Forwards with a mandatory gas stipend.
+    // - Instead of reverting, returns whether the transfer succeeded.
+
+    /// @dev Sends `amount` (in wei) ETH to `to`.
+    function safeTransferETH(address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(call(gas(), to, amount, gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Sends all the ETH in the current contract to `to`.
+    function safeTransferAllETH(address to) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer all the ETH and check if it succeeded or not.
+            if iszero(call(gas(), to, selfbalance(), gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Force sends `amount` (in wei) ETH to `to`, with a `gasStipend`.
+    function forceSafeTransferETH(address to, uint256 amount, uint256 gasStipend) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if lt(selfbalance(), amount) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            if iszero(call(gasStipend, to, amount, gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(amount, 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Force sends all the ETH in the current contract to `to`, with a `gasStipend`.
+    function forceSafeTransferAllETH(address to, uint256 gasStipend) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(call(gasStipend, to, selfbalance(), gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(selfbalance(), 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Force sends `amount` (in wei) ETH to `to`, with `GAS_STIPEND_NO_GRIEF`.
+    function forceSafeTransferETH(address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if lt(selfbalance(), amount) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            if iszero(call(GAS_STIPEND_NO_GRIEF, to, amount, gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(amount, 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Force sends all the ETH in the current contract to `to`, with `GAS_STIPEND_NO_GRIEF`.
+    function forceSafeTransferAllETH(address to) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(call(GAS_STIPEND_NO_GRIEF, to, selfbalance(), gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(selfbalance(), 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Sends `amount` (in wei) ETH to `to`, with a `gasStipend`.
+    function trySafeTransferETH(address to, uint256 amount, uint256 gasStipend)
+        internal
+        returns (bool success)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            success := call(gasStipend, to, amount, gas(), 0x00, gas(), 0x00)
+        }
+    }
+
+    /// @dev Sends all the ETH in the current contract to `to`, with a `gasStipend`.
+    function trySafeTransferAllETH(address to, uint256 gasStipend)
+        internal
+        returns (bool success)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            success := call(gasStipend, to, selfbalance(), gas(), 0x00, gas(), 0x00)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      ERC20 OPERATIONS                      */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Sends `amount` of ERC20 `token` from `from` to `to`.
+    /// Reverts upon failure.
+    ///
+    /// The `from` account must have at least `amount` approved for
+    /// the current contract to manage.
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x60, amount) // Store the `amount` argument.
+            mstore(0x40, to) // Store the `to` argument.
+            mstore(0x2c, shl(96, from)) // Store the `from` argument.
+            mstore(0x0c, 0x23b872dd000000000000000000000000) // `transferFrom(address,address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x1c, 0x64, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Sends all of ERC20 `token` from `from` to `to`.
+    /// Reverts upon failure.
+    ///
+    /// The `from` account must have their entire balance approved for
+    /// the current contract to manage.
+    function safeTransferAllFrom(address token, address from, address to)
+        internal
+        returns (uint256 amount)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x40, to) // Store the `to` argument.
+            mstore(0x2c, shl(96, from)) // Store the `from` argument.
+            mstore(0x0c, 0x70a08231000000000000000000000000) // `balanceOf(address)`.
+            // Read the balance, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    gt(returndatasize(), 0x1f), // At least 32 bytes returned.
+                    staticcall(gas(), token, 0x1c, 0x24, 0x60, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x00, 0x23b872dd) // `transferFrom(address,address,uint256)`.
+            amount := mload(0x60) // The `amount` is already at 0x60. We'll need to return it.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x1c, 0x64, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Sends `amount` of ERC20 `token` from the current contract to `to`.
+    /// Reverts upon failure.
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0xa9059cbb000000000000000000000000) // `transfer(address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Sends all of ERC20 `token` from the current contract to `to`.
+    /// Reverts upon failure.
+    function safeTransferAll(address token, address to) internal returns (uint256 amount) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, 0x70a08231) // Store the function selector of `balanceOf(address)`.
+            mstore(0x20, address()) // Store the address of the current contract.
+            // Read the balance, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    gt(returndatasize(), 0x1f), // At least 32 bytes returned.
+                    staticcall(gas(), token, 0x1c, 0x24, 0x34, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x14, to) // Store the `to` argument.
+            amount := mload(0x34) // The `amount` is already at 0x34. We'll need to return it.
+            mstore(0x00, 0xa9059cbb000000000000000000000000) // `transfer(address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Sets `amount` of ERC20 `token` for `to` to manage on behalf of the current contract.
+    /// Reverts upon failure.
+    function safeApprove(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
+            // Perform the approval, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x3e3f8f73) // `ApproveFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Sets `amount` of ERC20 `token` for `to` to manage on behalf of the current contract.
+    /// If the initial attempt to approve fails, attempts to reset the approved amount to zero,
+    /// then retries the approval again (some tokens, e.g. USDT, requires this).
+    /// Reverts upon failure.
+    function safeApproveWithRetry(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
+            // Perform the approval, retrying upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x34, 0) // Store 0 for the `amount`.
+                mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
+                pop(call(gas(), token, 0, 0x10, 0x44, 0x00, 0x00)) // Reset the approval.
+                mstore(0x34, amount) // Store back the original `amount`.
+                // Retry the approval, reverting upon failure.
+                if iszero(
+                    and(
+                        or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                        call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                    )
+                ) {
+                    mstore(0x00, 0x3e3f8f73) // `ApproveFailed()`.
+                    revert(0x1c, 0x04)
+                }
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Returns the amount of ERC20 `token` owned by `account`.
+    /// Returns zero if the `token` does not exist.
+    function balanceOf(address token, address account) internal view returns (uint256 amount) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, account) // Store the `account` argument.
+            mstore(0x00, 0x70a08231000000000000000000000000) // `balanceOf(address)`.
+            amount :=
+                mul(
+                    mload(0x20),
+                    and( // The arguments of `and` are evaluated from right to left.
+                        gt(returndatasize(), 0x1f), // At least 32 bytes returned.
+                        staticcall(gas(), token, 0x10, 0x24, 0x20, 0x20)
+                    )
+                )
+        }
+    }
+}
+
+
+// File: lib/shared/src/tokens/ERC721Extended.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import {ERC721} from "solady/src/tokens/ERC721.sol";
+
+/// @notice Simple ERC721 implementation with storage hitchhiking.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/tokens/ERC721.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/tree/master/contracts/token/ERC721/ERC721.sol)
+abstract contract ERC721Extended is ERC721 {
+    uint256 private constant _ERC721_MASTER_SLOT_SEED = 0x7d8825530a5a2e7a << 192;
+
+    /// @dev `keccak256(bytes("Transfer(address,address,uint256)"))`.
+    uint256 private constant _TRANSFER_EVENT_SIGNATURE =
+        0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
+
+    function _getOwnershipSlot(uint256 id) internal view virtual returns (address owner, uint96 extra) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            mstore(add(m, 0x00), id)
+            mstore(add(m, 0x1c), _ERC721_MASTER_SLOT_SEED)
+            let ownershipSlot := add(id, add(id, keccak256(add(m, 0x00), 0x20)))
+            let packed := sload(ownershipSlot)
+            owner := shr(96, shl(96, packed)) // and(0xffffffffffffffffffffffffffffffffffffffff, packed)
+            extra := shr(160, packed)
+        }
+    }
+
+    function _setOwnershipSlot(uint256 id, address owner, uint96 extra) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            mstore(add(m, 0x00), id)
+            mstore(add(m, 0x1c), _ERC721_MASTER_SLOT_SEED)
+            let ownershipSlot := add(id, add(id, keccak256(add(m, 0x00), 0x20)))
+            // Clear the upper 96 bits.
+            owner := shr(96, shl(96, owner))
+            sstore(ownershipSlot, or(owner, shl(160, extra)))
+        }
+    }
+
+    function _getBalanceSlot(address owner) internal view returns (uint256 slot) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            mstore(add(m, 0x1c), _ERC721_MASTER_SLOT_SEED)
+            mstore(add(m, 0x00), owner)
+            let balanceSlot := keccak256(add(m, 0x0c), 0x1c)
+            slot := sload(balanceSlot)
+        }
+    }
+
+    function _setBalanceSlot(address owner, uint32 ownerBalance, uint224 aux) internal {
+
+    }
+
+    function _changeBalance(address owner, bool decrement, uint256 amount) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            mstore(add(m, 0x1c), _ERC721_MASTER_SLOT_SEED)
+            mstore(add(m, 0x00), owner)
+            let balanceSlot := keccak256(add(m, 0x0c), 0x1c)
+            let balanceSlotPacked := sload(balanceSlot)
+
+            switch decrement
+            case 0 { balanceSlotPacked := add(balanceSlotPacked, amount) }
+            default { balanceSlotPacked := sub(balanceSlotPacked, amount) }
+
+            if iszero(and(balanceSlotPacked, _MAX_ACCOUNT_BALANCE)) {
+                mstore(add(m, 0x00), 0x01336cea) // `AccountBalanceOverflow()`.
+                revert(add(m, 0x1c), 0x04)
+            }
+            sstore(balanceSlot, balanceSlotPacked)
+        }
+    }
+
+    function _incrementBalance(address owner, uint256 amount) internal virtual {
+        _changeBalance(owner, false, amount);
+    }
+
+    function _decrementBalance(address owner, uint256 amount) internal virtual {
+        _changeBalance(owner, true, amount);
+    }
+
+
+    function _isApprovedOrOwner(address account, uint256 id, address owner)
+        internal
+        view
+        virtual
+        returns (bool result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            result := 1
+            // Clear the upper 96 bits.
+            account := shr(96, shl(96, account))
+            // Revert if the token does not exist.
+            if iszero(owner) {
+                mstore(add(m, 0x00), 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(add(m, 0x1c), 0x04)
+            }
+            // Check if `account` is the `owner`.
+            if iszero(eq(account, owner)) {
+                mstore(add(m, 0x00), id)
+                mstore(add(m, 0x1c), or(_ERC721_MASTER_SLOT_SEED, account))
+                let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+
+                mstore(add(m, 0x00), owner)
+                // Check if `account` is approved to
+                if iszero(sload(keccak256(add(m, 0x0c), 0x30))) {
+                    result := eq(account, sload(add(1, ownershipSlot)))
+                }
+            }
+        }
+    }
+
+    function _burn(address by, uint256 id, address owner, bool decrementBalance) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clear the upper 96 bits.
+            by := shr(96, shl(96, by))
+            // Load the ownership data.
+            let m := mload(0x40)
+            mstore(add(m, 0x00), id)
+            mstore(add(m, 0x1c), or(_ERC721_MASTER_SLOT_SEED, by))
+            let ownershipSlot := add(id, add(id, keccak256(add(m, 0x00), 0x20)))
+            // Revert if the token does not exist.
+            if iszero(owner) {
+                mstore(add(m, 0x00), 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(add(m, 0x1c), 0x04)
+            }
+            // Load and check the token approval.
+            {
+                mstore(add(m, 0x00), owner)
+                let approvedAddress := sload(add(1, ownershipSlot))
+                // If `by` is not the zero address, do the authorization check.
+                // Revert if the `by` is not the owner, nor approved.
+                if iszero(or(iszero(by), or(eq(by, owner), eq(by, approvedAddress)))) {
+                    if iszero(sload(keccak256(add(m, 0x0c), 0x30))) {
+                        mstore(add(m, 0x00), 0x4b6e7f18) // `NotOwnerNorApproved()`.
+                        revert(add(m, 0x1c), 0x04)
+                    }
+                }
+                // Delete the approved address if any.
+                if approvedAddress { sstore(add(1, ownershipSlot), 0) }
+            }
+            // Clear the owner and its extra data.
+            sstore(ownershipSlot, 0)
+            // Decrement the balance of `owner`.
+            if decrementBalance {
+                let balanceSlot := keccak256(add(m, 0x0c), 0x1c)
+                sstore(balanceSlot, sub(sload(balanceSlot), 1))
+            }
+            // Emit the {Transfer} event.
+            log4(add(m, 0x00), 0x00, _TRANSFER_EVENT_SIGNATURE, owner, 0, id)
+        }
+    }
+}
+
+
+// File: lib/shared/src/structs/Permit.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+struct Permit {
+     uint256 deadline;
+     bytes32 r;
+     bytes32 s;
+     uint8 v;
+     bool enable;
+}
+
+function NoPermit() pure returns (Permit memory) {
+    return Permit(0, 0, 0, 0, false);
+}
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1, "Math: mulDiv overflow");
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+}
+
+
+// File: lib/shared/src/tokens/IWETH9.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.4;
+
+interface IWETH9 {
+    function deposit() external payable;
+    function withdraw(uint wad) external;
+    function totalSupply() external view returns (uint);
+    function approve(address guy, uint wad) external returns (bool);
+    function transfer(address dst, uint wad) external returns (bool);
+    function transferFrom(address src, address dst, uint wad) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    event Approval(address indexed src, address indexed guy, uint wad);
+    event Transfer(address indexed src, address indexed dst, uint wad);
+    event Deposit(address indexed dst, uint wad);
+    event Withdrawal(address indexed src, uint wad);
+}
+
+// File: lib/shared/src/interfaces/IERC20Extended.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import {IERC20 as OZ_IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "openzeppelin/token/ERC20/extensions/IERC20Metadata.sol";
+import {IERC20Permit} from "openzeppelin/token/ERC20/extensions/IERC20Permit.sol";
+
+
+interface IERC20 is OZ_IERC20, IERC20Metadata {
+    // function decimals() external view returns (uint8);
+}
+
+interface IPermitERC20 is IERC20, IERC20Permit {
+    // function DOMAIN_SEPARATOR() external view returns (bytes32);
+    // function PERMIT_TYPEHASH() external pure returns (bytes32);
+    // function nonces(address owner) external view returns (uint);
+
+    // function permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s) external;
+}
+
+
+// File: lib/shared/lib/v2-core/contracts/interfaces/IUniswapV2Factory.sol
+pragma solidity >=0.5.0;
+
+interface IUniswapV2Factory {
+    event PairCreated(address indexed token0, address indexed token1, address pair, uint);
+
+    function feeTo() external view returns (address);
+    function feeToSetter() external view returns (address);
+
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+    function allPairs(uint) external view returns (address pair);
+    function allPairsLength() external view returns (uint);
+
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+
+    function setFeeTo(address) external;
+    function setFeeToSetter(address) external;
+}
+
+
+// File: lib/shared/lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol
+pragma solidity >=0.5.0;
+
+interface IUniswapV2Pair {
+    event Approval(address indexed owner, address indexed spender, uint value);
+    event Transfer(address indexed from, address indexed to, uint value);
+
+    function name() external pure returns (string memory);
+    function symbol() external pure returns (string memory);
+    function decimals() external pure returns (uint8);
+    function totalSupply() external view returns (uint);
+    function balanceOf(address owner) external view returns (uint);
+    function allowance(address owner, address spender) external view returns (uint);
+
+    function approve(address spender, uint value) external returns (bool);
+    function transfer(address to, uint value) external returns (bool);
+    function transferFrom(address from, address to, uint value) external returns (bool);
+
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+    function PERMIT_TYPEHASH() external pure returns (bytes32);
+    function nonces(address owner) external view returns (uint);
+
+    function permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s) external;
+
+    event Mint(address indexed sender, uint amount0, uint amount1);
+    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
+    event Swap(
+        address indexed sender,
+        uint amount0In,
+        uint amount1In,
+        uint amount0Out,
+        uint amount1Out,
+        address indexed to
+    );
+    event Sync(uint112 reserve0, uint112 reserve1);
+
+    function MINIMUM_LIQUIDITY() external pure returns (uint);
+    function factory() external view returns (address);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function price0CumulativeLast() external view returns (uint);
+    function price1CumulativeLast() external view returns (uint);
+    function kLast() external view returns (uint);
+
+    function mint(address to) external returns (uint liquidity);
+    function burn(address to) external returns (uint amount0, uint amount1);
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+    function skim(address to) external;
+    function sync() external;
+
+    function initialize(address, address) external;
+}
+
+
+// File: src/interfaces/IPayMaster.sol
+// SPDX-License-Identifier: Business license
+
+pragma solidity ^0.8.26;
+
+interface IPayMaster {
+    function OWNER() external returns (address);
+    function payFees(uint256 devFee) external payable;
+}
+
+
+
+// File: src/interfaces/ILiquidityVault.sol
+// SPDX-License-Identifier: Business license
+
+pragma solidity ^0.8.26;
+
+import {Permit} from "shared/src/structs/Permit.sol";
+
+interface ILiquidityVault {
+    struct MintParams {
+        address tokenA;
+        address tokenB;
+        Permit permitA;
+        Permit permitB;
+        uint256 amountA;
+        uint256 amountB;
+        uint32 lockDuration;
+    }
+
+    struct Snapshot {
+        address token0;
+        address token1;
+        uint256 amountIn0;
+        uint256 amountIn1;
+        uint256 liquidity;
+    }  
+
+    struct IncreaseParams {
+        uint256 additional0;
+        uint256 additional1;
+        Permit permit0;
+        Permit permit1;
+    }
+
+    function WETH() external pure returns (address);
+    function ETH() external pure returns (address);
+    function fees() external view returns (uint256, uint256, uint256);
+    function unlockTime(uint256 id) external view returns (uint256);
+
+    // API
+    function mint(address recipient, address referrer, MintParams calldata params) payable external returns (uint256 id, Snapshot memory snapshot);
+    function mint(MintParams calldata params) payable external returns (uint256 id, Snapshot memory snapshot);
+    function increase(uint256 id, IncreaseParams calldata params, Snapshot calldata snapshot) payable external returns (uint256 added0, uint256 added1);
+    function collect(uint256 id, Snapshot calldata snapshot) external returns (uint256 collectedFee0, uint256 collectedFee1);
+    function redeem(uint256 id, Snapshot calldata snapshot, bool removeLP) external;
+    function extend(uint256 id, uint32 additionalTime) external;
+
+}
+
+interface ILiquidityVaultReferral is ILiquidityVault {
+    function verifySnapshot(uint256 id, Snapshot calldata snapshot) external view returns (uint160 snapshotHash, uint96 referralHash);
+    function resetReferralHash(uint256 id, address referrer) external;
+}
+
+// File: src/MigrationToken.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.26;
+
+import {ERC20} from "solady/src/tokens/ERC20.sol";
+import {IPermitERC20} from "shared/src/interfaces/IERC20Extended.sol";
+import {Permit} from "shared/src/structs/Permit.sol";
+import {SafeTransferLib} from "solady/src/utils/SafeTransferLib.sol";
+
+contract Token is ERC20 {
+    address immutable OLD_TOKEN;
+    string NAME;
+    string SYMBOL;
+
+    function name() public view override returns (string memory) { return NAME; }
+    function symbol() public view override returns (string memory) { return SYMBOL; }
+
+    constructor(address token) {
+        OLD_TOKEN = token;
+        IPermitERC20 t = IPermitERC20(token);
+        NAME = t.name();
+        SYMBOL = t.symbol();
+
+        _mint(msg.sender, t.totalSupply());
+    }
+
+   /**
+     * @notice Upgrades users token by burning old token and sending them equivalent amount
+     * @dev Never transfer ERC20 tokens directly to this contract only native ETH.
+     * @param permit A struct containing the permit details for old token
+     * @param amount The amount to burn from msg.sender 
+     */
+    function migrate(Permit calldata permit, uint256 amount) external {
+        IPermitERC20 oldToken = IPermitERC20(OLD_TOKEN);
+        uint256 curAmount = oldToken.balanceOf(address(this));
+        if (amount > 0) {
+            if (permit.enable) oldToken.permit(msg.sender, address(this), amount, permit.deadline, permit.v, permit.r, permit.s);
+            SafeTransferLib.safeTransferFrom(address(oldToken), msg.sender, address(0), amount);
+        }
+        _transfer(address(this), msg.sender, curAmount + amount);
+
+        SafeTransferLib.safeTransfer(address(oldToken), address(0), curAmount);
+    }
+}
+
+
+// File: src/interfaces/ISuccessor.sol
+// SPDX-License-Identifier: Business license
+
+pragma solidity ^0.8.26;
+
+interface ISuccessor {
+    function encodeParams(uint40 unlockTime, bytes memory params) pure external returns (bytes memory);
+    function mint(address recipient, bytes memory params) payable external;
+}
+
+
+// File: lib/solady/src/tokens/ERC721.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple ERC721 implementation with storage hitchhiking.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/tokens/ERC721.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/tree/master/contracts/token/ERC721/ERC721.sol)
+///
+/// @dev Note:
+/// - The ERC721 standard allows for self-approvals.
+///   For performance, this implementation WILL NOT revert for such actions.
+///   Please add any checks with overrides if desired.
+/// - For performance, methods are made payable where permitted by the ERC721 standard.
+/// - The `safeTransfer` functions use the identity precompile (0x4)
+///   to copy memory internally.
+///
+/// If you are overriding:
+/// - NEVER violate the ERC721 invariant:
+///   the balance of an owner MUST be always be equal to their number of ownership slots.
+///   The transfer functions do not have an underflow guard for user token balances.
+/// - Make sure all variables written to storage are properly cleaned
+//    (e.g. the bool value for `isApprovedForAll` MUST be either 1 or 0 under the hood).
+/// - Check that the overridden function is actually used in the function you want to
+///   change the behavior of. Much of the code has been manually inlined for performance.
+abstract contract ERC721 {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev An account can hold up to 4294967295 tokens.
+    uint256 internal constant _MAX_ACCOUNT_BALANCE = 0xffffffff;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Only the token owner or an approved account can manage the token.
+    error NotOwnerNorApproved();
+
+    /// @dev The token does not exist.
+    error TokenDoesNotExist();
+
+    /// @dev The token already exists.
+    error TokenAlreadyExists();
+
+    /// @dev Cannot query the balance for the zero address.
+    error BalanceQueryForZeroAddress();
+
+    /// @dev Cannot mint or transfer to the zero address.
+    error TransferToZeroAddress();
+
+    /// @dev The token must be owned by `from`.
+    error TransferFromIncorrectOwner();
+
+    /// @dev The recipient's balance has overflowed.
+    error AccountBalanceOverflow();
+
+    /// @dev Cannot safely transfer to a contract that does not implement
+    /// the ERC721Receiver interface.
+    error TransferToNonERC721ReceiverImplementer();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Emitted when token `id` is transferred from `from` to `to`.
+    event Transfer(address indexed from, address indexed to, uint256 indexed id);
+
+    /// @dev Emitted when `owner` enables `account` to manage the `id` token.
+    event Approval(address indexed owner, address indexed account, uint256 indexed id);
+
+    /// @dev Emitted when `owner` enables or disables `operator` to manage all of their tokens.
+    event ApprovalForAll(address indexed owner, address indexed operator, bool isApproved);
+
+    /// @dev `keccak256(bytes("Transfer(address,address,uint256)"))`.
+    uint256 private constant _TRANSFER_EVENT_SIGNATURE =
+        0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
+
+    /// @dev `keccak256(bytes("Approval(address,address,uint256)"))`.
+    uint256 private constant _APPROVAL_EVENT_SIGNATURE =
+        0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925;
+
+    /// @dev `keccak256(bytes("ApprovalForAll(address,address,bool)"))`.
+    uint256 private constant _APPROVAL_FOR_ALL_EVENT_SIGNATURE =
+        0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership data slot of `id` is given by:
+    /// ```
+    ///     mstore(0x00, id)
+    ///     mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+    ///     let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+    /// ```
+    /// Bits Layout:
+    /// - [0..159]   `addr`
+    /// - [160..255] `extraData`
+    ///
+    /// The approved address slot is given by: `add(1, ownershipSlot)`.
+    ///
+    /// See: https://notes.ethereum.org/%40vbuterin/verkle_tree_eip
+    ///
+    /// The balance slot of `owner` is given by:
+    /// ```
+    ///     mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+    ///     mstore(0x00, owner)
+    ///     let balanceSlot := keccak256(0x0c, 0x1c)
+    /// ```
+    /// Bits Layout:
+    /// - [0..31]   `balance`
+    /// - [32..255] `aux`
+    ///
+    /// The `operator` approval slot of `owner` is given by:
+    /// ```
+    ///     mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, operator))
+    ///     mstore(0x00, owner)
+    ///     let operatorApprovalSlot := keccak256(0x0c, 0x30)
+    /// ```
+    uint256 private constant _ERC721_MASTER_SLOT_SEED = 0x7d8825530a5a2e7a << 192;
+
+    /// @dev Pre-shifted and pre-masked constant.
+    uint256 private constant _ERC721_MASTER_SLOT_SEED_MASKED = 0x0a5a2e7a00000000;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      ERC721 METADATA                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the token collection name.
+    function name() public view virtual returns (string memory);
+
+    /// @dev Returns the token collection symbol.
+    function symbol() public view virtual returns (string memory);
+
+    /// @dev Returns the Uniform Resource Identifier (URI) for token `id`.
+    function tokenURI(uint256 id) public view virtual returns (string memory);
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           ERC721                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of token `id`.
+    ///
+    /// Requirements:
+    /// - Token `id` must exist.
+    function ownerOf(uint256 id) public view virtual returns (address result) {
+        result = _ownerOf(id);
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(result) {
+                mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns the number of tokens owned by `owner`.
+    ///
+    /// Requirements:
+    /// - `owner` must not be the zero address.
+    function balanceOf(address owner) public view virtual returns (uint256 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Revert if the `owner` is the zero address.
+            if iszero(owner) {
+                mstore(0x00, 0x8f4eb604) // `BalanceQueryForZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            mstore(0x00, owner)
+            result := and(sload(keccak256(0x0c, 0x1c)), _MAX_ACCOUNT_BALANCE)
+        }
+    }
+
+    /// @dev Returns the account approved to manage token `id`.
+    ///
+    /// Requirements:
+    /// - Token `id` must exist.
+    function getApproved(uint256 id) public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            if iszero(shl(96, sload(ownershipSlot))) {
+                mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(0x1c, 0x04)
+            }
+            result := sload(add(1, ownershipSlot))
+        }
+    }
+
+    /// @dev Sets `account` as the approved account to manage token `id`.
+    ///
+    /// Requirements:
+    /// - Token `id` must exist.
+    /// - The caller must be the owner of the token,
+    ///   or an approved operator for the token owner.
+    ///
+    /// Emits an {Approval} event.
+    function approve(address account, uint256 id) public payable virtual {
+        _approve(msg.sender, account, id);
+    }
+
+    /// @dev Returns whether `operator` is approved to manage the tokens of `owner`.
+    function isApprovedForAll(address owner, address operator)
+        public
+        view
+        virtual
+        returns (bool result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x1c, operator)
+            mstore(0x08, _ERC721_MASTER_SLOT_SEED_MASKED)
+            mstore(0x00, owner)
+            result := sload(keccak256(0x0c, 0x30))
+        }
+    }
+
+    /// @dev Sets whether `operator` is approved to manage the tokens of the caller.
+    ///
+    /// Emits an {ApprovalForAll} event.
+    function setApprovalForAll(address operator, bool isApproved) public virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Convert to 0 or 1.
+            isApproved := iszero(iszero(isApproved))
+            // Update the `isApproved` for (`msg.sender`, `operator`).
+            mstore(0x1c, operator)
+            mstore(0x08, _ERC721_MASTER_SLOT_SEED_MASKED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x30), isApproved)
+            // Emit the {ApprovalForAll} event.
+            mstore(0x00, isApproved)
+            log3(
+                0x00, 0x20, _APPROVAL_FOR_ALL_EVENT_SIGNATURE, caller(), shr(96, shl(96, operator))
+            )
+        }
+    }
+
+    /// @dev Transfers token `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must exist.
+    /// - `from` must be the owner of the token.
+    /// - `to` cannot be the zero address.
+    /// - The caller must be the owner of the token, or be approved to manage the token.
+    ///
+    /// Emits a {Transfer} event.
+    function transferFrom(address from, address to, uint256 id) public payable virtual {
+        _beforeTokenTransfer(from, to, id);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clear the upper 96 bits.
+            let bitmaskAddress := shr(96, not(0))
+            from := and(bitmaskAddress, from)
+            to := and(bitmaskAddress, to)
+            // Load the ownership data.
+            mstore(0x00, id)
+            mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, caller()))
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let ownershipPacked := sload(ownershipSlot)
+            let owner := and(bitmaskAddress, ownershipPacked)
+            // Revert if `from` is not the owner, or does not exist.
+            if iszero(mul(owner, eq(owner, from))) {
+                if iszero(owner) {
+                    mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                    revert(0x1c, 0x04)
+                }
+                mstore(0x00, 0xa1148100) // `TransferFromIncorrectOwner()`.
+                revert(0x1c, 0x04)
+            }
+            // Revert if `to` is the zero address.
+            if iszero(to) {
+                mstore(0x00, 0xea553b34) // `TransferToZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+            // Load, check, and update the token approval.
+            {
+                mstore(0x00, from)
+                let approvedAddress := sload(add(1, ownershipSlot))
+                // Revert if the caller is not the owner, nor approved.
+                if iszero(or(eq(caller(), from), eq(caller(), approvedAddress))) {
+                    if iszero(sload(keccak256(0x0c, 0x30))) {
+                        mstore(0x00, 0x4b6e7f18) // `NotOwnerNorApproved()`.
+                        revert(0x1c, 0x04)
+                    }
+                }
+                // Delete the approved address if any.
+                if approvedAddress { sstore(add(1, ownershipSlot), 0) }
+            }
+            // Update with the new owner.
+            sstore(ownershipSlot, xor(ownershipPacked, xor(from, to)))
+            // Decrement the balance of `from`.
+            {
+                let fromBalanceSlot := keccak256(0x0c, 0x1c)
+                sstore(fromBalanceSlot, sub(sload(fromBalanceSlot), 1))
+            }
+            // Increment the balance of `to`.
+            {
+                mstore(0x00, to)
+                let toBalanceSlot := keccak256(0x0c, 0x1c)
+                let toBalanceSlotPacked := add(sload(toBalanceSlot), 1)
+                if iszero(and(toBalanceSlotPacked, _MAX_ACCOUNT_BALANCE)) {
+                    mstore(0x00, 0x01336cea) // `AccountBalanceOverflow()`.
+                    revert(0x1c, 0x04)
+                }
+                sstore(toBalanceSlot, toBalanceSlotPacked)
+            }
+            // Emit the {Transfer} event.
+            log4(0x00, 0x00, _TRANSFER_EVENT_SIGNATURE, from, to, id)
+        }
+        _afterTokenTransfer(from, to, id);
+    }
+
+    /// @dev Equivalent to `safeTransferFrom(from, to, id, "")`.
+    function safeTransferFrom(address from, address to, uint256 id) public payable virtual {
+        transferFrom(from, to, id);
+        if (_hasCode(to)) _checkOnERC721Received(from, to, id, "");
+    }
+
+    /// @dev Transfers token `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must exist.
+    /// - `from` must be the owner of the token.
+    /// - `to` cannot be the zero address.
+    /// - The caller must be the owner of the token, or be approved to manage the token.
+    /// - If `to` refers to a smart contract, it must implement
+    ///   {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+    ///
+    /// Emits a {Transfer} event.
+    function safeTransferFrom(address from, address to, uint256 id, bytes calldata data)
+        public
+        payable
+        virtual
+    {
+        transferFrom(from, to, id);
+        if (_hasCode(to)) _checkOnERC721Received(from, to, id, data);
+    }
+
+    /// @dev Returns true if this contract implements the interface defined by `interfaceId`.
+    /// See: https://eips.ethereum.org/EIPS/eip-165
+    /// This function call must use less than 30000 gas.
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let s := shr(224, interfaceId)
+            // ERC165: 0x01ffc9a7, ERC721: 0x80ac58cd, ERC721Metadata: 0x5b5e139f.
+            result := or(or(eq(s, 0x01ffc9a7), eq(s, 0x80ac58cd)), eq(s, 0x5b5e139f))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  INTERNAL QUERY FUNCTIONS                  */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns if token `id` exists.
+    function _exists(uint256 id) internal view virtual returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            result := iszero(iszero(shl(96, sload(add(id, add(id, keccak256(0x00, 0x20)))))))
+        }
+    }
+
+    /// @dev Returns the owner of token `id`.
+    /// Returns the zero address instead of reverting if the token does not exist.
+    function _ownerOf(uint256 id) internal view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            result := shr(96, shl(96, sload(add(id, add(id, keccak256(0x00, 0x20))))))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*            INTERNAL DATA HITCHHIKING FUNCTIONS             */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // For performance, no events are emitted for the hitchhiking setters.
+    // Please emit your own events if required.
+
+    /// @dev Returns the auxiliary data for `owner`.
+    /// Minting, transferring, burning the tokens of `owner` will not change the auxiliary data.
+    /// Auxiliary data can be set for any address, even if it does not have any tokens.
+    function _getAux(address owner) internal view virtual returns (uint224 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            mstore(0x00, owner)
+            result := shr(32, sload(keccak256(0x0c, 0x1c)))
+        }
+    }
+
+    /// @dev Set the auxiliary data for `owner` to `value`.
+    /// Minting, transferring, burning the tokens of `owner` will not change the auxiliary data.
+    /// Auxiliary data can be set for any address, even if it does not have any tokens.
+    function _setAux(address owner, uint224 value) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            mstore(0x00, owner)
+            let balanceSlot := keccak256(0x0c, 0x1c)
+            let packed := sload(balanceSlot)
+            sstore(balanceSlot, xor(packed, shl(32, xor(value, shr(32, packed)))))
+        }
+    }
+
+    /// @dev Returns the extra data for token `id`.
+    /// Minting, transferring, burning a token will not change the extra data.
+    /// The extra data can be set on a non-existent token.
+    function _getExtraData(uint256 id) internal view virtual returns (uint96 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            result := shr(160, sload(add(id, add(id, keccak256(0x00, 0x20)))))
+        }
+    }
+
+    /// @dev Sets the extra data for token `id` to `value`.
+    /// Minting, transferring, burning a token will not change the extra data.
+    /// The extra data can be set on a non-existent token.
+    function _setExtraData(uint256 id, uint96 value) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let packed := sload(ownershipSlot)
+            sstore(ownershipSlot, xor(packed, shl(160, xor(value, shr(160, packed)))))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  INTERNAL MINT FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Mints token `id` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must not exist.
+    /// - `to` cannot be the zero address.
+    ///
+    /// Emits a {Transfer} event.
+    function _mint(address to, uint256 id) internal virtual {
+        _beforeTokenTransfer(address(0), to, id);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clear the upper 96 bits.
+            to := shr(96, shl(96, to))
+            // Revert if `to` is the zero address.
+            if iszero(to) {
+                mstore(0x00, 0xea553b34) // `TransferToZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+            // Load the ownership data.
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let ownershipPacked := sload(ownershipSlot)
+            // Revert if the token already exists.
+            if shl(96, ownershipPacked) {
+                mstore(0x00, 0xc991cbb1) // `TokenAlreadyExists()`.
+                revert(0x1c, 0x04)
+            }
+            // Update with the owner.
+            sstore(ownershipSlot, or(ownershipPacked, to))
+            // Increment the balance of the owner.
+            {
+                mstore(0x00, to)
+                let balanceSlot := keccak256(0x0c, 0x1c)
+                let balanceSlotPacked := add(sload(balanceSlot), 1)
+                if iszero(and(balanceSlotPacked, _MAX_ACCOUNT_BALANCE)) {
+                    mstore(0x00, 0x01336cea) // `AccountBalanceOverflow()`.
+                    revert(0x1c, 0x04)
+                }
+                sstore(balanceSlot, balanceSlotPacked)
+            }
+            // Emit the {Transfer} event.
+            log4(0x00, 0x00, _TRANSFER_EVENT_SIGNATURE, 0, to, id)
+        }
+        _afterTokenTransfer(address(0), to, id);
+    }
+
+    /// @dev Equivalent to `_safeMint(to, id, "")`.
+    function _safeMint(address to, uint256 id) internal virtual {
+        _safeMint(to, id, "");
+    }
+
+    /// @dev Mints token `id` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must not exist.
+    /// - `to` cannot be the zero address.
+    /// - If `to` refers to a smart contract, it must implement
+    ///   {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+    ///
+    /// Emits a {Transfer} event.
+    function _safeMint(address to, uint256 id, bytes memory data) internal virtual {
+        _mint(to, id);
+        if (_hasCode(to)) _checkOnERC721Received(address(0), to, id, data);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  INTERNAL BURN FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Equivalent to `_burn(address(0), id)`.
+    function _burn(uint256 id) internal virtual {
+        _burn(address(0), id);
+    }
+
+    /// @dev Destroys token `id`, using `by`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must exist.
+    /// - If `by` is not the zero address,
+    ///   it must be the owner of the token, or be approved to manage the token.
+    ///
+    /// Emits a {Transfer} event.
+    function _burn(address by, uint256 id) internal virtual {
+        address owner = ownerOf(id);
+        _beforeTokenTransfer(owner, address(0), id);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clear the upper 96 bits.
+            by := shr(96, shl(96, by))
+            // Load the ownership data.
+            mstore(0x00, id)
+            mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, by))
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let ownershipPacked := sload(ownershipSlot)
+            // Reload the owner in case it is changed in `_beforeTokenTransfer`.
+            owner := shr(96, shl(96, ownershipPacked))
+            // Revert if the token does not exist.
+            if iszero(owner) {
+                mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(0x1c, 0x04)
+            }
+            // Load and check the token approval.
+            {
+                mstore(0x00, owner)
+                let approvedAddress := sload(add(1, ownershipSlot))
+                // If `by` is not the zero address, do the authorization check.
+                // Revert if the `by` is not the owner, nor approved.
+                if iszero(or(iszero(by), or(eq(by, owner), eq(by, approvedAddress)))) {
+                    if iszero(sload(keccak256(0x0c, 0x30))) {
+                        mstore(0x00, 0x4b6e7f18) // `NotOwnerNorApproved()`.
+                        revert(0x1c, 0x04)
+                    }
+                }
+                // Delete the approved address if any.
+                if approvedAddress { sstore(add(1, ownershipSlot), 0) }
+            }
+            // Clear the owner.
+            sstore(ownershipSlot, xor(ownershipPacked, owner))
+            // Decrement the balance of `owner`.
+            {
+                let balanceSlot := keccak256(0x0c, 0x1c)
+                sstore(balanceSlot, sub(sload(balanceSlot), 1))
+            }
+            // Emit the {Transfer} event.
+            log4(0x00, 0x00, _TRANSFER_EVENT_SIGNATURE, owner, 0, id)
+        }
+        _afterTokenTransfer(owner, address(0), id);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                INTERNAL APPROVAL FUNCTIONS                 */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns whether `account` is the owner of token `id`, or is approved to manage it.
+    ///
+    /// Requirements:
+    /// - Token `id` must exist.
+    function _isApprovedOrOwner(address account, uint256 id)
+        internal
+        view
+        virtual
+        returns (bool result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := 1
+            // Clear the upper 96 bits.
+            account := shr(96, shl(96, account))
+            // Load the ownership data.
+            mstore(0x00, id)
+            mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, account))
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let owner := shr(96, shl(96, sload(ownershipSlot)))
+            // Revert if the token does not exist.
+            if iszero(owner) {
+                mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(0x1c, 0x04)
+            }
+            // Check if `account` is the `owner`.
+            if iszero(eq(account, owner)) {
+                mstore(0x00, owner)
+                // Check if `account` is approved to manage the token.
+                if iszero(sload(keccak256(0x0c, 0x30))) {
+                    result := eq(account, sload(add(1, ownershipSlot)))
+                }
+            }
+        }
+    }
+
+    /// @dev Returns the account approved to manage token `id`.
+    /// Returns the zero address instead of reverting if the token does not exist.
+    function _getApproved(uint256 id) internal view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, id)
+            mstore(0x1c, _ERC721_MASTER_SLOT_SEED)
+            result := sload(add(1, add(id, add(id, keccak256(0x00, 0x20)))))
+        }
+    }
+
+    /// @dev Equivalent to `_approve(address(0), account, id)`.
+    function _approve(address account, uint256 id) internal virtual {
+        _approve(address(0), account, id);
+    }
+
+    /// @dev Sets `account` as the approved account to manage token `id`, using `by`.
+    ///
+    /// Requirements:
+    /// - Token `id` must exist.
+    /// - If `by` is not the zero address, `by` must be the owner
+    ///   or an approved operator for the token owner.
+    ///
+    /// Emits a {Transfer} event.
+    function _approve(address by, address account, uint256 id) internal virtual {
+        assembly {
+            // Clear the upper 96 bits.
+            let bitmaskAddress := shr(96, not(0))
+            account := and(bitmaskAddress, account)
+            by := and(bitmaskAddress, by)
+            // Load the owner of the token.
+            mstore(0x00, id)
+            mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, by))
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let owner := and(bitmaskAddress, sload(ownershipSlot))
+            // Revert if the token does not exist.
+            if iszero(owner) {
+                mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                revert(0x1c, 0x04)
+            }
+            // If `by` is not the zero address, do the authorization check.
+            // Revert if `by` is not the owner, nor approved.
+            if iszero(or(iszero(by), eq(by, owner))) {
+                mstore(0x00, owner)
+                if iszero(sload(keccak256(0x0c, 0x30))) {
+                    mstore(0x00, 0x4b6e7f18) // `NotOwnerNorApproved()`.
+                    revert(0x1c, 0x04)
+                }
+            }
+            // Sets `account` as the approved account to manage `id`.
+            sstore(add(1, ownershipSlot), account)
+            // Emit the {Approval} event.
+            log4(0x00, 0x00, _APPROVAL_EVENT_SIGNATURE, owner, account, id)
+        }
+    }
+
+    /// @dev Approve or remove the `operator` as an operator for `by`,
+    /// without authorization checks.
+    ///
+    /// Emits an {ApprovalForAll} event.
+    function _setApprovalForAll(address by, address operator, bool isApproved) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clear the upper 96 bits.
+            by := shr(96, shl(96, by))
+            operator := shr(96, shl(96, operator))
+            // Convert to 0 or 1.
+            isApproved := iszero(iszero(isApproved))
+            // Update the `isApproved` for (`by`, `operator`).
+            mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, operator))
+            mstore(0x00, by)
+            sstore(keccak256(0x0c, 0x30), isApproved)
+            // Emit the {ApprovalForAll} event.
+            mstore(0x00, isApproved)
+            log3(0x00, 0x20, _APPROVAL_FOR_ALL_EVENT_SIGNATURE, by, operator)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                INTERNAL TRANSFER FUNCTIONS                 */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Equivalent to `_transfer(address(0), from, to, id)`.
+    function _transfer(address from, address to, uint256 id) internal virtual {
+        _transfer(address(0), from, to, id);
+    }
+
+    /// @dev Transfers token `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must exist.
+    /// - `from` must be the owner of the token.
+    /// - `to` cannot be the zero address.
+    /// - If `by` is not the zero address,
+    ///   it must be the owner of the token, or be approved to manage the token.
+    ///
+    /// Emits a {Transfer} event.
+    function _transfer(address by, address from, address to, uint256 id) internal virtual {
+        _beforeTokenTransfer(from, to, id);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clear the upper 96 bits.
+            let bitmaskAddress := shr(96, not(0))
+            from := and(bitmaskAddress, from)
+            to := and(bitmaskAddress, to)
+            by := and(bitmaskAddress, by)
+            // Load the ownership data.
+            mstore(0x00, id)
+            mstore(0x1c, or(_ERC721_MASTER_SLOT_SEED, by))
+            let ownershipSlot := add(id, add(id, keccak256(0x00, 0x20)))
+            let ownershipPacked := sload(ownershipSlot)
+            let owner := and(bitmaskAddress, ownershipPacked)
+            // Revert if `from` is not the owner, or does not exist.
+            if iszero(mul(owner, eq(owner, from))) {
+                if iszero(owner) {
+                    mstore(0x00, 0xceea21b6) // `TokenDoesNotExist()`.
+                    revert(0x1c, 0x04)
+                }
+                mstore(0x00, 0xa1148100) // `TransferFromIncorrectOwner()`.
+                revert(0x1c, 0x04)
+            }
+            // Revert if `to` is the zero address.
+            if iszero(to) {
+                mstore(0x00, 0xea553b34) // `TransferToZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+            // Load, check, and update the token approval.
+            {
+                mstore(0x00, from)
+                let approvedAddress := sload(add(1, ownershipSlot))
+                // If `by` is not the zero address, do the authorization check.
+                // Revert if the `by` is not the owner, nor approved.
+                if iszero(or(iszero(by), or(eq(by, from), eq(by, approvedAddress)))) {
+                    if iszero(sload(keccak256(0x0c, 0x30))) {
+                        mstore(0x00, 0x4b6e7f18) // `NotOwnerNorApproved()`.
+                        revert(0x1c, 0x04)
+                    }
+                }
+                // Delete the approved address if any.
+                if approvedAddress { sstore(add(1, ownershipSlot), 0) }
+            }
+            // Update with the new owner.
+            sstore(ownershipSlot, xor(ownershipPacked, xor(from, to)))
+            // Decrement the balance of `from`.
+            {
+                let fromBalanceSlot := keccak256(0x0c, 0x1c)
+                sstore(fromBalanceSlot, sub(sload(fromBalanceSlot), 1))
+            }
+            // Increment the balance of `to`.
+            {
+                mstore(0x00, to)
+                let toBalanceSlot := keccak256(0x0c, 0x1c)
+                let toBalanceSlotPacked := add(sload(toBalanceSlot), 1)
+                if iszero(and(toBalanceSlotPacked, _MAX_ACCOUNT_BALANCE)) {
+                    mstore(0x00, 0x01336cea) // `AccountBalanceOverflow()`.
+                    revert(0x1c, 0x04)
+                }
+                sstore(toBalanceSlot, toBalanceSlotPacked)
+            }
+            // Emit the {Transfer} event.
+            log4(0x00, 0x00, _TRANSFER_EVENT_SIGNATURE, from, to, id)
+        }
+        _afterTokenTransfer(from, to, id);
+    }
+
+    /// @dev Equivalent to `_safeTransfer(from, to, id, "")`.
+    function _safeTransfer(address from, address to, uint256 id) internal virtual {
+        _safeTransfer(from, to, id, "");
+    }
+
+    /// @dev Transfers token `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must exist.
+    /// - `from` must be the owner of the token.
+    /// - `to` cannot be the zero address.
+    /// - The caller must be the owner of the token, or be approved to manage the token.
+    /// - If `to` refers to a smart contract, it must implement
+    ///   {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+    ///
+    /// Emits a {Transfer} event.
+    function _safeTransfer(address from, address to, uint256 id, bytes memory data)
+        internal
+        virtual
+    {
+        _transfer(address(0), from, to, id);
+        if (_hasCode(to)) _checkOnERC721Received(from, to, id, data);
+    }
+
+    /// @dev Equivalent to `_safeTransfer(by, from, to, id, "")`.
+    function _safeTransfer(address by, address from, address to, uint256 id) internal virtual {
+        _safeTransfer(by, from, to, id, "");
+    }
+
+    /// @dev Transfers token `id` from `from` to `to`.
+    ///
+    /// Requirements:
+    ///
+    /// - Token `id` must exist.
+    /// - `from` must be the owner of the token.
+    /// - `to` cannot be the zero address.
+    /// - If `by` is not the zero address,
+    ///   it must be the owner of the token, or be approved to manage the token.
+    /// - If `to` refers to a smart contract, it must implement
+    ///   {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+    ///
+    /// Emits a {Transfer} event.
+    function _safeTransfer(address by, address from, address to, uint256 id, bytes memory data)
+        internal
+        virtual
+    {
+        _transfer(by, from, to, id);
+        if (_hasCode(to)) _checkOnERC721Received(from, to, id, data);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    HOOKS FOR OVERRIDING                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Hook that is called before any token transfers, including minting and burning.
+    function _beforeTokenTransfer(address from, address to, uint256 id) internal virtual {}
+
+    /// @dev Hook that is called after any token transfers, including minting and burning.
+    function _afterTokenTransfer(address from, address to, uint256 id) internal virtual {}
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      PRIVATE HELPERS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns if `a` has bytecode of non-zero length.
+    function _hasCode(address a) private view returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := extcodesize(a) // Can handle dirty upper bits.
+        }
+    }
+
+    /// @dev Perform a call to invoke {IERC721Receiver-onERC721Received} on `to`.
+    /// Reverts if the target does not support the function correctly.
+    function _checkOnERC721Received(address from, address to, uint256 id, bytes memory data)
+        private
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Prepare the calldata.
+            let m := mload(0x40)
+            let onERC721ReceivedSelector := 0x150b7a02
+            mstore(m, onERC721ReceivedSelector)
+            mstore(add(m, 0x20), caller()) // The `operator`, which is always `msg.sender`.
+            mstore(add(m, 0x40), shr(96, shl(96, from)))
+            mstore(add(m, 0x60), id)
+            mstore(add(m, 0x80), 0x80)
+            let n := mload(data)
+            mstore(add(m, 0xa0), n)
+            if n { pop(staticcall(gas(), 4, add(data, 0x20), n, add(m, 0xc0), n)) }
+            // Revert if the call reverts.
+            if iszero(call(gas(), to, 0, add(m, 0x1c), add(n, 0xa4), m, 0x20)) {
+                if returndatasize() {
+                    // Bubble up the revert if the call reverts.
+                    returndatacopy(0x00, 0x00, returndatasize())
+                    revert(0x00, returndatasize())
+                }
+            }
+            // Load the returndata and compare it.
+            if iszero(eq(mload(m), shl(224, onERC721ReceivedSelector))) {
+                mstore(0x00, 0xd1a57ed6) // `TransferToNonERC721ReceiverImplementer()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/solady/src/tokens/ERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple ERC20 + EIP-2612 implementation.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/ERC20.sol)
+///
+/// @dev Note:
+/// - The ERC20 standard allows minting and transferring to and from the zero address,
+///   minting and transferring zero tokens, as well as self-approvals.
+///   For performance, this implementation WILL NOT revert for such actions.
+///   Please add any checks with overrides if desired.
+/// - The `permit` function use the ecrecover precompile (0x1).
+///
+/// If you are overriding:
+/// - NEVER violate the ERC20 invariant:
+///   the total sum of all balances must be equal to `totalSupply()`.
+/// - Check that the overridden function is actually used in the function you want to
+///   change the behavior of. Much of the code has been manually inlined for performance.
+abstract contract ERC20 {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The total supply has overflowed.
+    error TotalSupplyOverflow();
+
+    /// @dev The allowance has overflowed.
+    error AllowanceOverflow();
+
+    /// @dev The allowance has underflowed.
+    error AllowanceUnderflow();
+
+    /// @dev Insufficient balance.
+    error InsufficientBalance();
+
+    /// @dev Insufficient allowance.
+    error InsufficientAllowance();
+
+    /// @dev The permit is invalid.
+    error InvalidPermit();
+
+    /// @dev The permit has expired.
+    error PermitExpired();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Emitted when `amount` tokens is transferred from `from` to `to`.
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    /// @dev Emitted when `amount` tokens is approved by `owner` to be used by `spender`.
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /// @dev `keccak256(bytes("Transfer(address,address,uint256)"))`.
+    uint256 private constant _TRANSFER_EVENT_SIGNATURE =
+        0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
+
+    /// @dev `keccak256(bytes("Approval(address,address,uint256)"))`.
+    uint256 private constant _APPROVAL_EVENT_SIGNATURE =
+        0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The storage slot for the total supply.
+    uint256 private constant _TOTAL_SUPPLY_SLOT = 0x05345cdf77eb68f44c;
+
+    /// @dev The balance slot of `owner` is given by:
+    /// ```
+    ///     mstore(0x0c, _BALANCE_SLOT_SEED)
+    ///     mstore(0x00, owner)
+    ///     let balanceSlot := keccak256(0x0c, 0x20)
+    /// ```
+    uint256 private constant _BALANCE_SLOT_SEED = 0x87a211a2;
+
+    /// @dev The allowance slot of (`owner`, `spender`) is given by:
+    /// ```
+    ///     mstore(0x20, spender)
+    ///     mstore(0x0c, _ALLOWANCE_SLOT_SEED)
+    ///     mstore(0x00, owner)
+    ///     let allowanceSlot := keccak256(0x0c, 0x34)
+    /// ```
+    uint256 private constant _ALLOWANCE_SLOT_SEED = 0x7f5e9f20;
+
+    /// @dev The nonce slot of `owner` is given by:
+    /// ```
+    ///     mstore(0x0c, _NONCES_SLOT_SEED)
+    ///     mstore(0x00, owner)
+    ///     let nonceSlot := keccak256(0x0c, 0x20)
+    /// ```
+    uint256 private constant _NONCES_SLOT_SEED = 0x38377508;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev `(_NONCES_SLOT_SEED << 16) | 0x1901`.
+    uint256 private constant _NONCES_SLOT_SEED_WITH_SIGNATURE_PREFIX = 0x383775081901;
+
+    /// @dev `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`.
+    bytes32 private constant _DOMAIN_TYPEHASH =
+        0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f;
+
+    /// @dev `keccak256("1")`.
+    bytes32 private constant _VERSION_HASH =
+        0xc89efdaa54c0f20c7adf612882df0950f5a951637e0307cdcb4c672f298b8bc6;
+
+    /// @dev `keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")`.
+    bytes32 private constant _PERMIT_TYPEHASH =
+        0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       ERC20 METADATA                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the name of the token.
+    function name() public view virtual returns (string memory);
+
+    /// @dev Returns the symbol of the token.
+    function symbol() public view virtual returns (string memory);
+
+    /// @dev Returns the decimals places of the token.
+    function decimals() public view virtual returns (uint8) {
+        return 18;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           ERC20                            */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the amount of tokens in existence.
+    function totalSupply() public view virtual returns (uint256 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(_TOTAL_SUPPLY_SLOT)
+        }
+    }
+
+    /// @dev Returns the amount of tokens owned by `owner`.
+    function balanceOf(address owner) public view virtual returns (uint256 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x0c, _BALANCE_SLOT_SEED)
+            mstore(0x00, owner)
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /// @dev Returns the amount of tokens that `spender` can spend on behalf of `owner`.
+    function allowance(address owner, address spender)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x20, spender)
+            mstore(0x0c, _ALLOWANCE_SLOT_SEED)
+            mstore(0x00, owner)
+            result := sload(keccak256(0x0c, 0x34))
+        }
+    }
+
+    /// @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+    ///
+    /// Emits a {Approval} event.
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the allowance slot and store the amount.
+            mstore(0x20, spender)
+            mstore(0x0c, _ALLOWANCE_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x34), amount)
+            // Emit the {Approval} event.
+            mstore(0x00, amount)
+            log3(0x00, 0x20, _APPROVAL_EVENT_SIGNATURE, caller(), shr(96, mload(0x2c)))
+        }
+        return true;
+    }
+
+    /// @dev Transfer `amount` tokens from the caller to `to`.
+    ///
+    /// Requirements:
+    /// - `from` must at least have `amount`.
+    ///
+    /// Emits a {Transfer} event.
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        _beforeTokenTransfer(msg.sender, to, amount);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the balance slot and load its value.
+            mstore(0x0c, _BALANCE_SLOT_SEED)
+            mstore(0x00, caller())
+            let fromBalanceSlot := keccak256(0x0c, 0x20)
+            let fromBalance := sload(fromBalanceSlot)
+            // Revert if insufficient balance.
+            if gt(amount, fromBalance) {
+                mstore(0x00, 0xf4d678b8) // `InsufficientBalance()`.
+                revert(0x1c, 0x04)
+            }
+            // Subtract and store the updated balance.
+            sstore(fromBalanceSlot, sub(fromBalance, amount))
+            // Compute the balance slot of `to`.
+            mstore(0x00, to)
+            let toBalanceSlot := keccak256(0x0c, 0x20)
+            // Add and store the updated balance of `to`.
+            // Will not overflow because the sum of all user balances
+            // cannot exceed the maximum uint256 value.
+            sstore(toBalanceSlot, add(sload(toBalanceSlot), amount))
+            // Emit the {Transfer} event.
+            mstore(0x20, amount)
+            log3(0x20, 0x20, _TRANSFER_EVENT_SIGNATURE, caller(), shr(96, mload(0x0c)))
+        }
+        _afterTokenTransfer(msg.sender, to, amount);
+        return true;
+    }
+
+    /// @dev Transfers `amount` tokens from `from` to `to`.
+    ///
+    /// Note: Does not update the allowance if it is the maximum uint256 value.
+    ///
+    /// Requirements:
+    /// - `from` must at least have `amount`.
+    /// - The caller must have at least `amount` of allowance to transfer the tokens of `from`.
+    ///
+    /// Emits a {Transfer} event.
+    function transferFrom(address from, address to, uint256 amount) public virtual returns (bool) {
+        _beforeTokenTransfer(from, to, amount);
+        /// @solidity memory-safe-assembly
+        assembly {
+            let from_ := shl(96, from)
+            // Compute the allowance slot and load its value.
+            mstore(0x20, caller())
+            mstore(0x0c, or(from_, _ALLOWANCE_SLOT_SEED))
+            let allowanceSlot := keccak256(0x0c, 0x34)
+            let allowance_ := sload(allowanceSlot)
+            // If the allowance is not the maximum uint256 value.
+            if add(allowance_, 1) {
+                // Revert if the amount to be transferred exceeds the allowance.
+                if gt(amount, allowance_) {
+                    mstore(0x00, 0x13be252b) // `InsufficientAllowance()`.
+                    revert(0x1c, 0x04)
+                }
+                // Subtract and store the updated allowance.
+                sstore(allowanceSlot, sub(allowance_, amount))
+            }
+            // Compute the balance slot and load its value.
+            mstore(0x0c, or(from_, _BALANCE_SLOT_SEED))
+            let fromBalanceSlot := keccak256(0x0c, 0x20)
+            let fromBalance := sload(fromBalanceSlot)
+            // Revert if insufficient balance.
+            if gt(amount, fromBalance) {
+                mstore(0x00, 0xf4d678b8) // `InsufficientBalance()`.
+                revert(0x1c, 0x04)
+            }
+            // Subtract and store the updated balance.
+            sstore(fromBalanceSlot, sub(fromBalance, amount))
+            // Compute the balance slot of `to`.
+            mstore(0x00, to)
+            let toBalanceSlot := keccak256(0x0c, 0x20)
+            // Add and store the updated balance of `to`.
+            // Will not overflow because the sum of all user balances
+            // cannot exceed the maximum uint256 value.
+            sstore(toBalanceSlot, add(sload(toBalanceSlot), amount))
+            // Emit the {Transfer} event.
+            mstore(0x20, amount)
+            log3(0x20, 0x20, _TRANSFER_EVENT_SIGNATURE, shr(96, from_), shr(96, mload(0x0c)))
+        }
+        _afterTokenTransfer(from, to, amount);
+        return true;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          EIP-2612                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev For more performance, override to return the constant value
+    /// of `keccak256(bytes(name()))` if `name()` will never change.
+    function _constantNameHash() internal view virtual returns (bytes32 result) {}
+
+    /// @dev Returns the current nonce for `owner`.
+    /// This value is used to compute the signature for EIP-2612 permit.
+    function nonces(address owner) public view virtual returns (uint256 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the nonce slot and load its value.
+            mstore(0x0c, _NONCES_SLOT_SEED)
+            mstore(0x00, owner)
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /// @dev Sets `value` as the allowance of `spender` over the tokens of `owner`,
+    /// authorized by a signed approval by `owner`.
+    ///
+    /// Emits a {Approval} event.
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        bytes32 nameHash = _constantNameHash();
+        //  We simply calculate it on-the-fly to allow for cases where the `name` may change.
+        if (nameHash == bytes32(0)) nameHash = keccak256(bytes(name()));
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Revert if the block timestamp greater than `deadline`.
+            if gt(timestamp(), deadline) {
+                mstore(0x00, 0x1a15a3cc) // `PermitExpired()`.
+                revert(0x1c, 0x04)
+            }
+            let m := mload(0x40) // Grab the free memory pointer.
+            // Clean the upper 96 bits.
+            owner := shr(96, shl(96, owner))
+            spender := shr(96, shl(96, spender))
+            // Compute the nonce slot and load its value.
+            mstore(0x0e, _NONCES_SLOT_SEED_WITH_SIGNATURE_PREFIX)
+            mstore(0x00, owner)
+            let nonceSlot := keccak256(0x0c, 0x20)
+            let nonceValue := sload(nonceSlot)
+            // Prepare the domain separator.
+            mstore(m, _DOMAIN_TYPEHASH)
+            mstore(add(m, 0x20), nameHash)
+            mstore(add(m, 0x40), _VERSION_HASH)
+            mstore(add(m, 0x60), chainid())
+            mstore(add(m, 0x80), address())
+            mstore(0x2e, keccak256(m, 0xa0))
+            // Prepare the struct hash.
+            mstore(m, _PERMIT_TYPEHASH)
+            mstore(add(m, 0x20), owner)
+            mstore(add(m, 0x40), spender)
+            mstore(add(m, 0x60), value)
+            mstore(add(m, 0x80), nonceValue)
+            mstore(add(m, 0xa0), deadline)
+            mstore(0x4e, keccak256(m, 0xc0))
+            // Prepare the ecrecover calldata.
+            mstore(0x00, keccak256(0x2c, 0x42))
+            mstore(0x20, and(0xff, v))
+            mstore(0x40, r)
+            mstore(0x60, s)
+            let t := staticcall(gas(), 1, 0, 0x80, 0x20, 0x20)
+            // If the ecrecover fails, the returndatasize will be 0x00,
+            // `owner` will be be checked if it equals the hash at 0x00,
+            // which evaluates to false (i.e. 0), and we will revert.
+            // If the ecrecover succeeds, the returndatasize will be 0x20,
+            // `owner` will be compared against the returned address at 0x20.
+            if iszero(eq(mload(returndatasize()), owner)) {
+                mstore(0x00, 0xddafbaef) // `InvalidPermit()`.
+                revert(0x1c, 0x04)
+            }
+            // Increment and store the updated nonce.
+            sstore(nonceSlot, add(nonceValue, t)) // `t` is 1 if ecrecover succeeds.
+            // Compute the allowance slot and store the value.
+            // The `owner` is already at slot 0x20.
+            mstore(0x40, or(shl(160, _ALLOWANCE_SLOT_SEED), spender))
+            sstore(keccak256(0x2c, 0x34), value)
+            // Emit the {Approval} event.
+            log3(add(m, 0x60), 0x20, _APPROVAL_EVENT_SIGNATURE, owner, spender)
+            mstore(0x40, m) // Restore the free memory pointer.
+            mstore(0x60, 0) // Restore the zero pointer.
+        }
+    }
+
+    /// @dev Returns the EIP-712 domain separator for the EIP-2612 permit.
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32 result) {
+        bytes32 nameHash = _constantNameHash();
+        //  We simply calculate it on-the-fly to allow for cases where the `name` may change.
+        if (nameHash == bytes32(0)) nameHash = keccak256(bytes(name()));
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Grab the free memory pointer.
+            mstore(m, _DOMAIN_TYPEHASH)
+            mstore(add(m, 0x20), nameHash)
+            mstore(add(m, 0x40), _VERSION_HASH)
+            mstore(add(m, 0x60), chainid())
+            mstore(add(m, 0x80), address())
+            result := keccak256(m, 0xa0)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  INTERNAL MINT FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Mints `amount` tokens to `to`, increasing the total supply.
+    ///
+    /// Emits a {Transfer} event.
+    function _mint(address to, uint256 amount) internal virtual {
+        _beforeTokenTransfer(address(0), to, amount);
+        /// @solidity memory-safe-assembly
+        assembly {
+            let totalSupplyBefore := sload(_TOTAL_SUPPLY_SLOT)
+            let totalSupplyAfter := add(totalSupplyBefore, amount)
+            // Revert if the total supply overflows.
+            if lt(totalSupplyAfter, totalSupplyBefore) {
+                mstore(0x00, 0xe5cfe957) // `TotalSupplyOverflow()`.
+                revert(0x1c, 0x04)
+            }
+            // Store the updated total supply.
+            sstore(_TOTAL_SUPPLY_SLOT, totalSupplyAfter)
+            // Compute the balance slot and load its value.
+            mstore(0x0c, _BALANCE_SLOT_SEED)
+            mstore(0x00, to)
+            let toBalanceSlot := keccak256(0x0c, 0x20)
+            // Add and store the updated balance.
+            sstore(toBalanceSlot, add(sload(toBalanceSlot), amount))
+            // Emit the {Transfer} event.
+            mstore(0x20, amount)
+            log3(0x20, 0x20, _TRANSFER_EVENT_SIGNATURE, 0, shr(96, mload(0x0c)))
+        }
+        _afterTokenTransfer(address(0), to, amount);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  INTERNAL BURN FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Burns `amount` tokens from `from`, reducing the total supply.
+    ///
+    /// Emits a {Transfer} event.
+    function _burn(address from, uint256 amount) internal virtual {
+        _beforeTokenTransfer(from, address(0), amount);
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the balance slot and load its value.
+            mstore(0x0c, _BALANCE_SLOT_SEED)
+            mstore(0x00, from)
+            let fromBalanceSlot := keccak256(0x0c, 0x20)
+            let fromBalance := sload(fromBalanceSlot)
+            // Revert if insufficient balance.
+            if gt(amount, fromBalance) {
+                mstore(0x00, 0xf4d678b8) // `InsufficientBalance()`.
+                revert(0x1c, 0x04)
+            }
+            // Subtract and store the updated balance.
+            sstore(fromBalanceSlot, sub(fromBalance, amount))
+            // Subtract and store the updated total supply.
+            sstore(_TOTAL_SUPPLY_SLOT, sub(sload(_TOTAL_SUPPLY_SLOT), amount))
+            // Emit the {Transfer} event.
+            mstore(0x00, amount)
+            log3(0x00, 0x20, _TRANSFER_EVENT_SIGNATURE, shr(96, shl(96, from)), 0)
+        }
+        _afterTokenTransfer(from, address(0), amount);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                INTERNAL TRANSFER FUNCTIONS                 */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Moves `amount` of tokens from `from` to `to`.
+    function _transfer(address from, address to, uint256 amount) internal virtual {
+        _beforeTokenTransfer(from, to, amount);
+        /// @solidity memory-safe-assembly
+        assembly {
+            let from_ := shl(96, from)
+            // Compute the balance slot and load its value.
+            mstore(0x0c, or(from_, _BALANCE_SLOT_SEED))
+            let fromBalanceSlot := keccak256(0x0c, 0x20)
+            let fromBalance := sload(fromBalanceSlot)
+            // Revert if insufficient balance.
+            if gt(amount, fromBalance) {
+                mstore(0x00, 0xf4d678b8) // `InsufficientBalance()`.
+                revert(0x1c, 0x04)
+            }
+            // Subtract and store the updated balance.
+            sstore(fromBalanceSlot, sub(fromBalance, amount))
+            // Compute the balance slot of `to`.
+            mstore(0x00, to)
+            let toBalanceSlot := keccak256(0x0c, 0x20)
+            // Add and store the updated balance of `to`.
+            // Will not overflow because the sum of all user balances
+            // cannot exceed the maximum uint256 value.
+            sstore(toBalanceSlot, add(sload(toBalanceSlot), amount))
+            // Emit the {Transfer} event.
+            mstore(0x20, amount)
+            log3(0x20, 0x20, _TRANSFER_EVENT_SIGNATURE, shr(96, from_), shr(96, mload(0x0c)))
+        }
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                INTERNAL ALLOWANCE FUNCTIONS                */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Updates the allowance of `owner` for `spender` based on spent `amount`.
+    function _spendAllowance(address owner, address spender, uint256 amount) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the allowance slot and load its value.
+            mstore(0x20, spender)
+            mstore(0x0c, _ALLOWANCE_SLOT_SEED)
+            mstore(0x00, owner)
+            let allowanceSlot := keccak256(0x0c, 0x34)
+            let allowance_ := sload(allowanceSlot)
+            // If the allowance is not the maximum uint256 value.
+            if add(allowance_, 1) {
+                // Revert if the amount to be transferred exceeds the allowance.
+                if gt(amount, allowance_) {
+                    mstore(0x00, 0x13be252b) // `InsufficientAllowance()`.
+                    revert(0x1c, 0x04)
+                }
+                // Subtract and store the updated allowance.
+                sstore(allowanceSlot, sub(allowance_, amount))
+            }
+        }
+    }
+
+    /// @dev Sets `amount` as the allowance of `spender` over the tokens of `owner`.
+    ///
+    /// Emits a {Approval} event.
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let owner_ := shl(96, owner)
+            // Compute the allowance slot and store the amount.
+            mstore(0x20, spender)
+            mstore(0x0c, or(owner_, _ALLOWANCE_SLOT_SEED))
+            sstore(keccak256(0x0c, 0x34), amount)
+            // Emit the {Approval} event.
+            mstore(0x00, amount)
+            log3(0x00, 0x20, _APPROVAL_EVENT_SIGNATURE, shr(96, owner_), shr(96, mload(0x2c)))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HOOKS TO OVERRIDE                      */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Hook that is called before any transfer of tokens.
+    /// This includes minting and burning.
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    /// @dev Hook that is called after any transfer of tokens.
+    /// This includes minting and burning.
+    function _afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+}
+

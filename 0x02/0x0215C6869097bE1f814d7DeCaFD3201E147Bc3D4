@@ -1,0 +1,1632 @@
+
+// File: @1inch/solidity-utils/contracts/interfaces/IDaiLikePermit.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IDaiLikePermit {
+    function permit(
+        address holder,
+        address spender,
+        uint256 nonce,
+        uint256 expiry,
+        bool allowed,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
+
+// File: @1inch/solidity-utils/contracts/interfaces/IPermit2.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IPermit2 {
+    struct PermitDetails {
+        // ERC20 token address
+        address token;
+        // the maximum amount allowed to spend
+        uint160 amount;
+        // timestamp at which a spender's token allowances become invalid
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+    /// @notice The permit message signed for a single token allownce
+    struct PermitSingle {
+        // the permit data for a single token alownce
+        PermitDetails details;
+        // address permissioned on the allowed tokens
+        address spender;
+        // deadline on the permit signature
+        uint256 sigDeadline;
+    }
+    /// @notice Packed allowance
+    struct PackedAllowance {
+        // amount allowed
+        uint160 amount;
+        // permission expiry
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+
+    function transferFrom(address user, address spender, uint160 amount, address token) external;
+
+    function permit(address owner, PermitSingle memory permitSingle, bytes calldata signature) external;
+
+    function allowance(address user, address token, address spender) external view returns (PackedAllowance memory);
+}
+
+
+// File: @1inch/solidity-utils/contracts/interfaces/IWETH.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IWETH is IERC20 {
+    event Deposit(address indexed dst, uint256 wad);
+
+    event Withdrawal(address indexed src, uint256 wad);
+
+    function deposit() external payable;
+
+    function withdraw(uint256 amount) external;
+}
+
+
+// File: @1inch/solidity-utils/contracts/libraries/RevertReasonForwarder.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/// @title Revert reason forwarder.
+library RevertReasonForwarder {
+    /// @dev Forwards latest externall call revert.
+    function reRevert() internal pure {
+        // bubble up revert reason from latest external call
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let ptr := mload(0x40)
+            returndatacopy(ptr, 0, returndatasize())
+            revert(ptr, returndatasize())
+        }
+    }
+
+    /// @dev Returns latest external call revert reason.
+    function reReason() internal pure returns (bytes memory reason) {
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            reason := mload(0x40)
+            let length := returndatasize()
+            mstore(reason, length)
+            returndatacopy(add(reason, 0x20), 0, length)
+            mstore(0x40, add(reason, add(0x20, length)))
+        }
+    }
+}
+
+
+// File: @1inch/solidity-utils/contracts/libraries/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import "../interfaces/IDaiLikePermit.sol";
+import "../interfaces/IPermit2.sol";
+import "../interfaces/IWETH.sol";
+import "../libraries/RevertReasonForwarder.sol";
+
+/**
+ * @title Implements efficient safe methods for ERC20 interface.
+ * @notice Compared to the standard ERC20, this implementation offers several enhancements:
+ * 1. more gas-efficient, providing significant savings in transaction costs.
+ * 2. support for different permit implementations
+ * 3. forceApprove functionality
+ * 4. support for WETH deposit and withdraw
+ */
+library SafeERC20 {
+    error SafeTransferFailed();
+    error SafeTransferFromFailed();
+    error ForceApproveFailed();
+    error SafeIncreaseAllowanceFailed();
+    error SafeDecreaseAllowanceFailed();
+    error SafePermitBadLength();
+    error Permit2TransferAmountTooHigh();
+
+    // Uniswap Permit2 address
+    address private constant _PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    bytes4 private constant _PERMIT_LENGTH_ERROR = 0x68275857;  // SafePermitBadLength.selector
+    uint256 private constant _RAW_CALL_GAS_LIMIT = 5000;
+
+    /**
+     * @notice Fetches the balance of a specific ERC20 token held by an account.
+     * Consumes less gas then regular `ERC20.balanceOf`.
+     * @dev Note that the implementation does not perform dirty bits cleaning, so it is the
+     * responsibility of the caller to make sure that the higher 96 bits of the `account` parameter are clean.
+     * @param token The IERC20 token contract for which the balance will be fetched.
+     * @param account The address of the account whose token balance will be fetched.
+     * @return tokenBalance The balance of the specified ERC20 token held by the account.
+     */
+    function safeBalanceOf(
+        IERC20 token,
+        address account
+    ) internal view returns(uint256 tokenBalance) {
+        bytes4 selector = IERC20.balanceOf.selector;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            mstore(0x00, selector)
+            mstore(0x04, account)
+            let success := staticcall(gas(), token, 0x00, 0x24, 0x00, 0x20)
+            tokenBalance := mload(0)
+
+            if or(iszero(success), lt(returndatasize(), 0x20)) {
+                let ptr := mload(0x40)
+                returndatacopy(ptr, 0, returndatasize())
+                revert(ptr, returndatasize())
+            }
+        }
+    }
+
+    /**
+     * @notice Attempts to safely transfer tokens from one address to another.
+     * @dev If permit2 is true, uses the Permit2 standard; otherwise uses the standard ERC20 transferFrom.
+     * Either requires `true` in return data, or requires target to be smart-contract and empty return data.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `from` and `to` parameters are clean.
+     * @param token The IERC20 token contract from which the tokens will be transferred.
+     * @param from The address from which the tokens will be transferred.
+     * @param to The address to which the tokens will be transferred.
+     * @param amount The amount of tokens to transfer.
+     * @param permit2 If true, uses the Permit2 standard for the transfer; otherwise uses the standard ERC20 transferFrom.
+     */
+    function safeTransferFromUniversal(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount,
+        bool permit2
+    ) internal {
+        if (permit2) {
+            safeTransferFromPermit2(token, from, to, amount);
+        } else {
+            safeTransferFrom(token, from, to, amount);
+        }
+    }
+
+    /**
+     * @notice Attempts to safely transfer tokens from one address to another using the ERC20 standard.
+     * @dev Either requires `true` in return data, or requires target to be smart-contract and empty return data.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `from` and `to` parameters are clean.
+     * @param token The IERC20 token contract from which the tokens will be transferred.
+     * @param from The address from which the tokens will be transferred.
+     * @param to The address to which the tokens will be transferred.
+     * @param amount The amount of tokens to transfer.
+     */
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bytes4 selector = token.transferFrom.selector;
+        bool success;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), from)
+            mstore(add(data, 0x24), to)
+            mstore(add(data, 0x44), amount)
+            success := call(gas(), token, 0, data, 100, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+        if (!success) revert SafeTransferFromFailed();
+    }
+
+    /**
+     * @notice Attempts to safely transfer tokens from one address to another using the Permit2 standard.
+     * @dev Either requires `true` in return data, or requires target to be smart-contract and empty return data.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `from` and `to` parameters are clean.
+     * @param token The IERC20 token contract from which the tokens will be transferred.
+     * @param from The address from which the tokens will be transferred.
+     * @param to The address to which the tokens will be transferred.
+     * @param amount The amount of tokens to transfer.
+     */
+    function safeTransferFromPermit2(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        if (amount > type(uint160).max) revert Permit2TransferAmountTooHigh();
+        bytes4 selector = IPermit2.transferFrom.selector;
+        bool success;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), from)
+            mstore(add(data, 0x24), to)
+            mstore(add(data, 0x44), amount)
+            mstore(add(data, 0x64), token)
+            success := call(gas(), _PERMIT2, 0, data, 0x84, 0x0, 0x0)
+            if success {
+                success := gt(extcodesize(_PERMIT2), 0)
+            }
+        }
+        if (!success) revert SafeTransferFromFailed();
+    }
+
+    /**
+     * @notice Attempts to safely transfer tokens to another address.
+     * @dev Either requires `true` in return data, or requires target to be smart-contract and empty return data.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `to` parameter are clean.
+     * @param token The IERC20 token contract from which the tokens will be transferred.
+     * @param to The address to which the tokens will be transferred.
+     * @param value The amount of tokens to transfer.
+     */
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        if (!_makeCall(token, token.transfer.selector, to, value)) {
+            revert SafeTransferFailed();
+        }
+    }
+
+    /**
+     * @notice Attempts to approve a spender to spend a certain amount of tokens.
+     * @dev If `approve(from, to, amount)` fails, it tries to set the allowance to zero, and retries the `approve` call.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `spender` parameter are clean.
+     * @param token The IERC20 token contract on which the call will be made.
+     * @param spender The address which will spend the funds.
+     * @param value The amount of tokens to be spent.
+     */
+    function forceApprove(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        if (!_makeCall(token, token.approve.selector, spender, value)) {
+            if (
+                !_makeCall(token, token.approve.selector, spender, 0) ||
+                !_makeCall(token, token.approve.selector, spender, value)
+            ) {
+                revert ForceApproveFailed();
+            }
+        }
+    }
+
+    /**
+     * @notice Safely increases the allowance of a spender.
+     * @dev Increases with safe math check. Checks if the increased allowance will overflow, if yes, then it reverts the transaction.
+     * Then uses `forceApprove` to increase the allowance.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `spender` parameter are clean.
+     * @param token The IERC20 token contract on which the call will be made.
+     * @param spender The address which will spend the funds.
+     * @param value The amount of tokens to increase the allowance by.
+     */
+    function safeIncreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (value > type(uint256).max - allowance) revert SafeIncreaseAllowanceFailed();
+        forceApprove(token, spender, allowance + value);
+    }
+
+    /**
+     * @notice Safely decreases the allowance of a spender.
+     * @dev Decreases with safe math check. Checks if the decreased allowance will underflow, if yes, then it reverts the transaction.
+     * Then uses `forceApprove` to increase the allowance.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `spender` parameter are clean.
+     * @param token The IERC20 token contract on which the call will be made.
+     * @param spender The address which will spend the funds.
+     * @param value The amount of tokens to decrease the allowance by.
+     */
+    function safeDecreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (value > allowance) revert SafeDecreaseAllowanceFailed();
+        forceApprove(token, spender, allowance - value);
+    }
+
+    /**
+     * @notice Attempts to execute the `permit` function on the provided token with the sender and contract as parameters.
+     * Permit type is determined automatically based on permit calldata (IERC20Permit, IDaiLikePermit, and IPermit2).
+     * @dev Wraps `tryPermit` function and forwards revert reason if permit fails.
+     * @param token The IERC20 token to execute the permit function on.
+     * @param permit The permit data to be used in the function call.
+     */
+    function safePermit(IERC20 token, bytes calldata permit) internal {
+        if (!tryPermit(token, msg.sender, address(this), permit)) RevertReasonForwarder.reRevert();
+    }
+
+    /**
+     * @notice Attempts to execute the `permit` function on the provided token with custom owner and spender parameters.
+     * Permit type is determined automatically based on permit calldata (IERC20Permit, IDaiLikePermit, and IPermit2).
+     * @dev Wraps `tryPermit` function and forwards revert reason if permit fails.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `owner` and `spender` parameters are clean.
+     * @param token The IERC20 token to execute the permit function on.
+     * @param owner The owner of the tokens for which the permit is made.
+     * @param spender The spender allowed to spend the tokens by the permit.
+     * @param permit The permit data to be used in the function call.
+     */
+    function safePermit(IERC20 token, address owner, address spender, bytes calldata permit) internal {
+        if (!tryPermit(token, owner, spender, permit)) RevertReasonForwarder.reRevert();
+    }
+
+    /**
+     * @notice Attempts to execute the `permit` function on the provided token with the sender and contract as parameters.
+     * @dev Invokes `tryPermit` with sender as owner and contract as spender.
+     * @param token The IERC20 token to execute the permit function on.
+     * @param permit The permit data to be used in the function call.
+     * @return success Returns true if the permit function was successfully executed, false otherwise.
+     */
+    function tryPermit(IERC20 token, bytes calldata permit) internal returns(bool success) {
+        return tryPermit(token, msg.sender, address(this), permit);
+    }
+
+    /**
+     * @notice The function attempts to call the permit function on a given ERC20 token.
+     * @dev The function is designed to support a variety of permit functions, namely: IERC20Permit, IDaiLikePermit, and IPermit2.
+     * It accommodates both Compact and Full formats of these permit types.
+     * Please note, it is expected that the `expiration` parameter for the compact Permit2 and the `deadline` parameter
+     * for the compact Permit are to be incremented by one before invoking this function. This approach is motivated by
+     * gas efficiency considerations; as the unlimited expiration period is likely to be the most common scenario, and
+     * zeros are cheaper to pass in terms of gas cost. Thus, callers should increment the expiration or deadline by one
+     * before invocation for optimized performance.
+     * Note that the implementation does not perform dirty bits cleaning, so it is the responsibility of
+     * the caller to make sure that the higher 96 bits of the `owner` and `spender` parameters are clean.
+     * @param token The address of the ERC20 token on which to call the permit function.
+     * @param owner The owner of the tokens. This address should have signed the off-chain permit.
+     * @param spender The address which will be approved for transfer of tokens.
+     * @param permit The off-chain permit data, containing different fields depending on the type of permit function.
+     * @return success A boolean indicating whether the permit call was successful.
+     */
+    function tryPermit(IERC20 token, address owner, address spender, bytes calldata permit) internal returns(bool success) {
+        // load function selectors for different permit standards
+        bytes4 permitSelector = IERC20Permit.permit.selector;
+        bytes4 daiPermitSelector = IDaiLikePermit.permit.selector;
+        bytes4 permit2Selector = IPermit2.permit.selector;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let ptr := mload(0x40)
+
+            // Switch case for different permit lengths, indicating different permit standards
+            switch permit.length
+            // Compact IERC20Permit
+            case 100 {
+                mstore(ptr, permitSelector)     // store selector
+                mstore(add(ptr, 0x04), owner)   // store owner
+                mstore(add(ptr, 0x24), spender) // store spender
+
+                // Compact IERC20Permit.permit(uint256 value, uint32 deadline, uint256 r, uint256 vs)
+                {  // stack too deep
+                    let deadline := shr(224, calldataload(add(permit.offset, 0x20))) // loads permit.offset 0x20..0x23
+                    let vs := calldataload(add(permit.offset, 0x44))                 // loads permit.offset 0x44..0x63
+
+                    calldatacopy(add(ptr, 0x44), permit.offset, 0x20)            // store value     = copy permit.offset 0x00..0x19
+                    mstore(add(ptr, 0x64), sub(deadline, 1))                     // store deadline  = deadline - 1
+                    mstore(add(ptr, 0x84), add(27, shr(255, vs)))                // store v         = most significant bit of vs + 27 (27 or 28)
+                    calldatacopy(add(ptr, 0xa4), add(permit.offset, 0x24), 0x20) // store r         = copy permit.offset 0x24..0x43
+                    mstore(add(ptr, 0xc4), shr(1, shl(1, vs)))                   // store s         = vs without most significant bit
+                }
+                // IERC20Permit.permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0xe4, 0, 0)
+            }
+            // Compact IDaiLikePermit
+            case 72 {
+                mstore(ptr, daiPermitSelector)  // store selector
+                mstore(add(ptr, 0x04), owner)   // store owner
+                mstore(add(ptr, 0x24), spender) // store spender
+
+                // Compact IDaiLikePermit.permit(uint32 nonce, uint32 expiry, uint256 r, uint256 vs)
+                {  // stack too deep
+                    let expiry := shr(224, calldataload(add(permit.offset, 0x04))) // loads permit.offset 0x04..0x07
+                    let vs := calldataload(add(permit.offset, 0x28))               // loads permit.offset 0x28..0x47
+
+                    mstore(add(ptr, 0x44), shr(224, calldataload(permit.offset))) // store nonce   = copy permit.offset 0x00..0x03
+                    mstore(add(ptr, 0x64), sub(expiry, 1))                        // store expiry  = expiry - 1
+                    mstore(add(ptr, 0x84), true)                                  // store allowed = true
+                    mstore(add(ptr, 0xa4), add(27, shr(255, vs)))                 // store v       = most significant bit of vs + 27 (27 or 28)
+                    calldatacopy(add(ptr, 0xc4), add(permit.offset, 0x08), 0x20)  // store r       = copy permit.offset 0x08..0x27
+                    mstore(add(ptr, 0xe4), shr(1, shl(1, vs)))                    // store s       = vs without most significant bit
+                }
+                // IDaiLikePermit.permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0x104, 0, 0)
+            }
+            // IERC20Permit
+            case 224 {
+                mstore(ptr, permitSelector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length) // copy permit calldata
+                // IERC20Permit.permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0xe4, 0, 0)
+            }
+            // IDaiLikePermit
+            case 256 {
+                mstore(ptr, daiPermitSelector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length) // copy permit calldata
+                // IDaiLikePermit.permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0x104, 0, 0)
+            }
+            // Compact IPermit2
+            case 96 {
+                // Compact IPermit2.permit(uint160 amount, uint32 expiration, uint32 nonce, uint32 sigDeadline, uint256 r, uint256 vs)
+                mstore(ptr, permit2Selector)  // store selector
+                mstore(add(ptr, 0x04), owner) // store owner
+                mstore(add(ptr, 0x24), token) // store token
+
+                calldatacopy(add(ptr, 0x50), permit.offset, 0x14)             // store amount = copy permit.offset 0x00..0x13
+                // and(0xffffffffffff, ...) - conversion to uint48
+                mstore(add(ptr, 0x64), and(0xffffffffffff, sub(shr(224, calldataload(add(permit.offset, 0x14))), 1))) // store expiration = ((permit.offset 0x14..0x17 - 1) & 0xffffffffffff)
+                mstore(add(ptr, 0x84), shr(224, calldataload(add(permit.offset, 0x18)))) // store nonce = copy permit.offset 0x18..0x1b
+                mstore(add(ptr, 0xa4), spender)                               // store spender
+                // and(0xffffffffffff, ...) - conversion to uint48
+                mstore(add(ptr, 0xc4), and(0xffffffffffff, sub(shr(224, calldataload(add(permit.offset, 0x1c))), 1))) // store sigDeadline = ((permit.offset 0x1c..0x1f - 1) & 0xffffffffffff)
+                mstore(add(ptr, 0xe4), 0x100)                                 // store offset = 256
+                mstore(add(ptr, 0x104), 0x40)                                 // store length = 64
+                calldatacopy(add(ptr, 0x124), add(permit.offset, 0x20), 0x20) // store r      = copy permit.offset 0x20..0x3f
+                calldatacopy(add(ptr, 0x144), add(permit.offset, 0x40), 0x20) // store vs     = copy permit.offset 0x40..0x5f
+                // IPermit2.permit(address owner, PermitSingle calldata permitSingle, bytes calldata signature)
+                success := call(gas(), _PERMIT2, 0, ptr, 0x164, 0, 0)
+            }
+            // IPermit2
+            case 352 {
+                mstore(ptr, permit2Selector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length) // copy permit calldata
+                // IPermit2.permit(address owner, PermitSingle calldata permitSingle, bytes calldata signature)
+                success := call(gas(), _PERMIT2, 0, ptr, 0x164, 0, 0)
+            }
+            // Unknown
+            default {
+                mstore(ptr, _PERMIT_LENGTH_ERROR)
+                revert(ptr, 4)
+            }
+        }
+    }
+
+    /**
+     * @dev Executes a low level call to a token contract, making it resistant to reversion and erroneous boolean returns.
+     * @param token The IERC20 token contract on which the call will be made.
+     * @param selector The function signature that is to be called on the token contract.
+     * @param to The address to which the token amount will be transferred.
+     * @param amount The token amount to be transferred.
+     * @return success A boolean indicating if the call was successful. Returns 'true' on success and 'false' on failure.
+     * In case of success but no returned data, validates that the contract code exists.
+     * In case of returned data, ensures that it's a boolean `true`.
+     */
+    function _makeCall(
+        IERC20 token,
+        bytes4 selector,
+        address to,
+        uint256 amount
+    ) private returns (bool success) {
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), to)
+            mstore(add(data, 0x24), amount)
+            success := call(gas(), token, 0, data, 0x44, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Safely deposits a specified amount of Ether into the IWETH contract. Consumes less gas then regular `IWETH.deposit`.
+     * @param weth The IWETH token contract.
+     * @param amount The amount of Ether to deposit into the IWETH contract.
+     */
+    function safeDeposit(IWETH weth, uint256 amount) internal {
+        if (amount > 0) {
+            bytes4 selector = IWETH.deposit.selector;
+            assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+                mstore(0, selector)
+                if iszero(call(gas(), weth, amount, 0, 4, 0, 0)) {
+                    let ptr := mload(0x40)
+                    returndatacopy(ptr, 0, returndatasize())
+                    revert(ptr, returndatasize())
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Safely withdraws a specified amount of wrapped Ether from the IWETH contract. Consumes less gas then regular `IWETH.withdraw`.
+     * @dev Uses inline assembly to interact with the IWETH contract.
+     * @param weth The IWETH token contract.
+     * @param amount The amount of wrapped Ether to withdraw from the IWETH contract.
+     */
+    function safeWithdraw(IWETH weth, uint256 amount) internal {
+        bytes4 selector = IWETH.withdraw.selector;
+        assembly ("memory-safe") {  // solhint-disable-line no-inline-assembly
+            mstore(0, selector)
+            mstore(4, amount)
+            if iszero(call(gas(), weth, 0, 0, 0x24, 0, 0)) {
+                let ptr := mload(0x40)
+                returndatacopy(ptr, 0, returndatasize())
+                revert(ptr, returndatasize())
+            }
+        }
+    }
+
+    /**
+     * @notice Safely withdraws a specified amount of wrapped Ether from the IWETH contract to a specified recipient.
+     * Consumes less gas then regular `IWETH.withdraw`.
+     * @param weth The IWETH token contract.
+     * @param amount The amount of wrapped Ether to withdraw from the IWETH contract.
+     * @param to The recipient of the withdrawn Ether.
+     */
+    function safeWithdrawTo(IWETH weth, uint256 amount, address to) internal {
+        safeWithdraw(weth, amount);
+        if (to != address(this)) {
+            assembly ("memory-safe") {  // solhint-disable-line no-inline-assembly
+                if iszero(call(_RAW_CALL_GAS_LIMIT, to, amount, 0, 0, 0, 0)) {
+                    let ptr := mload(0x40)
+                    returndatacopy(ptr, 0, returndatasize())
+                    revert(ptr, returndatasize())
+                }
+            }
+        }
+    }
+}
+
+
+// File: @chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface AggregatorV3Interface {
+  function decimals() external view returns (uint8);
+
+  function description() external view returns (string memory);
+
+  function version() external view returns (uint256);
+
+  function getRoundData(
+    uint80 _roundId
+  ) external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+
+  function latestRoundData()
+    external
+    view
+    returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
+
+// File: @openzeppelin/contracts/access/AccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControl} from "./IAccessControl.sol";
+import {Context} from "../utils/Context.sol";
+import {ERC165} from "../utils/introspection/ERC165.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```solidity
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```solidity
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it. We recommend using {AccessControlDefaultAdminRules}
+ * to enforce additional security measures for this role.
+ */
+abstract contract AccessControl is Context, IAccessControl, ERC165 {
+    struct RoleData {
+        mapping(address account => bool) hasRole;
+        bytes32 adminRole;
+    }
+
+    mapping(bytes32 role => RoleData) private _roles;
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    /**
+     * @dev Modifier that checks that an account has a specific role. Reverts
+     * with an {AccessControlUnauthorizedAccount} error including the required role.
+     */
+    modifier onlyRole(bytes32 role) {
+        _checkRole(role);
+        _;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControl).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) public view virtual returns (bool) {
+        return _roles[role].hasRole[account];
+    }
+
+    /**
+     * @dev Reverts with an {AccessControlUnauthorizedAccount} error if `_msgSender()`
+     * is missing `role`. Overriding this function changes the behavior of the {onlyRole} modifier.
+     */
+    function _checkRole(bytes32 role) internal view virtual {
+        _checkRole(role, _msgSender());
+    }
+
+    /**
+     * @dev Reverts with an {AccessControlUnauthorizedAccount} error if `account`
+     * is missing `role`.
+     */
+    function _checkRole(bytes32 role, address account) internal view virtual {
+        if (!hasRole(role, account)) {
+            revert AccessControlUnauthorizedAccount(account, role);
+        }
+    }
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) public view virtual returns (bytes32) {
+        return _roles[role].adminRole;
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function grantRole(bytes32 role, address account) public virtual onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function revokeRole(bytes32 role, address account) public virtual onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been revoked `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) public virtual {
+        if (callerConfirmation != _msgSender()) {
+            revert AccessControlBadConfirmation();
+        }
+
+        _revokeRole(role, callerConfirmation);
+    }
+
+    /**
+     * @dev Sets `adminRole` as ``role``'s admin role.
+     *
+     * Emits a {RoleAdminChanged} event.
+     */
+    function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+        bytes32 previousAdminRole = getRoleAdmin(role);
+        _roles[role].adminRole = adminRole;
+        emit RoleAdminChanged(role, previousAdminRole, adminRole);
+    }
+
+    /**
+     * @dev Attempts to grant `role` to `account` and returns a boolean indicating if `role` was granted.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function _grantRole(bytes32 role, address account) internal virtual returns (bool) {
+        if (!hasRole(role, account)) {
+            _roles[role].hasRole[account] = true;
+            emit RoleGranted(role, account, _msgSender());
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Attempts to revoke `role` to `account` and returns a boolean indicating if `role` was revoked.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual returns (bool) {
+        if (hasRole(role, account)) {
+            _roles[role].hasRole[account] = false;
+            emit RoleRevoked(role, account, _msgSender());
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+
+// File: @openzeppelin/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/IAccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev The `account` is missing a role.
+     */
+    error AccessControlUnauthorizedAccount(address account, bytes32 neededRole);
+
+    /**
+     * @dev The caller of a function is not the expected one.
+     *
+     * NOTE: Don't confuse with {AccessControlUnauthorizedAccount}.
+     */
+    error AccessControlBadConfirmation();
+
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) external;
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/ERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "./IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ */
+abstract contract ERC165 is IERC165 {
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/utils/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Pausable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    bool private _paused;
+
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    /**
+     * @dev The operation failed because the contract is paused.
+     */
+    error EnforcedPause();
+
+    /**
+     * @dev The operation failed because the contract is not paused.
+     */
+    error ExpectedPause();
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        if (paused()) {
+            revert EnforcedPause();
+        }
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        if (!paused()) {
+            revert ExpectedPause();
+        }
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: contracts/interfaces/IPresale.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+interface IPresale {
+    struct StageData {
+        uint96 cost;
+        uint160 amount;
+    }
+
+    event TokensBought(address indexed token, address indexed user, address indexed referrer, uint256 amount);
+    event AmountAndUSD(address indexed user, uint256 amount, int256 usd);
+    event StageUpdated(uint256 currentStage);
+
+    function updateProtocolWallet(address wallet) external;
+    function setStage(uint256 stageIterator_) external;
+    function updateTotalSold(uint256 amount) external;
+    function pause() external;
+    function unpause() external;
+
+    function depositUSDCTo(address to, uint256 amount, address referrer) external;
+    function depositUSDTTo(address to, uint256 amount, address referrer) external;
+
+    function depositUSDC(uint256 amount, address referrer) external;
+    function depositUSDT(uint256 amount, address referrer) external;
+}
+
+// File: contracts/Presale.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import { IERC20, SafeERC20 } from "@1inch/solidity-utils/contracts/libraries/SafeERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "./interfaces/IPresale.sol";
+
+contract Presale is IPresale, AccessControl, Pausable {
+  using SafeERC20 for IERC20;
+
+  bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+  uint256 public constant DEFAULT_DELAY = 12 hours;
+
+  int32 public constant STABLETOKEN_PRICE = 1e8;
+  uint8 public constant STABLE_TOKEN_DECIMALS = 6;
+  uint8 public constant PRICEFEED_DECIMALS = 8;
+  uint8 public constant TOKEN_PRECISION = 18;
+
+  AggregatorV3Interface public immutable COIN_PRICE_FEED;
+
+  IERC20 public immutable usdcToken;
+  IERC20 public immutable usdtToken;
+
+  address public protocolWallet;
+
+  uint256 public totalTokensSold;
+  uint256 public totalSoldInUSD; //NOTE Precision is 8 decimals
+
+  uint256 public stageIterator;
+  StageData[] public stages;
+
+  mapping(address user => uint256 balance) public balances;
+
+  mapping(bytes4 selector => uint256 timestamp) private _timestamps;
+
+  constructor(
+    AggregatorV3Interface COIN_PRICE_FEED_,
+    IERC20 usdcToken_,
+    IERC20 usdtToken_,
+    address protocolWallet_,
+    address DAO,
+    address operator
+  ) {
+    COIN_PRICE_FEED = COIN_PRICE_FEED_;
+
+    usdcToken = usdcToken_;
+    usdtToken = usdtToken_;
+
+    protocolWallet = protocolWallet_;
+
+    stages.push(StageData(1e6, 75e5));
+    stages.push(StageData(15e5, 1e7));
+    stages.push(StageData(2e6, 175e5));
+    stages.push(StageData(25e5, 28e6));
+    stages.push(StageData(3e6, 4e7));
+    stages.push(StageData(35e5, 4e7));
+    stages.push(StageData(4e6, 35e6));
+    stages.push(StageData(45e5, 27e6));
+    stages.push(StageData(5e6, 8e6));
+    stages.push(StageData(55e5, 2e6));
+    stages.push(StageData(0, 0));
+
+    _grantRole(DEFAULT_ADMIN_ROLE, DAO);
+    _grantRole(OPERATOR_ROLE, operator);
+  }
+
+  //NOTE function selector is: 0xe308a099
+  function updateProtocolWallet(address wallet) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    uint256 delayedTill = _timestamps[0xe308a099];
+
+    if(delayedTill > 0 && delayedTill <= block.timestamp) {
+      protocolWallet = wallet;
+
+      _timestamps[0xe308a099] = 0;
+    } else {
+      _timestamps[0xe308a099] = block.timestamp + DEFAULT_DELAY;
+    }
+  }
+
+  function setStage(uint256 stageIterator_) external onlyRole(OPERATOR_ROLE) {
+    require(stageIterator_ < stages.length, "Presale: Wrong iterator");
+
+    stageIterator = stageIterator_;
+
+    emit StageUpdated(stageIterator);
+  }
+
+  //NOTE function selector is: 0x76aa28fc
+  function updateTotalSold(uint256 amount) external onlyRole(OPERATOR_ROLE) {
+    uint256 delayedTill = _timestamps[0x76aa28fc];
+
+    if(delayedTill > 0 && delayedTill <= block.timestamp) {
+      totalTokensSold = amount;
+
+      _timestamps[0x76aa28fc] = 0;
+    } else {
+      _timestamps[0x76aa28fc] = block.timestamp + DEFAULT_DELAY;
+    }
+  }
+
+  function pause() external onlyRole(OPERATOR_ROLE) {
+    _pause();
+  }
+
+  function unpause() external onlyRole(OPERATOR_ROLE) {
+    _unpause();
+  }
+//NOTe function selector is: 0x78e3214f
+  function rescueFunds(IERC20 token, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    uint256 delayedTill = _timestamps[0x78e3214f];
+
+    if(delayedTill > 0 && delayedTill <= block.timestamp) {
+      if (address(token) == address(0)) {
+          require(amount <= address(this).balance, "Presale: Wrong amount");
+          (bool success, ) = payable(msg.sender).call{value: amount}("");
+
+          require(success, "Payout: Transfer coin failed");
+      } else {
+          require(amount <= token.balanceOf(address(this)), "Presale: Wrong amount");
+
+          token.safeTransfer(protocolWallet, amount);
+      }
+
+      _timestamps[0x78e3214f] = 0;
+    } else {
+      _timestamps[0x78e3214f] = block.timestamp + DEFAULT_DELAY;
+    }
+  }
+
+  function depositUSDCTo(address to, uint256 amount, address referrer) external whenNotPaused {
+    (uint256 chargeBack, uint256 spendedValue) = _depositChecksAndEffects(usdcToken, to, amount, true);
+
+    _depositInteractions(usdcToken, amount, chargeBack, spendedValue);
+
+    emit TokensBought(address(usdcToken), to, referrer, spendedValue);
+  }
+
+  function depositUSDC(uint256 amount, address referrer) external whenNotPaused {
+    (uint256 chargeBack, uint256 spendedValue) = _depositChecksAndEffects(usdcToken, msg.sender, amount, true);
+
+    _depositInteractions(usdcToken, amount, chargeBack, spendedValue);
+
+    emit TokensBought(address(usdcToken), msg.sender, referrer, spendedValue);
+  }
+
+  function depositUSDTTo(address to, uint256 amount, address referrer) external whenNotPaused {
+    (uint256 chargeBack, uint256 spendedValue) = _depositChecksAndEffects(usdtToken, to, amount, true);
+
+    _depositInteractions(usdtToken, amount, chargeBack, spendedValue);
+
+    emit TokensBought(address(usdtToken), to, referrer, spendedValue);
+  }
+
+  function depositUSDT(uint256 amount, address referrer) external whenNotPaused {
+    (uint256 chargeBack, uint256 spendedValue) = _depositChecksAndEffects(usdtToken, msg.sender, amount, true);
+
+    _depositInteractions(usdtToken, amount, chargeBack, spendedValue);
+
+    emit TokensBought(address(usdtToken), msg.sender, referrer, spendedValue);
+  }
+
+  function depositCoinTo(address to, address referrer) public payable whenNotPaused {
+    (uint256 chargeBack, uint256 spendedValue) = _depositChecksAndEffects(IERC20(address(0)), to, msg.value, false);
+
+    (bool success, ) = payable(protocolWallet).call{value: spendedValue}("");
+    require(success, "Presale: Coin transfer failed");
+
+    if(chargeBack > 0) {
+      (success, ) = payable(msg.sender).call{value: chargeBack}("");
+      require(success, "Presale: Coin transfer failed");
+    }
+
+    emit TokensBought(address(0), to, referrer, spendedValue);
+  }
+
+  function depositCoin(address referrer) public payable whenNotPaused {
+    (uint256 chargeBack, uint256 spendedValue) = _depositChecksAndEffects(IERC20(address(0)), msg.sender, msg.value, false);
+
+    (bool success, ) = payable(protocolWallet).call{value: spendedValue}("");
+    require(success, "Presale: Coin transfer failed");
+
+    if(chargeBack > 0) {
+      (success, ) = payable(msg.sender).call{value: chargeBack}("");
+      require(success, "Presale: Coin transfer failed");
+    }
+
+    emit TokensBought(address(0), msg.sender, referrer, spendedValue);
+  }
+
+  function _depositChecksAndEffects(
+    IERC20 token,
+    address to,
+    uint256 value,
+    bool isStableToken
+  ) internal virtual returns (uint256 chargeBack, uint256 spendedValue) {
+    require(stages[stageIterator].amount != 0, "PreSale: is ended");
+
+    (uint256 tokensToTransfer, uint256 coinPrice) = _calculateAmount(isStableToken, value);
+    (chargeBack, spendedValue) = _purchase(token, to, coinPrice, tokensToTransfer, value);
+  }
+
+  function _depositInteractions(
+    IERC20 token,
+    uint256 amount,
+    uint256 chargeBack,
+    uint256 spendedValue
+  ) internal virtual {
+    token.safeTransferFrom(msg.sender, address(this), amount);
+    token.safeTransfer(protocolWallet, spendedValue);
+    if(chargeBack > 0) token.safeTransfer(msg.sender, chargeBack);
+  }
+
+  function _calculateAmount(bool isStableToken, uint256 value) internal virtual returns (uint256 amount, uint256 price) {
+    int256 coinPrice;
+    uint256 PRECISION;
+
+    if (isStableToken) {
+      coinPrice = STABLETOKEN_PRICE;
+      PRECISION = STABLE_TOKEN_DECIMALS;
+    } else {
+      (, coinPrice, , , ) = COIN_PRICE_FEED.latestRoundData();
+      PRECISION = TOKEN_PRECISION;
+    }
+
+    uint256 expectedAmount = uint(coinPrice) * value / uint(stages[stageIterator].cost);
+
+    emit AmountAndUSD(msg.sender, expectedAmount, coinPrice);
+
+    return (expectedAmount / 10 ** (PRECISION), uint(coinPrice));
+  }
+
+  function _purchase(
+    IERC20 token,
+    address to,
+    uint256 coinPrice,
+    uint256 amount,
+    uint256 value
+  ) internal virtual returns (uint256 tokensToChargeBack, uint256 spendedValue) {
+    StageData storage crtStage =  stages[stageIterator];
+
+    if (uint(crtStage.amount) <= amount) {
+      spendedValue = crtStage.amount * crtStage.cost;
+    } else {
+      spendedValue = amount * crtStage.cost;
+    }
+
+    totalSoldInUSD += spendedValue;
+
+    if(address(token) == address(0)) {
+      uint256 usdInEth = 1 ether / coinPrice;
+      spendedValue *= usdInEth;
+    } else {
+      spendedValue /= 10 ** (PRICEFEED_DECIMALS - STABLE_TOKEN_DECIMALS);
+    }
+
+    tokensToChargeBack = value - spendedValue;
+
+    if (uint(crtStage.amount) <= amount) {
+      balances[to] += crtStage.amount;
+      totalTokensSold += crtStage.amount;
+
+      crtStage.amount = 0;
+      stageIterator++;
+
+      emit StageUpdated(stageIterator);
+    } else {
+      balances[to] += amount;
+
+      totalTokensSold += amount;
+      crtStage.amount -= uint160(amount);
+    }
+  }
+}
+

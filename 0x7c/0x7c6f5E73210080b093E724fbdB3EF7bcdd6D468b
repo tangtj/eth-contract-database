@@ -1,0 +1,2110 @@
+
+// File: src/staking/Staking.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "./interfaces/IStaking.sol";
+import "../interfaces/ISalt.sol";
+import "./StakingRewards.sol";
+import "../pools/PoolUtils.sol";
+
+
+// Staking SALT provides xSALT at a 1:1 ratio.
+// Unstaking xSALT to reclaim SALT has a default unstake duration of 52 weeks and a minimum duration of two weeks.
+// Expedited unstaking for two weeks allows a default 20% of the SALT to be reclaimed, while unstaking for a full year allows the full 100% to be reclaimed.
+
+contract Staking is IStaking, StakingRewards
+    {
+	event SALTStaked(address indexed user, uint256 amountStaked);
+	event UnstakeInitiated(address indexed user, uint256 indexed unstakeID, uint256 amountUnstaked, uint256 claimableSALT, uint256 numWeeks);
+	event UnstakeCancelled(address indexed user, uint256 indexed unstakeID);
+	event SALTRecovered(address indexed user, uint256 indexed unstakeID, uint256 saltRecovered, uint256 expeditedUnstakeFee);
+	event XSALTTransferredFromAirdrop(address indexed toUser, uint256 amountTransferred);
+
+	using SafeERC20 for ISalt;
+
+	// The unstakeIDs for each user - including completed and cancelled unstakes.
+	mapping(address => uint256[]) private _userUnstakeIDs;
+
+	// Mapping of unstake IDs to their corresponding Unstake data.
+    mapping(uint256=>Unstake) private _unstakesByID;
+	uint256 public nextUnstakeID;
+
+
+	constructor( IExchangeConfig _exchangeConfig, IPoolsConfig _poolsConfig, IStakingConfig _stakingConfig )
+		StakingRewards( _exchangeConfig, _poolsConfig, _stakingConfig )
+		{
+		}
+
+
+	// Stake a given amount of SALT and immediately receive the same amount of xSALT.
+	// Requires exchange access for the sending wallet.
+	function stakeSALT( uint256 amountToStake ) external nonReentrant
+		{
+		require( exchangeConfig.walletHasAccess(msg.sender), "Sender does not have exchange access" );
+
+		// Increase the user's staking share so that they will receive more future SALT rewards.
+		// No cooldown as it takes default 52 weeks to unstake the xSALT to receive the full amount of staked SALT back.
+		_increaseUserShare( msg.sender, PoolUtils.STAKED_SALT, amountToStake, false );
+
+		// Transfer the SALT from the user's wallet
+		salt.safeTransferFrom( msg.sender, address(this), amountToStake );
+
+		emit SALTStaked(msg.sender, amountToStake);
+		}
+
+
+	// Unstake a given amount of xSALT over a certain duration.
+	// Unstaking immediately reduces the user's xSALT balance even though there will be the specified delay to convert it back to SALT
+	// With a full unstake duration the user receives 100% of their staked amount.
+	// With expedited unstaking the user receives less.
+	function unstake( uint256 amountUnstaked, uint256 numWeeks ) external nonReentrant returns (uint256 unstakeID)
+		{
+		require( userShareForPool(msg.sender, PoolUtils.STAKED_SALT) >= amountUnstaked, "Cannot unstake more than the amount staked" );
+
+		uint256 claimableSALT = calculateUnstake( amountUnstaked, numWeeks );
+		uint256 completionTime = block.timestamp + numWeeks * ( 1 weeks );
+
+		unstakeID = nextUnstakeID++;
+		Unstake memory u = Unstake( UnstakeState.PENDING, msg.sender, amountUnstaked, claimableSALT, completionTime, unstakeID );
+
+		_unstakesByID[unstakeID] = u;
+		_userUnstakeIDs[msg.sender].push( unstakeID );
+
+		// Decrease the user's staking share so that they will receive less future SALT rewards
+		// This call will send any pending SALT rewards to msg.sender as well.
+		// Note: _decreaseUserShare checks to make sure that the user has the specified staking share balance.
+		_decreaseUserShare( msg.sender, PoolUtils.STAKED_SALT, amountUnstaked, false );
+
+		emit UnstakeInitiated(msg.sender, unstakeID, amountUnstaked, claimableSALT, numWeeks);
+		}
+
+
+	// Cancel a pending unstake.
+	// Caller will be able to use the xSALT again immediately
+	function cancelUnstake( uint256 unstakeID ) external nonReentrant
+		{
+		Unstake storage u = _unstakesByID[unstakeID];
+
+		require( u.status == UnstakeState.PENDING, "Only PENDING unstakes can be cancelled" );
+		require( block.timestamp < u.completionTime, "Unstakes that have already completed cannot be cancelled" );
+		require( msg.sender == u.wallet, "Sender is not the original staker" );
+
+		// Update the user's share of the rewards for staked SALT
+		_increaseUserShare( msg.sender, PoolUtils.STAKED_SALT, u.unstakedXSALT, false );
+
+		u.status = UnstakeState.CANCELLED;
+		emit UnstakeCancelled(msg.sender, unstakeID);
+		}
+
+
+	// Recover claimable SALT from a completed unstake
+	function recoverSALT( uint256 unstakeID ) external nonReentrant
+		{
+		Unstake storage u = _unstakesByID[unstakeID];
+		require( u.status == UnstakeState.PENDING, "Only PENDING unstakes can be claimed" );
+		require( block.timestamp >= u.completionTime, "Unstake has not completed yet" );
+		require( msg.sender == u.wallet, "Sender is not the original staker" );
+
+		u.status = UnstakeState.CLAIMED;
+
+		// See if the user unstaked early and received only a portion of their original stake.
+		// The portion they did not receive will be considered the expeditedUnstakeFee.
+		uint256 expeditedUnstakeFee = u.unstakedXSALT - u.claimableSALT;
+
+		// Burn 100% of the expeditedUnstakeFee
+		if ( expeditedUnstakeFee > 0 )
+			{
+			// Send the expeditedUnstakeFee to the SALT contract and burn it
+			salt.safeTransfer( address(salt), expeditedUnstakeFee );
+            salt.burnTokensInContract();
+            }
+
+		// Send the reclaimed SALT back to the user
+		salt.safeTransfer( msg.sender, u.claimableSALT );
+
+		emit SALTRecovered(msg.sender, unstakeID, u.claimableSALT, expeditedUnstakeFee);
+		}
+
+
+	// === VIEWS ===
+
+	function userXSalt( address wallet ) external view returns (uint256)
+		{
+		return userShareForPool(wallet, PoolUtils.STAKED_SALT);
+		}
+
+
+	// Retrieve all unstakes associated with a user within a specific range.
+	function unstakesForUser( address user, uint256 start, uint256 end ) public view returns (Unstake[] memory)
+		{
+        // Check if start and end are within the bounds of the array
+        require(end >= start, "Invalid range: end cannot be less than start");
+
+        uint256[] memory userUnstakes = _userUnstakeIDs[user];
+
+        require(userUnstakes.length > end, "Invalid range: end is out of bounds");
+        require(start < userUnstakes.length, "Invalid range: start is out of bounds");
+
+        Unstake[] memory unstakes = new Unstake[](end - start + 1);
+
+        uint256 index;
+        for(uint256 i = start; i <= end; i++)
+            unstakes[index++] = _unstakesByID[ userUnstakes[i]];
+
+        return unstakes;
+    }
+
+
+	// Retrieve all unstakes associated with a user.
+	function unstakesForUser( address user ) external view returns (Unstake[] memory)
+		{
+		// Check to see how many unstakes the user has
+		uint256[] memory unstakeIDs = _userUnstakeIDs[user];
+		if ( unstakeIDs.length == 0 )
+			return new Unstake[](0);
+
+		// Return them all
+		return unstakesForUser( user, 0, unstakeIDs.length - 1 );
+		}
+
+
+	// Returns the unstakeIDs for the user
+	function userUnstakeIDs( address user ) external view returns (uint256[] memory)
+		{
+		return _userUnstakeIDs[user];
+		}
+
+
+	function unstakeByID(uint256 id) external view returns (Unstake memory)
+		{
+		return _unstakesByID[id];
+		}
+
+
+	// Calculate the reclaimable amount of SALT based on the amount of unstaked xSALT and unstake duration
+	// By default, unstaking for two weeks allows 20% of the SALT to be reclaimed, while unstaking for a full year allows the full 100% to be reclaimed.
+	function calculateUnstake( uint256 unstakedXSALT, uint256 numWeeks ) public view returns (uint256)
+		{
+		uint256 minUnstakeWeeks = stakingConfig.minUnstakeWeeks();
+        uint256 maxUnstakeWeeks = stakingConfig.maxUnstakeWeeks();
+        uint256 minUnstakePercent = stakingConfig.minUnstakePercent();
+
+		require( numWeeks >= minUnstakeWeeks, "Unstaking duration too short" );
+		require( numWeeks <= maxUnstakeWeeks, "Unstaking duration too long" );
+
+		uint256 percentAboveMinimum = 100 - minUnstakePercent;
+		uint256 unstakeRange = maxUnstakeWeeks - minUnstakeWeeks;
+
+		uint256 numerator = unstakedXSALT * ( minUnstakePercent * unstakeRange + percentAboveMinimum * ( numWeeks - minUnstakeWeeks ) );
+    	return numerator / ( 100 * unstakeRange );
+		}
+	}
+
+// File: src/staking/interfaces/IStaking.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "./IStakingRewards.sol";
+
+
+// Enum representing the possible states of an unstake request:
+// NONE: The default state, indicating that no unstake request has been made.
+// PENDING: The state indicating that an unstake request has been made, but has not yet completed.
+// CANCELLED: The state indicating that a pending unstake request has been cancelled by the user.
+// CLAIMED: The state indicating that a pending unstake request has been completed and the user can claim their SALT tokens.
+enum UnstakeState { NONE, PENDING, CANCELLED, CLAIMED }
+
+ struct Unstake
+	{
+	UnstakeState status;			// see above
+
+	address wallet;					// the wallet of the user performing the unstake
+	uint256 unstakedXSALT;		// the amount of xSALT that was unstaked
+	uint256 claimableSALT;		// claimable SALT at completion time
+	uint256 completionTime;	// the timestamp when the unstake completes
+	uint256	unstakeID;			// the unstake ID
+	}
+
+
+interface IStaking is IStakingRewards
+	{
+	function stakeSALT( uint256 amountToStake ) external;
+	function unstake( uint256 amountUnstaked, uint256 numWeeks ) external returns (uint256 unstakeID);
+	function cancelUnstake( uint256 unstakeID ) external;
+	function recoverSALT( uint256 unstakeID ) external;
+
+	// Views
+	function userXSalt( address wallet ) external view returns (uint256);
+	function unstakesForUser( address wallet, uint256 start, uint256 end ) external view returns (Unstake[] calldata);
+	function unstakesForUser( address wallet ) external view returns (Unstake[] calldata);
+	function userUnstakeIDs( address user ) external view returns (uint256[] calldata);
+	function unstakeByID(uint256 id) external view returns (Unstake calldata);
+	function calculateUnstake( uint256 unstakedXSALT, uint256 numWeeks ) external view returns (uint256);
+	}
+
+
+// File: src/interfaces/ISalt.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+
+
+interface ISalt is IERC20
+	{
+	function burnTokensInContract() external;
+
+	// Views
+	function totalBurned() external view returns (uint256);
+	}
+
+
+// File: src/staking/StakingRewards.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
+import "../pools/interfaces/IPoolsConfig.sol";
+import "../interfaces/IExchangeConfig.sol";
+import "./interfaces/IStakingRewards.sol";
+import "./interfaces/IStakingConfig.sol";
+import "../interfaces/ISalt.sol";
+
+// This contract allows users to receive rewards (as SALT tokens) for staking SALT or liquidity shares.
+// A user's reward is proportional to their share of the stake and is based on their share at the time that rewards are added.
+//
+// What staked shares represent is specific to the contracts that derive from StakingRewards.
+//
+// 1. Staking.sol: shares represent the amount of SALT staked (staked to the STAKED_SALT pool)
+// 2. Liquidity.sol: shares represent the amount of liquidity deposited and staked to specific pools
+//
+// Regarding virtualRewards: the idea is that the ratio of totalRewards/totalShare before the user increases share needs to equal (totalRewards+virtualRewards)/(totalShare+shareIncrease).
+// Namely that the ratio of rewards to shares before and after needs to remain the same. It's akin to a liquidity pool where the two tokens are "rewards" and "shares". When a user want add shares they borrow the rewards needed to create the correct proportion of virtualRewards / addedShares.
+// When rewards are added, it increases the value of the shares, in terms of the rewards.
+// On claim, users pay back any "borrowed" rewards (the virtual rewards).
+
+abstract contract StakingRewards is IStakingRewards, ReentrancyGuard
+    {
+	event UserShareIncreased(address indexed wallet, bytes32 indexed poolID, uint256 amountIncreased);
+	event UserShareDecreased(address indexed wallet, bytes32 indexed poolID, uint256 amountDecreased, uint256 claimedRewards);
+	event RewardsClaimed(address indexed wallet, uint256 claimedRewards);
+	event SaltRewardsAdded(bytes32 indexed poolID, uint256 amountAdded);
+
+	using SafeERC20 for ISalt;
+
+	ISalt immutable public salt;
+	IExchangeConfig immutable public exchangeConfig;
+    IStakingConfig immutable public stakingConfig;
+    IPoolsConfig immutable public poolsConfig;
+
+	// A nested mapping that stores the UserShareInfo data for each user and each poolID.
+	mapping(address=>mapping(bytes32=>UserShareInfo)) private _userShareInfo;
+
+    // A mapping that stores the total pending SALT rewards for each poolID.
+    mapping(bytes32=>uint256) public totalRewards;
+
+    // A mapping that stores the total shares for each poolID.
+    mapping(bytes32=>uint256) public totalShares;
+
+
+	// Constructs a new StakingRewards contract with providing configs
+ 	constructor( IExchangeConfig _exchangeConfig, IPoolsConfig _poolsConfig, IStakingConfig _stakingConfig )
+		{
+		exchangeConfig = _exchangeConfig;
+    	poolsConfig = _poolsConfig;
+		stakingConfig = _stakingConfig;
+
+		salt = _exchangeConfig.salt(); // cached for efficiency
+        }
+
+
+	// Increase a user's share for the given whitelisted pool.
+	function _increaseUserShare( address wallet, bytes32 poolID, uint256 increaseShareAmount, bool useCooldown ) internal
+		{
+		require( poolsConfig.isWhitelisted( poolID ), "Invalid pool" );
+		require( increaseShareAmount != 0, "Cannot increase zero share" );
+
+		UserShareInfo storage user = _userShareInfo[wallet][poolID];
+
+		if ( useCooldown )
+		if ( msg.sender != address(exchangeConfig.dao()) ) // DAO doesn't use the cooldown
+			{
+			require( block.timestamp >= user.cooldownExpiration, "Must wait for the cooldown to expire" );
+
+			// Update the cooldown expiration for future transactions
+			user.cooldownExpiration = block.timestamp + stakingConfig.modificationCooldown();
+			}
+
+		uint256 existingTotalShares = totalShares[poolID];
+
+		// Determine the amount of virtualRewards to add based on the current ratio of rewards/shares.
+		// The ratio of virtualRewards/increaseShareAmount is the same as totalRewards/totalShares for the pool.
+		// The virtual rewards will be deducted later when calculating the user's owed rewards.
+        if ( existingTotalShares != 0 ) // prevent / 0
+        	{
+			// Round up in favor of the protocol.
+			uint256 virtualRewardsToAdd = Math.ceilDiv( totalRewards[poolID] * increaseShareAmount, existingTotalShares );
+
+			user.virtualRewards += virtualRewardsToAdd;
+	        totalRewards[poolID] += virtualRewardsToAdd;
+	        }
+
+		// Update the deposit balances
+		user.userShare += increaseShareAmount;
+		totalShares[poolID] = existingTotalShares + increaseShareAmount;
+
+		emit UserShareIncreased(wallet, poolID, increaseShareAmount);
+		}
+
+
+	// Decrease a user's share for the pool and have any pending rewards sent to them.
+	// Does not require the pool to be valid (in case the pool was recently unwhitelisted).
+	function _decreaseUserShare( address wallet, bytes32 poolID, uint256 decreaseShareAmount, bool useCooldown ) internal
+		{
+		require( decreaseShareAmount != 0, "Cannot decrease zero share" );
+
+		UserShareInfo storage user = _userShareInfo[wallet][poolID];
+		require( decreaseShareAmount <= user.userShare, "Cannot decrease more than existing user share" );
+
+		if ( useCooldown )
+		if ( msg.sender != address(exchangeConfig.dao()) ) // DAO doesn't use the cooldown
+			{
+			require( block.timestamp >= user.cooldownExpiration, "Must wait for the cooldown to expire" );
+
+			// Update the cooldown expiration for future transactions
+			user.cooldownExpiration = block.timestamp + stakingConfig.modificationCooldown();
+			}
+
+		// Determine the share of the rewards for the amountToDecrease (will include previously added virtual rewards)
+		uint256 rewardsForAmount = ( totalRewards[poolID] * decreaseShareAmount ) / totalShares[poolID];
+
+		// For the amountToDecrease determine the proportion of virtualRewards (proportional to all virtualRewards for the user)
+
+		// Round virtualRewardsToRemoveFromClaimable up in favor of the protocol
+		uint256 virtualRewardsToRemoveFromClaimable = Math.ceilDiv(user.virtualRewards * decreaseShareAmount,  user.userShare );
+
+		// Round virtualRewardsToRemoveFromUserVirtRewards down in favor of the protocol
+		uint256 virtualRewardsToRemoveFromUserVirtRewards = (user.virtualRewards * decreaseShareAmount) / user.userShare;
+
+		// Update totals
+		totalRewards[poolID] -= rewardsForAmount;
+		totalShares[poolID] -= decreaseShareAmount;
+
+		// Update the user's share and virtual rewards
+		user.userShare -= decreaseShareAmount;
+		user.virtualRewards -= virtualRewardsToRemoveFromUserVirtRewards;
+
+		uint256 claimableRewards = 0;
+
+		// Some of the rewardsForAmount are actually virtualRewards and can't be claimed.
+
+		// In the event that virtualRewardsToRemoveFromClaimable are greater than actual rewards - claimableRewards will stay zero.
+		if ( virtualRewardsToRemoveFromClaimable < rewardsForAmount )
+			claimableRewards = rewardsForAmount - virtualRewardsToRemoveFromClaimable;
+
+		// Send the claimable rewards
+		if ( claimableRewards != 0 )
+			salt.safeTransfer( wallet, claimableRewards );
+
+		emit UserShareDecreased(wallet, poolID, decreaseShareAmount, claimableRewards);
+		}
+
+
+	// ===== PUBLIC FUNCTIONS =====
+
+	// Claim all available SALT rewards from multiple pools for the user.
+	// The claimed rewards are added to the user's virtual rewards balance - so that they can't be claimed again later.
+     function claimAllRewards( bytes32[] calldata poolIDs ) external nonReentrant returns (uint256 claimableRewards)
+    	{
+		mapping(bytes32=>UserShareInfo) storage userInfo = _userShareInfo[msg.sender];
+
+		claimableRewards = 0;
+		for( uint256 i = 0; i < poolIDs.length; i++ )
+			{
+			bytes32 poolID = poolIDs[i];
+
+			uint256 pendingRewards = userRewardForPool( msg.sender, poolID );
+
+			// Increase the virtualRewards balance for the user to account for them receiving the rewards without withdrawing
+			userInfo[poolID].virtualRewards += pendingRewards;
+
+			claimableRewards += pendingRewards;
+			}
+
+		if ( claimableRewards > 0 )
+			{
+			// Send the actual rewards
+			salt.safeTransfer( msg.sender, claimableRewards );
+
+			emit RewardsClaimed(msg.sender, claimableRewards);
+			}
+    	}
+
+
+	// Adds SALT rewards for specific whitelisted pools.
+	// There is some risk of addSALTRewards being frontrun to hunt rewards, but there are multiple mechanisms in place to prevent this from being effective.
+	// 1. There is a cooldown period of default one hour before shares can be withdrawn once deposited.
+	// 2. Staked SALT has a default unstake period of 52 weeks.
+	// 3. Rewards are first placed into a RewardsEmitter which deposits rewards via addSALTRewards at the default rate of 1% per day.
+	// 4. Rewards are deposited fairly often, with outstanding rewards being transferred with a frequency proportional to the activity of the exchange.
+	// Example: if $100k rewards were being deposited in a bulk transaction, it would only equate to $1000 (1%) the first day,
+	// or $10 in claimable rewards during a 15 minute upkeep period.
+ 	function addSALTRewards( AddedReward[] calldata addedRewards ) external nonReentrant
+		{
+		uint256 sum = 0;
+		for( uint256 i = 0; i < addedRewards.length; i++ )
+			{
+			AddedReward memory addedReward = addedRewards[i];
+
+			bytes32 poolID = addedReward.poolID;
+			require( poolsConfig.isWhitelisted( poolID ), "Invalid pool" );
+
+			uint256 amountToAdd = addedReward.amountToAdd;
+
+			totalRewards[ poolID ] += amountToAdd;
+			sum = sum + amountToAdd;
+
+			emit SaltRewardsAdded(poolID, amountToAdd);
+			}
+
+		// Transfer in the SALT for all the specified rewards
+		if ( sum > 0 )
+			{
+			// Transfer the SALT rewards from the sender
+			salt.safeTransferFrom( msg.sender, address(this), sum );
+			}
+		}
+
+
+	// === VIEWS ===
+
+	// Returns the total shares for specified pools.
+	function totalSharesForPools( bytes32[] calldata poolIDs ) external view returns (uint256[] memory shares)
+		{
+		shares = new uint256[]( poolIDs.length );
+
+		for( uint256 i = 0; i < shares.length; i++ )
+			shares[i] = totalShares[ poolIDs[i] ];
+		}
+
+
+	// Returns the total rewards for specified pools.
+	function totalRewardsForPools( bytes32[] calldata poolIDs ) external view returns (uint256[] memory rewards)
+		{
+		rewards = new uint256[]( poolIDs.length );
+
+		for( uint256 i = 0; i < rewards.length; i++ )
+			rewards[i] = totalRewards[ poolIDs[i] ];
+		}
+
+
+	// Returns the user's pending rewards for a specified pool.
+	function userRewardForPool( address wallet, bytes32 poolID ) public view returns (uint256)
+		{
+		// If there are no shares for the pool, the user can't have any shares either and there can't be any rewards
+		if ( totalShares[poolID] == 0 )
+			return 0;
+
+		UserShareInfo memory user = _userShareInfo[wallet][poolID];
+		if ( user.userShare == 0 )
+			return 0;
+
+		// Determine the share of the rewards for the user based on their deposited share
+		uint256 rewardsShare = ( totalRewards[poolID] * user.userShare ) / totalShares[poolID];
+
+		// Reduce by the virtualRewards - as they were only added to keep the share / rewards ratio the same when the used added their share
+
+		// In the event that virtualRewards exceeds rewardsShare due to precision loss - just return zero
+		if ( user.virtualRewards > rewardsShare )
+			return 0;
+
+		return rewardsShare - user.virtualRewards;
+		}
+
+
+	// Returns the user's pending rewards for specified pools.
+	function userRewardsForPools( address wallet, bytes32[] calldata poolIDs ) external view returns (uint256[] memory rewards)
+		{
+		rewards = new uint256[]( poolIDs.length );
+
+		for( uint256 i = 0; i < rewards.length; i++ )
+			rewards[i] = userRewardForPool( wallet, poolIDs[i] );
+		}
+
+
+	// Get the user's shares for a specified pool.
+	function userShareForPool( address wallet, bytes32 poolID ) public view returns (uint256)
+		{
+		return _userShareInfo[wallet][poolID].userShare;
+		}
+
+
+	// Get the user's shares for specified pools.
+	function userShareForPools( address wallet, bytes32[] calldata poolIDs ) external view returns (uint256[] memory shares)
+		{
+		shares = new uint256[]( poolIDs.length );
+
+		for( uint256 i = 0; i < shares.length; i++ )
+			shares[i] = _userShareInfo[wallet][ poolIDs[i] ].userShare;
+		}
+
+
+	// Get the user's virtual rewards for a specified pool.
+	function userVirtualRewardsForPool( address wallet, bytes32 poolID ) public view returns (uint256)
+		{
+		return _userShareInfo[wallet][poolID].virtualRewards;
+		}
+
+
+	// Get the cooldown time remaining for the user for specified pools.
+	function userCooldowns( address wallet, bytes32[] calldata poolIDs ) external view returns (uint256[] memory cooldowns)
+		{
+		cooldowns = new uint256[]( poolIDs.length );
+
+		mapping(bytes32=>UserShareInfo) storage userInfo = _userShareInfo[wallet];
+
+		for( uint256 i = 0; i < cooldowns.length; i++ )
+			{
+			uint256 cooldownExpiration = userInfo[ poolIDs[i] ].cooldownExpiration;
+
+			if ( block.timestamp >= cooldownExpiration )
+				cooldowns[i] = 0;
+			else
+				cooldowns[i] = cooldownExpiration - block.timestamp;
+			}
+		}
+	}
+
+// File: src/pools/PoolUtils.sol
+pragma solidity =0.8.22;
+
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+
+
+library PoolUtils
+	{
+	// Token reserves less than dust are treated as if they don't exist at all.
+	// With the 18 decimals that are used for most tokens, DUST has a value of 0.0000000000000001
+	uint256 constant public DUST = 100;
+
+	// A special pool that represents staked SALT that is not associated with any actual liquidity pool.
+    bytes32 constant public STAKED_SALT = bytes32(0);
+
+
+    // Return the unique poolID for the given two tokens.
+    // Tokens are sorted before being hashed to make reversed pairs equivalent.
+    function _poolID( IERC20 tokenA, IERC20 tokenB ) internal pure returns (bytes32 poolID)
+    	{
+        // See if the token orders are flipped
+        if ( uint160(address(tokenB)) < uint160(address(tokenA)) )
+            return keccak256(abi.encodePacked(address(tokenB), address(tokenA)));
+
+        return keccak256(abi.encodePacked(address(tokenA), address(tokenB)));
+    	}
+
+
+    // Return the unique poolID and whether or not it is flipped
+    function _poolIDAndFlipped( IERC20 tokenA, IERC20 tokenB ) internal pure returns (bytes32 poolID, bool flipped)
+    	{
+        // See if the token orders are flipped
+        if ( uint160(address(tokenB)) < uint160(address(tokenA)) )
+            return (keccak256(abi.encodePacked(address(tokenB), address(tokenA))), true);
+
+        return (keccak256(abi.encodePacked(address(tokenA), address(tokenB))), false);
+    	}
+	}
+
+
+// File: src/staking/interfaces/IStakingRewards.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+struct AddedReward
+	{
+	bytes32 poolID;							// The pool to add rewards to
+	uint256 amountToAdd;				// The amount of rewards (as SALT) to add
+	}
+
+struct UserShareInfo
+	{
+	uint256 userShare;					// A user's share for a given poolID
+	uint256 virtualRewards;				// The amount of rewards that were added to maintain proper rewards/share ratio - and will be deducted from a user's pending rewards.
+	uint256 cooldownExpiration;		// The timestamp when the user can modify their share
+	}
+
+
+interface IStakingRewards
+	{
+	function claimAllRewards( bytes32[] calldata poolIDs ) external returns (uint256 rewardsAmount);
+	function addSALTRewards( AddedReward[] calldata addedRewards ) external;
+
+	// Views
+	function totalShares(bytes32 poolID) external view returns (uint256);
+	function totalSharesForPools( bytes32[] calldata poolIDs ) external view returns (uint256[] calldata shares);
+	function totalRewardsForPools( bytes32[] calldata poolIDs ) external view returns (uint256[] calldata rewards);
+
+	function userRewardForPool( address wallet, bytes32 poolID ) external view returns (uint256);
+	function userShareForPool( address wallet, bytes32 poolID ) external view returns (uint256);
+	function userVirtualRewardsForPool( address wallet, bytes32 poolID ) external view returns (uint256);
+
+	function userRewardsForPools( address wallet, bytes32[] calldata poolIDs ) external view returns (uint256[] calldata rewards);
+	function userShareForPools( address wallet, bytes32[] calldata poolIDs ) external view returns (uint256[] calldata shares);
+	function userCooldowns( address wallet, bytes32[] calldata poolIDs ) external view returns (uint256[] calldata cooldowns);
+	}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.3) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../extensions/IERC20Permit.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20 token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && Address.isContract(address(token));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1, "Math: mulDiv overflow");
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+}
+
+
+// File: src/pools/interfaces/IPoolsConfig.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "./IPools.sol";
+
+
+interface IPoolsConfig
+	{
+	function whitelistPool( IERC20 tokenA, IERC20 tokenB ) external; // onlyOwner
+	function unwhitelistPool( IERC20 tokenA, IERC20 tokenB ) external; // onlyOwner
+	function changeMaximumWhitelistedPools(bool increase) external; // onlyOwner
+
+	// Views
+    function maximumWhitelistedPools() external view returns (uint256);
+
+	function numberOfWhitelistedPools() external view returns (uint256);
+	function isWhitelisted( bytes32 poolID ) external view returns (bool);
+	function whitelistedPools() external view returns (bytes32[] calldata);
+	function underlyingTokenPair( bytes32 poolID ) external view returns (IERC20 tokenA, IERC20 tokenB);
+
+	// Returns true if the token has been whitelisted (meaning it has been pooled with either WETH and USDC)
+	function tokenHasBeenWhitelisted( IERC20 token, IERC20 weth, IERC20 usdc ) external view returns (bool);
+	}
+
+// File: src/interfaces/IExchangeConfig.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "openzeppelin-contracts/contracts/finance/VestingWallet.sol";
+import "../staking/interfaces/ILiquidity.sol";
+import "../launch/interfaces/IInitialDistribution.sol";
+import "../rewards/interfaces/IRewardsEmitter.sol";
+import "../rewards/interfaces/ISaltRewards.sol";
+import "../rewards/interfaces/IEmissions.sol";
+import "../interfaces/IAccessManager.sol";
+import "../launch/interfaces/IAirdrop.sol";
+import "../dao/interfaces/IDAO.sol";
+import "../interfaces/ISalt.sol";
+import "./IUpkeep.sol";
+
+
+interface IExchangeConfig
+	{
+	function setContracts( IDAO _dao, IUpkeep _upkeep, IInitialDistribution _initialDistribution, VestingWallet _teamVestingWallet, VestingWallet _daoVestingWallet ) external; // onlyOwner
+	function setAccessManager( IAccessManager _accessManager ) external; // onlyOwner
+
+	// Views
+	function salt() external view returns (ISalt);
+	function wbtc() external view returns (IERC20);
+	function weth() external view returns (IERC20);
+	function usdc() external view returns (IERC20);
+	function usdt() external view returns (IERC20);
+
+	function daoVestingWallet() external view returns (VestingWallet);
+    function teamVestingWallet() external view returns (VestingWallet);
+    function initialDistribution() external view returns (IInitialDistribution);
+
+	function accessManager() external view returns (IAccessManager);
+	function dao() external view returns (IDAO);
+	function upkeep() external view returns (IUpkeep);
+	function teamWallet() external view returns (address);
+
+	function walletHasAccess( address wallet ) external view returns (bool);
+	}
+
+
+// File: src/staking/interfaces/IStakingConfig.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IStakingConfig
+	{
+	function changeMinUnstakeWeeks(bool increase) external; // onlyOwner
+	function changeMaxUnstakeWeeks(bool increase) external; // onlyOwner
+	function changeMinUnstakePercent(bool increase) external; // onlyOwner
+	function changeModificationCooldown(bool increase) external; // onlyOwner
+
+	// Views
+    function minUnstakeWeeks() external view returns (uint256);
+    function maxUnstakeWeeks() external view returns (uint256);
+    function minUnstakePercent() external view returns (uint256);
+    function modificationCooldown() external view returns (uint256);
+	}
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: src/pools/interfaces/IPools.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "../../staking/interfaces/ILiquidity.sol";
+import "../../dao/interfaces/IDAO.sol";
+import "./IPoolStats.sol";
+
+
+interface IPools is IPoolStats
+	{
+	function startExchangeApproved() external;
+	function setContracts( IDAO _dao, ILiquidity _liquidity ) external; // onlyOwner
+
+	function addLiquidity( IERC20 tokenA, IERC20 tokenB, uint256 maxAmountA, uint256 maxAmountB, uint256 minAddedAmountA, uint256 minAddedAmountB, uint256 totalLiquidity ) external returns (uint256 addedAmountA, uint256 addedAmountB, uint256 addedLiquidity);
+	function removeLiquidity( IERC20 tokenA, IERC20 tokenB, uint256 liquidityToRemove, uint256 minReclaimedA, uint256 minReclaimedB, uint256 totalLiquidity ) external returns (uint256 reclaimedA, uint256 reclaimedB);
+
+	function deposit( IERC20 token, uint256 amount ) external;
+	function withdraw( IERC20 token, uint256 amount ) external;
+	function swap( IERC20 swapTokenIn, IERC20 swapTokenOut, uint256 swapAmountIn, uint256 minAmountOut, uint256 deadline ) external returns (uint256 swapAmountOut);
+	function depositSwapWithdraw(IERC20 swapTokenIn, IERC20 swapTokenOut, uint256 swapAmountIn, uint256 minAmountOut, uint256 deadline ) external returns (uint256 swapAmountOut);
+	function depositDoubleSwapWithdraw( IERC20 swapTokenIn, IERC20 swapTokenMiddle, IERC20 swapTokenOut, uint256 swapAmountIn, uint256 minAmountOut, uint256 deadline ) external returns (uint256 swapAmountOut);
+	function depositZapSwapWithdraw(IERC20 swapTokenIn, IERC20 swapTokenOut, uint256 swapAmountIn ) external returns (uint256 swapAmountOut);
+
+	// Views
+	function exchangeIsLive() external view returns (bool);
+	function getPoolReserves(IERC20 tokenA, IERC20 tokenB) external view returns (uint256 reserveA, uint256 reserveB);
+	function depositedUserBalance(address user, IERC20 token) external view returns (uint256);
+	}
+
+
+
+// File: lib/openzeppelin-contracts/contracts/finance/VestingWallet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (finance/VestingWallet.sol)
+pragma solidity ^0.8.0;
+
+import "../token/ERC20/utils/SafeERC20.sol";
+import "../utils/Address.sol";
+import "../utils/Context.sol";
+
+/**
+ * @title VestingWallet
+ * @dev This contract handles the vesting of Eth and ERC20 tokens for a given beneficiary. Custody of multiple tokens
+ * can be given to this contract, which will release the token to the beneficiary following a given vesting schedule.
+ * The vesting schedule is customizable through the {vestedAmount} function.
+ *
+ * Any token transferred to this contract will follow the vesting schedule as if they were locked from the beginning.
+ * Consequently, if the vesting has already started, any amount of tokens sent to this contract will (at least partly)
+ * be immediately releasable.
+ */
+contract VestingWallet is Context {
+    event EtherReleased(uint256 amount);
+    event ERC20Released(address indexed token, uint256 amount);
+
+    uint256 private _released;
+    mapping(address => uint256) private _erc20Released;
+    address private immutable _beneficiary;
+    uint64 private immutable _start;
+    uint64 private immutable _duration;
+
+    /**
+     * @dev Set the beneficiary, start timestamp and vesting duration of the vesting wallet.
+     */
+    constructor(address beneficiaryAddress, uint64 startTimestamp, uint64 durationSeconds) payable {
+        require(beneficiaryAddress != address(0), "VestingWallet: beneficiary is zero address");
+        _beneficiary = beneficiaryAddress;
+        _start = startTimestamp;
+        _duration = durationSeconds;
+    }
+
+    /**
+     * @dev The contract should be able to receive Eth.
+     */
+    receive() external payable virtual {}
+
+    /**
+     * @dev Getter for the beneficiary address.
+     */
+    function beneficiary() public view virtual returns (address) {
+        return _beneficiary;
+    }
+
+    /**
+     * @dev Getter for the start timestamp.
+     */
+    function start() public view virtual returns (uint256) {
+        return _start;
+    }
+
+    /**
+     * @dev Getter for the vesting duration.
+     */
+    function duration() public view virtual returns (uint256) {
+        return _duration;
+    }
+
+    /**
+     * @dev Amount of eth already released
+     */
+    function released() public view virtual returns (uint256) {
+        return _released;
+    }
+
+    /**
+     * @dev Amount of token already released
+     */
+    function released(address token) public view virtual returns (uint256) {
+        return _erc20Released[token];
+    }
+
+    /**
+     * @dev Getter for the amount of releasable eth.
+     */
+    function releasable() public view virtual returns (uint256) {
+        return vestedAmount(uint64(block.timestamp)) - released();
+    }
+
+    /**
+     * @dev Getter for the amount of releasable `token` tokens. `token` should be the address of an
+     * IERC20 contract.
+     */
+    function releasable(address token) public view virtual returns (uint256) {
+        return vestedAmount(token, uint64(block.timestamp)) - released(token);
+    }
+
+    /**
+     * @dev Release the native token (ether) that have already vested.
+     *
+     * Emits a {EtherReleased} event.
+     */
+    function release() public virtual {
+        uint256 amount = releasable();
+        _released += amount;
+        emit EtherReleased(amount);
+        Address.sendValue(payable(beneficiary()), amount);
+    }
+
+    /**
+     * @dev Release the tokens that have already vested.
+     *
+     * Emits a {ERC20Released} event.
+     */
+    function release(address token) public virtual {
+        uint256 amount = releasable(token);
+        _erc20Released[token] += amount;
+        emit ERC20Released(token, amount);
+        SafeERC20.safeTransfer(IERC20(token), beneficiary(), amount);
+    }
+
+    /**
+     * @dev Calculates the amount of ether that has already vested. Default implementation is a linear vesting curve.
+     */
+    function vestedAmount(uint64 timestamp) public view virtual returns (uint256) {
+        return _vestingSchedule(address(this).balance + released(), timestamp);
+    }
+
+    /**
+     * @dev Calculates the amount of tokens that has already vested. Default implementation is a linear vesting curve.
+     */
+    function vestedAmount(address token, uint64 timestamp) public view virtual returns (uint256) {
+        return _vestingSchedule(IERC20(token).balanceOf(address(this)) + released(token), timestamp);
+    }
+
+    /**
+     * @dev Virtual implementation of the vesting formula. This returns the amount vested, as a function of time, for
+     * an asset given its total historical allocation.
+     */
+    function _vestingSchedule(uint256 totalAllocation, uint64 timestamp) internal view virtual returns (uint256) {
+        if (timestamp < start()) {
+            return 0;
+        } else if (timestamp > start() + duration()) {
+            return totalAllocation;
+        } else {
+            return (totalAllocation * (timestamp - start())) / duration();
+        }
+    }
+}
+
+
+// File: src/staking/interfaces/ILiquidity.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "./IStakingRewards.sol";
+
+
+interface ILiquidity is IStakingRewards
+	{
+	function depositLiquidityAndIncreaseShare( IERC20 tokenA, IERC20 tokenB, uint256 maxAmountA, uint256 maxAmountB, uint256 minAddedAmountA, uint256 minAddedAmountB, uint256 minAddedLiquidity, uint256 deadline, bool useZapping ) external returns (uint256 addedLiquidity);
+	function withdrawLiquidityAndClaim( IERC20 tokenA, IERC20 tokenB, uint256 liquidityToWithdraw, uint256 minReclaimedA, uint256 minReclaimedB, uint256 deadline ) external returns (uint256 reclaimedA, uint256 reclaimedB);
+	}
+
+
+// File: src/launch/interfaces/IInitialDistribution.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "./IBootstrapBallot.sol";
+import "./IAirdrop.sol";
+
+
+interface IInitialDistribution
+	{
+	function distributionApproved( IAirdrop airdrop1, IAirdrop airdrop2 ) external;
+
+	// Views
+	function bootstrapBallot() external view returns (IBootstrapBallot);
+	}
+
+
+// File: src/rewards/interfaces/IRewardsEmitter.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "../../staking/interfaces/IStakingRewards.sol";
+
+
+interface IRewardsEmitter
+	{
+	function addSALTRewards( AddedReward[] calldata addedRewards ) external;
+	function performUpkeep( uint256 timeSinceLastUpkeep ) external;
+
+	// Views
+	function pendingRewardsForPools( bytes32[] calldata pools ) external view returns (uint256[] calldata);
+	}
+
+
+// File: src/rewards/interfaces/ISaltRewards.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "./IRewardsEmitter.sol";
+
+
+interface ISaltRewards
+	{
+	function sendInitialSaltRewards( uint256 liquidityBootstrapAmount, bytes32[] calldata poolIDs ) external;
+    function performUpkeep( bytes32[] calldata poolIDs, uint256[] calldata profitsForPools ) external;
+
+    // Views
+    function stakingRewardsEmitter() external view returns (IRewardsEmitter);
+    function liquidityRewardsEmitter() external view returns (IRewardsEmitter);
+    }
+
+// File: src/rewards/interfaces/IEmissions.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IEmissions
+	{
+	function performUpkeep( uint256 timeSinceLastUpkeep ) external;
+    }
+
+// File: src/interfaces/IAccessManager.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IAccessManager
+	{
+	function excludedCountriesUpdated() external;
+	function grantAccess(bytes calldata signature) external;
+
+	// Views
+	function geoVersion() external view returns (uint256);
+	function walletHasAccess(address wallet) external view returns (bool);
+	}
+
+
+// File: src/launch/interfaces/IAirdrop.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IAirdrop
+	{
+	function authorizeWallet( address wallet, uint256 saltAmount ) external;
+	function allowClaiming() external;
+	function claim() external;
+
+	// Views
+	function claimedByUser( address wallet) external view returns (uint256);
+	function claimingAllowed() external view returns (bool);
+	function claimingStartTimestamp() external view returns (uint256);
+	function claimableAmount(address wallet) external view returns (uint256);
+    function airdropForUser( address wallet ) external view returns (uint256);
+	}
+
+
+// File: src/dao/interfaces/IDAO.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+import "../../rewards/interfaces/ISaltRewards.sol";
+import "../../pools/interfaces/IPools.sol";
+import "../../interfaces/ISalt.sol";
+
+interface IDAO
+	{
+	function finalizeBallot( uint256 ballotID ) external;
+	function manuallyRemoveBallot( uint256 ballotID ) external;
+
+	function withdrawFromDAO( IERC20 token ) external returns (uint256 withdrawnAmount);
+
+	// Views
+	function pools() external view returns (IPools);
+	function websiteURL() external view returns (string memory);
+	function countryIsExcluded( string calldata country ) external view returns (bool);
+	}
+
+// File: src/interfaces/IUpkeep.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IUpkeep
+	{
+	function performUpkeep() external;
+
+	// Views
+	function currentRewardsForCallingPerformUpkeep() external view returns (uint256);
+	function lastUpkeepTimeEmissions() external view returns (uint256);
+	function lastUpkeepTimeRewardsEmitters() external view returns (uint256);
+	}
+
+
+// File: src/pools/interfaces/IPoolStats.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IPoolStats
+	{
+	// These are the indicies (in terms of a poolIDs location in the current whitelistedPoolIDs array) of pools involved in an arbitrage path
+	struct ArbitrageIndicies
+		{
+		uint64 index1;
+		uint64 index2;
+		uint64 index3;
+		}
+
+	function clearProfitsForPools() external;
+	function updateArbitrageIndicies() external;
+
+	// Views
+	function profitsForWhitelistedPools() external view returns (uint256[] memory _calculatedProfits);
+	function arbitrageIndicies(bytes32 poolID) external view returns (ArbitrageIndicies memory);
+	}
+
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: src/launch/interfaces/IBootstrapBallot.sol
+// SPDX-License-Identifier: BUSL 1.1
+pragma solidity =0.8.22;
+
+
+interface IBootstrapBallot
+	{
+	function vote( bool voteStartExchangeYes, uint256 saltAmount, bytes calldata signature ) external;
+	function finalizeBallot() external;
+
+	function authorizeAirdrop2( uint256 saltAmount, bytes calldata signature ) external;
+	function finalizeAirdrop2() external;
+
+	// Views
+	function claimableTimestamp1() external view returns (uint256);
+	function claimableTimestamp2() external view returns (uint256);
+
+	function hasVoted(address user) external view returns (bool);
+	function ballotFinalized() external view returns (bool);
+
+	function startExchangeYes() external view returns (uint256);
+	function startExchangeNo() external view returns (uint256);
+	}
+

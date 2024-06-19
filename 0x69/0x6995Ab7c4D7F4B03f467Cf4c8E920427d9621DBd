@@ -1,0 +1,1209 @@
+
+// File: StateChainGateway.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IERC20.sol";
+import "IStateChainGateway.sol";
+import "IKeyManager.sol";
+import "IFlipIssuer.sol";
+import "IFLIP.sol";
+import "AggKeyNonceConsumer.sol";
+import "GovernanceCommunityGuarded.sol";
+
+/**
+ * @title    State Chain Gateway contract
+ * @notice   Manages the funding and redemption FLIP from/to stateChain accounts.
+ *           Accounts on the FLIP state chain basically have full control
+ *           of FLIP leaving the contract. FLIP can be added to the StateChain
+ *           account via `fundStateChainAccount` with their stateChain nodeID.
+ *
+ *           This contract also handles the minting and burning of FLIP after the
+ *           initial supply is minted during FLIP's creation. At any time, a
+ *           valid aggragate signature can be submitted to the contract which
+ *           updates the total supply by minting or burning the necessary FLIP.
+ */
+contract StateChainGateway is IFlipIssuer, IStateChainGateway, AggKeyNonceConsumer, GovernanceCommunityGuarded {
+    /// @dev    The FLIP token address. To be set only once after deployment via setFlip.
+    // solhint-disable-next-line var-name-mixedcase
+    IFLIP private _FLIP;
+
+    /// @dev    The minimum amount of FLIP needed to fund an account, to prevent spamming
+    uint256 private _minFunding;
+    /// @dev    Holding pending redemptions for the 48h withdrawal delay
+    mapping(bytes32 => Redemption) private _pendingRedemptions;
+    /// @dev   Time after registerRedemption required to wait before call to executeRedemption
+    // solhint-disable-next-line var-name-mixedcase
+    uint48 public immutable REDEMPTION_DELAY;
+
+    /// @dev    The last block number in which the State Chain updated the totalSupply
+    uint256 private _lastSupplyUpdateBlockNum = 0;
+
+    // Defined in IStateChainGateway, just here for convenience
+    // struct Redemption {
+    //     uint amount;
+    //     address redeemAddress;
+    //     // 48 so that 160 (from redeemAddress) + 48 + 48 is 256 they can all be packed
+    //     // into a single 256 bit slot
+    //     uint48 startTime;
+    //     uint48 expiryTime;
+    //     address executor;
+    // }
+
+    constructor(
+        IKeyManager keyManager,
+        uint256 minFunding,
+        uint48 redemptionDelay
+    ) AggKeyNonceConsumer(keyManager) nzUint(redemptionDelay) {
+        _minFunding = minFunding;
+        REDEMPTION_DELAY = redemptionDelay;
+    }
+
+    /// @dev   Get the governor address from the KeyManager. This is called by the onlyGovernor
+    ///        modifier in the GovernanceCommunityGuarded. This logic can't be moved to the
+    ///        GovernanceCommunityGuarded since it requires a reference to the KeyManager.
+    function _getGovernor() internal view override returns (address) {
+        return getKeyManager().getGovernanceKey();
+    }
+
+    /// @dev   Get the community key from the KeyManager. This is called by the isCommunityKey
+    ///        modifier in the GovernanceCommunityGuarded. This logic can't be moved to the
+    ///        GovernanceCommunityGuarded since it requires a reference to the KeyManager.
+    function _getCommunityKey() internal view override returns (address) {
+        return getKeyManager().getCommunityKey();
+    }
+
+    /**
+     * @notice  Get the FLIP token address
+     * @dev     This function and it's return value will be checked when updating the FLIP issuer.
+     *          Do not remove nor modify this function in future versions of this contract.
+     * @return  The address of FLIP
+     */
+    function getFLIP() external view override returns (IFLIP) {
+        return _FLIP;
+    }
+
+    /// @dev   Ensure that a new keyManager has the getGovernanceKey() and getCommunityKey()
+    ///        functions implemented. These are functions required for this contract to
+    ///        to at least be able to use the emergency mechanism.
+    function _checkUpdateKeyManager(IKeyManager keyManager, bool omitChecks) internal view override {
+        address newGovKey = keyManager.getGovernanceKey();
+        address newCommKey = keyManager.getCommunityKey();
+
+        if (!omitChecks) {
+            // Ensure that the keys are the same
+            require(newGovKey == _getGovernor() && newCommKey == _getCommunityKey());
+
+            Key memory newAggKey = keyManager.getAggregateKey();
+            Key memory currentAggKey = getKeyManager().getAggregateKey();
+
+            require(
+                newAggKey.pubKeyX == currentAggKey.pubKeyX && newAggKey.pubKeyYParity == currentAggKey.pubKeyYParity
+            );
+        } else {
+            // Check that the addresses have been initialized
+            require(newGovKey != address(0) && newCommKey != address(0));
+        }
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Sets the FLIP address after initialization. We can't do this in the constructor
+     *          because FLIP contract requires this contract's address on deployment for minting.
+     *          First this contract is deployed, then the FLIP contract and finally setFLIP
+     *          should be called. Deployed via DeployerContract.sol so it can't be frontrun.
+     *          The FLIP address can only be set once.
+     * @param flip FLIP token address
+     */
+    function setFlip(IFLIP flip) external override nzAddr(address(flip)) {
+        require(address(_FLIP) == address(0), "Gateway: Flip address already set");
+        _FLIP = flip;
+        emit FLIPSet(address(flip));
+    }
+
+    /**
+     * @notice          Add FLIP funds to a StateChain account identified with a nodeID
+     * @dev             Requires the funder to have called `approve` in FLIP
+     * @param amount    The amount of FLIP tokens
+     * @param nodeID    The nodeID of the account to fund
+     */
+    function fundStateChainAccount(bytes32 nodeID, uint256 amount) external override nzBytes32(nodeID) {
+        IFLIP flip = _FLIP;
+        require(address(flip) != address(0), "Gateway: Flip not set");
+        require(amount >= _minFunding, "Gateway: not enough funds");
+        // Assumption of set token allowance by the user
+        flip.transferFrom(msg.sender, address(this), amount);
+        emit Funded(nodeID, amount, msg.sender);
+    }
+
+    /**
+     * @notice  Redeem FLIP from the StateChain. The State Chain will determine the amount
+     *          that can be redeemed, but a basic calculation for a validator would be:
+     *          amount redeemable = stake + rewards - penalties.
+     * @param sigData   Struct containing the signature data over the message
+     *                  to verify, signed by the aggregate key.
+     * @param nodeID    The nodeID of the account redeeming the FLIP
+     * @param amount    The amount of funds to be locked up
+     * @param redeemAddress    The redeemAddress who will receive the FLIP
+     * @param expiryTime  The last valid timestamp that can execute this redemption (uint48)
+     * @param executor    The address that can execute the redemption (zero address if anyone)
+     */
+    function registerRedemption(
+        SigData calldata sigData,
+        bytes32 nodeID,
+        uint256 amount,
+        address redeemAddress,
+        uint48 expiryTime,
+        address executor
+    )
+        external
+        override
+        onlyNotSuspended
+        nzBytes32(nodeID)
+        nzUint(amount)
+        nzAddr(redeemAddress)
+        consumesKeyNonce(
+            sigData,
+            keccak256(abi.encode(this.registerRedemption.selector, nodeID, amount, redeemAddress, expiryTime, executor))
+        )
+    {
+        require(
+            // Must be fresh or have been executed & deleted, or past the expiry
+            block.timestamp > uint256(_pendingRedemptions[nodeID].expiryTime),
+            "Gateway: a pending redemption exists"
+        );
+
+        uint48 startTime = uint48(block.timestamp) + REDEMPTION_DELAY;
+        require(expiryTime > startTime, "Gateway: expiry time too soon");
+
+        _pendingRedemptions[nodeID] = Redemption(amount, redeemAddress, startTime, expiryTime, executor);
+        emit RedemptionRegistered(nodeID, amount, redeemAddress, startTime, expiryTime, executor);
+    }
+
+    /**
+     * @notice  Execute a pending redemption to get back funds. Cannot execute a pending
+     *          redemption before 48h have passed after registering it, or after the specified
+     *          expiry time
+     * @dev     No need for nzUint(nodeID) since that is handled by `redemption.expiryTime > 0`
+     * @param nodeID    The nodeID of the funder
+     */
+    function executeRedemption(bytes32 nodeID) external override onlyNotSuspended returns (address, uint256) {
+        Redemption memory redemption = _pendingRedemptions[nodeID];
+        require(
+            block.timestamp >= redemption.startTime && redemption.expiryTime > 0,
+            "Gateway: early or already execd"
+        );
+
+        // Housekeeping
+        delete _pendingRedemptions[nodeID];
+
+        if (block.timestamp <= redemption.expiryTime) {
+            if (redemption.executor != address(0)) {
+                require(msg.sender == redemption.executor, "Gateway: not executor");
+            }
+            emit RedemptionExecuted(nodeID, redemption.amount);
+
+            // Send the tokens
+            _FLIP.transfer(redemption.redeemAddress, redemption.amount);
+            return (redemption.redeemAddress, redemption.amount);
+        } else {
+            emit RedemptionExpired(nodeID, redemption.amount);
+            return (redemption.redeemAddress, 0);
+        }
+    }
+
+    /**
+     * @notice  Compares a given new FLIP supply against the old supply and mints or burns
+     *          FLIP tokens from this contract as appropriate.
+     *          It requires a message signed by the aggregate key.
+     * @dev     Hardcoded to only mint and burn FLIP tokens to/from this contract.
+     * @param sigData               Struct containing the signature data over the message
+     *                              to verify, signed by the aggregate key.
+     * @param newTotalSupply        new total supply of FLIP
+     * @param stateChainBlockNumber State Chain block number for the new total supply
+     */
+    function updateFlipSupply(
+        SigData calldata sigData,
+        uint256 newTotalSupply,
+        uint256 stateChainBlockNumber
+    )
+        external
+        override
+        onlyNotSuspended
+        nzUint(newTotalSupply)
+        consumesKeyNonce(
+            sigData,
+            keccak256(abi.encode(this.updateFlipSupply.selector, newTotalSupply, stateChainBlockNumber))
+        )
+    {
+        require(stateChainBlockNumber > _lastSupplyUpdateBlockNum, "Gateway: old FLIP supply update");
+        _lastSupplyUpdateBlockNum = stateChainBlockNumber;
+        IFLIP flip = _FLIP;
+        uint256 oldSupply = flip.totalSupply();
+        if (newTotalSupply < oldSupply) {
+            uint256 amount = oldSupply - newTotalSupply;
+            flip.burn(address(this), amount);
+        } else if (newTotalSupply > oldSupply) {
+            uint256 amount = newTotalSupply - oldSupply;
+            flip.mint(address(this), amount);
+        }
+        emit FlipSupplyUpdated(oldSupply, newTotalSupply, stateChainBlockNumber);
+    }
+
+    /**
+     * @notice  Updates the address that is allowed to issue FLIP tokens. This will be used when this
+     *          contract needs an upgrade. A new contract will be deployed and all the FLIP will be
+     *          transferred to it via the redemption process. Finally the right to issue FLIP will be transferred.
+     * @dev     The new issuer must be a contract and, in a standard upgrade, it must have the reference FLIP address.
+     *          In a special case where the check is omitted, the new issuer must be a contract, never an EOA.
+     * @param sigData     Struct containing the signature data over the message
+     *                    to verify, signed by the aggregate key.
+     * @param newIssuer   New contract that will issue FLIP tokens.
+     * @param omitChecks Allow the omission of the extra checks in a special case
+     */
+    function updateFlipIssuer(
+        SigData calldata sigData,
+        address newIssuer,
+        bool omitChecks
+    )
+        external
+        override
+        onlyNotSuspended
+        nzAddr(newIssuer)
+        consumesKeyNonce(sigData, keccak256(abi.encode(this.updateFlipIssuer.selector, newIssuer, omitChecks)))
+    {
+        if (!omitChecks) {
+            require(IFlipIssuer(newIssuer).getFLIP() == _FLIP, "Gateway: wrong FLIP ref");
+        } else {
+            require(newIssuer.code.length > 0);
+        }
+
+        _FLIP.updateIssuer(newIssuer);
+    }
+
+    /**
+     * @notice      Set the minimum amount of funds needed for `fundStateChainAccount` to be able
+     *              to be called. Used to prevent spamming of funding.
+     * @param newMinFunding   The new minimum funding amount
+     */
+    function setMinFunding(uint256 newMinFunding) external override nzUint(newMinFunding) onlyGovernor {
+        emit MinFundingChanged(_minFunding, newMinFunding);
+        _minFunding = newMinFunding;
+    }
+
+    /**
+     * @notice Withdraw all FLIP to governance address in case of emergency. This withdrawal needs
+     *         to be approved by the Community, it is a last resort. Used to rectify an emergency.
+     *         Transfer the issuance to the governance address if this contract is the issuer.
+     */
+    function govWithdraw() external override onlyGovernor onlyCommunityGuardDisabled onlySuspended {
+        IFLIP flip = _FLIP;
+        uint256 amount = flip.balanceOf(address(this));
+
+        // Could use msg.sender or getGovernor() but hardcoding the get call just for extra safety
+        address governor = getKeyManager().getGovernanceKey();
+        flip.transfer(governor, amount);
+        emit GovernanceWithdrawal(governor, amount);
+
+        // Check issuer to ensure this doesn't revert
+        if (flip.getIssuer() == address(this)) {
+            flip.updateIssuer(governor);
+        }
+    }
+
+    /**
+     * @notice Update the FLIP Issuer address with the governance address in case of emergency.
+     *         This needs to be approved by the Community, it is a last resort. Used to rectify
+     *         an emergency.
+     */
+    function govUpdateFlipIssuer() external override onlyGovernor onlyCommunityGuardDisabled onlySuspended {
+        address governor = getKeyManager().getGovernanceKey();
+        _FLIP.updateIssuer(governor);
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  Non-state-changing functions            //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Get the minimum amount of funds that's required for funding
+     *          an account on the StateChain.
+     * @return  The minimum amount (uint)
+     */
+    function getMinimumFunding() external view override returns (uint256) {
+        return _minFunding;
+    }
+
+    /**
+     * @notice  Get the pending redemption for the input nodeID. If there was never
+     *          a pending redemption for this nodeID, or it has already been executed
+     *          (and therefore deleted), it'll return (0, 0x00..., 0, 0)
+     * @param nodeID   The nodeID which has a pending redemption
+     * @return         The redemption (Redemption struct)
+     */
+    function getPendingRedemption(bytes32 nodeID) external view override returns (Redemption memory) {
+        return _pendingRedemptions[nodeID];
+    }
+
+    /**
+     * @notice  Get the last state chain block number of the last supply update
+     * @return  The state chain block number of the last supply update
+     */
+    function getLastSupplyUpdateBlockNumber() external view override returns (uint256) {
+        return _lastSupplyUpdateBlockNum;
+    }
+}
+
+
+// File: IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+
+// File: IStateChainGateway.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IFLIP.sol";
+import "IAggKeyNonceConsumer.sol";
+import "IGovernanceCommunityGuarded.sol";
+import "IFlipIssuer.sol";
+
+/**
+ * @title    StateChainGateway interface
+ */
+interface IStateChainGateway is IGovernanceCommunityGuarded, IFlipIssuer, IAggKeyNonceConsumer {
+    event Funded(bytes32 indexed nodeID, uint256 amount, address funder);
+    event RedemptionRegistered(
+        bytes32 indexed nodeID,
+        uint256 amount,
+        address indexed redeemAddress,
+        uint48 startTime,
+        uint48 expiryTime,
+        address executor
+    );
+    event RedemptionExecuted(bytes32 indexed nodeID, uint256 amount);
+    event RedemptionExpired(bytes32 indexed nodeID, uint256 amount);
+    event MinFundingChanged(uint256 oldMinFunding, uint256 newMinFunding);
+    event GovernanceWithdrawal(address to, uint256 amount);
+    event FLIPSet(address flip);
+    event FlipSupplyUpdated(uint256 oldSupply, uint256 newSupply, uint256 stateChainBlockNumber);
+
+    struct Redemption {
+        uint256 amount;
+        address redeemAddress;
+        // 48 so that 160 (from redeemAddress) + 48 + 48 is 256 they can all be packed
+        // into a single 256 bit slot
+        uint48 startTime;
+        uint48 expiryTime;
+        address executor;
+    }
+
+    /**
+     * @notice  Sets the FLIP address after initialization. We can't do this in the constructor
+     *          because FLIP contract requires this contract's address on deployment for minting.
+     *          First this contract is deployed, then the FLIP contract and finally setFLIP
+     *          should be called. OnlyDeployer modifer for added security since tokens will be
+     *          minted to this contract before calling setFLIP.
+     * @param flip FLIP token address
+     */
+    function setFlip(IFLIP flip) external;
+
+    /**
+     * @notice          Add FLIP funds to a StateChain account identified with a nodeID
+     * @dev             Requires the funder to have called `approve` in FLIP
+     * @param amount    The amount of FLIP tokens
+     * @param nodeID    The nodeID of the account to fund
+     */
+    function fundStateChainAccount(bytes32 nodeID, uint256 amount) external;
+
+    /**
+     * @notice  Redeem FLIP from the StateChain. The State Chain will determine the amount
+     *          that can be redeemed, but a basic calculation for a validator would be:
+     *          amount redeemable = stake + rewards - penalties.
+     * @param sigData   Struct containing the signature data over the message
+     *                  to verify, signed by the aggregate key.
+     * @param nodeID    The nodeID of the account redeeming the FLIP
+     * @param amount    The amount of funds to be locked up
+     * @param redeemAddress    The redeemAddress who will receive the FLIP
+     * @param expiryTime   The last valid timestamp that can execute this redemption (uint48)
+     */
+    function registerRedemption(
+        SigData calldata sigData,
+        bytes32 nodeID,
+        uint256 amount,
+        address redeemAddress,
+        uint48 expiryTime,
+        address executor
+    ) external;
+
+    /**
+     * @notice  Execute a pending redemption to get back funds. Cannot execute a pending
+     *          redemption before 48h have passed after registering it, or after the specified
+     *          expiry time
+     * @dev     No need for nzUint(nodeID) since that is handled by `redemption.expiryTime > 0`
+     * @param nodeID    The nodeID of the account redeeming the FLIP
+     * @return          The address that received the FLIP and the amount
+     */
+    function executeRedemption(bytes32 nodeID) external returns (address, uint256);
+
+    /**
+     * @notice  Compares a given new FLIP supply against the old supply and mints or burns
+     *          FLIP tokens from this contract as appropriate.
+     *          It requires a message signed by the aggregate key.
+     * @param sigData    Struct containing the signature data over the message
+     *                   to verify, signed by the aggregate key.
+     * @param newTotalSupply        new total supply of FLIP
+     * @param stateChainBlockNumber State Chain block number for the new total supply
+     */
+    function updateFlipSupply(SigData calldata sigData, uint256 newTotalSupply, uint256 stateChainBlockNumber) external;
+
+    /**
+     * @notice  Updates the address that is allowed to issue FLIP tokens. This will be used when this
+     *          contract needs an upgrade. A new contract will be deployed and all the FLIP will be
+     *          transferred to it via the redemption process. Finally the right to issue FLIP will be transferred.
+     * @param sigData     Struct containing the signature data over the message
+     *                    to verify, signed by the aggregate key.
+     * @param newIssuer   New contract that will issue FLIP tokens.
+     * @param omitChecks Allow the omission of the extra checks in a special case
+     */
+    function updateFlipIssuer(SigData calldata sigData, address newIssuer, bool omitChecks) external;
+
+    /**
+     * @notice      Set the minimum amount of funds needed for `fundStateChainAccount` to be able
+     *              to be called. Used to prevent spamming of funding.
+     * @param newMinFunding   The new minimum funding amount
+     */
+    function setMinFunding(uint256 newMinFunding) external;
+
+    /**
+     * @notice Withdraw all FLIP to governance address in case of emergency. This withdrawal needs
+     *         to be approved by the Community, it is a last resort. Used to rectify an emergency.
+     *         The governance address is also updated as the issuer of FLIP.
+     */
+    function govWithdraw() external;
+
+    /**
+     * @notice Update the FLIP Issuer address with the governance address in case of emergency.
+     *         This needs to be approved by the Community, it is a last resort. Used to rectify
+     *         an emergency.
+     */
+    function govUpdateFlipIssuer() external;
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  Non-state-changing functions            //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Get the minimum amount of funds that's required for funding
+     *          an account on the StateChain.
+     * @return  The minimum amount (uint)
+     */
+    function getMinimumFunding() external view returns (uint256);
+
+    /**
+     * @notice  Get the pending redemption for the input nodeID. If there was never
+     *          a pending redemption for this nodeID, or it has already been executed
+     *          (and therefore deleted), it'll return (0, 0x00..., 0, 0)
+     * @param nodeID   The nodeID which has a pending redemption
+     * @return         The redemption (Redemption struct)
+     */
+    function getPendingRedemption(bytes32 nodeID) external view returns (Redemption memory);
+
+    /**
+     * @notice  Get the last state chain block number that the supply was updated at
+     * @return  The state chain block number of the last update
+     */
+    function getLastSupplyUpdateBlockNumber() external view returns (uint256);
+}
+
+
+// File: IFLIP.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IERC20.sol";
+
+/**
+ * @title    FLIP interface for the FLIP utility token
+ */
+interface IFLIP is IERC20 {
+    event IssuerUpdated(address oldIssuer, address newIssuer);
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    function mint(address account, uint amount) external;
+
+    function burn(address account, uint amount) external;
+
+    function updateIssuer(address newIssuer) external;
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  Non-state-changing functions            //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    function getIssuer() external view returns (address);
+}
+
+
+// File: IAggKeyNonceConsumer.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IShared.sol";
+import "IKeyManager.sol";
+
+/**
+ * @title    AggKeyNonceConsumer interface
+ */
+
+interface IAggKeyNonceConsumer is IShared {
+    event UpdatedKeyManager(address keyManager);
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+    /**
+     * @notice  Update KeyManager reference. Used if KeyManager contract is updated
+     * @param sigData    Struct containing the signature data over the message
+     *                   to verify, signed by the aggregate key.
+     * @param keyManager New KeyManager's address
+     * @param omitChecks Allow the omission of the extra checks in a special case
+     */
+    function updateKeyManager(SigData calldata sigData, IKeyManager keyManager, bool omitChecks) external;
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                          Getters                         //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Get the KeyManager address/interface that's used to validate sigs
+     * @return  The KeyManager (IKeyManager)
+     */
+    function getKeyManager() external view returns (IKeyManager);
+}
+
+
+// File: IShared.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+import "IERC20.sol";
+
+/**
+ * @title    Shared interface
+ * @notice   Holds structs needed by other interfaces
+ */
+interface IShared {
+    /**
+     * @dev  SchnorrSECP256K1 requires that each key has a public key part (x coordinate),
+     *       a parity for the y coordinate (0 if the y ordinate of the public key is even, 1
+     *       if it's odd)
+     */
+    struct Key {
+        uint256 pubKeyX;
+        uint8 pubKeyYParity;
+    }
+
+    /**
+     * @dev  Contains a signature and the nonce used to create it. Also the recovered address
+     *       to check that the signature is valid
+     */
+    struct SigData {
+        uint256 sig;
+        uint256 nonce;
+        address kTimesGAddress;
+    }
+
+    /**
+     * @param token The address of the token to be transferred
+     * @param recipient The address of the recipient of the transfer
+     * @param amount    The amount to transfer, in wei (uint)
+     */
+    struct TransferParams {
+        address token;
+        address payable recipient;
+        uint256 amount;
+    }
+
+    /**
+     * @param swapID    The unique identifier for this swap (bytes32), used for create2
+     * @param token     The token to be transferred
+     */
+    struct DeployFetchParams {
+        bytes32 swapID;
+        address token;
+    }
+
+    /**
+     * @param fetchContract   The address of the deployed Deposit contract
+     * @param token     The token to be transferred
+     */
+    struct FetchParams {
+        address payable fetchContract;
+        address token;
+    }
+}
+
+
+// File: IKeyManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IShared.sol";
+
+/**
+ * @title    KeyManager interface
+ * @notice   The interface for functions KeyManager implements
+ */
+interface IKeyManager is IShared {
+    event AggKeySetByAggKey(Key oldAggKey, Key newAggKey);
+    event AggKeySetByGovKey(Key oldAggKey, Key newAggKey);
+    event GovKeySetByAggKey(address oldGovKey, address newGovKey);
+    event GovKeySetByGovKey(address oldGovKey, address newGovKey);
+    event CommKeySetByAggKey(address oldCommKey, address newCommKey);
+    event CommKeySetByCommKey(address oldCommKey, address newCommKey);
+    event SignatureAccepted(SigData sigData, address signer);
+    event GovernanceAction(bytes32 message);
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    function consumeKeyNonce(SigData memory sigData, bytes32 contractMsgHash) external;
+
+    function setAggKeyWithAggKey(SigData memory sigData, Key memory newAggKey) external;
+
+    function setAggKeyWithGovKey(Key memory newAggKey) external;
+
+    function setGovKeyWithAggKey(SigData calldata sigData, address newGovKey) external;
+
+    function setGovKeyWithGovKey(address newGovKey) external;
+
+    function setCommKeyWithAggKey(SigData calldata sigData, address newCommKey) external;
+
+    function setCommKeyWithCommKey(address newCommKey) external;
+
+    function govAction(bytes32 message) external;
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  Non-state-changing functions            //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    function getAggregateKey() external view returns (Key memory);
+
+    function getGovernanceKey() external view returns (address);
+
+    function getCommunityKey() external view returns (address);
+
+    function isNonceUsedByAggKey(uint256 nonce) external view returns (bool);
+
+    function getLastValidateTime() external view returns (uint256);
+}
+
+
+// File: IGovernanceCommunityGuarded.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IShared.sol";
+
+/**
+ * @title    GovernanceCommunityGuarded interface
+ */
+
+interface IGovernanceCommunityGuarded is IShared {
+    event CommunityGuardDisabled(bool communityGuardDisabled);
+    event Suspended(bool suspended);
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+    /**
+     * @notice  Enable Community Guard
+     */
+
+    function enableCommunityGuard() external;
+
+    /**
+     * @notice  Disable Community Guard
+     */
+    function disableCommunityGuard() external;
+
+    /**
+     * @notice  Can be used to suspend contract execution - only executable by
+     *          governance and only to be used in case of emergency.
+     */
+    function suspend() external;
+
+    /**
+     * @notice      Resume contract execution
+     */
+    function resume() external;
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                          Getters                         //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Get the Community Key
+     * @return  The CommunityKey
+     */
+    function getCommunityKey() external view returns (address);
+
+    /**
+     * @notice  Get the Community Guard state
+     * @return  The Community Guard state
+     */
+    function getCommunityGuardDisabled() external view returns (bool);
+
+    /**
+     * @notice  Get suspended state
+     * @return  The suspended state
+     */
+    function getSuspendedState() external view returns (bool);
+
+    /**
+     * @notice  Get governor address
+     * @return  The governor address
+     */
+    function getGovernor() external view returns (address);
+}
+
+
+// File: IFlipIssuer.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IFLIP.sol";
+
+/**
+ * @title    Flip Issuer interface
+ * @notice   This interface is required when updating the FLIP issuer.
+ *           Additionally, any contract inheriting this should implement the
+ *           mint and burn capabilities to interact with the FLIP contract.
+ */
+interface IFlipIssuer {
+    /**
+     * @notice  Get the FLIP token address
+     * @return  The address of FLIP
+     */
+    function getFLIP() external view returns (IFLIP);
+}
+
+
+// File: AggKeyNonceConsumer.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IKeyManager.sol";
+import "IAggKeyNonceConsumer.sol";
+import "Shared.sol";
+
+/**
+ * @title    AggKeyNonceConsumer contract
+ * @notice   Manages the reference to the KeyManager contract. The address
+ *           is set in the constructor and can only be updated with a valid
+ *           signature validated by the current KeyManager contract. This shall
+ *           be done if the KeyManager contract is updated.
+ */
+abstract contract AggKeyNonceConsumer is Shared, IAggKeyNonceConsumer {
+    /// @dev    The KeyManager used to checks sigs used in functions here
+    IKeyManager private _keyManager;
+
+    constructor(IKeyManager keyManager) nzAddr(address(keyManager)) {
+        _keyManager = keyManager;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Update KeyManager reference. Used if KeyManager contract is updated
+     * @param sigData    Struct containing the signature data over the message
+     *                   to verify, signed by the aggregate key.
+     * @param keyManager New KeyManager's address
+     * @param omitChecks Allow the omission of the extra checks in a special case
+     */
+    function updateKeyManager(
+        SigData calldata sigData,
+        IKeyManager keyManager,
+        bool omitChecks
+    )
+        external
+        override
+        nzAddr(address(keyManager))
+        consumesKeyNonce(sigData, keccak256(abi.encode(this.updateKeyManager.selector, keyManager, omitChecks)))
+    {
+        // Check that the new KeyManager is a contract
+        require(address(keyManager).code.length > 0);
+
+        // Allow the child to check compatibility with the new KeyManager
+        _checkUpdateKeyManager(keyManager, omitChecks);
+
+        _keyManager = keyManager;
+        emit UpdatedKeyManager(address(keyManager));
+    }
+
+    /// @dev   This will be called when upgrading to a new KeyManager. This allows the child's contract
+    ///        to check its compatibility with the new KeyManager. This is to prevent the contract from
+    //         getting bricked. There is no good way to enforce the implementation of consumeKeyNonce().
+    function _checkUpdateKeyManager(IKeyManager keyManager, bool omitChecks) internal view virtual;
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                          Getters                         //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Get the KeyManager address/interface that's used to validate sigs
+     * @return  The KeyManager (IKeyManager)
+     */
+    function getKeyManager() public view override returns (IKeyManager) {
+        return _keyManager;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                         Modifiers                        //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev    Calls consumeKeyNonce in _keyManager
+    modifier consumesKeyNonce(SigData calldata sigData, bytes32 contractMsgHash) {
+        getKeyManager().consumeKeyNonce(sigData, contractMsgHash);
+        _;
+    }
+}
+
+
+// File: Shared.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IShared.sol";
+
+/**
+ * @title    Shared contract
+ * @notice   Holds constants and modifiers that are used in multiple contracts
+ * @dev      It would be nice if this could be a library, but modifiers can't be exported :(
+ */
+
+abstract contract Shared is IShared {
+    /// @dev The address used to indicate whether transfer should send native or a token
+    address internal constant _NATIVE_ADDR = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    address internal constant _ZERO_ADDR = address(0);
+    bytes32 internal constant _NULL = "";
+    uint256 internal constant _E_18 = 1e18;
+
+    /// @dev    Checks that a uint isn't zero/empty
+    modifier nzUint(uint256 u) {
+        require(u != 0, "Shared: uint input is empty");
+        _;
+    }
+
+    /// @dev    Checks that an address isn't zero/empty
+    modifier nzAddr(address a) {
+        require(a != _ZERO_ADDR, "Shared: address input is empty");
+        _;
+    }
+
+    /// @dev    Checks that a bytes32 isn't zero/empty
+    modifier nzBytes32(bytes32 b) {
+        require(b != _NULL, "Shared: bytes32 input is empty");
+        _;
+    }
+
+    /// @dev    Checks that the pubKeyX is populated
+    modifier nzKey(Key memory key) {
+        require(key.pubKeyX != 0, "Shared: pubKeyX is empty");
+        _;
+    }
+}
+
+
+// File: GovernanceCommunityGuarded.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "IGovernanceCommunityGuarded.sol";
+import "AggKeyNonceConsumer.sol";
+import "Shared.sol";
+
+/**
+ * @title    GovernanceCommunityGuarded contract
+ * @notice   Allows the governor to perform certain actions for the procotol's safety in
+ *           case of emergency. The aim is to allow the governor to suspend execution of
+ *           critical functions.
+ *           Also, it allows the CommunityKey to safeguard certain functions so the
+ *           governor can execute them iff the communityKey allows it.
+ */
+abstract contract GovernanceCommunityGuarded is Shared, IGovernanceCommunityGuarded {
+    /// @dev    Community Guard Disabled
+    bool private _communityGuardDisabled;
+
+    /// @dev    Whether execution is suspended
+    bool private _suspended = false;
+
+    /**
+     * @notice  Get the governor's address. The contracts inheriting this (StateChainGateway and Vault)
+     *          get the governor's address from the KeyManager through the AggKeyNonceConsumer's
+     *          inheritance. Therefore, the implementation of this function must be left
+     *          to the children. This is not implemented as a virtual onlyGovernor modifier to force
+     *          the children to implement this function - virtual modifiers don't enforce that.
+     * @return  The governor's address
+     */
+    function _getGovernor() internal view virtual returns (address);
+
+    /**
+     * @notice  Get the community's address. The contracts inheriting this (StateChainGateway and Vault)
+     *          get the community's address from the KeyManager through the AggKeyNonceConsumer's
+     *          inheritance. Therefore, the implementation of this function must be left
+     *          to the children. This is not implemented as a virtual onlyCommunityKey modifier to force
+     *          the children to implement this function - virtual modifiers don't enforce that.
+     * @return  The community's address
+     */
+    function _getCommunityKey() internal view virtual returns (address);
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                  State-changing functions                //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Enable Community Guard
+     */
+    function enableCommunityGuard() external override onlyCommunityKey onlyCommunityGuardDisabled {
+        _communityGuardDisabled = false;
+        emit CommunityGuardDisabled(false);
+    }
+
+    /**
+     * @notice  Disable Community Guard
+     */
+    function disableCommunityGuard() external override onlyCommunityKey onlyCommunityGuardEnabled {
+        _communityGuardDisabled = true;
+        emit CommunityGuardDisabled(true);
+    }
+
+    /**
+     * @notice Can be used to suspend contract execution - only executable by
+     * governance and only to be used in case of emergency.
+     */
+    function suspend() external override onlyGovernor onlyNotSuspended {
+        _suspended = true;
+        emit Suspended(true);
+    }
+
+    /**
+     * @notice      Resume contract execution
+     */
+    function resume() external override onlyGovernor onlySuspended {
+        _suspended = false;
+        emit Suspended(false);
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                          Getters                         //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /**
+     * @notice  Get the Community Key
+     * @return  The CommunityKey
+     */
+    function getCommunityKey() external view override returns (address) {
+        return _getCommunityKey();
+    }
+
+    /**
+     * @notice  Get the Community Guard state
+     * @return  The Community Guard state
+     */
+    function getCommunityGuardDisabled() external view override returns (bool) {
+        return _communityGuardDisabled;
+    }
+
+    /**
+     * @notice  Get suspended state
+     * @return  The suspended state
+     */
+    function getSuspendedState() external view override returns (bool) {
+        return _suspended;
+    }
+
+    /**
+     * @notice  Get governor address
+     * @return  The governor address
+     */
+    function getGovernor() external view override returns (address) {
+        return _getGovernor();
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                                                          //
+    //                         Modifiers                        //
+    //                                                          //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev    Check that the caller is the Community Key address.
+    modifier onlyCommunityKey() {
+        require(msg.sender == _getCommunityKey(), "Governance: not Community Key");
+        _;
+    }
+
+    /// @dev    Check that community has disabled the community guard.
+    modifier onlyCommunityGuardDisabled() {
+        require(_communityGuardDisabled, "Governance: community guard enabled");
+        _;
+    }
+
+    /// @dev    Check that community has disabled the community guard.
+    modifier onlyCommunityGuardEnabled() {
+        require(!_communityGuardDisabled, "Governance: community guard disabled");
+        _;
+    }
+
+    /// @notice Ensure that the caller is the governor address. Calls the getGovernor
+    ///         function which is implemented by the children.
+    modifier onlyGovernor() {
+        require(msg.sender == _getGovernor(), "Governance: not governor");
+        _;
+    }
+
+    // @notice Check execution is suspended
+    modifier onlySuspended() {
+        require(_suspended, "Governance: not suspended");
+        _;
+    }
+
+    // @notice Check execution is not suspended
+    modifier onlyNotSuspended() {
+        require(!_suspended, "Governance: suspended");
+        _;
+    }
+}
+

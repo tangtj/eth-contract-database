@@ -1,0 +1,1510 @@
+
+// File: contracts/WrappedLooksRareToken.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+import {LowLevelERC20Transfer} from "@looksrare/contracts-libs/contracts/lowLevelCallers/LowLevelERC20Transfer.sol";
+import {ITransferManager} from "@looksrare/contracts-transfer-manager/contracts/interfaces/ITransferManager.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+
+import {IStakingRewards} from "./interfaces/IStakingRewards.sol";
+
+/**
+ * @title WrappedLooksRareToken
+ * @notice WrappedLooksRareToken is a LOOKS wrapper that is used for staking and auto-compounding.
+ * @author LooksRare protocol team (👀,💎)
+ */
+contract WrappedLooksRareToken is ERC20, LowLevelERC20Transfer {
+    /**
+     * @notice The cooldown period for unwrap requests.
+     */
+    uint256 public constant UNWRAP_REQUEST_COOLDOWN = 1 weeks;
+
+    /**
+     * @notice The amount after fee for instant unwrap in basis points.
+     */
+    uint256 public constant INSTANT_UNWRAP_AMOUNT_AFTER_FEE_IN_BASIS_POINTS = 9_500;
+
+    /**
+     * @notice The LOOKS token address.
+     */
+    address public immutable LOOKS;
+
+    /**
+     * @notice The transfer manager to handle LOOKS approvals and transfers.
+     */
+    ITransferManager public immutable TRANSFER_MANAGER;
+
+    /**
+     * @dev The deployer of the contract. Only used for initialization.
+     */
+    address private immutable DEPLOYER;
+
+    /**
+     * @notice A unwrap request.
+     * @param amount The amount of LOOKS to unwrap.
+     * @param timestamp The timestamp of the unwrap request.
+     */
+    struct UnwrapRequest {
+        uint216 amount;
+        uint40 timestamp;
+    }
+
+    mapping(address requester => UnwrapRequest) public unwrapRequests;
+
+    /**
+     * @notice The staking rewards contract.
+     */
+    IStakingRewards public stakingRewards;
+
+    /**
+     * @notice The auto-compounder contract.
+     */
+    IERC4626 public autoCompounder;
+
+    /**
+     * @notice Whether the contract has been initialized. Initialize cannot be called twice.
+     */
+    bool private initialized;
+
+    event Wrapped(address indexed wrapper, uint256 amount);
+    event Initialized(address _stakingRewards, address _autoCompounder);
+    event Staked(address indexed staker, uint256 amount);
+    event AutoCompounded(address indexed staker, uint256 amount);
+    event UnwrapRequestSubmitted(address indexed requester, uint256 amount);
+    event UnwrapRequestCancelled(address indexed requester, uint256 amount);
+    event UnwrapRequestCompleted(address indexed requester, uint256 amount);
+    event InstantUnwrap(address indexed requester, uint256 amount);
+
+    error WrappedLooksRareToken__AlreadyInitialized();
+    error WrappedLooksRareToken__InsufficientBalance();
+    error WrappedLooksRareToken__InvalidAddress();
+    error WrappedLooksRareToken__NoUnwrapRequest();
+    error WrappedLooksRareToken__OngoingUnwrapRequest();
+    error WrappedLooksRareToken__TooEarlyToCompleteUnwrapRequest();
+    error WrappedLooksRareToken__Unauthorized();
+
+    /**
+     * @param looks LooksRare token
+     * @param transferManager Transfer manager
+     */
+    constructor(address looks, address transferManager) ERC20("Wrapped LooksRare Token", "wLOOKS") {
+        LOOKS = looks;
+        TRANSFER_MANAGER = ITransferManager(transferManager);
+        DEPLOYER = msg.sender;
+    }
+
+    /**
+     * @notice Set staking rewards and auto-compounder. Can only be called once.
+     * @param _stakingRewards Staking rewards
+     * @param _autoCompounder Auto-compounder
+     */
+    function initialize(address _stakingRewards, address _autoCompounder) external {
+        if (msg.sender != DEPLOYER) {
+            revert WrappedLooksRareToken__Unauthorized();
+        }
+
+        if (initialized) {
+            revert WrappedLooksRareToken__AlreadyInitialized();
+        }
+
+        initialized = true;
+
+        stakingRewards = IStakingRewards(_stakingRewards);
+        autoCompounder = IERC4626(_autoCompounder);
+
+        emit Initialized(_stakingRewards, _autoCompounder);
+    }
+
+    /**
+     * @notice Wrap LOOKS to receive wLOOKS
+     * @param amount Wrap amount
+     */
+    function wrap(uint256 amount) external {
+        TRANSFER_MANAGER.transferERC20(LOOKS, msg.sender, address(this), amount);
+        _mint(msg.sender, amount);
+
+        emit Wrapped(msg.sender, amount);
+    }
+
+    /**
+     * @notice Wrap LOOKS and deposit wLOOKS straight into StakingRewards
+     * @param amount Wrap amount
+     */
+    function wrapAndStake(uint256 amount) external {
+        TRANSFER_MANAGER.transferERC20(LOOKS, msg.sender, address(this), amount);
+        _mint(address(this), amount);
+        _approve(address(this), address(stakingRewards), amount);
+        stakingRewards.stakeOnBehalf(amount, msg.sender);
+
+        emit Staked(msg.sender, amount);
+    }
+
+    /**
+     * @notice Wrap LOOKS and deposit wLOOKS straight into AutoCompounder
+     * @param amount Wrap amount
+     */
+    function wrapAndAutoCompound(uint256 amount) external {
+        TRANSFER_MANAGER.transferERC20(LOOKS, msg.sender, address(this), amount);
+        _mint(address(this), amount);
+        _approve(address(this), address(autoCompounder), amount);
+        autoCompounder.deposit(amount, msg.sender);
+
+        emit AutoCompounded(msg.sender, amount);
+    }
+
+    /**
+     * @notice Submit unwrap request
+     * @param amount Unwrap amount
+     */
+    function submitUnwrapRequest(uint216 amount) external {
+        if (balanceOf(msg.sender) < amount) {
+            revert WrappedLooksRareToken__InsufficientBalance();
+        }
+
+        if (unwrapRequests[msg.sender].timestamp != 0) {
+            revert WrappedLooksRareToken__OngoingUnwrapRequest();
+        }
+
+        _burn(msg.sender, amount);
+
+        unwrapRequests[msg.sender] = UnwrapRequest({amount: amount, timestamp: uint40(block.timestamp)});
+
+        emit UnwrapRequestSubmitted(msg.sender, amount);
+    }
+
+    /**
+     * @notice Complete unwrap request to receive LOOKS
+     */
+    function completeUnwrapRequest() external {
+        uint256 requestedAt = unwrapRequests[msg.sender].timestamp;
+        if (requestedAt == 0) {
+            revert WrappedLooksRareToken__NoUnwrapRequest();
+        }
+
+        unchecked {
+            if (requestedAt + UNWRAP_REQUEST_COOLDOWN > block.timestamp) {
+                revert WrappedLooksRareToken__TooEarlyToCompleteUnwrapRequest();
+            }
+        }
+
+        uint256 amount = unwrapRequests[msg.sender].amount;
+
+        unwrapRequests[msg.sender].amount = 0;
+        unwrapRequests[msg.sender].timestamp = 0;
+
+        _executeERC20DirectTransfer(LOOKS, msg.sender, amount);
+
+        emit UnwrapRequestCompleted(msg.sender, amount);
+    }
+
+    /**
+     * @notice Cancel unwrap request and get back wLOOKS
+     */
+    function cancelUnwrapRequest() external {
+        uint256 requestedAt = unwrapRequests[msg.sender].timestamp;
+        if (requestedAt == 0) {
+            revert WrappedLooksRareToken__NoUnwrapRequest();
+        }
+
+        uint256 amount = unwrapRequests[msg.sender].amount;
+
+        unwrapRequests[msg.sender].amount = 0;
+        unwrapRequests[msg.sender].timestamp = 0;
+
+        _mint(msg.sender, amount);
+
+        emit UnwrapRequestCancelled(msg.sender, amount);
+    }
+
+    /**
+     * @notice Unwrap LOOKS instantly. 5% of the unwrap amount is burned.
+     * @param amount Unwrap amount
+     */
+    function instantUnwrap(uint256 amount) external {
+        if (balanceOf(msg.sender) < amount) {
+            revert WrappedLooksRareToken__InsufficientBalance();
+        }
+
+        _burn(msg.sender, amount);
+
+        uint256 transferAmount = (amount * INSTANT_UNWRAP_AMOUNT_AFTER_FEE_IN_BASIS_POINTS) / 10_000;
+        _executeERC20DirectTransfer(LOOKS, msg.sender, transferAmount);
+        unchecked {
+            _executeERC20DirectTransfer(LOOKS, 0x000000000000000000000000000000000000dEaD, amount - transferAmount);
+        }
+
+        emit InstantUnwrap(msg.sender, amount);
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        if (to == address(this)) {
+            revert WrappedLooksRareToken__InvalidAddress();
+        }
+        return super.transfer(to, value);
+    }
+
+    function transferFrom(address from, address to, uint256 value) public override returns (bool) {
+        if (to == address(this)) {
+            revert WrappedLooksRareToken__InvalidAddress();
+        }
+        return super.transferFrom(from, to, value);
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/lowLevelCallers/LowLevelERC20Transfer.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+// Interfaces
+import {IERC20} from "../interfaces/generic/IERC20.sol";
+
+// Errors
+import {ERC20TransferFail, ERC20TransferFromFail} from "../errors/LowLevelErrors.sol";
+import {NotAContract} from "../errors/GenericErrors.sol";
+
+/**
+ * @title LowLevelERC20Transfer
+ * @notice This contract contains low-level calls to transfer ERC20 tokens.
+ * @author LooksRare protocol team (👀,💎)
+ */
+contract LowLevelERC20Transfer {
+    /**
+     * @notice Execute ERC20 transferFrom
+     * @param currency Currency address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param amount Amount to transfer
+     */
+    function _executeERC20TransferFrom(address currency, address from, address to, uint256 amount) internal {
+        if (currency.code.length == 0) {
+            revert NotAContract();
+        }
+
+        (bool status, bytes memory data) = currency.call(abi.encodeCall(IERC20.transferFrom, (from, to, amount)));
+
+        if (!status) {
+            revert ERC20TransferFromFail();
+        }
+
+        if (data.length > 0) {
+            if (!abi.decode(data, (bool))) {
+                revert ERC20TransferFromFail();
+            }
+        }
+    }
+
+    /**
+     * @notice Execute ERC20 (direct) transfer
+     * @param currency Currency address
+     * @param to Recipient address
+     * @param amount Amount to transfer
+     */
+    function _executeERC20DirectTransfer(address currency, address to, uint256 amount) internal {
+        if (currency.code.length == 0) {
+            revert NotAContract();
+        }
+
+        (bool status, bytes memory data) = currency.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+
+        if (!status) {
+            revert ERC20TransferFail();
+        }
+
+        if (data.length > 0) {
+            if (!abi.decode(data, (bool))) {
+                revert ERC20TransferFail();
+            }
+        }
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-transfer-manager/contracts/interfaces/ITransferManager.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+// Enums
+import {TokenType} from "../enums/TokenType.sol";
+
+/**
+ * @title ITransferManager
+ * @author LooksRare protocol team (👀,💎)
+ */
+interface ITransferManager {
+    /**
+     * @notice This struct is only used for transferBatchItemsAcrossCollections.
+     * @param tokenAddress Token address
+     * @param tokenType 0 for ERC721, 1 for ERC1155
+     * @param itemIds Array of item ids to transfer
+     * @param amounts Array of amounts to transfer
+     */
+    struct BatchTransferItem {
+        address tokenAddress;
+        TokenType tokenType;
+        uint256[] itemIds;
+        uint256[] amounts;
+    }
+
+    /**
+     * @notice It is emitted if operators' approvals to transfer NFTs are granted by a user.
+     * @param user Address of the user
+     * @param operators Array of operator addresses
+     */
+    event ApprovalsGranted(address user, address[] operators);
+
+    /**
+     * @notice It is emitted if operators' approvals to transfer NFTs are revoked by a user.
+     * @param user Address of the user
+     * @param operators Array of operator addresses
+     */
+    event ApprovalsRemoved(address user, address[] operators);
+
+    /**
+     * @notice It is emitted if a new operator is added to the global allowlist.
+     * @param operator Operator address
+     */
+    event OperatorAllowed(address operator);
+
+    /**
+     * @notice It is emitted if an operator is removed from the global allowlist.
+     * @param operator Operator address
+     */
+    event OperatorRemoved(address operator);
+
+    /**
+     * @notice It is returned if the operator to approve has already been approved by the user.
+     */
+    error OperatorAlreadyApprovedByUser();
+
+    /**
+     * @notice It is returned if the operator to revoke has not been previously approved by the user.
+     */
+    error OperatorNotApprovedByUser();
+
+    /**
+     * @notice It is returned if the transfer caller is already allowed by the owner.
+     * @dev This error can only be returned for owner operations.
+     */
+    error OperatorAlreadyAllowed();
+
+    /**
+     * @notice It is returned if the operator to approve is not in the global allowlist defined by the owner.
+     * @dev This error can be returned if the user tries to grant approval to an operator address not in the
+     *      allowlist or if the owner tries to remove the operator from the global allowlist.
+     */
+    error OperatorNotAllowed();
+
+    /**
+     * @notice It is returned if the transfer caller is invalid.
+     *         For a transfer called to be valid, the operator must be in the global allowlist and
+     *         approved by the 'from' user.
+     */
+    error TransferCallerInvalid();
+
+    /**
+     * @notice This function transfers ERC20 tokens.
+     * @param tokenAddress Token address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param amount amount
+     */
+    function transferERC20(
+        address tokenAddress,
+        address from,
+        address to,
+        uint256 amount
+    ) external;
+
+    /**
+     * @notice This function transfers a single item for a single ERC721 collection.
+     * @param tokenAddress Token address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param itemId Item ID
+     */
+    function transferItemERC721(
+        address tokenAddress,
+        address from,
+        address to,
+        uint256 itemId
+    ) external;
+
+    /**
+     * @notice This function transfers items for a single ERC721 collection.
+     * @param tokenAddress Token address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param itemIds Array of itemIds
+     * @param amounts Array of amounts
+     */
+    function transferItemsERC721(
+        address tokenAddress,
+        address from,
+        address to,
+        uint256[] calldata itemIds,
+        uint256[] calldata amounts
+    ) external;
+
+    /**
+     * @notice This function transfers a single item for a single ERC1155 collection.
+     * @param tokenAddress Token address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param itemId Item ID
+     * @param amount Amount
+     */
+    function transferItemERC1155(
+        address tokenAddress,
+        address from,
+        address to,
+        uint256 itemId,
+        uint256 amount
+    ) external;
+
+    /**
+     * @notice This function transfers items for a single ERC1155 collection.
+     * @param tokenAddress Token address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param itemIds Array of itemIds
+     * @param amounts Array of amounts
+     * @dev It does not allow batch transferring if from = msg.sender since native function should be used.
+     */
+    function transferItemsERC1155(
+        address tokenAddress,
+        address from,
+        address to,
+        uint256[] calldata itemIds,
+        uint256[] calldata amounts
+    ) external;
+
+    /**
+     * @notice This function transfers items across an array of tokens that can be ERC20, ERC721 and ERC1155.
+     * @param items Array of BatchTransferItem
+     * @param from Sender address
+     * @param to Recipient address
+     */
+    function transferBatchItemsAcrossCollections(
+        BatchTransferItem[] calldata items,
+        address from,
+        address to
+    ) external;
+
+    /**
+     * @notice This function allows a user to grant approvals for an array of operators.
+     *         Users cannot grant approvals if the operator is not allowed by this contract's owner.
+     * @param operators Array of operator addresses
+     * @dev Each operator address must be globally allowed to be approved.
+     */
+    function grantApprovals(address[] calldata operators) external;
+
+    /**
+     * @notice This function allows a user to revoke existing approvals for an array of operators.
+     * @param operators Array of operator addresses
+     * @dev Each operator address must be approved at the user level to be revoked.
+     */
+    function revokeApprovals(address[] calldata operators) external;
+
+    /**
+     * @notice This function allows an operator to be added for the shared transfer system.
+     *         Once the operator is allowed, users can grant NFT approvals to this operator.
+     * @param operator Operator address to allow
+     * @dev Only callable by owner.
+     */
+    function allowOperator(address operator) external;
+
+    /**
+     * @notice This function allows the user to remove an operator for the shared transfer system.
+     * @param operator Operator address to remove
+     * @dev Only callable by owner.
+     */
+    function removeOperator(address operator) external;
+
+    /**
+     * @notice This returns whether the user has approved the operator address.
+     * The first address is the user and the second address is the operator.
+     */
+    function hasUserApprovedOperator(address user, address operator) external view returns (bool);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/ERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/ERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "./IERC20.sol";
+import {IERC20Metadata} from "./extensions/IERC20Metadata.sol";
+import {Context} from "../../utils/Context.sol";
+import {IERC20Errors} from "../../interfaces/draft-IERC6093.sol";
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.openzeppelin.com/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * The default value of {decimals} is 18. To change this, you should override
+ * this function so it returns a different value.
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ */
+abstract contract ERC20 is Context, IERC20, IERC20Metadata, IERC20Errors {
+    mapping(address account => uint256) private _balances;
+
+    mapping(address account => mapping(address spender => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the default value returned by this function, unless
+     * it's overridden.
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `value`.
+     */
+    function transfer(address to, uint256 value) public virtual returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, value);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `value` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 value) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, value);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `value`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `value`.
+     */
+    function transferFrom(address from, address to, uint256 value) public virtual returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, value);
+        _transfer(from, to, value);
+        return true;
+    }
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * NOTE: This function is not virtual, {_update} should be overridden instead.
+     */
+    function _transfer(address from, address to, uint256 value) internal {
+        if (from == address(0)) {
+            revert ERC20InvalidSender(address(0));
+        }
+        if (to == address(0)) {
+            revert ERC20InvalidReceiver(address(0));
+        }
+        _update(from, to, value);
+    }
+
+    /**
+     * @dev Transfers a `value` amount of tokens from `from` to `to`, or alternatively mints (or burns) if `from`
+     * (or `to`) is the zero address. All customizations to transfers, mints, and burns should be done by overriding
+     * this function.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _update(address from, address to, uint256 value) internal virtual {
+        if (from == address(0)) {
+            // Overflow check required: The rest of the code assumes that totalSupply never overflows
+            _totalSupply += value;
+        } else {
+            uint256 fromBalance = _balances[from];
+            if (fromBalance < value) {
+                revert ERC20InsufficientBalance(from, fromBalance, value);
+            }
+            unchecked {
+                // Overflow not possible: value <= fromBalance <= totalSupply.
+                _balances[from] = fromBalance - value;
+            }
+        }
+
+        if (to == address(0)) {
+            unchecked {
+                // Overflow not possible: value <= totalSupply or value <= fromBalance <= totalSupply.
+                _totalSupply -= value;
+            }
+        } else {
+            unchecked {
+                // Overflow not possible: balance + value is at most totalSupply, which we know fits into a uint256.
+                _balances[to] += value;
+            }
+        }
+
+        emit Transfer(from, to, value);
+    }
+
+    /**
+     * @dev Creates a `value` amount of tokens and assigns them to `account`, by transferring it from address(0).
+     * Relies on the `_update` mechanism
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * NOTE: This function is not virtual, {_update} should be overridden instead.
+     */
+    function _mint(address account, uint256 value) internal {
+        if (account == address(0)) {
+            revert ERC20InvalidReceiver(address(0));
+        }
+        _update(address(0), account, value);
+    }
+
+    /**
+     * @dev Destroys a `value` amount of tokens from `account`, lowering the total supply.
+     * Relies on the `_update` mechanism.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * NOTE: This function is not virtual, {_update} should be overridden instead
+     */
+    function _burn(address account, uint256 value) internal {
+        if (account == address(0)) {
+            revert ERC20InvalidSender(address(0));
+        }
+        _update(account, address(0), value);
+    }
+
+    /**
+     * @dev Sets `value` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     *
+     * Overrides to this logic should be done to the variant with an additional `bool emitEvent` argument.
+     */
+    function _approve(address owner, address spender, uint256 value) internal {
+        _approve(owner, spender, value, true);
+    }
+
+    /**
+     * @dev Variant of {_approve} with an optional flag to enable or disable the {Approval} event.
+     *
+     * By default (when calling {_approve}) the flag is set to true. On the other hand, approval changes made by
+     * `_spendAllowance` during the `transferFrom` operation set the flag to false. This saves gas by not emitting any
+     * `Approval` event during `transferFrom` operations.
+     *
+     * Anyone who wishes to continue emitting `Approval` events on the`transferFrom` operation can force the flag to
+     * true using the following override:
+     * ```
+     * function _approve(address owner, address spender, uint256 value, bool) internal virtual override {
+     *     super._approve(owner, spender, value, true);
+     * }
+     * ```
+     *
+     * Requirements are the same as {_approve}.
+     */
+    function _approve(address owner, address spender, uint256 value, bool emitEvent) internal virtual {
+        if (owner == address(0)) {
+            revert ERC20InvalidApprover(address(0));
+        }
+        if (spender == address(0)) {
+            revert ERC20InvalidSpender(address(0));
+        }
+        _allowances[owner][spender] = value;
+        if (emitEvent) {
+            emit Approval(owner, spender, value);
+        }
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `value`.
+     *
+     * Does not update the allowance value in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Does not emit an {Approval} event.
+     */
+    function _spendAllowance(address owner, address spender, uint256 value) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            if (currentAllowance < value) {
+                revert ERC20InsufficientAllowance(spender, currentAllowance, value);
+            }
+            unchecked {
+                _approve(owner, spender, currentAllowance - value, false);
+            }
+        }
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/interfaces/IERC4626.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC4626.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "../token/ERC20/extensions/IERC20Metadata.sol";
+
+/**
+ * @dev Interface of the ERC4626 "Tokenized Vault Standard", as defined in
+ * https://eips.ethereum.org/EIPS/eip-4626[ERC-4626].
+ */
+interface IERC4626 is IERC20, IERC20Metadata {
+    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
+
+    event Withdraw(
+        address indexed sender,
+        address indexed receiver,
+        address indexed owner,
+        uint256 assets,
+        uint256 shares
+    );
+
+    /**
+     * @dev Returns the address of the underlying token used for the Vault for accounting, depositing, and withdrawing.
+     *
+     * - MUST be an ERC-20 token contract.
+     * - MUST NOT revert.
+     */
+    function asset() external view returns (address assetTokenAddress);
+
+    /**
+     * @dev Returns the total amount of the underlying asset that is “managed” by Vault.
+     *
+     * - SHOULD include any compounding that occurs from yield.
+     * - MUST be inclusive of any fees that are charged against assets in the Vault.
+     * - MUST NOT revert.
+     */
+    function totalAssets() external view returns (uint256 totalManagedAssets);
+
+    /**
+     * @dev Returns the amount of shares that the Vault would exchange for the amount of assets provided, in an ideal
+     * scenario where all the conditions are met.
+     *
+     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.
+     * - MUST NOT show any variations depending on the caller.
+     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.
+     * - MUST NOT revert.
+     *
+     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the
+     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and
+     * from.
+     */
+    function convertToShares(uint256 assets) external view returns (uint256 shares);
+
+    /**
+     * @dev Returns the amount of assets that the Vault would exchange for the amount of shares provided, in an ideal
+     * scenario where all the conditions are met.
+     *
+     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.
+     * - MUST NOT show any variations depending on the caller.
+     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.
+     * - MUST NOT revert.
+     *
+     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the
+     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and
+     * from.
+     */
+    function convertToAssets(uint256 shares) external view returns (uint256 assets);
+
+    /**
+     * @dev Returns the maximum amount of the underlying asset that can be deposited into the Vault for the receiver,
+     * through a deposit call.
+     *
+     * - MUST return a limited value if receiver is subject to some deposit limit.
+     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of assets that may be deposited.
+     * - MUST NOT revert.
+     */
+    function maxDeposit(address receiver) external view returns (uint256 maxAssets);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their deposit at the current block, given
+     * current on-chain conditions.
+     *
+     * - MUST return as close to and no more than the exact amount of Vault shares that would be minted in a deposit
+     *   call in the same transaction. I.e. deposit should return the same or more shares as previewDeposit if called
+     *   in the same transaction.
+     * - MUST NOT account for deposit limits like those returned from maxDeposit and should always act as though the
+     *   deposit would be accepted, regardless if the user has enough tokens approved, etc.
+     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToShares and previewDeposit SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by depositing.
+     */
+    function previewDeposit(uint256 assets) external view returns (uint256 shares);
+
+    /**
+     * @dev Mints shares Vault shares to receiver by depositing exactly amount of underlying tokens.
+     *
+     * - MUST emit the Deposit event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+     *   deposit execution, and are accounted for during deposit.
+     * - MUST revert if all of assets cannot be deposited (due to deposit limit being reached, slippage, the user not
+     *   approving enough underlying tokens to the Vault contract, etc).
+     *
+     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.
+     */
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+
+    /**
+     * @dev Returns the maximum amount of the Vault shares that can be minted for the receiver, through a mint call.
+     * - MUST return a limited value if receiver is subject to some mint limit.
+     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of shares that may be minted.
+     * - MUST NOT revert.
+     */
+    function maxMint(address receiver) external view returns (uint256 maxShares);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their mint at the current block, given
+     * current on-chain conditions.
+     *
+     * - MUST return as close to and no fewer than the exact amount of assets that would be deposited in a mint call
+     *   in the same transaction. I.e. mint should return the same or fewer assets as previewMint if called in the
+     *   same transaction.
+     * - MUST NOT account for mint limits like those returned from maxMint and should always act as though the mint
+     *   would be accepted, regardless if the user has enough tokens approved, etc.
+     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToAssets and previewMint SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by minting.
+     */
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+
+    /**
+     * @dev Mints exactly shares Vault shares to receiver by depositing amount of underlying tokens.
+     *
+     * - MUST emit the Deposit event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the mint
+     *   execution, and are accounted for during mint.
+     * - MUST revert if all of shares cannot be minted (due to deposit limit being reached, slippage, the user not
+     *   approving enough underlying tokens to the Vault contract, etc).
+     *
+     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.
+     */
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+
+    /**
+     * @dev Returns the maximum amount of the underlying asset that can be withdrawn from the owner balance in the
+     * Vault, through a withdraw call.
+     *
+     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.
+     * - MUST NOT revert.
+     */
+    function maxWithdraw(address owner) external view returns (uint256 maxAssets);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their withdrawal at the current block,
+     * given current on-chain conditions.
+     *
+     * - MUST return as close to and no fewer than the exact amount of Vault shares that would be burned in a withdraw
+     *   call in the same transaction. I.e. withdraw should return the same or fewer shares as previewWithdraw if
+     *   called
+     *   in the same transaction.
+     * - MUST NOT account for withdrawal limits like those returned from maxWithdraw and should always act as though
+     *   the withdrawal would be accepted, regardless if the user has enough shares, etc.
+     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToShares and previewWithdraw SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by depositing.
+     */
+    function previewWithdraw(uint256 assets) external view returns (uint256 shares);
+
+    /**
+     * @dev Burns shares from owner and sends exactly assets of underlying tokens to receiver.
+     *
+     * - MUST emit the Withdraw event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+     *   withdraw execution, and are accounted for during withdraw.
+     * - MUST revert if all of assets cannot be withdrawn (due to withdrawal limit being reached, slippage, the owner
+     *   not having enough shares, etc).
+     *
+     * Note that some implementations will require pre-requesting to the Vault before a withdrawal may be performed.
+     * Those methods should be performed separately.
+     */
+    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+
+    /**
+     * @dev Returns the maximum amount of Vault shares that can be redeemed from the owner balance in the Vault,
+     * through a redeem call.
+     *
+     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.
+     * - MUST return balanceOf(owner) if owner is not subject to any withdrawal limit or timelock.
+     * - MUST NOT revert.
+     */
+    function maxRedeem(address owner) external view returns (uint256 maxShares);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their redeemption at the current block,
+     * given current on-chain conditions.
+     *
+     * - MUST return as close to and no more than the exact amount of assets that would be withdrawn in a redeem call
+     *   in the same transaction. I.e. redeem should return the same or more assets as previewRedeem if called in the
+     *   same transaction.
+     * - MUST NOT account for redemption limits like those returned from maxRedeem and should always act as though the
+     *   redemption would be accepted, regardless if the user has enough shares, etc.
+     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToAssets and previewRedeem SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by redeeming.
+     */
+    function previewRedeem(uint256 shares) external view returns (uint256 assets);
+
+    /**
+     * @dev Burns exactly shares from owner and sends assets of underlying tokens to receiver.
+     *
+     * - MUST emit the Withdraw event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+     *   redeem execution, and are accounted for during redeem.
+     * - MUST revert if all of shares cannot be redeemed (due to withdrawal limit being reached, slippage, the owner
+     *   not having enough shares, etc).
+     *
+     * NOTE: some implementations will require pre-requesting to the Vault before a withdrawal may be performed.
+     * Those methods should be performed separately.
+     */
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+}
+
+
+// File: contracts/interfaces/IStakingRewards.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity ^0.8.7;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @title IStakingRewardsFunctions
+/// @notice Interface for the staking rewards contract that interact with the `RewardsDistributor` contract
+interface IStakingRewardsFunctions {
+    function notifyRewardAmount(uint256 reward) external;
+
+    function recoverERC20(address tokenAddress, address to, uint256 tokenAmount) external;
+
+    function setNewRewardsDistribution(address newRewardsDistribution) external;
+}
+
+/// @title IStakingRewards
+/// @notice Previous interface with additionnal getters for public variables
+interface IStakingRewards is IStakingRewardsFunctions {
+    function periodFinish() external view returns (uint256);
+
+    function rewardToken() external view returns (IERC20);
+
+    function getReward() external;
+
+    function stake(uint256 amount) external;
+
+    function withdraw(uint256 amount) external;
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function earned(address account) external view returns (uint256);
+
+    function stakeOnBehalf(uint256 amount, address staker) external;
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/interfaces/generic/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IERC20 {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+    function decimals() external view returns (uint8);
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/errors/LowLevelErrors.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @notice It is emitted if the ETH transfer fails.
+ */
+error ETHTransferFail();
+
+/**
+ * @notice It is emitted if the ERC20 approval fails.
+ */
+error ERC20ApprovalFail();
+
+/**
+ * @notice It is emitted if the ERC20 transfer fails.
+ */
+error ERC20TransferFail();
+
+/**
+ * @notice It is emitted if the ERC20 transferFrom fails.
+ */
+error ERC20TransferFromFail();
+
+/**
+ * @notice It is emitted if the ERC721 transferFrom fails.
+ */
+error ERC721TransferFromFail();
+
+/**
+ * @notice It is emitted if the ERC1155 safeTransferFrom fails.
+ */
+error ERC1155SafeTransferFromFail();
+
+/**
+ * @notice It is emitted if the ERC1155 safeBatchTransferFrom fails.
+ */
+error ERC1155SafeBatchTransferFromFail();
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/errors/GenericErrors.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @notice It is emitted if the call recipient is not a contract.
+ */
+error NotAContract();
+
+
+// File: node_modules/@looksrare/contracts-transfer-manager/contracts/enums/TokenType.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+enum TokenType {
+    ERC20,
+    ERC721,
+    ERC1155
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/interfaces/draft-IERC6093.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/draft-IERC6093.sol)
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Standard ERC20 Errors
+ * Interface of the https://eips.ethereum.org/EIPS/eip-6093[ERC-6093] custom errors for ERC20 tokens.
+ */
+interface IERC20Errors {
+    /**
+     * @dev Indicates an error related to the current `balance` of a `sender`. Used in transfers.
+     * @param sender Address whose tokens are being transferred.
+     * @param balance Current balance for the interacting account.
+     * @param needed Minimum amount required to perform a transfer.
+     */
+    error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed);
+
+    /**
+     * @dev Indicates a failure with the token `sender`. Used in transfers.
+     * @param sender Address whose tokens are being transferred.
+     */
+    error ERC20InvalidSender(address sender);
+
+    /**
+     * @dev Indicates a failure with the token `receiver`. Used in transfers.
+     * @param receiver Address to which tokens are being transferred.
+     */
+    error ERC20InvalidReceiver(address receiver);
+
+    /**
+     * @dev Indicates a failure with the `spender`’s `allowance`. Used in transfers.
+     * @param spender Address that may be allowed to operate on tokens without being their owner.
+     * @param allowance Amount of tokens a `spender` is allowed to operate with.
+     * @param needed Minimum amount required to perform a transfer.
+     */
+    error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
+
+    /**
+     * @dev Indicates a failure with the `approver` of a token to be approved. Used in approvals.
+     * @param approver Address initiating an approval operation.
+     */
+    error ERC20InvalidApprover(address approver);
+
+    /**
+     * @dev Indicates a failure with the `spender` to be approved. Used in approvals.
+     * @param spender Address that may be allowed to operate on tokens without being their owner.
+     */
+    error ERC20InvalidSpender(address spender);
+}
+
+/**
+ * @dev Standard ERC721 Errors
+ * Interface of the https://eips.ethereum.org/EIPS/eip-6093[ERC-6093] custom errors for ERC721 tokens.
+ */
+interface IERC721Errors {
+    /**
+     * @dev Indicates that an address can't be an owner. For example, `address(0)` is a forbidden owner in EIP-20.
+     * Used in balance queries.
+     * @param owner Address of the current owner of a token.
+     */
+    error ERC721InvalidOwner(address owner);
+
+    /**
+     * @dev Indicates a `tokenId` whose `owner` is the zero address.
+     * @param tokenId Identifier number of a token.
+     */
+    error ERC721NonexistentToken(uint256 tokenId);
+
+    /**
+     * @dev Indicates an error related to the ownership over a particular token. Used in transfers.
+     * @param sender Address whose tokens are being transferred.
+     * @param tokenId Identifier number of a token.
+     * @param owner Address of the current owner of a token.
+     */
+    error ERC721IncorrectOwner(address sender, uint256 tokenId, address owner);
+
+    /**
+     * @dev Indicates a failure with the token `sender`. Used in transfers.
+     * @param sender Address whose tokens are being transferred.
+     */
+    error ERC721InvalidSender(address sender);
+
+    /**
+     * @dev Indicates a failure with the token `receiver`. Used in transfers.
+     * @param receiver Address to which tokens are being transferred.
+     */
+    error ERC721InvalidReceiver(address receiver);
+
+    /**
+     * @dev Indicates a failure with the `operator`’s approval. Used in transfers.
+     * @param operator Address that may be allowed to operate on tokens without being their owner.
+     * @param tokenId Identifier number of a token.
+     */
+    error ERC721InsufficientApproval(address operator, uint256 tokenId);
+
+    /**
+     * @dev Indicates a failure with the `approver` of a token to be approved. Used in approvals.
+     * @param approver Address initiating an approval operation.
+     */
+    error ERC721InvalidApprover(address approver);
+
+    /**
+     * @dev Indicates a failure with the `operator` to be approved. Used in approvals.
+     * @param operator Address that may be allowed to operate on tokens without being their owner.
+     */
+    error ERC721InvalidOperator(address operator);
+}
+
+/**
+ * @dev Standard ERC1155 Errors
+ * Interface of the https://eips.ethereum.org/EIPS/eip-6093[ERC-6093] custom errors for ERC1155 tokens.
+ */
+interface IERC1155Errors {
+    /**
+     * @dev Indicates an error related to the current `balance` of a `sender`. Used in transfers.
+     * @param sender Address whose tokens are being transferred.
+     * @param balance Current balance for the interacting account.
+     * @param needed Minimum amount required to perform a transfer.
+     * @param tokenId Identifier number of a token.
+     */
+    error ERC1155InsufficientBalance(address sender, uint256 balance, uint256 needed, uint256 tokenId);
+
+    /**
+     * @dev Indicates a failure with the token `sender`. Used in transfers.
+     * @param sender Address whose tokens are being transferred.
+     */
+    error ERC1155InvalidSender(address sender);
+
+    /**
+     * @dev Indicates a failure with the token `receiver`. Used in transfers.
+     * @param receiver Address to which tokens are being transferred.
+     */
+    error ERC1155InvalidReceiver(address receiver);
+
+    /**
+     * @dev Indicates a failure with the `operator`’s approval. Used in transfers.
+     * @param operator Address that may be allowed to operate on tokens without being their owner.
+     * @param owner Address of the current owner of a token.
+     */
+    error ERC1155MissingApprovalForAll(address operator, address owner);
+
+    /**
+     * @dev Indicates a failure with the `approver` of a token to be approved. Used in approvals.
+     * @param approver Address initiating an approval operation.
+     */
+    error ERC1155InvalidApprover(address approver);
+
+    /**
+     * @dev Indicates a failure with the `operator` to be approved. Used in approvals.
+     * @param operator Address that may be allowed to operate on tokens without being their owner.
+     */
+    error ERC1155InvalidOperator(address operator);
+
+    /**
+     * @dev Indicates an array length mismatch between ids and values in a safeBatchTransferFrom operation.
+     * Used in batch transfers.
+     * @param idsLength Length of the array of token identifiers
+     * @param valuesLength Length of the array of token amounts
+     */
+    error ERC1155InvalidArrayLength(uint256 idsLength, uint256 valuesLength);
+}
+

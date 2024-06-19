@@ -1,0 +1,1430 @@
+
+// File: src/RealVault.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.21;
+
+// https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/extensions/ERC4626.sol
+
+import {ReentrancyGuard} from "oz/utils/ReentrancyGuard.sol";
+import {Ownable} from "oz/access/Ownable.sol";
+import {Ownable2Step} from "oz/access/Ownable2Step.sol";
+import {TransferHelper} from "v3-periphery/libraries/TransferHelper.sol";
+import {IReal} from "./interfaces/IReal.sol";
+import {IMinter} from "./interfaces/IMinter.sol";
+import {IAssetsVault} from "./interfaces/IAssetsVault.sol";
+import {IStrategyManager} from "./interfaces/IStrategyManager.sol";
+import {ShareMath} from "./libraries/ShareMath.sol";
+
+/**
+ * @title Real Ether Vault (reETH)
+ * @author Mavvverick
+ * @notice The Real Vault (reETH) is responsible for managing deposit, withdrawal, and settlement processes
+ * using ERC4626 standard. Users can deposit ETH into the Vault, where it is held securely until settlement,
+ * thereby participating in the yield generation process and receiving rewards as reETH token holders.
+ * Upon settlement, funds are deployed to the underlying strategy pool for yield generation.The Vault ensures
+ * the security of deposited assets and facilitates seamless interactions within the Real Network ecosystem.
+ * Users can interact with the Vault to deposit, withdraw, and settle RealETH tokens, contributing to the
+ * stability and growth of the platform. Additionally, the Vault's architecture provides flexibility for
+ * future yield staking /re-staking strategy and optimizations, ensuring its continued effectiveness in
+ * managing assets and supporting the Real Network infrastructure.
+ */
+contract RealVault is ReentrancyGuard, Ownable2Step {
+    uint256 internal constant ONE = 1;
+    uint256 internal constant MULTIPLIER = 10 ** 18;
+    uint256 internal constant ONE_HUNDRED_PERCENT = 100_0000;
+    uint256 internal constant MAXMIUM_FEE_RATE = ONE_HUNDRED_PERCENT / 100; // 1%
+    uint256 internal constant MINIMUM_REBASE_INTERVAL = 60 * 60; // 1hour
+    uint256 internal constant NUMBER_OF_DEAD_SHARES = 10 ** 15;
+
+    uint256 public minWithdrawableShares = 1_00;
+    uint256 public rebaseTimeInterval = 24 * 60 * 60; // 1 day
+    uint256 public rebaseTime;
+
+    address public immutable minter;
+    address public immutable real;
+    address payable public immutable assetsVault;
+    address payable public immutable strategyManager;
+
+    address public proposal;
+    address public feeRecipient;
+
+    uint256 public latestRoundID;
+    uint256 public withdrawFeeRate;
+
+    uint256 public withdrawableAmountInPast;
+    uint256 public withdrawingSharesInPast;
+    uint256 public withdrawingSharesInRound;
+    uint256 public withdrawAmountDust;
+
+    /// @notice On every round's close, the pricePerShare value of an real token is stored
+    /// This is used to determine the number of shares to be returned
+    /// to a user at the time of minting
+    mapping(uint256 => uint256) public roundPricePerShare;
+    mapping(uint256 => uint256) public settlementTime;
+    mapping(address => WithdrawReceipt) public userReceipts;
+
+    struct WithdrawReceipt {
+        uint256 withdrawRound;
+        uint256 withdrawShares;
+        uint256 withdrawableAmount;
+    }
+
+    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
+    event InitiateWithdraw(address indexed account, uint256 shares, uint256 round);
+    event CancelWithdraw(address indexed account, uint256 amount, uint256 round);
+    event Withdrawn(address indexed account, uint256 amount, uint256 round);
+    event WithdrawnFromStrategy(
+        address indexed account, uint256 amount, uint256 actualAmount, uint256 totalAmount, uint256 round
+    );
+    event RollToNextRound(uint256 indexed round, uint256 vaultIn, uint256 vaultOut, uint256 sharePrice);
+    event VaultMigrated(address indexed oldVault, address newVault);
+    event StrategyAdded(address indexed strategy);
+    event StrategyDestroyed(address indexed strategy);
+    event StrategyCleared(address indexed strategy);
+    event InvestmentPortfolioUpdated(address[] indexed strategies, uint256[] indexed ratios);
+    event FeeCharged(address indexed account, uint256 amount);
+    event SetWithdrawFeeRate(uint256 indexed oldRate, uint256 newRate);
+    event SetFeeRecipient(address indexed oldAddr, address newAddr);
+    event SetRebaseInterval(uint256 indexed interval);
+    event SettleWithdrawDust(uint256 indexed dust);
+    event MinWithdrawableSharesUpdated(uint256 indexed minShares);
+    event ProposalUpdated(address indexed oldAddr, address newAddr);
+
+    error RealVault__NotReady();
+    error RealVault__Migrated();
+    error RealVault__InsufficientShares();
+    error RealVault__InvalidAmount();
+    error RealVault__ZeroAddress();
+    error RealVault__MininmumWithdraw();
+    error RealVault__WithdrawInstantly();
+    error RealVault__NoRequestFound();
+    error RealVault__NotProposal();
+    error RealVault__ExceedBalance();
+    error RealVault__WaitInQueue();
+    error RealVault__MinimumWithdrawableShares();
+    error RealVault__ExceedRequestedAmount(uint256 requestedAmount, uint256 actualAmount);
+    error RealVault__ExceedWithdrawAmount();
+    error RealVault__ExceedMaxFeeRate(uint256 _feeRate);
+    error RealVault__MinimumRebaseInterval(uint256 minInterval);
+
+    /**
+     * @param _intialOwner Address of the initial owner of the contract.
+     * @param _minter Address of the minter contract.
+     * @param _assetsVault Address of the assets vault contract.
+     * @param _strategyManager Address of the strategy manager contract.
+     * @param _proposal Address of the proposal contract.
+     */
+    constructor(
+        address _intialOwner,
+        address _minter,
+        address payable _assetsVault,
+        address payable _strategyManager,
+        address _proposal
+    ) payable Ownable(_intialOwner) {
+        if (_proposal == address(0) || _assetsVault == address(0) || _strategyManager == address(0)) {
+            revert RealVault__ZeroAddress();
+        }
+
+        minter = _minter;
+        proposal = _proposal;
+        assetsVault = _assetsVault;
+        strategyManager = _strategyManager;
+
+        real = IMinter(_minter).real();
+        rebaseTime = block.timestamp;
+
+        // mint dead shares
+        if (IReal(real).totalSupply() == 0) {
+            TransferHelper.safeTransferETH(assetsVault, NUMBER_OF_DEAD_SHARES);
+            IMinter(minter).mint(address(0xdead), NUMBER_OF_DEAD_SHARES);
+        }
+    }
+
+    /**
+     * @dev Modifier to restrict access to only the proposal contract.
+     */
+    modifier onlyProposal() {
+        if (proposal != msg.sender) revert RealVault__NotProposal();
+        _;
+    }
+
+    /**
+     * @dev Deposit assets into the RealVault.
+     * @return mintAmount The amount of shares minted.
+     */
+    function deposit(uint256 mintAmountMin) external payable nonReentrant returns (uint256 mintAmount) {
+        mintAmount = _depositFor(msg.sender, msg.sender, msg.value, mintAmountMin);
+    }
+
+    /**
+     * @dev Deposit assets into the RealVault on behalf of another address.
+     * @param receiver Address to receive the minted shares.
+     * @return mintAmount The amount of shares minted.
+     */
+    function depositFor(address receiver, uint256 mintAmountMin)
+        external
+        payable
+        nonReentrant
+        returns (uint256 mintAmount)
+    {
+        mintAmount = _depositFor(msg.sender, receiver, msg.value, mintAmountMin);
+    }
+
+    /**
+     * @dev Initiate a withdrawal request for a specified number of shares.
+     * @param _shares Number of shares to withdraw.
+     */
+    function requestWithdraw(uint256 _shares) external nonReentrant {
+        if (_shares == 0) revert RealVault__InvalidAmount();
+        if (_shares < minWithdrawableShares) revert RealVault__MininmumWithdraw();
+
+        uint256 _latestRoundID = latestRoundID;
+
+        if (_latestRoundID == 0) revert RealVault__WithdrawInstantly();
+
+        IReal realToken = IReal(real);
+        IMinter realEthMinter = IMinter(minter);
+
+        if (realToken.balanceOf(msg.sender) < _shares) revert RealVault__ExceedBalance();
+        TransferHelper.safeTransferFrom(real, msg.sender, address(this), _shares);
+
+        withdrawingSharesInRound = withdrawingSharesInRound + _shares;
+        WithdrawReceipt memory mReceipt = userReceipts[msg.sender];
+
+        if (mReceipt.withdrawRound == _latestRoundID) {
+            mReceipt.withdrawShares = mReceipt.withdrawShares + _shares;
+        } else if (mReceipt.withdrawRound == 0) {
+            mReceipt.withdrawShares = _shares;
+            mReceipt.withdrawRound = _latestRoundID;
+        } else {
+            // Withdraw previous round share first
+            mReceipt = _updateUserReceipt(mReceipt, realEthMinter, _shares, _latestRoundID);
+        }
+
+        userReceipts[msg.sender] = mReceipt;
+        emit InitiateWithdraw(msg.sender, _shares, _latestRoundID);
+    }
+
+    /**
+     * @dev Cancel a pending withdrawal request.
+     * @param _shares Number of shares to cancel the withdrawal for.
+     */
+    function cancelWithdraw(uint256 _shares) external nonReentrant {
+        if (_shares == 0) revert RealVault__InvalidAmount();
+
+        WithdrawReceipt memory mReceipt = userReceipts[msg.sender];
+        uint256 _latestRoundID = latestRoundID;
+
+        if (mReceipt.withdrawRound != _latestRoundID) revert RealVault__NoRequestFound();
+        if (_shares > mReceipt.withdrawShares) {
+            revert RealVault__ExceedRequestedAmount(_shares, mReceipt.withdrawShares);
+        }
+
+        unchecked {
+            mReceipt.withdrawShares -= _shares;
+        }
+
+        // check minimum shares request
+        if (mReceipt.withdrawShares != 0 && mReceipt.withdrawShares < minWithdrawableShares) {
+            revert RealVault__MininmumWithdraw();
+        }
+
+        TransferHelper.safeTransfer(real, msg.sender, _shares);
+
+        if (mReceipt.withdrawShares == 0) {
+            mReceipt.withdrawRound = 0;
+        }
+
+        userReceipts[msg.sender] = mReceipt;
+        withdrawingSharesInRound = withdrawingSharesInRound - _shares;
+
+        emit CancelWithdraw(msg.sender, _shares, _latestRoundID);
+    }
+
+    /**
+     * @dev Withdraw assets instantly or after a delay, depending on availability.
+     * @param _amount Amount of assets to withdraw.
+     * @param _shares Number of shares to withdraw.
+     * @return actualWithdrawn The actual amount of assets withdrawn.
+     */
+    function instantWithdraw(uint256 _amount, uint256 _shares)
+        external
+        nonReentrant
+        returns (uint256 actualWithdrawn)
+    {
+        if (_amount == 0 && _shares == 0) revert RealVault__InvalidAmount();
+
+        IAssetsVault aVault = IAssetsVault(assetsVault);
+        IMinter realEthMinter = IMinter(minter);
+
+        uint256 _latestRoundID = latestRoundID;
+        (uint256 idleAmount,) = getVaultAvailableAmount();
+
+        if (_amount != 0) {
+            WithdrawReceipt memory mReceipt = userReceipts[msg.sender];
+
+            if (mReceipt.withdrawRound != _latestRoundID && mReceipt.withdrawRound != 0) {
+                // Withdraw previous round share first
+                mReceipt = _updateUserReceipt(mReceipt, realEthMinter, 0, 0);
+            }
+
+            if (mReceipt.withdrawableAmount < _amount) revert RealVault__ExceedWithdrawAmount();
+
+            unchecked {
+                mReceipt.withdrawableAmount -= _amount;
+            }
+
+            userReceipts[msg.sender] = mReceipt;
+
+            withdrawableAmountInPast = withdrawableAmountInPast - _amount;
+            actualWithdrawn = _amount;
+
+            emit Withdrawn(msg.sender, _amount, _latestRoundID);
+        }
+
+        if (_shares != 0) {
+            uint256 sharePrice;
+
+            if (_latestRoundID == 0) {
+                sharePrice = MULTIPLIER;
+            } else {
+                uint256 currSharePrice = currentSharePrice();
+                uint256 latestSharePrice;
+
+                unchecked {
+                    latestSharePrice = roundPricePerShare[_latestRoundID - ONE];
+                }
+                sharePrice = latestSharePrice < currSharePrice ? latestSharePrice : currSharePrice;
+            }
+
+            uint256 ethAmount = ShareMath.sharesToAsset(_shares, sharePrice);
+
+            realEthMinter.burn(msg.sender, _shares);
+
+            if (ethAmount <= idleAmount) {
+                actualWithdrawn = actualWithdrawn + ethAmount;
+
+                emit Withdrawn(msg.sender, ethAmount, _latestRoundID);
+            } else {
+                actualWithdrawn = actualWithdrawn + idleAmount;
+
+                unchecked {
+                    ethAmount = ethAmount - idleAmount;
+                }
+
+                IStrategyManager manager = IStrategyManager(strategyManager);
+                // if strategy sells the LSD token on the decentralized exchange (DEX),
+                // deducting swap fees from the requested amount.
+                uint256 actualAmount = manager.forceWithdraw(ethAmount);
+
+                actualWithdrawn = actualWithdrawn + actualAmount;
+
+                emit WithdrawnFromStrategy(msg.sender, ethAmount, actualAmount, actualWithdrawn, _latestRoundID);
+            }
+        }
+
+        if (aVault.getBalance() < actualWithdrawn) revert RealVault__WaitInQueue();
+
+        uint256 withFee;
+        if (withdrawFeeRate != 0) {
+            withFee = (actualWithdrawn * withdrawFeeRate) / ONE_HUNDRED_PERCENT;
+            aVault.withdraw(feeRecipient, withFee);
+
+            emit FeeCharged(msg.sender, withFee);
+        }
+        unchecked {
+            aVault.withdraw(msg.sender, actualWithdrawn - withFee);
+        }
+    }
+
+    /**
+     * @dev Rebalances the strategies without incoming and outgoing amounts.
+     */
+    function onlyRebaseStrategies() external nonReentrant onlyProposal {
+        IStrategyManager(strategyManager).onlyRebaseStrategies();
+    }
+
+    /**
+     * @dev Transition to the next round, managing vault balances and share prices.
+     */
+    function rollToNextRound() external nonReentrant {
+        if (block.timestamp < rebaseTime + rebaseTimeInterval) revert RealVault__NotReady();
+        rebaseTime = block.timestamp;
+
+        IStrategyManager manager = IStrategyManager(strategyManager);
+        IAssetsVault aVault = IAssetsVault(assetsVault);
+        uint256 previewSharePrice = currentSharePrice();
+
+        uint256 vaultBalance = aVault.getBalance();
+        uint256 amountToWithdraw = ShareMath.sharesToAsset(withdrawingSharesInRound, previewSharePrice);
+        uint256 amountVaultNeed = withdrawableAmountInPast + amountToWithdraw;
+        uint256 allPendingValue = manager.getAllStrategyPendingValue();
+
+        uint256 vaultIn;
+        uint256 vaultOut;
+
+        if (vaultBalance > amountVaultNeed) {
+            unchecked {
+                vaultIn = vaultBalance - amountVaultNeed;
+            }
+        } else if (vaultBalance + allPendingValue < amountVaultNeed) {
+            unchecked {
+                vaultOut = amountVaultNeed - vaultBalance - allPendingValue;
+            }
+        }
+
+        manager.rebaseStrategies(vaultIn, vaultOut);
+
+        uint256 _latestRoundID = latestRoundID;
+        uint256 newSharePrice = currentSharePrice();
+        roundPricePerShare[_latestRoundID] = previewSharePrice < newSharePrice ? previewSharePrice : newSharePrice;
+
+        settlementTime[_latestRoundID] = block.timestamp;
+        unchecked {
+            latestRoundID = _latestRoundID + ONE;
+        }
+
+        withdrawingSharesInPast = withdrawingSharesInPast + withdrawingSharesInRound;
+        withdrawableAmountInPast =
+            withdrawableAmountInPast + ShareMath.sharesToAsset(withdrawingSharesInRound, newSharePrice);
+        withdrawingSharesInRound = 0;
+        emit RollToNextRound(latestRoundID, vaultIn, vaultOut, newSharePrice);
+    }
+
+    /**
+     * @dev Migrate the vault to a new contract.
+     * @param _vault Address of the new vault.
+     */
+    function migrateVault(address _vault) external onlyProposal {
+        IMinter(minter).setNewVault(_vault);
+        IAssetsVault(assetsVault).setNewVault(_vault);
+        IStrategyManager(strategyManager).setNewVault(_vault);
+
+        // migrate pending withdrawals by transferring any real token balance held by the contract
+        // to the new implementation which should manually migrate userReceipts entries.
+        IReal realToken = IReal(real);
+        uint256 balance = realToken.balanceOf(address(this));
+        if (balance > 0) TransferHelper.safeTransfer(real, _vault, balance);
+
+        emit VaultMigrated(address(this), _vault);
+    }
+
+    /**
+     * @dev Add a new strategy to the strategy manager.
+     * @param _strategy Address of the new strategy.
+     */
+    function addStrategy(address _strategy) external onlyProposal {
+        IStrategyManager manager = IStrategyManager(strategyManager);
+
+        manager.addStrategy(_strategy);
+        emit StrategyAdded(_strategy);
+    }
+
+    /**
+     * @dev Destroy a strategy from the strategy manager.
+     * Funds must be returned to the asset valut from the strategy before destroyin the strategy.
+     * @param _strategy Address of the strategy to destroy.
+     */
+    function destroyStrategy(address _strategy) external onlyOwner {
+        IStrategyManager manager = IStrategyManager(strategyManager);
+
+        manager.destroyStrategy(_strategy);
+        emit StrategyDestroyed(_strategy);
+    }
+
+    /**
+     * @dev Clear a strategy from the vault.
+     * Invested funds will be returned to the asset valut from the strategy
+     * @param _strategy Address of the strategy to clear.
+     */
+    function clearStrategy(address _strategy) external onlyOwner {
+        IStrategyManager manager = IStrategyManager(strategyManager);
+
+        manager.clearStrategy(_strategy);
+        emit StrategyCleared(_strategy);
+    }
+
+    /**
+     * @dev Update the investment portfolio of the vault.
+     * Set the strategy and potfolio allocation ratio in the manager.
+     * Previous strategy ratios will set to zero before applying the new allocation ratio.
+     * @param _strategies Array of addresses representing the new strategies.
+     * @param _ratios Array of ratios corresponding to the strategies.
+     */
+    function updateInvestmentPortfolio(address[] memory _strategies, uint256[] memory _ratios) external onlyProposal {
+        IStrategyManager manager = IStrategyManager(strategyManager);
+
+        manager.setStrategies(_strategies, _ratios);
+
+        emit InvestmentPortfolioUpdated(_strategies, _ratios);
+    }
+
+    /**
+     * @dev Update the address of the proposal contract or multisig.
+     * @param _proposal Address of the new proposal contract or multisig.
+     */
+    function updateProposal(address _proposal) external onlyProposal {
+        if (_proposal == address(0)) revert RealVault__ZeroAddress();
+        emit ProposalUpdated(proposal, _proposal);
+        proposal = _proposal;
+    }
+
+    function settleWithdrawDust(uint256 amount) external {
+        uint256 _withdrawAmountDust = withdrawAmountDust;
+        if (_withdrawAmountDust < MULTIPLIER) revert RealVault__InvalidAmount();
+        if (amount > _withdrawAmountDust) revert RealVault__ExceedBalance();
+        withdrawableAmountInPast -= amount;
+        withdrawAmountDust -= amount;
+        emit SettleWithdrawDust(amount);
+    }
+
+    // [INTERNAL FUNCTIONS]
+    function _depositFor(address caller, address receiver, uint256 assets, uint256 mintAmountMin)
+        internal
+        returns (uint256 mintAmount)
+    {
+        if (assets == 0) revert RealVault__InvalidAmount();
+
+        mintAmount = previewDeposit(address(this).balance); // shares amount to be minted
+        if (mintAmount < mintAmountMin) revert RealVault__InsufficientShares();
+
+        IAssetsVault(assetsVault).deposit{value: address(this).balance}();
+        IMinter(minter).mint(receiver, mintAmount);
+        emit Deposit(caller, receiver, assets, mintAmount);
+    }
+
+    function _updateUserReceipt(
+        WithdrawReceipt memory mReceipt,
+        IMinter realEthMinter,
+        uint256 _shares,
+        uint256 _latestRoundID
+    ) private returns (WithdrawReceipt memory) {
+        uint256 pps = roundPricePerShare[mReceipt.withdrawRound];
+        uint256 withdrawAmount = ShareMath.sharesToAsset(mReceipt.withdrawShares, pps);
+        uint256 convertedShares = ShareMath.assetToShares(withdrawAmount, pps);
+
+        if (withdrawAmount > 0 && convertedShares < mReceipt.withdrawShares) {
+            // Default is to round down (Solidity), track dust for withdrawAmount
+            withdrawAmountDust++;
+        }
+
+        realEthMinter.burn(address(this), mReceipt.withdrawShares);
+        withdrawingSharesInPast = withdrawingSharesInPast - mReceipt.withdrawShares;
+
+        mReceipt.withdrawShares = _shares;
+        mReceipt.withdrawableAmount = mReceipt.withdrawableAmount + withdrawAmount;
+
+        mReceipt.withdrawRound = _latestRoundID;
+        return mReceipt;
+    }
+
+    // [SETTER FUNCTIONS]
+
+    /**
+     * @dev Sets the withdrawal fee rate.
+     * @param _withdrawFeeRate The new withdrawal fee rate.
+     * Requirements:
+     * - The new fee rate must not exceed the maximum fee rate.
+     */
+    function setWithdrawFeeRate(uint256 _withdrawFeeRate) external onlyOwner {
+        if (_withdrawFeeRate > MAXMIUM_FEE_RATE) revert RealVault__ExceedMaxFeeRate(_withdrawFeeRate);
+
+        emit SetWithdrawFeeRate(withdrawFeeRate, _withdrawFeeRate);
+
+        withdrawFeeRate = _withdrawFeeRate;
+    }
+
+    /**
+     * @dev Sets the fee recipient address.
+     * @param _feeRecipient The new fee recipient address.
+     * Requirements:
+     * - The new fee recipient address must not be the zero address.
+     */
+    function setFeeRecipient(address _feeRecipient) external onlyOwner {
+        if (_feeRecipient == address(0)) revert RealVault__ZeroAddress();
+
+        emit SetFeeRecipient(feeRecipient, _feeRecipient);
+
+        feeRecipient = _feeRecipient;
+    }
+
+    /**
+     * @dev Sets the rebase interval.
+     * @param _interval The new rebase interval.
+     * Requirements:
+     * - The new interval must not be less than the minimum rebase interval.
+     */
+    function setRebaseInterval(uint256 _interval) external onlyOwner {
+        if (_interval < MINIMUM_REBASE_INTERVAL) revert RealVault__MinimumRebaseInterval(MINIMUM_REBASE_INTERVAL);
+        rebaseTimeInterval = _interval;
+        emit SetRebaseInterval(rebaseTimeInterval);
+    }
+
+    /**
+     * @dev Sets the minimum withdrawable shares.
+     * @param _minWithdrawableShares The new minimum withdrawable shares.
+     * Requirements:
+     * - The new minimum must not be less than the 100 wei.
+     */
+    function setMinWithdrawableShares(uint256 _minWithdrawableShares) external onlyOwner {
+        if (_minWithdrawableShares < 1_00) revert RealVault__MinimumWithdrawableShares();
+        minWithdrawableShares = _minWithdrawableShares;
+        emit MinWithdrawableSharesUpdated(_minWithdrawableShares);
+    }
+
+    // [VIEW FUNCTIONS]
+
+    /**
+     * @dev Calculates the number of shares corresponding to a given asset amount.
+     * @param assets The amount of assets to calculate shares for.
+     * @return The number of shares.
+     */
+    function previewDeposit(uint256 assets) public view virtual returns (uint256) {
+        uint256 sharePrice;
+        if (latestRoundID == 0) {
+            sharePrice = MULTIPLIER;
+        } else {
+            uint256 currSharePrice = currentSharePrice();
+            uint256 latestSharePrice;
+            unchecked {
+                latestSharePrice = roundPricePerShare[latestRoundID - ONE];
+            }
+            sharePrice = latestSharePrice > currSharePrice ? latestSharePrice : currSharePrice;
+        }
+
+        return ShareMath.assetToShares(assets, sharePrice);
+    }
+
+    /**
+     * @dev Retrieves the current share price.
+     * Send a certain amount of shares to the blackhole address when the protocol accepts
+     * deposits for the first time. https://github.com/OpenZeppelin/openzeppelin-contracts/issues/3706
+     * @return price current share price.
+     */
+    function currentSharePrice() public view returns (uint256 price) {
+        IReal realToken = IReal(real);
+        uint256 totalReal = realToken.totalSupply();
+        if (latestRoundID == 0) {
+            return MULTIPLIER;
+        }
+
+        uint256 etherAmount = IAssetsVault(assetsVault).getBalance()
+            + IStrategyManager(strategyManager).getAllStrategiesValue() - withdrawableAmountInPast;
+        uint256 activeShare = totalReal - withdrawingSharesInPast;
+        return (etherAmount * MULTIPLIER) / activeShare;
+    }
+
+    /**
+     * @dev Retrieves the available amount in the vault.
+     * @return idleAmount idle amount amount in the vault.
+     * @return investedAmount invested amount in the vault.
+     */
+    function getVaultAvailableAmount() public view returns (uint256 idleAmount, uint256 investedAmount) {
+        IAssetsVault vault = IAssetsVault(assetsVault);
+
+        if (vault.getBalance() > withdrawableAmountInPast) {
+            unchecked {
+                idleAmount = vault.getBalance() - withdrawableAmountInPast;
+            }
+        }
+
+        investedAmount = IStrategyManager(strategyManager).getTotalInvestedValue();
+    }
+
+    receive() external payable {}
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable2Step.sol)
+
+pragma solidity ^0.8.20;
+
+import {Ownable} from "./Ownable.sol";
+
+/**
+ * @dev Contract module which provides access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is specified at deployment time in the constructor for `Ownable`. This
+ * can later be changed with {transferOwnership} and {acceptOwnership}.
+ *
+ * This module is used through inheritance. It will make available all functions
+ * from parent (Ownable).
+ */
+abstract contract Ownable2Step is Ownable {
+    address private _pendingOwner;
+
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Returns the address of the pending owner.
+     */
+    function pendingOwner() public view virtual returns (address) {
+        return _pendingOwner;
+    }
+
+    /**
+     * @dev Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one.
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        _pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner(), newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual override {
+        delete _pendingOwner;
+        super._transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev The new owner accepts the ownership transfer.
+     */
+    function acceptOwnership() public virtual {
+        address sender = _msgSender();
+        if (pendingOwner() != sender) {
+            revert OwnableUnauthorizedAccount(sender);
+        }
+        _transferOwnership(sender);
+    }
+}
+
+
+// File: lib/v3-periphery/contracts/libraries/TransferHelper.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.6.0;
+
+import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+
+library TransferHelper {
+    /// @notice Transfers tokens from the targeted address to the given destination
+    /// @notice Errors with 'STF' if transfer fails
+    /// @param token The contract address of the token to be transferred
+    /// @param from The originating address from which the tokens will be transferred
+    /// @param to The destination address of the transfer
+    /// @param value The amount to be transferred
+    function safeTransferFrom(
+        address token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'STF');
+    }
+
+    /// @notice Transfers tokens from msg.sender to a recipient
+    /// @dev Errors with ST if transfer fails
+    /// @param token The contract address of the token which will be transferred
+    /// @param to The recipient of the transfer
+    /// @param value The value of the transfer
+    function safeTransfer(
+        address token,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'ST');
+    }
+
+    /// @notice Approves the stipulated contract to spend the given allowance in the given token
+    /// @dev Errors with 'SA' if transfer fails
+    /// @param token The contract address of the token to be approved
+    /// @param to The target of the approval
+    /// @param value The amount of the given token the target will be allowed to spend
+    function safeApprove(
+        address token,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.approve.selector, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'SA');
+    }
+
+    /// @notice Transfers ETH to the recipient address
+    /// @dev Fails with `STE`
+    /// @param to The destination of the transfer
+    /// @param value The value to be transferred
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success, ) = to.call{value: value}(new bytes(0));
+        require(success, 'STE');
+    }
+}
+
+
+// File: src/interfaces/IReal.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.21;
+
+import {IERC20} from "oz/token/ERC20/IERC20.sol";
+
+/**
+ * @title Real Interface
+ * @dev Interface for a token contract representing real-world assets.
+ */
+interface IReal is IERC20 {
+    /**
+     * @dev Mints tokens and assigns them to the specified address.
+     * @param _to The address to which the minted tokens will be assigned.
+     * @param _amount The amount of tokens to mint.
+     */
+    function mint(address _to, uint256 _amount) external;
+
+    /**
+     * @dev Burns tokens from the specified address.
+     * @param _from The address from which tokens will be burned.
+     * @param _amount The amount of tokens to burn.
+     */
+    function burn(address _from, uint256 _amount) external;
+}
+
+
+// File: src/interfaces/IMinter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.21;
+
+/**
+ * @title Minter Interface
+ * @dev Interface for a contract responsible for minting and burning tokens.
+ */
+interface IMinter {
+    /**
+     * @dev Sets a new vault address.
+     * @param _vault The address of the new vault.
+     */
+    function setNewVault(address _vault) external;
+
+    /**
+     * @dev Mints tokens and assigns them to the specified address.
+     * @param _to The address to which the minted tokens will be assigned.
+     * @param _amount The amount of tokens to mint.
+     */
+    function mint(address _to, uint256 _amount) external;
+
+    /**
+     * @dev Burns tokens from the specified address.
+     * @param _from The address from which tokens will be burned.
+     * @param _amount The amount of tokens to burn.
+     */
+    function burn(address _from, uint256 _amount) external;
+
+    /**
+     * @dev Gets the address of the real token.
+     * @return The address of the real token.
+     */
+    function real() external view returns (address);
+
+    /**
+     * @dev Gets the address of the real token vault.
+     * @return The address of the real token vault.
+     */
+    function vault() external view returns (address);
+
+    /**
+     * @dev Gets the price of the token.
+     * @return price The price of the token.
+     */
+    function getTokenPrice() external view returns (uint256 price);
+}
+
+
+// File: src/interfaces/IAssetsVault.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.21;
+
+/**
+ * @title AssetsVault Interface
+ * @dev Interface for managing assets within a vault contract.
+ */
+interface IAssetsVault {
+    /**
+     * @dev Deposits funds into the vault.
+     */
+    function deposit() external payable;
+
+    /**
+     * @dev Withdraws funds from the vault.
+     * @param to The address to which the withdrawn funds will be transferred.
+     * @param amount The amount of funds to withdraw.
+     */
+    function withdraw(address to, uint256 amount) external;
+
+    /**
+     * @dev Sets a new vault address.
+     * @param _vault The address of the new vault.
+     */
+    function setNewVault(address _vault) external;
+
+    /**
+     * @dev Gets the balance of the vault.
+     * @return balanceAmount The balance of the vault.
+     */
+    function getBalance() external view returns (uint256 balanceAmount);
+}
+
+
+// File: src/interfaces/IStrategyManager.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.21;
+
+/**
+ * @title StrategyManager Interface
+ * @dev Interface for a contract managing multiple eth investment strategies.
+ */
+interface IStrategyManager {
+    /**
+     * @dev Sets a new vault address.
+     * @param _vault The address of the new vault.
+     */
+    function setNewVault(address _vault) external;
+
+    /**
+     * @dev Adds a new strategy to be managed.
+     * @param _strategy The address of the strategy to add.
+     */
+    function addStrategy(address _strategy) external;
+
+    /**
+     * @dev Destroys a strategy, removing it from management.
+     * @param _strategy The address of the strategy to destroy.
+     */
+    function destroyStrategy(address _strategy) external;
+
+    /**
+     * @dev Clears a strategy, potentially withdrawing its funds and resetting parameters.
+     * @param _strategy The address of the strategy to clear.
+     */
+    function clearStrategy(address _strategy) external;
+
+    /**
+     * @dev Rebalances the strategies based on incoming and outgoing amounts.
+     * @param amountIn The amount of funds to be rebalanced into the strategies.
+     * @param amountOut The amount of funds to be rebalanced out of the strategies.
+     */
+    function rebaseStrategies(uint256 amountIn, uint256 amountOut) external;
+
+    /**
+     * @dev Rebalances the strategies without incoming and outgoing amounts.
+     */
+    function onlyRebaseStrategies() external;
+
+    /**
+     * @dev Forces a withdrawal of a specified amount of ETH from the strategies.
+     * @param ethAmount The amount of ETH to withdraw.
+     * @return actualAmount The actual amount of ETH withdrawn.
+     */
+    function forceWithdraw(uint256 ethAmount) external returns (uint256 actualAmount);
+
+    /**
+     * @dev Sets the strategies and their corresponding ratios.
+     * @param _strategies The addresses of the strategies to set.
+     * @param _ratios The corresponding ratios for each strategy.
+     */
+    function setStrategies(address[] memory _strategies, uint256[] memory _ratios) external;
+
+    /**
+     * @dev Retrieves the address of the assets vault managed by the strategy manager.
+     * @return vault The address of the assets vault.
+     */
+    function assetsVault() external view returns (address vault);
+
+    /**
+     * @dev Retrieves the total value managed by all strategies.
+     * @return amount The total value managed by all strategies.
+     */
+    function getAllStrategiesValue() external view returns (uint256 amount);
+
+    /**
+     * @dev Retrieves the total valid value managed by all strategies.
+     * @return amount The total valid value managed by all strategies.
+     */
+    function getTotalInvestedValue() external view returns (uint256 amount);
+
+    /**
+     * @dev Retrieves the total pending value managed by all strategies.
+     * @return amount The total pending value managed by all strategies.
+     */
+    function getAllStrategyPendingValue() external view returns (uint256 amount);
+}
+
+
+// File: src/libraries/ShareMath.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.21;
+
+import {FullMath} from "v3-core-0.8/libraries/FullMath.sol";
+
+library ShareMath {
+    uint256 internal constant DECIMAL = 18;
+    uint256 internal constant DECIMAL_OFFSET = 10 ** DECIMAL;
+    uint256 internal constant PLACEHOLDER_UINT = 1;
+
+    /**
+     * @notice Converts an amount of tokens to shares.
+     * @param assetAmount The amount of tokens to convert.
+     * @param assetPerShare The price per share.
+     * @return The equivalent amount of shares.
+     *
+     * Note: All rounding errors should be rounded down in the interest of the protocol's safety.
+     * Token transfers, including deposit and withdraw operations, may require a rounding, leading to potential
+     * transferring at most one GWEI less than expected aggregated over a long period of time.
+     */
+    function assetToShares(uint256 assetAmount, uint256 assetPerShare) internal pure returns (uint256) {
+        require(assetPerShare > PLACEHOLDER_UINT, "ShareMath Lib: Invalid assetPerShare");
+        return FullMath.mulDiv(assetAmount, DECIMAL_OFFSET, assetPerShare);
+    }
+
+    /**
+     * @notice Converts an amount of shares to tokens.
+     * @param shares The amount of shares to convert.
+     * @param assetPerShare The price per share.
+     * @return The equivalent amount of tokens.
+     */
+    function sharesToAsset(uint256 shares, uint256 assetPerShare) internal pure returns (uint256) {
+        require(assetPerShare > PLACEHOLDER_UINT, "ShareMath Lib: Invalid assetPerShare");
+        return FullMath.mulDiv(shares, assetPerShare, DECIMAL_OFFSET);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/v3-core-0.8/contracts/libraries/FullMath.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+/// @title Contains 512-bit math functions
+/// @notice Facilitates multiplication and division that can have overflow of an intermediate value without any loss of precision
+/// @dev Handles "phantom overflow" i.e., allows multiplication and division where an intermediate value overflows 256 bits
+library FullMath {
+    /// @notice Calculates floor(a×b÷denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+    /// @param a The multiplicand
+    /// @param b The multiplier
+    /// @param denominator The divisor
+    /// @return result The 256-bit result
+    /// @dev Credit to Remco Bloemen under MIT license https://xn--2-umb.com/21/muldiv
+    function mulDiv(
+        uint256 a,
+        uint256 b,
+        uint256 denominator
+    ) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = a * b
+            // Compute the product mod 2**256 and mod 2**256 - 1
+            // then use the Chinese Remainder Theorem to reconstruct
+            // the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2**256 + prod0
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(a, b, not(0))
+                prod0 := mul(a, b)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division
+            if (prod1 == 0) {
+                require(denominator > 0);
+                assembly {
+                    result := div(prod0, denominator)
+                }
+                return result;
+            }
+
+            // Make sure the result is less than 2**256.
+            // Also prevents denominator == 0
+            require(denominator > prod1);
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0]
+            // Compute remainder using mulmod
+            uint256 remainder;
+            assembly {
+                remainder := mulmod(a, b, denominator)
+            }
+            // Subtract 256 bit number from 512 bit number
+            assembly {
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator
+            // Compute largest power of two divisor of denominator.
+            // Always >= 1.
+            uint256 twos = (0 - denominator) & denominator;
+            // Divide denominator by power of two
+            assembly {
+                denominator := div(denominator, twos)
+            }
+
+            // Divide [prod1 prod0] by the factors of two
+            assembly {
+                prod0 := div(prod0, twos)
+            }
+            // Shift in bits from prod1 into prod0. For this we need
+            // to flip `twos` such that it is 2**256 / twos.
+            // If twos is zero, then it becomes one
+            assembly {
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2**256
+            // Now that denominator is an odd number, it has an inverse
+            // modulo 2**256 such that denominator * inv = 1 mod 2**256.
+            // Compute the inverse by starting with a seed that is correct
+            // correct for four bits. That is, denominator * inv = 1 mod 2**4
+            uint256 inv = (3 * denominator) ^ 2;
+            // Now use Newton-Raphson iteration to improve the precision.
+            // Thanks to Hensel's lifting lemma, this also works in modular
+            // arithmetic, doubling the correct bits in each step.
+            inv *= 2 - denominator * inv; // inverse mod 2**8
+            inv *= 2 - denominator * inv; // inverse mod 2**16
+            inv *= 2 - denominator * inv; // inverse mod 2**32
+            inv *= 2 - denominator * inv; // inverse mod 2**64
+            inv *= 2 - denominator * inv; // inverse mod 2**128
+            inv *= 2 - denominator * inv; // inverse mod 2**256
+
+            // Because the division is now exact we can divide by multiplying
+            // with the modular inverse of denominator. This will give us the
+            // correct result modulo 2**256. Since the precoditions guarantee
+            // that the outcome is less than 2**256, this is the final result.
+            // We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inv;
+            return result;
+        }
+    }
+
+    /// @notice Calculates ceil(a×b÷denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+    /// @param a The multiplicand
+    /// @param b The multiplier
+    /// @param denominator The divisor
+    /// @return result The 256-bit result
+    function mulDivRoundingUp(
+        uint256 a,
+        uint256 b,
+        uint256 denominator
+    ) internal pure returns (uint256 result) {
+        unchecked {
+            result = mulDiv(a, b, denominator);
+            if (mulmod(a, b, denominator) > 0) {
+                require(result < type(uint256).max);
+                result++;
+            }
+        }
+    }
+}
+

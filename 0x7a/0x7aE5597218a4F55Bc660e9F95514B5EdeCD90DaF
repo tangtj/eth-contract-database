@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract QOM_BRIDGE {
+    IERC20 public token;
+    mapping(address => bool) public isOwner;
+    mapping(address => uint256) public deposits;
+    mapping(address => uint256) public withdrawable;
+    uint256 public minimumTokenBridge;
+    address public deployer;
+
+    event OwnerAdded(address indexed owner);
+    event OwnerRemoved(address indexed owner);
+    event DepositMade(address indexed user, uint256 amount);
+    event WithdrawableUpdated(address indexed user, uint256 amount);
+    event Withdrawn(address indexed owner, uint256 amount);
+
+    modifier onlyOwner() {
+        require(isOwner[msg.sender], "Not an owner");
+        _;
+    }
+
+    constructor(address _token, uint256 _minimumTokenBridge, address[] memory _owners) {
+        token = IERC20(_token);
+        minimumTokenBridge = _minimumTokenBridge;
+        for (uint256 i = 0; i < _owners.length; i++) {
+            isOwner[_owners[i]] = true;
+            emit OwnerAdded(_owners[i]);
+        }
+        isOwner[msg.sender] = true;
+        deployer = msg.sender;
+    }
+
+    function addOwner(address _owner) external onlyOwner {
+        isOwner[_owner] = true;
+        emit OwnerAdded(_owner);
+    }
+
+    function removeOwner(address _owner) external onlyOwner {
+        require(_owner != deployer, "Cannot remove deployer");
+        isOwner[_owner] = false;
+        emit OwnerRemoved(_owner);
+    }
+
+    function deposit(uint256 _amount) external {
+        require(_amount > 0, "Deposit amount must be greater than zero");
+        require(_amount >= minimumTokenBridge, "Deposit is below minimum");
+        require(token.transferFrom(msg.sender, address(this), _amount), "Token transfer failed");
+        deposits[msg.sender] += _amount;
+        emit DepositMade(msg.sender, _amount);
+    }
+
+    function setWithdrawable(address _user, uint256 _amount) external onlyOwner {
+        withdrawable[_user] = _amount;
+        emit WithdrawableUpdated(_user, _amount);
+    }
+
+    function withdrawUnstuckFunds(uint256 _amount) external onlyOwner {
+        require(_amount > 0, "Withdraw amount must be greater than zero");
+        require(token.balanceOf(address(this)) >= _amount, "Insufficient contract balance");
+        require(token.transfer(msg.sender, _amount), "Token transfer failed");
+        emit Withdrawn(msg.sender, _amount);
+    }
+
+    function withdraw(uint256 _amount) external {
+        require(withdrawable[msg.sender] >= _amount, "Amount exceeds withdrawable balance");
+        withdrawable[msg.sender] -= _amount;
+        require(token.transfer(msg.sender, _amount), "Token transfer failed");
+        emit Withdrawn(msg.sender, _amount);
+    }
+
+    function withdrawStuckToken(address _token, address _to) external onlyOwner {
+        require(_token != address(0), "_token address cannot be 0");
+        uint256 _contractBalance = IERC20(_token).balanceOf(address(this));
+        IERC20(_token).transfer(_to, _contractBalance);
+    }
+
+    function withdrawStuckEth(address toAddr) external onlyOwner {
+        (bool success, ) = toAddr.call{
+            value: address(this).balance
+        } ("");
+        require(success);
+    }
+}

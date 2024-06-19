@@ -1,0 +1,1175 @@
+/**
+ *Submitted for verification at sepolia.basescan.org on 2024-05-26
+*/
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+//optimize 200
+/// Standard IERC20 interface
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+/// Factory interface of uniswap and forks
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+/// First part of the router interface of uniswap and forks
+interface IUniswapV2Router01 {
+    function factory() external pure returns (address);
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+/// Second part of the router interface of uniswap and forks
+interface IUniswapV2Router02 is IUniswapV2Router01 {
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function getAmountsOut(uint amountIn, address[] memory path) external view returns (uint[] memory amounts);
+}
+
+/// Interface for the pairs of uniswap and forks
+interface IPair {
+    function burn(address to) external returns (uint amount0, uint amount1);
+    function mint(address to) external returns (uint liquidity);
+    function price0CumulativeLast() external view returns (uint);
+    function price1CumulativeLast() external view returns (uint);
+    function sync() external;
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external view returns(uint);
+}
+
+interface Dataport {
+    function DATA_READ() external view returns(address);
+}
+
+/// Interface to convert protocol fee via threshold
+interface protCont {
+    function cont(address addy, uint256 fee, address user) external;
+}
+
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+/// Transfer Helper to ensure the correct transfer of the tokens or ETH
+library SafeTransfer {
+    using Address for address;
+    function safeApprove(IERC20 token, address spender, uint256 value) 
+    internal {
+    // safeApprove should only be called when setting an initial allowance,
+    // or when resetting it to zero. To increase and decrease it, use
+    // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+    require(
+        (value == 0) || (token.allowance(address(this), spender) == 0),
+        "SafeERC20: approve from non-zero to non-zero allowance"
+    );
+    _callOptionalReturn(token, 
+    abi.encodeWithSelector(token.approve.selector, spender, value));
+}
+    /** Safe Transfer asset from one wallet with approval of the wallet
+    * @param erc20: the contract address of the erc20 token
+    * @param from: the wallet to take from
+    * @param amount: the amount to take from the wallet
+    **/
+    function _pullUnderlying(IERC20 erc20, address from, uint amount) internal
+    {
+        safeTransferFrom(erc20,from,address(this),amount);
+    }
+
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /** Safe Transfer asset to one wallet from within the contract
+    * @param erc20: the contract address of the erc20 token
+    * @param to: the wallet to send to
+    * @param amount: the amount to send from the contract
+    **/
+    function _pushUnderlying(IERC20 erc20, address to, uint amount) internal
+    {
+        safeTransfer(erc20,to,amount);
+    }
+
+    /** Safe Transfer ETH to one wallet from within the contract
+    * @param to: the wallet to send to
+    * @param value: the amount to send from the contract
+    **/
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success,) = to.call{value : value}(new bytes(0));
+        require(success, 'TransferHelper::safeTransferETH: ETH transfer failed');
+    }
+
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+interface Reader {
+    function isExchange(address addy, address lp) external view returns (bool);
+    function isAdmin(address addy) external view returns (bool);
+    function superAdmin(address addy) external view returns (bool);
+    function isSetter(address addy) external view returns (bool);
+    function setIsSD(address addy) external;
+    function setExchangeSD(address SD, address LP, bool _bool) external;
+    function protocolAddy() external view returns (address);    
+    function feeConverter() external view returns (address); 
+    function feeConverterDeployer() external view returns (address); 
+    function feeConverterSD(address who) external view returns (address);
+    function sdDepAddy() external view returns (address);
+    function getProtocolFee() external view returns (uint256);
+    function isSD(address addy) external view returns(bool);
+    function breaker() external view returns (bool); //circuit breaked in case of an exploit to handle
+    function isWhitelistContract(address addy) external view returns (bool);
+    function setWhitelistContract(address addy, bool _bool) external;
+    function stakeDeployerAddress() external view returns(address);
+    function LEAPDepAddy() external view returns(address);
+    function fegAddress() external view returns(address);
+    function UNISWAP_V2_ROUTER(address token) external view returns(address);
+    function UNISWAP_V2_ROUTER() external view returns(address);
+    function uniswapV2Pair(address token) external view returns(address);
+    function set_UNISWAP_V2_ROUTER(address token, address _uniswapV2Router, address _uniswapV2Pair) external;
+    function backingLogicDep() external view returns(address);
+    function setTick(address who) external;
+    function frontRun(address who, uint256 range, uint256 slip) external view returns(bool yes);
+    function wETH() external view returns(address);
+    function smartDaoDeployer() external view returns(address);
+    function setBackingLogicAddress(address token, address addy) external;
+    function BackingLogicAddress(address token) external view returns(address);
+    function uniswapV2PairFEG() external view returns(address);
+    function isKYCToken(address addy) external view returns(bool);
+    function kyc(address sd, address user) external view returns(string memory,string memory,uint256,uint256,bool);
+}
+
+interface blogic {
+    function createBacking(address backingTokenAddress, address wETH, uint256 _tTotal) external returns(address);
+    function convertBack(uint256 bs, uint256 backingThreshold, address DR) external returns(uint256);
+    function convertLiq(uint256 ls, uint256 liquidityThreshold, address DR) external returns(uint256);
+    function setFrontRunProtection(address user, uint256 range, uint256 slippage) external;
+    function slippage(address user) external view returns(uint256,uint256);
+}
+
+contract SDT is IERC20 {
+    mapping(address => uint256[]) private balance; // all previous balance data
+    mapping(address => uint256) private balances; // all previous balance data
+    mapping(address => uint256) private balancesBypass; // all previous balance data
+    mapping(address => uint256[]) private blockNumber; // block number of balance data
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => UserData) public User;
+    mapping(address => uint256) public liquidityUnlockTime; //Enter LP address for its unlocktime
+    mapping(address => bool) public taxFree; //exclude all the fees from this address
+    mapping(address => bool) public exempt; //exclude all the reflections from this address
+    mapping(address => bool) public bypass; //bypass balance history
+    address public sdOwner; // Token creator, can set poolOwner functions
+    address private constant BURN = 0x000000000000000000000000000000000000dEaD;
+    address public sdStake; // staking share location
+    address public sdFeeRecipient; // where fees are sent
+    address public LGEAddress; // LGE address for fund raise
+    address[] public allUser; // All holders ever
+    address public backingAsset;
+    address public backingLogicAddress;
+    address public dataread; // last known data read for gas savings
+    uint[12] public allFee; // all the final fees of the SD tokens
+    uint[12] public suggestedAllFee; // all the suggested fee
+    uint256 private constant MAX = ~uint256(0);
+    uint256 private _tTotal; // total supply
+    uint256 public tBase; //reflection tuple
+    uint256 public backingThreshold; //0.01%
+    uint256 public liquidityThreshold; //0.01%
+    uint256 public liqShare = 0; //amount waiting for auto liquidity conversion
+    uint256 public backShare = 0; //amount waiting for auto backing conversion
+    uint256 public timeDelay = type(uint256).max;
+    uint256 public totalHolders; // Total current holders
+    uint256 public maxTx;
+    bool public onlySB = true; // if true then only tax buy/sell transactions, if false then tax every transaction
+    bool public suggestedOnlySB = true; // suggested change
+    bool public LGE; // Is set to enter LGE, public transfer disabled and edit functions disabled
+    bool public LGELive; // Has live LGE event going
+    string public name;
+    string public symbol;
+    mapping(address => bool) private whitelist;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
+    uint8  public override constant decimals = 18;
+    event UpdateBackingThreshold(uint newTreshold);
+    event UpdateLiquidityThreshold(uint newTreshold);
+    event SuggestFee(address sender, bool onlySB);
+    event SetFee(address sender);    
+    
+    modifier live(address sender, address recipient){
+        address DR = dataread;
+        if(!Reader(DR).superAdmin(msg.sender)){ 
+        if(Reader(DR).breaker()) {
+        address ba = backingLogicAddress;
+        require((Reader(DR).superAdmin(recipient) || Reader(DR).superAdmin(sender)) || sender == ba  || recipient == ba || recipient == BURN, "Circuit breaker paused");
+        }
+        }
+        _;
+    }
+
+    /**
+    * helping function that deploys the contract and returns it's address (avoids storing all the bytecode in a tmp variable)
+    * @param n: the name of the token
+    * @param symbol_: The symbol of the token
+    * @param fee: the fees that should be applied (0.1% = 1 and 1000 = 0)
+    *   fee[0] = backingFeeBuy
+    *   fee[1] = burningFeeBuy
+    *   fee[2] = liquidityFeeBuy
+    *   fee[3] = growthFeeBuy
+    *   fee[4] = stakingFeeBuy
+    *   fee[5] = reflectionFeeBuy
+    *   fee[6] = backingFeeSell
+    *   fee[7] = burningFeeSell
+    *   fee[8] = liquidityFeeSell
+    *   fee[9] = growthFeeSell
+    *   fee[10] = stakingFeeSell
+    *   fee[11] = reflectionFeeSell
+    * @param sb: if true all Fees apply to only buy and sells. On false it alows also for transfer taxes.
+    * @param ownerAddr: The address of the owner (required as msg.sender will be this contract otherwise)
+    * @param backingTokenAddress: The ERC20 address of the backing token. Need to be listed on uniswap/pancakeswap
+    **/
+    constructor(string memory n, string memory symbol_, uint supply, uint[12] memory fee, bool sb, address ownerAddr, address backingTokenAddress, bool _LGE) {
+        _tTotal = supply * 10 ** 18;
+        require(_tTotal <= type(uint128).max - 1);
+        //required because of pcs limitation
+        tBase = (MAX - (MAX % _tTotal));
+        liquidityThreshold = _tTotal / 500000;
+        maxTx = _tTotal;
+        name = n;
+        symbol = symbol_;
+        sdOwner = ownerAddr;
+        allFee = fee;
+        sdFeeRecipient = ownerAddr;
+        bypass[ownerAddr] = true;
+        User[ownerAddr].active = true;
+        totalHolders += 1;
+        User[ownerAddr].id = totalHolders;
+        User[ownerAddr].start = block.number;
+        allUser.push(ownerAddr);
+        balancesBypass[ownerAddr] = tBase;
+        bypass[BURN] = true;
+        bypass[address(this)] = true;
+        blockNumber[ownerAddr].push(block.number);
+        emit Transfer(address(0), ownerAddr, _tTotal);
+        dataread = Dataport(0xcCeD1a96321B2B2a06E8F3F4B0B883dDD059968c).DATA_READ();
+        address ba = blogic(Reader(dataread).backingLogicDep()).createBacking(backingTokenAddress, wETH(), _tTotal);
+        backingLogicAddress = ba;
+        bypass[ba] = true;
+        whitelist[address(this)] = true;
+        whitelist[ba] = true;
+        onlySB = sb;
+        taxFree[ownerAddr] = true;
+        taxFree[address(this)] = true;
+        taxFree[ba] = true;
+        LGE = _LGE;
+        exempt[address(this)] = true;
+        exempt[ba] = true;
+        _status = _NOT_ENTERED;
+        backingThreshold = backingTokenAddress == address(0) ? 0 : _tTotal / 500000;
+        backingAsset = backingTokenAddress == address(0) ? address(this) : backingTokenAddress;
+    }    
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED || whitelist[msg.sender], "ReentrancyGuard");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+
+    function setBackingAddress(address addy) external {
+        require(msg.sender == backingLogicAddress && !LGE);
+        backingAsset = addy;
+    }
+
+    function setBackingLogicAddress(address addy) external {
+        require(msg.sender == backingLogicAddress && !LGE);
+        backingLogicAddress = addy;
+        bypass[addy] = true;
+    }
+
+    function addWhitelist(address toAdd, bool _bool) public {
+        require(msg.sender == sdOwner);
+        whitelist[toAdd] = _bool;
+    }
+
+    function isExchange(address addy) public view returns(bool) {
+        return Reader(dataread).isExchange(address(this), addy);
+    }
+
+    function setBypass(address addy, bool _bool) public {
+        require(msg.sender == sdOwner && !isExchange(addy));
+        if(_bool) {
+            require(!bypass[addy]);
+            balancesBypass[addy] = balanceOf(addy) * (tBase/_tTotal);
+        }
+        if(!_bool) {
+            require(bypass[addy]);
+            balance[addy].push(balanceOf(addy) * (tBase/_tTotal));
+            balancesBypass[addy] = 0;
+        }
+        balances[addy] = balanceOf(addy) * (_tTotal/tBase);
+        bypass[addy] = _bool;
+    }
+
+    function setMaxTx(uint256 amount) external {
+        require(msg.sender == sdOwner);
+        require(amount >= _tTotal / 100000);
+        maxTx = amount;
+    }
+
+    struct UserData {
+        bool active; // Held tokens
+        uint256 start; // Time of first token holding
+        uint256 id; // Holder number
+    }
+
+    // Get users last balance
+    function lastBalance(address user) public view returns(uint256 bal) {
+        bal = balance[user].length > 0 ? balance[user][balance[user].length - 1] : 0;
+    }
+
+    function balanceLength(address user) external view returns(uint256) {
+        return balance[user].length;
+    }
+
+    function getAllFee(uint256 choice) external view returns(uint256[] memory fees) {
+        uint256 a = allFee.length;
+        fees = new uint256[](a);
+        if(choice == 0) {
+        for(uint256 i = 0; i < a; i++) {
+            fees[i] = allFee[i];
+        }
+        }
+        if(choice == 1) {
+        for(uint256 i = 0; i < a; i++) {
+            fees[i] = suggestedAllFee[i];
+        }
+        }
+    }
+
+    // Get users entire balance change history with block number, for taking on demand snapshots
+    function allLastBalance(address user) external view returns(uint256[] memory _balances, uint256[] memory blockNumbers) {
+        if(balance[user].length > 0) {
+        _balances = new uint256[](balance[user].length);
+        blockNumbers = new uint256[](blockNumber[user].length);
+        for(uint256 i = 0; i < balance[user].length; i++) {
+            _balances[i] = balance[user][i];
+            blockNumbers[i] = blockNumber[user][i];
+        }
+        }
+    }
+
+    function wETH() public view returns(address) {
+        return Reader(dataread).wETH();
+    }
+
+    /**
+    * Sets tick for front run protection data
+    **/
+    function _setTick(address D) internal {
+        address dep = Reader(D).sdDepAddy();
+        if(!Reader(D).isSD(backingAsset) && backingAsset != wETH()) {
+        Reader(dep).setTick(address(this));   
+        }
+    }
+    
+    /**
+    * Sets user slippage amount for Front Run Protection
+    **/
+    function setProtection(uint256 range, uint256 slippage) external {
+        require(slippage <= 30 && range <= 100, "30/100");
+        blogic(Reader(dataread).sdDepAddy()).setFrontRunProtection(msg.sender, range, slippage);
+    }
+    
+    /**
+    * Return owner for standard contract readers
+    **/
+    function owner() external view returns(address) {
+        return sdOwner;
+    }
+    
+    /**
+    * Return current router for token
+    **/
+    function UNISWAP_V2_ROUTER() public view returns(address router) {
+        router = Reader(dataread).UNISWAP_V2_ROUTER(address(this));
+    }
+
+    /**
+    * Return current main uniswap pair for token
+    **/
+    function uniswapV2Pair() public view returns(address pair) {
+        pair = Reader(dataread).uniswapV2Pair(address(this));
+    }
+
+    ///  function that is called after the constructor to Whitelist this contract and the BackingLogicAddress
+    /// Cannot be done during the constructor as the SD is not yet set as an SD on the Data reader and thus isn't allowed
+    /// to access the data reader
+    function afterConstructor() external {
+        address u = uniswapV2Pair();
+        exempt[u] = true;
+        if(LGE) {
+        Reader(dataread).setExchangeSD(address(this), u, true);
+        }
+        taxFree[u] = LGE ? true : false;
+        whitelist[UNISWAP_V2_ROUTER()] = true;
+    }
+
+    /**
+    * enables LGE for token, locks transfers and contract edit functions to public while LGE is active.
+    **/
+    function setLGE(address addy) external {
+        require(Reader(dataread).LEAPDepAddy() == msg.sender);
+        require(!LGELive);
+        require(balanceOf(uniswapV2Pair()) == 0);
+        LGE = true;
+        LGELive = true;
+        LGEAddress = addy;
+        taxFree[uniswapV2Pair()] = true; //reversed on endLGE
+        taxFree[LGEAddress] = true; //reversed on endLGE
+        Reader(dataread).setExchangeSD(address(this), uniswapV2Pair(), false);
+    }
+
+    /**
+    * Ends LGE or disables LGE bool if true and called by sdOwner
+    **/
+    function endLGE() external {
+        address u = uniswapV2Pair();
+        if(Reader(dataread).LEAPDepAddy() == msg.sender) {
+        require(LGELive);
+        LGE = false;
+        LGELive = false;
+        taxFree[u] = false;
+        taxFree[LGEAddress] = false;
+        Reader(dataread).setExchangeSD(address(this), u, true);
+        }
+        if(msg.sender == sdOwner) {
+        require(!LGELive && LGEAddress == address(0));
+        LGE = false;
+        taxFree[u] = false;
+        Reader(dataread).setExchangeSD(address(this), u, true);
+        }
+    }
+
+    /**
+    * adds another exchange (correct buy/sell fees will apply) to the list. Only SD owner
+    * @param LP: The address of the LPtoken
+    * @param adding: False ==> remove it from the list , True ==> add it to the known exchange
+    *
+    **/
+    function setExchange(address LP, bool adding) external {
+        require((msg.sender == sdOwner && !LGE));
+        require(!taxFree[LP],"not allowed");
+        require(address(LP).code.length > 0);
+        require(LP != address(this) && LP != LGEAddress && LP != sdStake && LP != backingLogicAddress);
+        Reader(dataread).setExchangeSD(address(this), LP, adding);
+    }
+
+    /**
+    * adds another address to the list of exampted fees. Only SD owner
+    * @param user: The address to be exampted of any fees
+    * @param adding: False ==> remove it from the list , True ==> add it to the known exchange
+    *
+    **/
+    function setTaxFreeUser(address user, bool adding) external {
+        require(msg.sender == sdOwner && !LGE);
+        require(!isExchange(user),"not allowed");
+        if(!adding) {
+        require(user != address(this) && user != LGEAddress && user != sdStake && user != backingLogicAddress);
+        }
+        taxFree[user] = adding;
+    }
+
+    /**
+    * adds another address to the list of exampted from reflections. Only SD owner
+    * @param user: The address to be exampted of any reflections
+    * @param adding: False ==> remove it, True ==> add it.
+    *
+    **/
+    function setExemptUser(address user, bool adding) public {
+        require(msg.sender == sdOwner || msg.sender == Reader(dataread).LEAPDepAddy() || Reader(dataread).backingLogicDep() == msg.sender || Reader(dataread).isAdmin(msg.sender) || Reader(dataread).stakeDeployerAddress() == msg.sender, "invalid e");  
+        if(adding) {
+        require(!exempt[user]);
+        balances[user] = balanceOf(user);
+        }
+        if(!adding){
+        require(exempt[user]);
+        balances[user] = 0;
+        }
+        exempt[user] = adding;
+        if(bypass[user]) {
+            balancesBypass[user] = balanceOf(user) * (tBase / _tTotal);
+        }
+        if(!bypass[user]) {
+            balance[user].push(balanceOf(user) * (tBase / _tTotal));
+            balancesBypass[user] = 0;
+        }
+    }
+
+    /**
+    * Sets a new address to receive the growth fees
+    * @param addy: The address which will receive of the devloppment/growth fees
+    *
+    **/
+    function setSDFeeRecipient(address addy) external {
+        require(addy != address(0));
+        require(msg.sender == sdOwner || msg.sender == Reader(dataread).feeConverterDeployer());
+        sdFeeRecipient = addy;
+    }
+
+    /**
+    * Sets a new address to receive the staking fees
+    * @notice taxes are not applied if it is not set
+    * @param addy: The address which will receive of the staking fees
+    *
+    **/
+    function setStakingAddress(address addy) external {
+        require(msg.sender == Reader(dataread).stakeDeployerAddress());
+        sdStake = addy;
+    }   
+    
+     /*
+     *  Sets new fees with max 50%
+     *  @notice  0.1% = 1
+     *  @param feeSet :
+     *  allFee[0] = backingFeeBuy
+     *  allFee[1] = burningFeeBuy
+     *  allFee[2] = liquidityFeeBuy
+     *  allFee[3] = growthFeeBuy
+     *  allFee[4] = stakingFeeBuy
+     *  allFee[5] = reflectionFeeBuy
+     *  allFee[6] = backingFeeSell
+     *  allFee[7] = burningFeeSell
+     *  allFee[8] = liquidityFeeSell
+     *  allFee[9] = growthFeeSell
+     *  allFee[10] = stakingFeeSell
+     *  allFee[11] = reflectionFeeSell
+     *  @param onlySellBuy : True ==> only taxed on buys/sell False ==> always taxed
+     **/
+
+    function setFee() external {
+        require(block.timestamp >= timeDelay && !LGE, "Time");
+        allFee = suggestedAllFee;
+        onlySB = suggestedOnlySB;
+        timeDelay = type(uint256).max;
+        emit SetFee(msg.sender);
+    }
+
+    /* Sets a 72 hour time delay on setFee
+    */
+    function suggestSetFee(uint[12] calldata feeSet, bool onlySellBuy) external {        
+        bool admin = Reader(dataread).isAdmin(msg.sender);
+        require((msg.sender == sdOwner || admin) && !LGE);      
+        require(feeSet[0] + feeSet[1] + feeSet[2] + feeSet[3] + feeSet[4] + feeSet[5] < 501 && feeSet[6] + feeSet[7] + feeSet[8] + feeSet[9] + feeSet[10] + feeSet[11] < 501, "50% max");
+        suggestedAllFee = feeSet;
+        suggestedOnlySB = onlySellBuy;
+        timeDelay = admin ? block.timestamp : block.timestamp + 3 days; // 3 days grace period
+        emit SuggestFee(msg.sender, onlySellBuy);
+    }
+
+    /**
+    * Set the Backing treshold max  <0.5% of total supply and minimum 1000 as too small will lead to do null sells
+    * which will revert the transaction. Thus potentially make the token unsellable.
+    * @param amt: The raw SD token amount that is needed.
+    **/    
+    function setBackingThreshold(uint256 amt) external {
+        require(msg.sender == sdOwner && !LGE);
+        if(backingAsset == address(this)) {
+        require(amt == 0, "0 amt");
+        }
+        if(allFee[0] == 0 && allFee[6] == 0) {
+        backingThreshold = type(uint256).max;
+        }
+        else{
+        require(amt > 1000, ">1000");
+        backingThreshold = amt;
+        }
+        emit UpdateBackingThreshold(amt);
+    }
+
+    /**
+    * Set the liquidity threshold max  <0.5% of total supply and minimum 1000 as too small will lead to do null sells
+    * which will revert the transaction. Thus potentially make the token unsellable.
+    * @param amt: The raw SD token amount that is needed.
+    **/
+    function setLiquidityThreshold(uint256 amt) external {
+        require(msg.sender == sdOwner && !LGE);
+        if(allFee[2] == 0 && allFee[8] == 0) {
+        liquidityThreshold = type(uint256).max;
+        }
+        else{
+        require(amt >= 1000, ">1000");
+        liquidityThreshold = amt;
+        }
+        emit UpdateLiquidityThreshold(liquidityThreshold);
+    }
+
+    /**
+    * Set a new owner for the SD. Also allows for renouncing
+    * @param newOwner : The new Owner address
+    **/
+    function setNewOwner(address newOwner) external {
+        require(msg.sender == sdOwner && !LGE);
+        sdOwner = newOwner;
+    }
+
+    /**
+    * Onwer can chose to lock the LP or tokens. Unlocks the manual burn by doing so.
+    * @param lockDays: The amounts in days for the lock to last
+    * @param addy: The token address (e.g. uniswap LP token) to lock away
+    * @param amt: The amount of tokens that wants to get locked away
+    **/
+    function initialLockLiquidity(uint256 lockDays, address addy, uint256 amt) nonReentrant external {// enter in days, to lock more liquidity simply send to this address
+        require(msg.sender == sdOwner);
+        //if lock exists use extend or send the tokens there directy to increase the amount
+        require(block.timestamp > liquidityUnlockTime[addy], "locked");
+        require(lockDays >= 1);
+        uint256 time = block.timestamp + (lockDays * 1 days);
+        liquidityUnlockTime[addy] = time;
+        SafeTransfer._pullUnderlying(IERC20(addy), msg.sender, amt);
+    }
+
+    /**
+    * Onwer can chose to extend his lock by x days.
+    * @param lockDays: The amounts in days for the lock to be extended
+    * @param addy: The token address (e.g. uniswap LP token) to lock away
+    **/
+    function extendLiquidityLock(uint256 lockDays, address addy) nonReentrant external {// enter in days
+        require(msg.sender == sdOwner);
+        require(IERC20(addy).balanceOf(address(this)) > 0);
+        liquidityUnlockTime[addy] += lockDays * 1 days;
+    }
+
+    /**
+    * Onwer can chose to remove his tokens.
+    * @param amt: The amounts of tokens to be removed
+    * @param addy: The token address (e.g. uniswap LP token) to lock away
+    **/
+    function removeLiquidity(uint256 amt, address addy) nonReentrant external {
+        require(msg.sender == sdOwner);
+        //checks remaining time
+        require(block.timestamp >= liquidityUnlockTime[addy], "locked");
+        //Gives the maximum amount out if the amt asked is above
+        uint256 a = IERC20(addy).balanceOf(address(this));
+        uint currentBalance = a;
+        uint amount = currentBalance < amt  ? currentBalance : amt;
+        SafeTransfer._pushUnderlying(IERC20(addy), sdOwner, amount);
+    }
+
+    /**
+    * Verify the liquidity lock of the given address
+    * @return bool    : Is it locked
+    * @return uint256 : time remaining 0 if unlocked
+    * @return uint256 : The amount that is locked
+    **/
+    function checkLiquidityLock(address addy) external view returns (bool, uint256, uint256) {//is Locked, time remaining, how much is locked
+        uint256 time = liquidityUnlockTime[addy];
+        time = (block.timestamp < time) ? time - block.timestamp : 0;
+        bool locked = false;
+        uint256 amt = 0;
+        if (time > 0) {
+            locked = true;
+            amt = IERC20(addy).balanceOf(address(this));
+        }
+        return (locked, time, amt);
+    }
+
+    /**
+    * function to check how many tokens will be taken due to the fees
+    * @param recipient : the addresss that will receive the tokens
+    * @param amt : how many tokens are transfered
+    * @return reciever , amount , fee : a
+    * reciever: list of receiver which are the recipient AND the tax destinations
+    * reciver[0] : Backing Contract
+    * reciver[1] : Burn address
+    * reciver[2] : Backing Contract
+    * reciver[3] : Owner wallet or wallet that has been set as destination
+    * reciver[4] : staking contract
+    * reciver[5] : Protocol wallet (protocol fees)
+    * reciver[6] : recipient
+    * amount : The amount each reciever will receive
+    * fee : the total collected fee
+    **/
+    function takeFees(address _backingLogicAddress, address recipient, uint256 amt, address DR) internal view returns (address[7] memory reciever, uint256[7] memory amount, uint256 ref, uint256 fee) {
+        //check for a sell
+        uint i = isExchange(recipient) ? 6 : 0;
+        fee = 0;
+        uint256[12] memory tmpFee = allFee;
+        // 6 different fees to  iterate through. But reflections won't be there so 5
+        for (uint j = 0; j < 5; j++) {
+            if (tmpFee[j + i] > 0 && (j != 4 || sdStake != address(0))) { //skips staking if not set
+            amount[j] = amt * allFee[j + i] / 1000;
+            fee += amount[j];
+            }
+        }
+        reciever = [_backingLogicAddress, BURN, _backingLogicAddress, sdFeeRecipient, sdStake, Reader(DR).protocolAddy(), recipient];
+        uint256 pf = Reader(DR).getProtocolFee();
+        amount[5] = pf == 0 ? 0 : amt * pf / 1000;
+        ref = allFee[5 + i];
+        fee += amount[5];
+    }
+
+    /**
+    * Create balance history for address, used for many purposes like creating on demand snapshots and front run protection data.
+    * @ sender    : token sender
+    * @ recipient : token recipient, if not active create user struct and begin tracking
+    * @ amount : amount of transfer
+    **/
+    function updateUserData(address sender, address recipient, uint256 amount) private {
+        bool i = User[recipient].active;
+        if(!i) {
+            User[recipient].active = true;
+            totalHolders += 1;
+            User[recipient].id = totalHolders;
+            User[recipient].start = block.number;
+            allUser.push(recipient);
+        }
+
+        if(sender != address(0)) {
+        if(!bypass[sender]) {
+        balance[sender].push(lastBalance(sender) - (amount * (tBase / _tTotal)));
+        blockNumber[sender].push(block.number);
+        }
+        if(bypass[sender]) {
+        balancesBypass[sender] -= amount * (tBase / _tTotal);
+        }
+        if(exempt[sender]) {
+        balances[sender] -= amount;
+        }
+        }
+
+        if(recipient != address(0)) {
+        if(!bypass[recipient]) {
+        balance[recipient].push(lastBalance(recipient) + (amount * (tBase / _tTotal)));
+        blockNumber[recipient].push(block.number);
+        }
+        if(bypass[recipient]) {
+        balancesBypass[recipient] += amount * (tBase / _tTotal);
+        }
+        if(exempt[recipient]) {
+        balances[recipient] += amount;
+        }
+        }
+    }
+
+    /**
+    * This function lets you know if there was a front run trade before your transaction within a given percentage rate.
+    * If you input slip 5 then if the last trade moved the tracked balance of the previous range of trades average by 5% then front run happened.
+    * If there has been more then choosen trade block ticks on same block before your call we can assume that there has been manipulation on the ticks, since it was outside your trade allowance.
+    * On contracts if returned bool is true then revert trade to save losses.
+    * @param who : The SmartDeFi token
+    * @param range : slippage amount in pool
+    **/
+    function frontRun(address who, uint256 range, uint256 slip) public view returns(bool yes) {
+        if(range > 0) {
+        if(balance[who].length > range + 3) { // skip if length is under range
+        uint256 l = balance[who].length - 2; // we will skip the most recent balance
+        uint256 a = (balance[who][balance[who].length - 1] * range); // * range to compare
+        uint256 t;
+        for(uint256 i = 0; i < range; i++) {
+            t += balance[who][l - i];
+            if(l - i == 0) {
+            a = (i + l) * a / range;
+            break;
+            }
+        }
+        if(a > (t + (t * slip / 100))) {
+            yes = true;
+        }
+        if(a < (t - (t * slip / 100))) {
+            yes = true;
+        }
+        }
+        }
+    }
+
+    /**
+    * calculates the fees or returns early if transfer is taxless
+    * @param sender: the sending address
+    * @param recipient: The recipient address
+    * @param amount: The amount that is transfered
+    *
+    **/
+    function preTransfer(address sender, address recipient, uint256 amount) private live(sender,recipient) {
+        bool i;
+        if(Reader(dataread).isKYCToken(address(this)) && !isExchange(recipient)) {
+        (,,,,i) = Reader(dataread).kyc(address(this), recipient);
+        require(i, "not kyc");
+        }
+        require(recipient != sender, "s=r");
+        require(recipient != address(0) && sender != address(0));
+        if(!taxFree[sender] && !taxFree[recipient]) {
+        require(amount <= maxTx, "max tx limit");
+        }    
+        // needed for the liquidity or backing sell
+        address DR = dataread;
+        address dep = Reader(DR).sdDepAddy();
+        address bla = backingLogicAddress;
+        if(LGE){
+        require(sender != uniswapV2Pair(), "nbdp");
+        address fp = Reader(LGEAddress).uniswapV2PairFEG();
+        if(recipient == uniswapV2Pair() || recipient == fp) {
+        require(LGEAddress == sender, "npc");
+        }
+        }
+
+        if(isExchange(sender)) {
+        (uint256 rg, uint256 rr) = blogic(dep).slippage(recipient);
+        if(rr > 0 ) {
+        require(!frontRun(sender, rg, rr), "Front run");
+        }
+        }
+
+        if(isExchange(recipient)) {
+        (uint256 sg, uint256 sr) = blogic(dep).slippage(sender);
+        if(sr > 0 ) {
+        require(!frontRun(recipient, sg, sr), "Front run");
+        }
+        }
+
+        bool o;
+        if(Reader(DR).isWhitelistContract(sender) || Reader(DR).isWhitelistContract(recipient) || taxFree[sender] || taxFree[recipient]) {
+        o = true;
+        }
+
+        if(o) {    
+        updateUserData(sender, recipient, amount);
+        emit Transfer(sender, recipient, amount);
+        _setTick(DR);
+        }
+
+        if(!o) {
+        uint256 fees = 0;
+        uint256 ref;
+        address[7] memory recievers;
+        uint256[7] memory amts;
+        //  checks if it is not a transfer and then if it is not a sell nor an exchange
+        if(!onlySB || (isExchange(recipient) || isExchange(sender))) {
+            // calculates the fees if the contract is not whitelisted / excluded
+        (recievers, amts, ref, fees) = takeFees(bla, recipient, amount, DR);
+        }        
+        updateUserData(sender, address(0), amount); // if !taxless update only sender data here so we don't do it for each fee step in _transfer
+        // "true" recipient
+        recievers[6] = recipient;
+        amts[6] = amount - fees;
+        _transfer(sender, recievers, amts, ref, DR);
+        }
+    }
+
+    /**
+    * Allows to send tokens to a recipient from the iniciators wallet
+    * @param recipient : the destination of the transfer
+    * @param amount : the amount that wants to be transfered
+    * @return bool : if the transfer has been successfull or not
+    **/
+    function transfer(address recipient, uint256 amount) public override nonReentrant returns (bool) {            
+        // if an protocolAddy is not 0, automatically convert fees if threshold is met
+        address DR = dataread;
+        if(!taxFree[msg.sender]) {
+        if(msg.sender.code.length == 0 && recipient.code.length == 0) {
+        address fc0 = Reader(DR).feeConverter();
+        address fc1 = Reader(DR).feeConverterSD(address(this));
+        if (fc0 != address(0)){
+        protCont(fc0).cont(address(this), 0, msg.sender);
+        }
+        if(fc1 != address(0)) {
+        protCont(fc1).cont(address(this), 1, msg.sender);
+        }
+        }
+        }
+        preTransfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    /**
+    * function to check how many tokens will be taken due to the fees
+    * @param amount : how many tokens are transfered to the corresponding recipient
+    * @param recipient: list of receiver which are the recipient AND the tax destinations
+    * recipient[0] : Backing Contract
+    * recipient[1] : Burn address
+    * recipient[2] : Backing Contract
+    * recipient[3] : Owner wallet or wallet that has been set as destination
+    * recipient[4] : staking contract
+    * recipient[5] : Protocol wallet (protocol fees)
+    * recipient[6] : recipient
+    * @param amount : The amount each reciever will receive
+    **/
+    function _transfer(address sender, address[7] memory recipient, uint256[7] memory amount, uint256 ref, address DR) private {
+        if (recipient[6] == uniswapV2Pair()) {
+            if(backShare > backingThreshold) {
+                backShare = blogic(backingLogicAddress).convertBack(backShare, backingThreshold, DR);
+            }
+            if(liqShare > liquidityThreshold) {
+                liqShare = blogic(backingLogicAddress).convertLiq(liqShare, liquidityThreshold, DR);
+            }
+        }
+        liqShare = amount[2] > 0 ? liqShare + amount[2] : liqShare;
+        backShare = backingAsset != address(this) ? amount[0] > 0 ? backShare + amount[0] : backShare : 0;
+        address s = sender;
+        for (uint i = 0; i < 7; i++) {
+            if (amount[i] > 0 && recipient[i] != address(0)) {
+            // no taxes nor reflections on taxes transfer and if reflection is 0
+            if (ref == 0) {
+                updateUserData(address(0), recipient[i], amount[i]); // since sender data was updated in pretransfer only update recipient
+                emit Transfer(sender, recipient[i], amount[i]);
+            }
+            //reflection logic
+            if (ref > 0) {
+                address recip = recipient[i];
+                (uint256 tTransferAmount, uint256 tShare) = _getWorth(amount[i], recip, ref);
+                updateUserData(address(0), recip, tTransferAmount); // since sender data was updated in pretransfer only update recipient
+                uint256 tb = tShare * (tBase / _tTotal);
+                if(tBase - tb > _tTotal) {
+                tBase -= tb;
+                }
+                if(tBase - tb <= _tTotal) {
+                tBase = _tTotal;
+                }
+                emit Transfer(s, recip, tTransferAmount);
+            }
+            }
+        }     
+        _setTick(DR);
+    }
+
+    /**
+    * Allows to send tokens with approval from one wallet to another address
+    * @param sender : from which wallet to initiate the transfer
+    * @param recipient : the destination of the transfer
+    * @param amount : the amount that wants to be transfered
+    * @return bool : if the transfer has been successfull or not
+    **/
+    function transferFrom(address sender, address recipient, uint256 amount) external override nonReentrant returns (bool) {
+        _approve(sender, msg.sender, _allowances[sender][msg.sender] - amount);
+        preTransfer(sender, recipient, amount);
+        return true;
+    }
+
+    /**
+    * Check how much the owner allowed the spender to spend
+    * @param _owner : The source
+    * @param spender : The one initiating the transfer
+    * @return uint256: How much the spender is allowed to spend from the owners wallet
+    **/
+    function allowance(address _owner, address spender) external view override returns (uint256) {
+        return _allowances[_owner][spender];
+    }
+
+    /**
+    * Allowing a spender to spend the amount of tokens from your wallet
+    * @param spender : the allowed address
+    * @param amount : The allowed amount
+    * @return bool : successfully allowed
+    **/
+    function approve(address spender, uint256 amount) external override live(msg.sender,spender) returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    /// @return the total Supply of the token
+    function totalSupply() external view override returns (uint256) {
+        return _tTotal;
+    }
+
+    /**
+    * @param account : the address to check the balance of
+    * @return bal : The amount of token in the wallet of the given account
+    **/
+    function balanceOf(address account) public view override returns (uint256 bal) {
+
+        if(!exempt[account] && !bypass[account]) {
+        bal = lastBalance(account) == 0 ? 0 : lastBalance(account) / (tBase / _tTotal);
+        }
+        if(!exempt[account] && bypass[account]) {
+        bal = balancesBypass[account] == 0 ? 0 : balancesBypass[account] / (tBase / _tTotal);
+        }
+        if(exempt[account]) {
+        bal = balances[account];
+        }
+    }
+
+    /**
+    * Allowing a spender to spend the amount of tokens from your wallet
+    * @param owner_ : the  initiators wallet
+    * @param spender : the allowed address
+    * @param amount : The allowed amount
+    **/
+    function _approve(address owner_, address spender, uint256 amount) private {
+        _allowances[owner_][spender] = amount;
+        emit Approval(owner_, spender, amount);
+    }
+
+    /************************************* RFI SECTION *****************************************************************/
+    function _getWorth(uint256 tAmount, address recipient, uint256 ref) private view returns (uint256 tTransferAmount, uint256 tShare) {
+        if(Reader(dataread).isWhitelistContract(recipient) || Reader(dataread).isWhitelistContract(msg.sender) || taxFree[msg.sender] || taxFree[recipient]) {
+        return (tAmount, 0);
+        }
+        tShare = ref == 0 ? 0 : tAmount * ref / 1000;
+        tTransferAmount = tAmount - tShare;
+        return (tTransferAmount, tShare);
+    }
+    /*******************************************************************************************************************/
+}

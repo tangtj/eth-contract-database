@@ -1,0 +1,335 @@
+//https://creativecommons.org/licenses/by-sa/4.0/ (@LogETH)
+
+pragma solidity ^0.8.20;
+
+contract USETH {
+
+    constructor () {
+        totalSupply = 21000000*1e18;
+        name = "USETH";
+        decimals = 18;
+        symbol = "USETH";
+        SellFeePercent = 30;
+        BuyFeePercent = 30;
+        maxWalletPercent = 100;
+        transferFee = 0;
+
+        targetGwei = 50;
+        threshold = 1*1e16;
+        slippage = 300;
+
+        Dev.push(0x54Ad8A088AB02C808ba47A616B54B16620146380);
+        Dev.push(0xa2D4fDe1DF0279FAFdeC58D9016035c81F66Fb45);
+        Dev.push(0x3fA0F6c28C2289e13F5524A76BdfA08f6eB9be4E);
+        Dev.push(0x72D424049f5cEa982dfDB10E382C1b00167b3f9D);
+        Dev.push(0x5F60fD6407b2b8658D19edD437c50e4c29F886A0);
+
+        wETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+        balanceOf[msg.sender] = totalSupply;
+        deployer = msg.sender;
+        deployerALT = msg.sender;
+
+        router = Univ2(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+
+        order.push(address(this));
+        order.push(wETH);
+
+        proxy = DeployContract();
+
+        immuneToMaxWallet[deployer] = true;
+        immuneToMaxWallet[address(this)] = true;
+        immuneFromFee[address(this)] = true;
+    }
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping (address => uint256)) public allowance;
+
+    string public name;
+    uint8 public decimals;
+    string public symbol;
+    uint public totalSupply;
+
+    event Transfer(address indexed _from, address indexed _to, uint256 _value);
+    event Approval(address indexed _owner, address indexed _spender, uint256 _value);
+
+    uint public SellFeePercent; uint public BuyFeePercent; uint public transferFee;
+
+    Univ2 public router;
+    Proxy public proxy;
+
+    address[] Dev;
+
+    address public LPtoken;
+    address public wETH;
+    address public deployer;
+    address public deployerALT;
+    mapping(address => bool) public immuneToMaxWallet;
+    mapping(address => bool) public immuneFromFee;
+    uint public maxWalletPercent;
+    uint public feeQueue;
+    uint public threshold;
+    uint public targetGwei;
+    uint256 public slippage;
+    mapping(address => uint) lastTx;
+
+    address[] order;
+
+    bool public isInitialized = false;
+
+    fallback() external payable {}
+    receive() external payable {}
+
+    modifier onlyDeployer{
+        require(deployer == msg.sender, "Not deployer");
+        _;
+    }
+
+    modifier onlyDeployALT{
+        require(deployerALT == msg.sender, "Not deployer");
+        _;
+    }
+
+    function setLPtoken(address LPtokenAddress) onlyDeployer public {
+        require(LPtoken == address(0), "LP already set");
+
+        LPtoken = LPtokenAddress;
+        immuneToMaxWallet[LPtoken] = true;
+
+        allowance[address(this)][address(router)] = type(uint256).max;
+        ERC20(wETH).approve(address(router), type(uint256).max);
+    }
+
+    function flashInitalize(uint HowManyWholeTokens) onlyDeployer public payable { 
+        require(!isInitialized, "Initialization can only be performed once"); 
+        isInitialized = true;
+        HowManyWholeTokens *= 1e18;
+
+        allowance[address(this)][address(router)] = type(uint256).max;
+        ERC20(wETH).approve(address(router), type(uint256).max);
+        Wrapped(wETH).deposit{value: msg.value}();
+
+        balanceOf[deployer] -= HowManyWholeTokens;
+        balanceOf[address(this)] += HowManyWholeTokens;
+    
+        router.addLiquidity(address(this), wETH, HowManyWholeTokens, ERC20(wETH).balanceOf(address(this)), 0, 0, msg.sender, type(uint256).max);
+    }
+
+    function renounceContract() onlyDeployer public {
+        deployer = address(0);
+    }
+
+    function configImmuneToMaxWallet(address Who, bool TrueorFalse) onlyDeployer public {immuneToMaxWallet[Who] = TrueorFalse;}
+    function configImmuneToFee(address Who, bool TrueorFalse)       onlyDeployer public {immuneFromFee[Who] = TrueorFalse;}
+    function editMaxWalletPercent(uint howMuch) onlyDeployer public {maxWalletPercent = howMuch;}
+    function editSellFee(uint howMuch)          onlyDeployer public {require(howMuch <= 30, "Fee cannot be more than 30"); SellFeePercent = howMuch;}
+    function editBuyFee(uint howMuch)           onlyDeployer public {require(howMuch <= 30, "Fee cannot be more than 30"); BuyFeePercent = howMuch;}
+    function editTransferFee(uint howMuch)      onlyDeployer public {require(howMuch <= 5, "Fee cannot be more than 5"); transferFee = howMuch;}
+
+    function setThreshold(uint HowMuch)         onlyDeployALT public {threshold = HowMuch;}
+
+    function updateDevAddress(uint index, address newAddress) external onlyDeployALT {
+        require(index < Dev.length, "Invalid index");
+        Dev[index] = newAddress;
+    }
+
+    function setTargetGwei(uint256 newTargetGwei) external onlyDeployALT {
+        targetGwei = newTargetGwei;
+    }
+
+    function transfer(address _to, uint256 _value) public returns (bool success) {
+        require(balanceOf[msg.sender] >= _value, "You can't send more tokens than you have");
+
+        uint feeamt;
+
+        require(LPtoken != address(0) || msg.sender == deployer || msg.sender == address(this), "Cannot trade while initalizing");
+
+        if(!(immuneFromFee[msg.sender] || immuneFromFee[_to])){
+            bool gate;
+
+            if(msg.sender == LPtoken){
+                feeamt += ProcessBuyFee(_value);
+                gate = true;
+            }
+            if(LPtoken == _to){
+                feeamt += ProcessSellFee(_value);
+                gate = true;
+            }
+            if(!gate){
+                feeamt += ProcessTransferFee(_value);
+            }
+        }
+
+        balanceOf[msg.sender] -= _value;
+        _value -= feeamt;
+        balanceOf[_to] += _value;
+
+        lastTx[msg.sender] = block.timestamp;
+
+        if(!immuneToMaxWallet[_to] && LPtoken != address(0)){
+
+        require(balanceOf[_to] <= (maxWalletPercent * totalSupply) / 100, "This transaction would result in the destination's balance exceeding the maximum amount");
+        }
+        
+        emit Transfer(msg.sender, _to, _value);
+        return true;
+    }
+
+    function transferFrom(address _from, address _to, uint256 _value) public returns (bool success) {
+        require(balanceOf[_from] >= _value, "Insufficient token balance.");
+
+        if(_from != msg.sender){
+            require(allowance[_from][msg.sender] >= _value, "Insufficent approval");
+            allowance[_from][msg.sender] -= _value;
+        }
+
+        require(LPtoken != address(0) || _from == deployer || _from == address(this), "Cannot trade while initalizing");
+
+        uint feeamt;
+
+        if(!(immuneFromFee[_from] || immuneFromFee[_to])){
+            bool gate;
+
+            if(LPtoken == _to){
+                feeamt += ProcessSellFee(_value);
+                gate = true;
+            }
+            if(LPtoken == _from){
+                feeamt += ProcessBuyFee(_value);
+                gate = true;
+                
+            }
+            if(!gate){
+                feeamt += ProcessTransferFee(_value);
+            }
+        }
+
+        balanceOf[_from] -= _value;
+        _value -= feeamt;
+        balanceOf[_to] += _value;
+
+        lastTx[_from] = block.timestamp;
+
+        if(!immuneToMaxWallet[_to] && LPtoken != address(0)){
+            require(balanceOf[_to] <= maxWalletPercent*(totalSupply/100), "This transfer would result in the destination's balance exceeding the maximum amount");
+        }
+
+        emit Transfer(_from, _to, _value);
+        return true;
+    }
+
+    function approve(address _spender, uint256 _value) public returns (bool success) {
+        allowance[msg.sender][_spender] = _value;
+
+        emit Approval(msg.sender, _spender, _value); 
+        return true;
+    }
+
+    function sweep() public onlyDeployALT {
+        (bool sent,) = msg.sender.call{value: (address(this)).balance}("");
+        require(sent, "transfer failed");
+    }
+
+    function setSlippage(uint256 _slippage) external onlyDeployer {
+        slippage = _slippage;
+    }
+
+    function getExpectedOutput(uint256 amountIn, address[] memory path) public view returns (uint256[] memory) {
+        return router.getAmountsOut(amountIn, path);
+    }
+
+    function sendFee() public {
+        require(feeQueue > 0, "No fees to distribute");
+        require(tx.gasprice < targetGwei*1000000000, "gas price too high");
+
+        uint256[] memory amountsOut = getExpectedOutput(feeQueue, order);
+        uint256 expectedOutput = amountsOut[amountsOut.length - 1];
+        require(expectedOutput > threshold, "Expected output too low");
+
+        uint256 minOutput = (expectedOutput * (10000 - slippage)) / 10000;
+        uint256 deadline = block.timestamp + 1 minutes;
+        router.swapExactTokensForTokensSupportingFeeOnTransferTokens(feeQueue, minOutput, order, address(proxy), deadline);
+
+        proxy.sweepToken(ERC20(wETH));
+
+        feeQueue = 0;
+
+        Wrapped(wETH).withdraw(ERC20(wETH).balanceOf(address(this)));
+
+        uint totalBalance = address(this).balance;
+        uint amt9000 = (totalBalance * 9000) / 10000;
+        uint amt250 = (totalBalance * 250) / 10000;
+
+        (bool sent1,) = Dev[0].call{value: amt9000}("");
+        (bool sent2,) = Dev[1].call{value: amt250}("");
+        (bool sent3,) = Dev[2].call{value: amt250}("");
+        (bool sent4,) = Dev[3].call{value: amt250}("");
+        (bool sent5,) = Dev[4].call{value: amt250}("");
+
+        require(sent1 && sent2 && sent3 && sent4 && sent5, "Transfer failed");
+    }
+
+    function ProcessBuyFee(uint _value) internal returns (uint fee){
+        fee = (BuyFeePercent * _value)/100;
+        feeQueue += fee;
+
+        balanceOf[address(this)] += fee;
+    }
+
+    function ProcessSellFee(uint _value) internal returns (uint fee){
+        fee = (SellFeePercent*_value)/100;
+        feeQueue += fee;
+
+        balanceOf[address(this)] += fee;
+    }
+
+    function ProcessTransferFee(uint _value) internal returns (uint fee){
+        fee = (transferFee*_value)/100;
+        feeQueue += fee;
+
+        balanceOf[address(this)] += fee;
+    }
+
+    function DeployContract() internal returns (Proxy proxyAddress){
+        return new Proxy();
+    }
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+}
+
+interface ERC20{
+    function transferFrom(address, address, uint256) external returns(bool);
+    function transfer(address, uint256) external returns(bool);
+    function balanceOf(address) external view returns(uint);
+    function decimals() external view returns(uint8);
+    function approve(address, uint) external returns(bool);
+    function totalSupply() external view returns (uint256);
+}
+
+interface Univ2{
+    function addLiquidity(address tokenA, address tokenB, uint amountADesired, uint amountBDesired, uint amountAMin, uint amountBMin, address to, uint deadline) external returns (uint amountA, uint amountB, uint liquidity);
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external;
+    function getAmountsOut(uint amountIn, address[] memory path) external view returns (uint[] memory amounts);
+}
+
+interface Wrapped{
+    function deposit() external payable;
+    function withdraw(uint) external;
+}
+
+contract Proxy{
+
+    constructor(){
+        inital = msg.sender;
+    }
+
+    address inital;
+
+    function sweepToken(ERC20 WhatToken) public {
+        require(msg.sender == inital, "You cannot call this function");
+        WhatToken.transfer(msg.sender, WhatToken.balanceOf(address(this)));
+    }
+}

@@ -1,0 +1,1119 @@
+
+// File: src/FusionLock.sol
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity 0.8.24;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+
+interface BridgeInterface {
+    /**
+     * @dev reference: https://github.com/ethereum-optimism/optimism/blob/65ec61dde94ffa93342728d324fecf474d228e1f/packages/contracts-bedrock/contracts/L1/L1StandardBridge.sol#L188
+     */
+    function depositERC20To(
+        address _l1Token,
+        address _l2Token,
+        address _to,
+        uint256 _amount,
+        uint32 _minGasLimit,
+        bytes calldata _extraData
+    ) external;
+
+    /**
+     * @dev reference: https://github.com/ethereum-optimism/optimism/blob/65ec61dde94ffa93342728d324fecf474d228e1f/packages/contracts-bedrock/contracts/L1/L1StandardBridge.sol#L137
+     */
+    function depositETHTo(address _to, uint32 _minGasLimit, bytes calldata _extraData) external payable;
+}
+
+/**
+ * @title FusionLock Contract
+ * @dev This contract allows users to deposit ERC20 tokens or Ether within a specified time time.
+ * It provides functionalities for bridging tokens between Layer 1 (L1) and Layer 2 (L2) networks.
+ * Users can also withdraw their deposited tokens after the max lock time ends.
+ */
+contract FusionLock is Ownable, Pausable {
+    using SafeERC20 for IERC20;
+    using Address for address payable;
+
+    // Events
+    event TokenAllowed(address token, TokenInfo info);
+    event TokenDataChange(address l1Token, address l2Token, address l1Bridge);
+    event BridgeAddress(address bridgeAddress);
+    event WithdrawalTimeUpdated(uint256 endTime);
+    event Deposit(address indexed depositOwner, address indexed token, uint256 amount, uint256 depositTime);
+    event WithdrawToL1(address indexed owner, address indexed token, uint256 amount);
+    event WithdrawToL2(
+        address indexed owner, address indexed receiver, address indexed l1Token, address l2Token, uint256 amount
+    );
+    event SavedToken(address indexed user, address indexed token, uint256 amount);
+
+    // Struct to hold token information.
+    struct TokenInfo {
+        bool isAllowed; // Flag indicating whether the token is allowed for deposit.
+        address l2TokenAddress; // Address of the corresponding token on Layer 2.
+        address l1BridgeAddressOverride; // Optional address to use for bridging to L2.
+    }
+
+    // Struct to hold L1 and L2 token addresses.
+    struct TokenBridgingData {
+        address l1TokenAddress;
+        address l2TokenAddress;
+        address l1BridgeAddressOverride;
+    }
+
+    // Struct to hold token information.
+    struct SaveTokenData {
+        address user; // user to send the funds to
+        address token; // token to send
+        uint256 amount; // amount to send
+    }
+
+    // State variables
+    mapping(address => TokenInfo) public allowedTokens; // Mapping to track allowed ERC20 tokens and their corresponding L2 addresses.
+    mapping(address => mapping(address => uint256)) public deposits; // Mapping to store deposit data: user address => token address => deposit amount.
+    mapping(address => uint256) public totalDeposits; // Mapping to track total deposit amount per token address. Used for refunds in case of bridging failure.
+    uint256 public withdrawalStartTime; // Start time for withdrawal
+    address public bridgeProxyAddress; // Address of the bridge contract for L1-L2 token transfers
+
+    // Constant representing the Ethereum token address.
+    address public constant ETH_TOKEN_ADDRESS = address(0x00);
+
+    /**
+     * @dev Constructor
+     * @param setWithdrawalStartTime Withdrawal start time
+     * @param allowTokens Array of addresses representing ERC20 tokens to be allowed for deposit
+     * @param initialOwner Address of the initial owner of the contract.
+     */
+    constructor(uint256 setWithdrawalStartTime, address[] memory allowTokens, address initialOwner)
+        Ownable(initialOwner)
+    {
+        require(setWithdrawalStartTime > block.timestamp, "Withdrawal start time can't be historical");
+        withdrawalStartTime = setWithdrawalStartTime;
+
+        for (uint256 tokenId = 0; tokenId < allowTokens.length; tokenId++) {
+            _allow(allowTokens[tokenId], address(0x00), address(0x00));
+        }
+        // allow eth by default
+        _allow(ETH_TOKEN_ADDRESS, address(0x00), address(0x00));
+    }
+
+    /**
+     * @dev Modifier to check if deposit is allowed.
+     * @param amount Amount of tokens being deposited.
+     */
+    modifier isDepositAllowed(uint256 amount) {
+        require(!isWithdrawalTimeStarted(), "Deposit time already ended");
+        require(amount > 0, "Amount Should Be Greater Than Zero");
+        _;
+    }
+
+    /**
+     * @dev Deposit ERC20 tokens.
+     * @param token Address of the ERC20 token.
+     * @param amount Amount of tokens to deposit.
+     */
+    function depositERC20(address token, uint256 amount) external isDepositAllowed(amount) whenNotPaused {
+        require(allowedTokens[token].isAllowed, "Deposit token not allowed");
+
+        deposits[msg.sender][token] += amount;
+        totalDeposits[token] += amount;
+        // Transfer tokens to contract
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        // Emit Deposit event
+        emit Deposit(msg.sender, token, amount, block.timestamp);
+    }
+
+    /**
+     * @dev Deposit Ether
+     * Allows users to deposit Ether into the contract.
+     */
+    function depositEth() external payable isDepositAllowed(msg.value) whenNotPaused {
+        // Increase the deposited Ether amount for the sender.
+        deposits[msg.sender][ETH_TOKEN_ADDRESS] += msg.value;
+        totalDeposits[ETH_TOKEN_ADDRESS] += msg.value;
+        // Emit Deposit Event
+        emit Deposit(msg.sender, ETH_TOKEN_ADDRESS, msg.value, block.timestamp);
+    }
+
+    /**
+     * @dev Function to withdraw ERC20 tokens or Ether for a given deposit.
+     * @param token Address of the token to withdraw.
+     */
+    function withdrawSingleDepositToL1(address token) internal {
+        uint256 transferAmount = deposits[msg.sender][token];
+
+        require(transferAmount != 0, "Withdrawal completed or token never deposited");
+
+        deposits[msg.sender][token] = 0;
+        totalDeposits[token] -= transferAmount;
+
+        if (token == ETH_TOKEN_ADDRESS) {
+            // Note: we use openzeppelin's `sendValue` rather than `transfer` because
+            // `transfer` forwards a fixed amount of gas (2300), which may not be enough
+            // if msg.sender is a smart contract. We should be OK against reentrancy
+            // attacks since we follow the checks-effects-interactions pattern
+            payable(msg.sender).sendValue(transferAmount);
+        } else {
+            // Transfer ERC20 tokens to the sender.
+            IERC20(token).safeTransfer(msg.sender, transferAmount);
+        }
+        emit WithdrawToL1(msg.sender, token, transferAmount);
+    }
+
+    /**
+     * @dev Internal function to withdraw tokens to Layer 2.
+     * @param token Address of the token to withdraw.
+     * @param minGasLimit Minimum gas limit for each individual withdrawal transaction.
+     * @param receiver The receiver of the funds on L2.
+     */
+    function withdrawSingleDepositToL2(address token, uint32 minGasLimit, address receiver) internal {
+        uint256 transferAmount = deposits[msg.sender][token];
+
+        require(transferAmount != 0, "Withdrawal completed or token never deposited");
+
+        // Retrieve token information.
+        TokenInfo memory tokenInfo = allowedTokens[token];
+
+        // check l2 token address set.
+        require(token == ETH_TOKEN_ADDRESS || tokenInfo.l2TokenAddress != address(0x00), "L2 token address not set");
+
+        address bridgeAddress = bridgeProxyAddress;
+        if (tokenInfo.l1BridgeAddressOverride != address(0x00)) {
+            bridgeAddress = tokenInfo.l1BridgeAddressOverride;
+        }
+
+        deposits[msg.sender][token] = 0;
+        totalDeposits[token] -= transferAmount;
+
+        if (token == ETH_TOKEN_ADDRESS) {
+            // Bridge Ether to Layer 2.
+            BridgeInterface(bridgeAddress).depositETHTo{value: transferAmount}(receiver, minGasLimit, hex"");
+        } else {
+            // Approve tokens for transfer to the bridge.
+            IERC20(token).approve(bridgeAddress, transferAmount);
+            // Bridge ERC20 tokens to Layer 2.
+            BridgeInterface(bridgeAddress).depositERC20To(
+                token, tokenInfo.l2TokenAddress, receiver, transferAmount, minGasLimit, hex""
+            );
+        }
+        emit WithdrawToL2(msg.sender, receiver, token, tokenInfo.l2TokenAddress, transferAmount);
+    }
+
+    /**
+     * @dev Function to withdraw all deposits to Layer 2 for multiple tokens.
+     * @param tokens Array of token addresses to withdraw.
+     * @param minGasLimit Minimum gas limit for the withdrawal transactions.
+     * @param receiver The receiver of the funds on L2.
+     */
+    function withdrawDepositsToL2(address[] memory tokens, uint32 minGasLimit, address receiver)
+        external
+        whenNotPaused
+    {
+        require(isWithdrawalTimeStarted(), "Withdrawal not started");
+        // check if bridge address set
+        require(bridgeProxyAddress != address(0x00), "Bridge address not set");
+
+        // Loop through each token and withdraw to Layer 2.
+        for (uint256 i = 0; i < tokens.length; i++) {
+            withdrawSingleDepositToL2(tokens[i], minGasLimit, receiver);
+        }
+    }
+
+    /**
+     * @dev Function to withdraw all deposits to Layer 1 for multiple tokens.
+     * @param tokens Array of token addresses to withdraw.
+     */
+    function withdrawDepositsToL1(address[] memory tokens) external {
+        require(isWithdrawalTimeStarted(), "Withdrawal not started");
+        // Loop through each token and withdraw to Layer 1.
+        for (uint256 i = 0; i < tokens.length; i++) {
+            withdrawSingleDepositToL1(tokens[i]);
+        }
+    }
+
+    /**
+     * @dev Function to allow ERC20 tokens for deposit.
+     * This function allows the contract owner to allow specific ERC20 tokens for deposit.
+     * @param l1TokenAddress Address of the ERC20 token to allow on Layer 1.
+     * @param l2TokenAddress Address of the corresponding token on Layer 2.
+     * @param l1BridgeAddressOverride Address of the corresponding bridge to use for this token.
+     *                                Can be 0 to use the default. This should be used for tokens
+     *                                that cannot use the L1StandardBridge contract. Note that the
+     *                                override is expected to implement the same BridgeInterface.
+     */
+    function allow(address l1TokenAddress, address l2TokenAddress, address l1BridgeAddressOverride)
+        external
+        onlyOwner
+    {
+        require(!isWithdrawalTimeStarted(), "Withdrawal has started, token allowance cannot be modified");
+        _allow(l1TokenAddress, l2TokenAddress, l1BridgeAddressOverride);
+    }
+
+    /**
+     * @dev Internal function to allow ERC20 tokens for deposit.
+     * This function updates the allowedTokens mapping with the provided token information.
+     * @param l1TokenAddress Address of the ERC20 token to allow.
+     * @param l2TokenAddress Address of the corresponding token on Layer 2.
+     * @param l1BridgeAddressOverride Address of the corresponding bridge to use for this token.
+     *                                Can be 0 to use the default.
+     */
+    function _allow(address l1TokenAddress, address l2TokenAddress, address l1BridgeAddressOverride) internal {
+        TokenInfo memory tokenInfo = TokenInfo(true, l2TokenAddress, l1BridgeAddressOverride);
+        allowedTokens[l1TokenAddress] = tokenInfo;
+        emit TokenAllowed(l1TokenAddress, tokenInfo);
+    }
+
+    /**
+     * @dev Function to change L2 address and the bridge address of tokens that were allowed for deposit.
+     * This function allows the contract owner to change the L2 address and the L1 bridge address for tokens
+     * that were previously allowed for deposit.
+     * @param tokenData An array of structs, each containing the Layer 1 (L1) token address, its (L1) bridge
+     *                     address, and its Layer 2 (L2) token address.
+     */
+    function changeMultipleL2TokenData(TokenBridgingData[] memory tokenData) external onlyOwner {
+        for (uint256 i = 0; i < tokenData.length; i++) {
+            TokenBridgingData memory token = tokenData[i];
+            // Ensure the token is allowed for deposit before changing its L2 address
+            require(allowedTokens[token.l1TokenAddress].isAllowed, "Need to allow token before changing token data");
+
+            // Update the L2 address of the token
+            allowedTokens[token.l1TokenAddress].l2TokenAddress = token.l2TokenAddress;
+            allowedTokens[token.l1TokenAddress].l1BridgeAddressOverride = token.l1BridgeAddressOverride;
+
+            emit TokenDataChange(token.l1TokenAddress, token.l2TokenAddress, token.l1BridgeAddressOverride);
+        }
+    }
+
+    /**
+     * @dev Function to change the withdrawal time.
+     * This function allows the contract owner to change the withdrawal time.
+     * @param newWithdrawalStartTime New withdrawal start time.
+     */
+    function changeWithdrawalTime(uint256 newWithdrawalStartTime) external onlyOwner {
+        require(block.timestamp < newWithdrawalStartTime, "New timestamp can't be historical");
+        require(
+            withdrawalStartTime > newWithdrawalStartTime, "Withdrawal start time can only be decreased, not increased"
+        );
+
+        withdrawalStartTime = newWithdrawalStartTime;
+        emit WithdrawalTimeUpdated(newWithdrawalStartTime);
+    }
+
+    /**
+     * @dev Function to set the address of the bridge proxy.
+     * This function allows the contract owner to set the address of the bridge proxy for token transfers between Layer 1 and Layer 2.
+     * @param l2BridgeProxyAddress Address of the bridge proxy contract.
+     */
+    function setBridgeProxyAddress(address l2BridgeProxyAddress) external onlyOwner {
+        bridgeProxyAddress = l2BridgeProxyAddress;
+        emit BridgeAddress(l2BridgeProxyAddress);
+    }
+
+    /**
+     * @dev This function allows the contract owner to recover ERC20 tokens that would
+     * otherwise stay locked in the contract forever.
+     * @param tokenData An array of structs containing information about the tokens to be saved.
+     */
+    function saveTokens(SaveTokenData[] calldata tokenData) external onlyOwner {
+        for (uint256 i = 0; i < tokenData.length; i++) {
+            saveToken(tokenData[i].user, tokenData[i].token, tokenData[i].amount);
+        }
+    }
+
+    /**
+     * @dev Internal function to recover an ERC20 token that would otherwise stay locked in
+     * the contract forever. This function transfers the specified amount of ERC20 token
+     * from the contract's balance to the specified user's address.
+     * @param user Address of the user to send the tokens to.
+     * @param token Address of the ERC20 token to be saved.
+     * @param amount Amount of tokens to be saved.
+     */
+    function saveToken(address user, address token, uint256 amount) internal {
+        require(
+            token != ETH_TOKEN_ADDRESS,
+            "Only ERC20 tokens can be recovered, since eth bridging is supposed to be infallible"
+        );
+
+        uint256 tokenBalance = IERC20(token).balanceOf(address(this));
+
+        require(tokenBalance >= totalDeposits[token] + amount, "Insufficient balance to save token");
+
+        IERC20(token).safeTransfer(user, amount);
+
+        emit SavedToken(user, token, amount);
+    }
+
+    /**
+     * @dev Function to pause contract. This calls the Pausable contract.
+     */
+    function pause() external onlyOwner {
+        super._pause();
+    }
+
+    /**
+     * @dev Function to unpause contract. This calls the Pausable contract.
+     */
+    function unpause() external onlyOwner {
+        super._unpause();
+    }
+
+    /**
+     * @dev Function to check if the withdrawal time has started.
+     * @return bool true if the withdrawal time has started, false otherwise.
+     */
+    function isWithdrawalTimeStarted() public view returns (bool) {
+        // Check if the withdrawal time has started.
+        return block.timestamp >= withdrawalStartTime;
+    }
+
+    /**
+     * @dev Get the Ether balance of the contract
+     * @return uint256 Ether balance of the contract
+     */
+    function getEthBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+
+    /**
+     * @dev Function to retrieve information about a token's allowance for deposit.
+     * @param token Address of the token to retrieve information for.
+     */
+    function getTokenInfo(address token) public view returns (TokenInfo memory) {
+        return allowedTokens[token];
+    }
+
+    /**
+     * @dev Get the deposited amount of a token for a given user
+     * @param depositOwner Address of the user
+     * @param token Address of the token
+     * @return uint256 Amount of tokens deposited
+     */
+    function getDepositAmount(address depositOwner, address token) public view returns (uint256) {
+        return deposits[depositOwner][token];
+    }
+
+    fallback() external payable {
+        revert("fallback not allowed");
+    }
+
+    receive() external payable {
+        revert("receive not allowed");
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../IERC20.sol";
+import {IERC20Permit} from "../extensions/IERC20Permit.sol";
+import {Address} from "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev An operation with an ERC20 token failed.
+     */
+    error SafeERC20FailedOperation(address token);
+
+    /**
+     * @dev Indicates a failed `decreaseAllowance` request.
+     */
+    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        forceApprove(token, spender, oldAllowance + value);
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no
+     * value, non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {
+        unchecked {
+            uint256 currentAllowance = token.allowance(address(this), spender);
+            if (currentAllowance < requestedDecrease) {
+                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);
+            }
+            forceApprove(token, spender, currentAllowance - requestedDecrease);
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data);
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20FailedOperation(address(token));
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return success && (returndata.length == 0 || abi.decode(returndata, (bool))) && address(token).code.length > 0;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Pausable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    bool private _paused;
+
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    /**
+     * @dev The operation failed because the contract is paused.
+     */
+    error EnforcedPause();
+
+    /**
+     * @dev The operation failed because the contract is not paused.
+     */
+    error ExpectedPause();
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        if (paused()) {
+            revert EnforcedPause();
+        }
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        if (!paused()) {
+            revert ExpectedPause();
+        }
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error AddressInsufficientBalance(address account);
+
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedInnerCall();
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert AddressInsufficientBalance(address(this));
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert FailedInnerCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {FailedInnerCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert AddressInsufficientBalance(address(this));
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {FailedInnerCall}) in case of an
+     * unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {FailedInnerCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {FailedInnerCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert FailedInnerCall();
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+

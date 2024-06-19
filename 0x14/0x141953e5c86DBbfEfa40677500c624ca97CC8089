@@ -1,0 +1,449 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+// optimize 200
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+}
+
+interface StakeV2{
+    function getPending1(address staker) external view returns(uint256 _pendingReward);
+    function getPending2(address staker) external view returns(uint256 _pendingReward);
+    function getPending3(address staker) external view returns(uint256 _pendingReward);
+    function isStakeholder(address _address) external view returns(bool);
+    function userStakedFEG(address user) external view returns(uint256 StakedFEG);
+}
+
+interface dr {
+    function setMainBreaker(bool boolean) external;
+    function isAdmin(address addy) external view returns(bool);
+    function superAdmin(address addy) external view returns(bool);
+    function wETH() external view returns(address);
+    function stake(address user, uint256 amt) external returns(uint256);
+    function FEGstake() external view returns(address);
+}
+
+interface backing {
+    function liquifyForBacking(uint256 amt) external;
+    function BackingLogicAddress() external view returns(address);
+    function backingLogicAddress() external view returns(address);
+}
+
+library TransferHelper {
+    function safeApprove(address token, address to, uint value) internal {
+        // bytes4(keccak256(bytes('approve(address,uint256)')));
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: APPROVE_FAILED');
+    }
+
+    function safeTransfer(address token, address to, uint value) internal {
+        // bytes4(keccak256(bytes('transfer(address,uint256)')));
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: TRANSFER_FAILED');
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint value) internal {
+        // bytes4(keccak256(bytes('transferFrom(address,address,uint256)')));
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: TRANSFER_FROM_FAILED');
+    }
+
+    function safeTransferETH(address to, uint value) internal {
+        (bool success,) = to.call{value:value}(new bytes(0));
+        require(success, 'TransferHelper: ETH_TRANSFER_FAILED');
+    }
+}
+
+contract ReEntrancyGuard {
+    bool internal locked;
+
+    modifier noReentrant() {
+        require(!locked, "No re-entrancy");
+        locked = true;
+        _;
+        locked = false;
+    }
+}
+
+interface br {    
+    function costBridge(uint16 toChain) external view returns(uint256,uint256);
+    function bridge(uint16 toChain, uint256 amount, address user) external payable;
+    function bridgeSD(address addy) external view returns(address);
+}      
+
+contract Upgrader is ReEntrancyGuard {
+    address public constant V_2 = 0x4a9D6b95459eb9532B7E4d82Ca214a3b20fa2358;
+    address public constant FEGv1 = 0x389999216860AB8E0175387A0c90E5c52522C945;
+    address public constant FEGv2 = 0xbededDf2eF49E87037c4fb2cA34d1FF3D3992A11;
+    address public constant FEGv3 = 0xF3c7CECF8cBC3066F9a87b310cEBE198d00479aC; 
+    address public constant ROX = 0x378c77C5379cA07BBB5B3506c08a1C769dEC91c2 ; 
+    address public dev = 0x249Df570e549E93788F0682dc522741701Ef75E1; 
+    address public dataread = 0xdAE383661587232FBd254b05a395CB8e35E6e7B6;
+    mapping(address => bool) public expired;
+    mapping(address => uint256) public convertedROX;
+    mapping(address => uint256) public FEGfromROX;
+    mapping(address => uint256) public FEGperDist;
+    mapping(address => uint256) public totalFEGFromROXAvailable;
+    mapping(address => uint256) public lastClaimed;
+    mapping(address => bool) public convertEnabledROX;
+    uint256 public timer;
+    uint256 public coolDown = 1 days;
+    uint256 public timerFee;
+    uint256 public burnThreshold = 100000000e18;
+    uint256 public FEGforROXTotal;
+    uint256 public FEGforROXClaimed;
+    uint256 public ROXReleasePeriods = 25;
+    uint256 public timerROX = 30 days;
+    uint256 public ROXPerRelease;
+    uint256 public FEGperROX;
+    uint256 public FEGSinceLastUpgrade;
+    uint256 public FEGUpgraded;
+    uint256 public convertCheckRate = 1000000000e18;
+    uint256 public _fee = 10;
+    bool public live = true;
+    event Upgrade(address, uint256, uint256, uint16);
+    event SaveLostTokens(address, uint256);
+    event FEGClaimedForROX(address, uint256, uint16);
+    event StakeFEGClaimedForROX(address, uint256);
+    event DepositROX(address, uint256);
+    mapping(address=>uint256) public amtClaimed;
+    mapping(address=>bool) public claimed;
+    constructor() {
+        timer = 1717200000; //june 1st 0:00 utc
+    }
+    receive() external payable {}
+
+    modifier Live() {
+        require(live, "not live");
+        _;
+    }
+
+    function FEGStake() public view returns(address) {
+        return dr(dataread).FEGstake();
+    }
+    
+    function fee() public view returns(uint256 fee_) {
+        uint256 time = timerFee;
+        if(time > 0) {
+        for(uint256 i = 0; i < 25; i++) {
+            if(block.timestamp > time) {
+                time += 30 days;
+                fee_ += _fee;
+                if(fee_ >= 100) {
+                fee_ = 100;
+                break;
+                }
+            }
+            if(block.timestamp <= time) {
+                break;
+            }
+        }
+        }
+        if(time == 0) {
+            fee_ = 0;
+        }
+    }
+
+    function setfee(uint256 fee_) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        _fee = fee_;
+    }
+
+    function setDev(address addy) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        dev = addy;
+    }
+
+    function resetFEGChecker() external {
+        require(dr(dataread).superAdmin(msg.sender) || dr(dataread).isAdmin(msg.sender));
+        FEGSinceLastUpgrade = 0;
+    }
+
+    function setTimerFee(uint256 amt) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        timerFee = amt;
+    }
+
+    function setConvertCheckRate(uint256 amt) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        require(amt > 10000000e18, "10m min");
+        convertCheckRate = amt;
+    }
+
+    function loadFEGForROX(uint256 amt) external noReentrant {
+        require(dr(dataread).superAdmin(msg.sender));
+        TransferHelper.safeTransferFrom(FEGv3, msg.sender, address(this), amt * 1e18);  
+        FEGforROXTotal += amt;
+        ROXPerRelease = FEGforROXTotal / ROXReleasePeriods;
+        FEGperROX = FEGforROXTotal * 1e9 / 1000;
+    }
+
+    function roundROX() public view returns(uint256 round) {
+        round = 1;
+        if(block.timestamp < timer) {
+        round = 0;
+        }
+        if(round > 0) {
+        for(uint256 i = 0; i < 26; i++) {
+        if(block.timestamp > timer + (timerROX * round)) {
+            round += 1;
+            if(round == 25) {
+            break; //failsafe
+            }
+        }
+        }
+    }
+    }
+
+    function costBridge(uint16 toChain) external view returns(uint256 cost) {
+        address brd = br(dataread).bridgeSD(FEGv3);
+        (cost,) = br(brd).costBridge(toChain);
+    }
+
+    function setLive(bool _bool) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        live = _bool;
+    }
+
+    function setCoolDown(uint256 amt) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        coolDown = amt;
+    }
+
+    function setBurnThreshold(uint256 amt) external {
+        require(dr(dataread).superAdmin(msg.sender));
+        burnThreshold = amt;
+    }
+    
+    function setExp(address user, bool _bool) external {
+        require(dr(dataread).isAdmin(msg.sender));
+        expired[user] = _bool;
+    }
+
+    function WETH() public view returns(address) {
+        return dr(dataread).wETH();
+    }
+
+    function depositROX() external noReentrant {
+        require(block.timestamp > timer, "<June1");
+        require(!expired[msg.sender], "expired wallet");
+        uint256 amt = IERC20(ROX).balanceOf(msg.sender);
+        require(!convertEnabledROX[msg.sender], "already");
+        uint256 tot = totalEligibleROXForFEG(msg.sender);
+        TransferHelper.safeTransferFrom(ROX, msg.sender, address(this), amt);  
+        convertedROX[msg.sender] = amt;
+        convertEnabledROX[msg.sender] = true;
+        FEGperDist[msg.sender] = tot / ROXReleasePeriods;
+        totalFEGFromROXAvailable[msg.sender] = tot;
+        emit DepositROX(msg.sender, amt);
+    }
+
+    function claimFEGRelease(uint256 amt, uint16 toChain, address to) external noReentrant payable {
+        require(!expired[msg.sender], "expired wallet");
+        require(convertEnabledROX[msg.sender], "not ready");
+        require(block.timestamp > lastClaimed[msg.sender] + coolDown, "1 day cooldown");
+        require(amt > 0, "cannot claim 0");
+        require(totalFEGFromROXAvailable[msg.sender] >= amt, "over");
+        uint256 tot = roundROX() * FEGperDist[msg.sender];
+        uint256 amtOpen = tot - FEGfromROX[msg.sender];
+        require(amt <= amtOpen, "not enough open");
+        lastClaimed[msg.sender] = block.timestamp;
+        FEGfromROX[msg.sender] += amt;
+        totalFEGFromROXAvailable[msg.sender] -= amt;
+        FEGforROXClaimed += amt;
+        if(toChain == 0) {
+        TransferHelper.safeTransfer(FEGv3,to,amt);
+        }
+        if(toChain > 0) {
+        address brd = br(dataread).bridgeSD(FEGv3);
+        (uint256 cost,) = br(brd).costBridge(toChain);
+        require(msg.value >= cost, "insufficient fee");
+        TransferHelper.safeApprove(FEGv3, brd, amt);
+        br(brd).bridge{value: cost}(toChain,amt,to);
+        }
+        emit FEGClaimedForROX(msg.sender, amt, toChain);
+    }
+
+    function stakeFEGRelease(uint256 amt) external noReentrant {
+        require(!expired[msg.sender], "expired wallet");
+        require(convertEnabledROX[msg.sender], "not ready");
+        require(block.timestamp > lastClaimed[msg.sender] + coolDown, "1 day cooldown");
+        require(amt > 0, "cannot claim 0");
+        require(totalFEGFromROXAvailable[msg.sender] >= amt, "over");
+        uint256 tot = roundROX() * FEGperDist[msg.sender];
+        uint256 amtOpen = tot - FEGfromROX[msg.sender];
+        require(amt <= amtOpen, "not enough open");
+        FEGfromROX[msg.sender] += amt;
+        FEGforROXClaimed += amt;
+        totalFEGFromROXAvailable[msg.sender] -= amt;
+        lastClaimed[msg.sender] = block.timestamp;
+        address stake = FEGStake();
+        TransferHelper.safeApprove(FEGv3, stake, amt);
+        dr(stake).stake(msg.sender, amt);
+        emit StakeFEGClaimedForROX(msg.sender, amt);
+    }
+
+    function totalEligibleROXForFEG(address holder) public view returns(uint256) {
+        return (IERC20(ROX).balanceOf(holder) * FEGperROX);
+    }
+
+    function totalOpenROXForFEG(address holder) public view returns(uint256) {
+        uint256 tot = roundROX() * FEGperDist[holder];
+        uint256 amtOpen = tot - FEGfromROX[holder];
+        return amtOpen;
+    }        
+
+    function balanceEligible(address holder) public view returns(uint256,uint256,uint256) {
+        uint256 fv = IERC20(FEGv1).balanceOf(holder);
+        uint256 totOld = fv > 1000000 ? (fv / 1000000) * 1e9: 0;
+        uint256 totFee;
+        if(fee() > 0 && totOld > 0) {
+        totFee = totOld * fee() / 100;
+        totOld -= totFee;
+        }
+        uint256 totF = IERC20(FEGv2).balanceOf(holder);
+        return (totOld, totFee, totF);
+    }
+
+    function allBalances(address holder) external view returns(uint256 fegv1, uint256 fegv2, uint256 stakev2, uint256 rox) {
+        fegv1 = IERC20(FEGv1).balanceOf(holder);
+        fegv2 = IERC20(FEGv2).balanceOf(holder);
+        stakev2 = StakeV2(V_2).userStakedFEG(holder);
+        rox = IERC20(ROX).balanceOf(holder);
+    }
+
+    function stakingV2Eligible(address holder) public view returns(uint256,uint256) {
+        uint256 sv = StakeV2(V_2).userStakedFEG(holder);
+        uint256 tot = sv > 1000000 ? (sv / 1000000) * 1e9: 0;
+        uint256 totFee;
+        if(fee() > 0) {
+        totFee += tot * fee() / 100;
+        tot -= totFee;
+        }
+        return (tot , totFee);
+    }
+
+    function upgradeFEG(uint16 toChain, address to) external noReentrant Live payable {
+        require(!expired[msg.sender], "expired wallet");
+        require(IERC20(FEGv1).balanceOf(msg.sender) == 0 && IERC20(V_2).balanceOf(msg.sender) == 0, "must be 0");
+        uint256 bal = IERC20(FEGv2).balanceOf(msg.sender);
+        FEGSinceLastUpgrade += bal;
+        require(FEGSinceLastUpgrade < convertCheckRate, "reset checker");
+        if(bal > 0) {
+        require(!claimed[msg.sender], "done");
+        require(IERC20(FEGv3).balanceOf(address(this)) >= bal + ((FEGforROXTotal * 1e18) - FEGforROXClaimed), "fill upgrader");
+        TransferHelper.safeTransferFrom(FEGv2, msg.sender, address(this), bal);  
+        if(toChain == 0) {
+        TransferHelper.safeTransfer(FEGv3,to,bal);
+        }
+        if(toChain > 0) {
+        address brd = br(dataread).bridgeSD(FEGv3);
+        (uint256 cost,) = br(brd).costBridge(toChain);
+        require(msg.value >= cost, "insufficient fee");
+        TransferHelper.safeApprove(FEGv3, brd, bal);
+        br(brd).bridge{value: cost}(toChain,bal,to);
+        }
+        claimed[msg.sender] = true;
+        amtClaimed[msg.sender] += bal;
+        }
+        if(IERC20(FEGv2).balanceOf(address(this)) > burnThreshold) {
+        addBacking();
+        }
+        emit Upgrade(msg.sender, 0 , bal, toChain);
+    }
+
+    function stakeUpgradeFEG() external noReentrant Live {
+        require(!expired[msg.sender], "expired wallet");
+        require(IERC20(FEGv1).balanceOf(msg.sender) == 0 && IERC20(V_2).balanceOf(msg.sender) == 0, "must be 0");
+        uint256 bal = IERC20(FEGv2).balanceOf(msg.sender);
+        if(bal > 0) {
+        require(!claimed[msg.sender], "done");
+        require(IERC20(FEGv3).balanceOf(address(this)) >= bal + ((FEGforROXTotal * 1e18) - FEGforROXClaimed), "fill upgrader");
+        TransferHelper.safeTransferFrom(FEGv2, msg.sender, address(this), bal);  
+        amtClaimed[msg.sender] += bal;
+        claimed[msg.sender] = true;
+        address stake = FEGStake();
+        TransferHelper.safeApprove(FEGv3, stake, bal);
+        dr(stake).stake(msg.sender, bal);
+        }
+        if(IERC20(FEGv2).balanceOf(address(this)) > burnThreshold) {
+        addBacking();
+        }
+        emit Upgrade(msg.sender, 0 , bal, 0);
+    }
+
+    function totalEligible(address holder) public view returns(uint256){
+        (uint256 a,,uint256 c) = balanceEligible(holder);
+        (uint256 b,) = stakingV2Eligible(holder);        
+        return a + b + c;
+    }
+
+    function saveLostTokens(address toSave) external { //added function to save any lost tokens
+        require(FEGv1 != toSave,"Can't extract FEG");
+        require(FEGv2 != toSave,"Can't extract FEG"); // only burn for backing
+        require(V_2 != toSave,"Can't extract V-2");
+        require(ROX != toSave,"Can't extract V-2");
+        require(WETH() != toSave,"Can't extract WETH");
+        require(dr(dataread).superAdmin(msg.sender));
+        uint256 toSend = IERC20(toSave).balanceOf(address(this));
+        TransferHelper.safeTransfer(toSave,dev,toSend);
+        emit SaveLostTokens(toSave, toSend);
+    }
+
+    function addBacking() public {
+        address back = backing(FEGv2).BackingLogicAddress();
+        uint256 bh = IERC20(FEGv2).balanceOf(address(this));
+        TransferHelper.safeApprove(FEGv2, back, bh);
+        backing(back).liquifyForBacking(bh);
+        address newback = backing(FEGv3).backingLogicAddress();
+        address weth = WETH();
+        TransferHelper.safeTransfer(weth, newback, IERC20(weth).balanceOf(address(this))); 
+    }
+
+    function upgradeAllOLD(uint16 toChain, address to) external noReentrant Live payable {
+        require(!claimed[msg.sender]);
+        require(!expired[msg.sender], "expired wallet");
+        address user = msg.sender;
+        uint256 toSend = 0;
+        (uint256 old, uint256 fbe, uint256 old2) = balanceEligible(user);
+        if(old > 0){
+        TransferHelper.safeTransferFrom(FEGv1, user, address(this), IERC20(FEGv1).balanceOf(user));
+        }
+        if(old2 > 0){
+        TransferHelper.safeTransferFrom(FEGv2, user, address(this), IERC20(FEGv2).balanceOf(user));  
+        if(IERC20(FEGv2).balanceOf(address(this)) > burnThreshold) {
+        addBacking();
+        } 
+        }
+        toSend += (old + old2);
+        //Staking V_2
+        (uint256 v2Bal, uint256 v2v) = stakingV2Eligible(user);
+        uint256 v2tot = IERC20(V_2).balanceOf(user);
+        if(v2Bal > 0){
+        //V_2 logic
+        toSend += v2Bal;
+        TransferHelper.safeTransferFrom(V_2, user, address(this), v2tot);
+        //Guarantee transfer of FSS
+        require(IERC20(V_2).balanceOf(user) == 0, "Must be left with 0 FSS balance");
+        }
+        FEGSinceLastUpgrade += toSend;
+        require(FEGSinceLastUpgrade < convertCheckRate, "reset checker");
+        //checks if the person get's anything
+        require(toSend > 0, "Nothing to upgrade");
+        require(IERC20(FEGv3).balanceOf(address(this)) >= toSend + ((FEGforROXTotal * 1e18) - FEGforROXClaimed), "fill upgrader");
+        amtClaimed[user] += toSend + fbe + v2v;
+        claimed[user] = true; 
+        if(toChain == 0) {
+        TransferHelper.safeTransfer(FEGv3,to,toSend);
+        }
+        if(toChain > 0) {
+        address brd = br(dataread).bridgeSD(FEGv3);
+        (uint256 cost,) = br(brd).costBridge(toChain);
+        require(msg.value >= cost, "insufficient fee");
+        TransferHelper.safeApprove(FEGv3, brd, toSend);
+        br(brd).bridge{value: cost}(toChain,toSend,to);
+        }
+        emit Upgrade(user, v2Bal, toSend, toChain);
+    }
+}

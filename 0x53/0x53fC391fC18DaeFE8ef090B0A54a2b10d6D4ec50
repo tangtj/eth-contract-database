@@ -1,0 +1,2366 @@
+
+// File: src/WaymontSafeExternalSigner.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+import "lib/safe-contracts/contracts/Safe.sol";
+import "lib/safe-contracts/contracts/EIP712DomainSeparator.sol";
+import "lib/safe-contracts/contracts/CheckSignaturesEIP1271.sol";
+import "lib/safe-contracts/contracts/common/Enum.sol";
+
+import "lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol";
+
+import "./WaymontSafePolicyGuardianSigner.sol";
+
+/// @title WaymontSafeExternalSigner
+/// @notice Smart contract signer (via ERC-1271) for Safes allowing execution of transactions signed together through merkle trees and/or without incremental nonces.
+/// This contract is meant to be used with Safe contracts v1.4.1 (https://github.com/safe-global/safe-contracts/tree/v1.4.1). It can also be used with v1.4.0.
+contract WaymontSafeExternalSigner is EIP712DomainSeparator, CheckSignaturesEIP1271 {
+    // @dev Equivalent of `Safe.SAFE_TX_TYPEHASH` but for transactions verified by this contract specifically.
+    // Computed as: `keccak256("WaymontSafeExternalSignerTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 uniqueId,uint256 groupUniqueId,uint256 deadline)");`
+    bytes32 private constant EXTERNAL_SIGNER_SAFE_TX_TYPEHASH = 0xf641ab1aa14257ef40a4f6202602bc27847e79f0aa3bac95aa170c03c99d6290;
+
+    /// @notice Address of the `WaymontSafePolicyGuardianSigner` contract.
+    /// @dev Whether or not this variable is set controls whether or not this contract should ensure that the policy guardian is enabled on the Safe when making reusable function calls.
+    WaymontSafePolicyGuardianSigner public policyGuardianSigner;
+
+    /// @notice Blacklist for function calls that have already been dispatched or that have been revoked.
+    mapping(uint256 => bool) public functionCallUniqueIdBlacklist;
+
+    /// @notice Quantity of gas (in ETH) allocated to reusable smart actions.
+    uint256 public reusableFunctionCallGasTank;
+
+    /// @dev Initializes the contract by setting the `Safe`, signers, and threshold.
+    /// Can only be called once (because `setupOwners` can only be called once).
+    /// @param _safe The `Safe` of which this signer contract will be an owner.
+    /// @param signers The signers underlying this signer contract.
+    /// @param threshold The threshold required of signers underlying this signer contract.
+    /// @param _policyGuardianSigner Whether or not this variable is set controls whether or not this contract should ensure that the policy guardian is enabled on the Safe when making reusable function calls. Currently there are no plans to ever set this to false but keeping it as an option keeps the contracts flexible (so they can be used without the policy guardian if desired in the future).
+    function initialize(Safe _safe, address[] calldata signers, uint256 threshold, WaymontSafePolicyGuardianSigner _policyGuardianSigner) external {
+        // Input validation
+        require(_safe.isOwner(address(this)), "The Safe is not owned by this Waymont signer contract.");
+
+        // Call `setupOwners` (can only be called once)
+        setupOwners(signers, threshold);
+
+        // Set the `Safe` and `WaymontSafePolicyGuardianSigner`
+        safe = _safe;
+        policyGuardianSigner = _policyGuardianSigner;
+    }
+
+    /// @notice Blacklists a function call unique ID.
+    /// @param uniqueId The function call unique ID to be blacklisted.
+    function blacklistFunctionCall(uint256 uniqueId) external {
+        require(msg.sender == address(safe), "Sender is not the safe.");
+        functionCallUniqueIdBlacklist[uniqueId] = true;
+    }
+
+    /// @notice Sets the gas tank available to reusable function calls.
+    /// @param value The amount of ETH that should be in the gas tank.
+    function setGasTank(uint256 value) external {
+        require(msg.sender == address(safe), "Sender is not the safe.");
+        reusableFunctionCallGasTank = value;
+    }
+
+    /// @notice Signature validation function used by the `Safe` overlying this contract to validate underlying signers attached to this contract.
+    /// @param _data Data signed in `_signature`.
+    /// @param _signature Signature byte array associated with `_data`.
+    /// @dev MUST return the bytes4 magic value 0x20c13b0b when function passes.
+    /// MUST NOT modify state (using STATICCALL for solc < 0.5, view modifier for solc > 0.5).
+    /// MUST allow external calls.
+    function isValidSignature(bytes calldata _data, bytes memory _signature) external view returns (bytes4) {
+        // Check signatures
+        checkSignatures(keccak256(_data), _signature);
+
+        // Return success by default
+        return bytes4(0x20c13b0b);
+    }
+
+    /// @notice Additional parameters used by `WaymontSafeExternalSigner.execTransaction` (that are not part of `Safe.execTransaction`).
+    /// @param externalSignatures The signatures from this `WaymontSafeExternalSigner` contract's set of signers (to be validated by this contract).
+    /// @param uniqueId If specified (as greater than 0), acts as a single-use, non-incremental nonce (that can be blacklisted). WARNING: If using a merkle tree, make sure to use random `uniqueId` values to prevent the unauthorized submission of transactions using signatures and merkle proofs that have already been revealed. If you are using reusable function calls, this is not an option, so you must rely on the policy guardian (which the function below ensures is enabled if set in this contract's storage) or, alternatively, the presence of signers other than this contract that use normal single-use signatures.
+    /// @param groupUniqueId If specified (as greater than 0), acts as a multi-use, non-incremental unique ID that can be blacklisted. Must specify if `uniqueId` is not specified.
+    /// @param deadline Transactions must be executed before the deadline. Set to `0xFF00000000000000000000000000000000000000000000000000000000000000` for no deadline (saves gas over using `type(uint256).max` due to the presence of more zero bytes (cheaper) over non-zero bytes in function calldata).
+    /// @param merkleProof Array containing the sibling hashes on the branch from the leaf to the root of the merkle tree.
+    struct AdditionalExecTransactionParams {
+        bytes externalSignatures;
+        uint256 uniqueId;
+        uint256 groupUniqueId;
+        uint256 deadline;
+        bytes32[] merkleProof;
+    }
+
+    /// @notice Proxy for `Safe.execTransaction` allowing execution of transactions signed together through merkle trees and/or without incremental nonces.
+    /// @dev See `Safe.execTransaction` for a description of the first 10 params.
+    /// WARNING: If using a merkle tree, make sure to use random `uniqueId` values to prevent the unauthorized submission of transactions using signatures and merkle proofs that have already been revealed. If you are using reusable function calls, this is not an option, so you must rely on the policy guardian (which the function below ensures is enabled if set in this contract's storage) or, alternatively, the presence of signers other than this contract that use normal single-use signatures.
+    /// NOTE: Gas tank deductions for reusable function calls are based on the (estimated) `safeTxGas + baseGas`, unlike the refunds themselves, which are based on the (actual) `gasUsed + baseGas`.
+    /// @param additionalParams See struct type above for more info.
+    function execTransaction(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory safeSignatures,
+        AdditionalExecTransactionParams memory additionalParams
+    ) external returns (bool success) {
+        // Validate deadline
+        require(block.timestamp <= additionalParams.deadline, "This TX is expired/past its deadline.");
+
+        // If specified, validate unique ID not used/blacklisted; if not specified and policy guardian is required, validate that policy guardian signature is required; if group unique ID specified, validate not blacklisted
+        require(additionalParams.uniqueId > 0 || additionalParams.groupUniqueId > 0, "Must specify either a unique ID or group unique ID to have the ability to prevent the repeat use of this function call.");
+        if (additionalParams.uniqueId > 0) require(!functionCallUniqueIdBlacklist[additionalParams.uniqueId], "Function call unique ID has already been used or has been blacklisted.");
+        else if (address(policyGuardianSigner) != address(0)) require(safe.isOwner(address(policyGuardianSigner)) && safe.getThreshold() == safe.getOwners().length && policyGuardianSigner.policyGuardian() != address(0) && !policyGuardianSigner.policyGuardianDisabled(safe), "Policy guardian must be enabled to submit reusable transactions.");
+        if (additionalParams.groupUniqueId > 0) require(!functionCallUniqueIdBlacklist[additionalParams.groupUniqueId], "Function call group unique ID has been blacklisted.");
+
+        // Scope to avoid "stack too deep"
+        {
+            // Compute newTxHash
+            bytes32 newSafeTxHash = keccak256(abi.encode(EXTERNAL_SIGNER_SAFE_TX_TYPEHASH, to, value, keccak256(data), operation, safeTxGas, baseGas, gasPrice, gasToken, refundReceiver, additionalParams.uniqueId, additionalParams.groupUniqueId, additionalParams.deadline));
+            bytes32 newTxHash = keccak256(abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), newSafeTxHash));
+
+            // Process merkle proof
+            newTxHash = MerkleProof.processProof(additionalParams.merkleProof, newTxHash);
+
+            // Check signatures
+            checkSignatures(newTxHash, additionalParams.externalSignatures);
+        }
+
+        // If uniqueId is reusable, subtract from gas tank (checked math will revert if not enough)
+        if (additionalParams.uniqueId == 0) reusableFunctionCallGasTank -= (baseGas + safeTxGas) * (gasPrice < tx.gasprice || gasToken != address(0) ? gasPrice : tx.gasprice);
+        // If uniqueId is not reusable, blacklist unique ID's future use
+        else functionCallUniqueIdBlacklist[additionalParams.uniqueId] = true;
+
+        // Execute the transaction
+        // Hashes are automatically approved by the sender with v == 1 and r == approver (this contract)
+        // See line 316-321 of safe-contracts v1.4.0 Safe.sol: https://github.com/safe-global/safe-contracts/blob/v1.4.0/contracts/Safe.sol#L316-L321
+        return safe.execTransaction(to, value, data, operation, safeTxGas, baseGas, gasPrice, gasToken, refundReceiver, safeSignatures);
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/Safe.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+import "./base/ModuleManager.sol";
+import "./base/OwnerManager.sol";
+import "./base/FallbackManager.sol";
+import "./base/GuardManager.sol";
+import "./common/NativeCurrencyPaymentFallback.sol";
+import "./common/Singleton.sol";
+import "./common/SignatureDecoder.sol";
+import "./common/SecuredTokenTransfer.sol";
+import "./common/StorageAccessible.sol";
+import "./interfaces/ISignatureValidator.sol";
+import "./external/SafeMath.sol";
+
+/**
+ * @title Safe - A multisignature wallet with support for confirmations using signed messages based on EIP-712.
+ * @dev Most important concepts:
+ *      - Threshold: Number of required confirmations for a Safe transaction.
+ *      - Owners: List of addresses that control the Safe. They are the only ones that can add/remove owners, change the threshold and
+ *        approve transactions. Managed in `OwnerManager`.
+ *      - Transaction Hash: Hash of a transaction is calculated using the EIP-712 typed structured data hashing scheme.
+ *      - Nonce: Each transaction should have a different nonce to prevent replay attacks.
+ *      - Signature: A valid signature of an owner of the Safe for a transaction hash.
+ *      - Guard: Guard is a contract that can execute pre- and post- transaction checks. Managed in `GuardManager`.
+ *      - Modules: Modules are contracts that can be used to extend the write functionality of a Safe. Managed in `ModuleManager`.
+ *      - Fallback: Fallback handler is a contract that can provide additional read-only functional for Safe. Managed in `FallbackManager`.
+ *      Note: This version of the implementation contract doesn't emit events for the sake of gas efficiency and therefore requires a tracing node for indexing/
+ *      For the events-based implementation see `SafeL2.sol`.
+ * @author Stefan George - @Georgi87
+ * @author Richard Meissner - @rmeissner
+ */
+contract Safe is
+    Singleton,
+    NativeCurrencyPaymentFallback,
+    ModuleManager,
+    OwnerManager,
+    SignatureDecoder,
+    SecuredTokenTransfer,
+    ISignatureValidatorConstants,
+    FallbackManager,
+    StorageAccessible,
+    GuardManager
+{
+    using SafeMath for uint256;
+
+    string public constant VERSION = "1.4.0";
+
+    // keccak256(
+    //     "EIP712Domain(uint256 chainId,address verifyingContract)"
+    // );
+    bytes32 private constant DOMAIN_SEPARATOR_TYPEHASH = 0x47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218;
+
+    // keccak256(
+    //     "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)"
+    // );
+    bytes32 private constant SAFE_TX_TYPEHASH = 0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8;
+
+    event SafeSetup(address indexed initiator, address[] owners, uint256 threshold, address initializer, address fallbackHandler);
+    event ApproveHash(bytes32 indexed approvedHash, address indexed owner);
+    event SignMsg(bytes32 indexed msgHash);
+    event ExecutionFailure(bytes32 indexed txHash, uint256 payment);
+    event ExecutionSuccess(bytes32 indexed txHash, uint256 payment);
+
+    uint256 public nonce;
+    bytes32 private _deprecatedDomainSeparator;
+    // Mapping to keep track of all message hashes that have been approved by ALL REQUIRED owners
+    mapping(bytes32 => uint256) public signedMessages;
+    // Mapping to keep track of all hashes (message or transaction) that have been approved by ANY owners
+    mapping(address => mapping(bytes32 => uint256)) public approvedHashes;
+
+    // This constructor ensures that this contract can only be used as a singleton for Proxy contracts
+    constructor() {
+        /**
+         * By setting the threshold it is not possible to call setup anymore,
+         * so we create a Safe with 0 owners and threshold 1.
+         * This is an unusable Safe, perfect for the singleton
+         */
+        threshold = 1;
+    }
+
+    /**
+     * @notice Sets an initial storage of the Safe contract.
+     * @dev This method can only be called once.
+     *      If a proxy was created without setting up, anyone can call setup and claim the proxy.
+     * @param _owners List of Safe owners.
+     * @param _threshold Number of required confirmations for a Safe transaction.
+     * @param to Contract address for optional delegate call.
+     * @param data Data payload for optional delegate call.
+     * @param fallbackHandler Handler for fallback calls to this contract
+     * @param paymentToken Token that should be used for the payment (0 is ETH)
+     * @param payment Value that should be paid
+     * @param paymentReceiver Address that should receive the payment (or 0 if tx.origin)
+     */
+    function setup(
+        address[] calldata _owners,
+        uint256 _threshold,
+        address to,
+        bytes calldata data,
+        address fallbackHandler,
+        address paymentToken,
+        uint256 payment,
+        address payable paymentReceiver
+    ) external {
+        // setupOwners checks if the Threshold is already set, therefore preventing that this method is called twice
+        setupOwners(_owners, _threshold);
+        if (fallbackHandler != address(0)) internalSetFallbackHandler(fallbackHandler);
+        // As setupOwners can only be called if the contract has not been initialized we don't need a check for setupModules
+        setupModules(to, data);
+
+        if (payment > 0) {
+            // To avoid running into issues with EIP-170 we reuse the handlePayment function (to avoid adjusting code of that has been verified we do not adjust the method itself)
+            // baseGas = 0, gasPrice = 1 and gas = payment => amount = (payment + 0) * 1 = payment
+            handlePayment(payment, 0, 1, paymentToken, paymentReceiver);
+        }
+        emit SafeSetup(msg.sender, _owners, _threshold, to, fallbackHandler);
+    }
+
+    /** @notice Executes a `operation` {0: Call, 1: DelegateCall}} transaction to `to` with `value` (Native Currency)
+     *          and pays `gasPrice` * `gasLimit` in `gasToken` token to `refundReceiver`.
+     * @dev The fees are always transferred, even if the user transaction fails.
+     *      This method doesn't perform any sanity check of the transaction, such as:
+     *      - if the contract at `to` address has code or not
+     *      - if the `gasToken` is a contract or not
+     *      It is the responsibility of the caller to perform such checks.
+     * @param to Destination address of Safe transaction.
+     * @param value Ether value of Safe transaction.
+     * @param data Data payload of Safe transaction.
+     * @param operation Operation type of Safe transaction.
+     * @param safeTxGas Gas that should be used for the Safe transaction.
+     * @param baseGas Gas costs that are independent of the transaction execution(e.g. base transaction fee, signature check, payment of the refund)
+     * @param gasPrice Gas price that should be used for the payment calculation.
+     * @param gasToken Token address (or 0 if ETH) that is used for the payment.
+     * @param refundReceiver Address of receiver of gas payment (or 0 if tx.origin).
+     * @param signatures Signature data that should be verified.
+     *                   Can be packed ECDSA signature ({bytes32 r}{bytes32 s}{uint8 v}), contract signature (EIP-1271) or approved hash.
+     * @return success Boolean indicating transaction's success.
+     */
+    function execTransaction(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory signatures
+    ) public payable virtual returns (bool success) {
+        bytes32 txHash;
+        // Use scope here to limit variable lifetime and prevent `stack too deep` errors
+        {
+            bytes memory txHashData = encodeTransactionData(
+                // Transaction info
+                to,
+                value,
+                data,
+                operation,
+                safeTxGas,
+                // Payment info
+                baseGas,
+                gasPrice,
+                gasToken,
+                refundReceiver,
+                // Signature info
+                nonce
+            );
+            // Increase nonce and execute transaction.
+            nonce++;
+            txHash = keccak256(txHashData);
+            checkSignatures(txHash, txHashData, signatures);
+        }
+        address guard = getGuard();
+        {
+            if (guard != address(0)) {
+                Guard(guard).checkTransaction(
+                    // Transaction info
+                    to,
+                    value,
+                    data,
+                    operation,
+                    safeTxGas,
+                    // Payment info
+                    baseGas,
+                    gasPrice,
+                    gasToken,
+                    refundReceiver,
+                    // Signature info
+                    signatures,
+                    msg.sender
+                );
+            }
+        }
+        // We require some gas to emit the events (at least 2500) after the execution and some to perform code until the execution (500)
+        // We also include the 1/64 in the check that is not send along with a call to counteract potential shortings because of EIP-150
+        require(gasleft() >= ((safeTxGas * 64) / 63).max(safeTxGas + 2500) + 500, "GS010");
+        // Use scope here to limit variable lifetime and prevent `stack too deep` errors
+        {
+            uint256 gasUsed = gasleft();
+            // If the gasPrice is 0 we assume that nearly all available gas can be used (it is always more than safeTxGas)
+            // We only substract 2500 (compared to the 3000 before) to ensure that the amount passed is still higher than safeTxGas
+            success = execute(to, value, data, operation, gasPrice == 0 ? (gasleft() - 2500) : safeTxGas);
+            gasUsed = gasUsed.sub(gasleft());
+            // If no safeTxGas and no gasPrice was set (e.g. both are 0), then the internal tx is required to be successful
+            // This makes it possible to use `estimateGas` without issues, as it searches for the minimum gas where the tx doesn't revert
+            require(success || safeTxGas != 0 || gasPrice != 0, "GS013");
+            // We transfer the calculated tx costs to the tx.origin to avoid sending it to intermediate contracts that have made calls
+            uint256 payment = 0;
+            if (gasPrice > 0) {
+                payment = handlePayment(gasUsed, baseGas, gasPrice, gasToken, refundReceiver);
+            }
+            if (success) emit ExecutionSuccess(txHash, payment);
+            else emit ExecutionFailure(txHash, payment);
+        }
+        {
+            if (guard != address(0)) {
+                Guard(guard).checkAfterExecution(txHash, success);
+            }
+        }
+    }
+
+    /**
+     * @notice Handles the payment for a Safe transaction.
+     * @param gasUsed Gas used by the Safe transaction.
+     * @param baseGas Gas costs that are independent of the transaction execution (e.g. base transaction fee, signature check, payment of the refund).
+     * @param gasPrice Gas price that should be used for the payment calculation.
+     * @param gasToken Token address (or 0 if ETH) that is used for the payment.
+     * @return payment The amount of payment made in the specified token.
+     */
+    function handlePayment(
+        uint256 gasUsed,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver
+    ) private returns (uint256 payment) {
+        // solhint-disable-next-line avoid-tx-origin
+        address payable receiver = refundReceiver == address(0) ? payable(tx.origin) : refundReceiver;
+        if (gasToken == address(0)) {
+            // For ETH we will only adjust the gas price to not be higher than the actual used gas price
+            payment = gasUsed.add(baseGas).mul(gasPrice < tx.gasprice ? gasPrice : tx.gasprice);
+            require(receiver.send(payment), "GS011");
+        } else {
+            payment = gasUsed.add(baseGas).mul(gasPrice);
+            require(transferToken(gasToken, receiver, payment), "GS012");
+        }
+    }
+
+    /**
+     * @notice Checks whether the signature provided is valid for the provided data and hash. Reverts otherwise.
+     * @param dataHash Hash of the data (could be either a message hash or transaction hash)
+     * @param data That should be signed (this is passed to an external validator contract)
+     * @param signatures Signature data that should be verified.
+     *                   Can be packed ECDSA signature ({bytes32 r}{bytes32 s}{uint8 v}), contract signature (EIP-1271) or approved hash.
+     */
+    function checkSignatures(bytes32 dataHash, bytes memory data, bytes memory signatures) public view {
+        // Load threshold to avoid multiple storage loads
+        uint256 _threshold = threshold;
+        // Check that a threshold is set
+        require(_threshold > 0, "GS001");
+        checkNSignatures(dataHash, data, signatures, _threshold);
+    }
+
+    /**
+     * @notice Checks whether the signature provided is valid for the provided data and hash. Reverts otherwise.
+     * @dev Since the EIP-1271 does an external call, be mindful of reentrancy attacks.
+     * @param dataHash Hash of the data (could be either a message hash or transaction hash)
+     * @param data That should be signed (this is passed to an external validator contract)
+     * @param signatures Signature data that should be verified.
+     *                   Can be packed ECDSA signature ({bytes32 r}{bytes32 s}{uint8 v}), contract signature (EIP-1271) or approved hash.
+     * @param requiredSignatures Amount of required valid signatures.
+     */
+    function checkNSignatures(bytes32 dataHash, bytes memory data, bytes memory signatures, uint256 requiredSignatures) public view {
+        // Check that the provided signature data is not too short
+        require(signatures.length >= requiredSignatures.mul(65), "GS020");
+        // There cannot be an owner with address 0.
+        address lastOwner = address(0);
+        address currentOwner;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+        uint256 i;
+        for (i = 0; i < requiredSignatures; i++) {
+            (v, r, s) = signatureSplit(signatures, i);
+            if (v == 0) {
+                require(keccak256(data) == dataHash, "GS027");
+                // If v is 0 then it is a contract signature
+                // When handling contract signatures the address of the contract is encoded into r
+                currentOwner = address(uint160(uint256(r)));
+
+                // Check that signature data pointer (s) is not pointing inside the static part of the signatures bytes
+                // This check is not completely accurate, since it is possible that more signatures than the threshold are send.
+                // Here we only check that the pointer is not pointing inside the part that is being processed
+                require(uint256(s) >= requiredSignatures.mul(65), "GS021");
+
+                // Check that signature data pointer (s) is in bounds (points to the length of data -> 32 bytes)
+                require(uint256(s).add(32) <= signatures.length, "GS022");
+
+                // Check if the contract signature is in bounds: start of data is s + 32 and end is start + signature length
+                uint256 contractSignatureLen;
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    contractSignatureLen := mload(add(add(signatures, s), 0x20))
+                }
+                require(uint256(s).add(32).add(contractSignatureLen) <= signatures.length, "GS023");
+
+                // Check signature
+                bytes memory contractSignature;
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    // The signature data for contract signatures is appended to the concatenated signatures and the offset is stored in s
+                    contractSignature := add(add(signatures, s), 0x20)
+                }
+                require(ISignatureValidator(currentOwner).isValidSignature(data, contractSignature) == EIP1271_MAGIC_VALUE, "GS024");
+            } else if (v == 1) {
+                // If v is 1 then it is an approved hash
+                // When handling approved hashes the address of the approver is encoded into r
+                currentOwner = address(uint160(uint256(r)));
+                // Hashes are automatically approved by the sender of the message or when they have been pre-approved via a separate transaction
+                require(msg.sender == currentOwner || approvedHashes[currentOwner][dataHash] != 0, "GS025");
+            } else if (v > 30) {
+                // If v > 30 then default va (27,28) has been adjusted for eth_sign flow
+                // To support eth_sign and similar we adjust v and hash the messageHash with the Ethereum message prefix before applying ecrecover
+                currentOwner = ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v - 4, r, s);
+            } else {
+                // Default is the ecrecover flow with the provided data hash
+                // Use ecrecover with the messageHash for EOA signatures
+                currentOwner = ecrecover(dataHash, v, r, s);
+            }
+            require(currentOwner > lastOwner && owners[currentOwner] != address(0) && currentOwner != SENTINEL_OWNERS, "GS026");
+            lastOwner = currentOwner;
+        }
+    }
+
+    /**
+     * @notice Marks hash `hashToApprove` as approved.
+     * @dev This can be used with a pre-approved hash transaction signature.
+     *      IMPORTANT: The approved hash stays approved forever. There's no revocation mechanism, so it behaves similarly to ECDSA signatures
+     * @param hashToApprove The hash to mark as approved for signatures that are verified by this contract.
+     */
+    function approveHash(bytes32 hashToApprove) external {
+        require(owners[msg.sender] != address(0), "GS030");
+        approvedHashes[msg.sender][hashToApprove] = 1;
+        emit ApproveHash(hashToApprove, msg.sender);
+    }
+
+    /**
+     * @notice Returns the ID of the chain the contract is currently deployed on.
+     * @return The ID of the current chain as a uint256.
+     */
+    function getChainId() public view returns (uint256) {
+        uint256 id;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            id := chainid()
+        }
+        return id;
+    }
+
+    /**
+     * @dev Returns the domain separator for this contract, as defined in the EIP-712 standard.
+     * @return bytes32 The domain separator hash.
+     */
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, getChainId(), this));
+    }
+
+    /**
+     * @notice Returns the pre-image of the transaction hash (see getTransactionHash).
+     * @param to Destination address.
+     * @param value Ether value.
+     * @param data Data payload.
+     * @param operation Operation type.
+     * @param safeTxGas Gas that should be used for the safe transaction.
+     * @param baseGas Gas costs for that are independent of the transaction execution(e.g. base transaction fee, signature check, payment of the refund)
+     * @param gasPrice Maximum gas price that should be used for this transaction.
+     * @param gasToken Token address (or 0 if ETH) that is used for the payment.
+     * @param refundReceiver Address of receiver of gas payment (or 0 if tx.origin).
+     * @param _nonce Transaction nonce.
+     * @return Transaction hash bytes.
+     */
+    function encodeTransactionData(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address refundReceiver,
+        uint256 _nonce
+    ) public view returns (bytes memory) {
+        bytes32 safeTxHash = keccak256(
+            abi.encode(
+                SAFE_TX_TYPEHASH,
+                to,
+                value,
+                keccak256(data),
+                operation,
+                safeTxGas,
+                baseGas,
+                gasPrice,
+                gasToken,
+                refundReceiver,
+                _nonce
+            )
+        );
+        return abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), safeTxHash);
+    }
+
+    /**
+     * @notice Returns transaction hash to be signed by owners.
+     * @param to Destination address.
+     * @param value Ether value.
+     * @param data Data payload.
+     * @param operation Operation type.
+     * @param safeTxGas Fas that should be used for the safe transaction.
+     * @param baseGas Gas costs for data used to trigger the safe transaction.
+     * @param gasPrice Maximum gas price that should be used for this transaction.
+     * @param gasToken Token address (or 0 if ETH) that is used for the payment.
+     * @param refundReceiver Address of receiver of gas payment (or 0 if tx.origin).
+     * @param _nonce Transaction nonce.
+     * @return Transaction hash.
+     */
+    function getTransactionHash(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address refundReceiver,
+        uint256 _nonce
+    ) public view returns (bytes32) {
+        return keccak256(encodeTransactionData(to, value, data, operation, safeTxGas, baseGas, gasPrice, gasToken, refundReceiver, _nonce));
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/EIP712DomainSeparator.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title EIP712DomainSeparator - An abstract contract with only `domainSeparator` isolated from `Safe`.
+ * @author Stefan George - @Georgi87
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract EIP712DomainSeparator {
+    // keccak256(
+    //     "EIP712Domain(uint256 chainId,address verifyingContract)"
+    // );
+    bytes32 private constant DOMAIN_SEPARATOR_TYPEHASH = 0x47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218;
+
+    /**
+     * @notice Returns the ID of the chain the contract is currently deployed on.
+     * @return The ID of the current chain as a uint256.
+     */
+    function getChainId() public view returns (uint256) {
+        uint256 id;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            id := chainid()
+        }
+        return id;
+    }
+
+    /**
+     * @dev Returns the domain separator for this contract, as defined in the EIP-712 standard.
+     * @return bytes32 The domain separator hash.
+     */
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, getChainId(), this));
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/CheckSignaturesEIP1271.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+import "./base/IsolatedOwnerManager.sol";
+import "./common/SignatureDecoder.sol";
+import "./interfaces/IStandardSignatureValidator.sol";
+import "./external/SafeMath.sol";
+
+/**
+ * @title CheckSignaturesEIP1271 - An abstract contract with only `checkSignatures` isolated from `Safe` (forked from `ad9b3190d4889abeeaa02c5c05138d9c327f2460`, which contains the same contracts as `v1.4.0`) with non-legacy EIP-1271 support (copied from the newer commit `1cfa95710057e33832600e6b9ad5ececca8f7839`).
+ * @author Stefan George - @Georgi87
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract CheckSignaturesEIP1271 is IsolatedOwnerManager, SignatureDecoder, IStandardSignatureValidatorConstants {
+    using SafeMath for uint256;
+
+    // This constructor ensures that this contract can only be used as a singleton for proxy contracts
+    constructor() {
+        /**
+         * By setting the threshold it is not possible to call setupOwners anymore,
+         * so we create a contract with 0 owners and threshold 1.
+         * This is an unusable contract, perfect for the singleton
+         */
+        threshold = 1;
+    }
+
+    /**
+     * @notice Checks whether the signature provided is valid for the provided data and hash. Reverts otherwise.
+     * @param dataHash Hash of the data (could be either a message hash or transaction hash)
+     * @param signatures Signature data that should be verified.
+     *                   Can be packed ECDSA signature ({bytes32 r}{bytes32 s}{uint8 v}), contract signature (EIP-1271) or approved hash.
+     */
+    function checkSignatures(bytes32 dataHash, bytes memory signatures) public view {
+        // Load threshold to avoid multiple storage loads
+        uint256 _threshold = threshold;
+        // Check that a threshold is set
+        require(_threshold > 0, "GS001");
+        checkNSignatures(dataHash, signatures, _threshold);
+    }
+
+    /**
+     * @notice Checks whether the signature provided is valid for the provided data and hash. Reverts otherwise.
+     * @dev Since the EIP-1271 does an external call, be mindful of reentrancy attacks.
+     * @param dataHash Hash of the data (could be either a message hash or transaction hash)
+     * @param signatures Signature data that should be verified.
+     *                   Can be packed ECDSA signature ({bytes32 r}{bytes32 s}{uint8 v}), contract signature (EIP-1271) or approved hash.
+     * @param requiredSignatures Amount of required valid signatures.
+     */
+    function checkNSignatures(bytes32 dataHash, bytes memory signatures, uint256 requiredSignatures) public view {
+        // Check that the provided signature data is not too short
+        require(signatures.length >= requiredSignatures.mul(65), "GS020");
+        // There cannot be an owner with address 0.
+        address lastOwner = address(0);
+        address currentOwner;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+        uint256 i;
+        for (i = 0; i < requiredSignatures; i++) {
+            (v, r, s) = signatureSplit(signatures, i);
+            if (v == 0) {
+                // If v is 0 then it is a contract signature
+                // When handling contract signatures the address of the contract is encoded into r
+                currentOwner = address(uint160(uint256(r)));
+
+                // Check that signature data pointer (s) is not pointing inside the static part of the signatures bytes
+                // This check is not completely accurate, since it is possible that more signatures than the threshold are send.
+                // Here we only check that the pointer is not pointing inside the part that is being processed
+                require(uint256(s) >= requiredSignatures.mul(65), "GS021");
+
+                // Check that signature data pointer (s) is in bounds (points to the length of data -> 32 bytes)
+                require(uint256(s).add(32) <= signatures.length, "GS022");
+
+                // Check if the contract signature is in bounds: start of data is s + 32 and end is start + signature length
+                uint256 contractSignatureLen;
+                /* solhint-disable no-inline-assembly */
+                /// @solidity memory-safe-assembly
+                assembly {
+                    contractSignatureLen := mload(add(add(signatures, s), 0x20))
+                }
+                /* solhint-enable no-inline-assembly */
+                require(uint256(s).add(32).add(contractSignatureLen) <= signatures.length, "GS023");
+
+                // Check signature
+                bytes memory contractSignature;
+                /* solhint-disable no-inline-assembly */
+                /// @solidity memory-safe-assembly
+                assembly {
+                    // The signature data for contract signatures is appended to the concatenated signatures and the offset is stored in s
+                    contractSignature := add(add(signatures, s), 0x20)
+                }
+                /* solhint-enable no-inline-assembly */
+                // NOTE: The following line is copied from the newer commit `1cfa95710057e33832600e6b9ad5ececca8f7839` to `safe-global/safe-contracts`; this differs from the `safe-contracts` commit from which this repository has been forked (`ad9b3190d4889abeeaa02c5c05138d9c327f2460`, which contains the same contracts as `v1.4.0`), in which a legacy implementation of EIP-1271 is used
+                require(IStandardSignatureValidator(currentOwner).isValidSignature(dataHash, contractSignature) == EIP1271_MAGIC_VALUE, "GS024");
+            } else if (v > 30) {
+                // If v > 30 then default va (27,28) has been adjusted for eth_sign flow
+                // To support eth_sign and similar we adjust v and hash the messageHash with the Ethereum message prefix before applying ecrecover
+                currentOwner = ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", dataHash)), v - 4, r, s);
+            } else {
+                // Default is the ecrecover flow with the provided data hash
+                // Use ecrecover with the messageHash for EOA signatures
+                currentOwner = ecrecover(dataHash, v, r, s);
+            }
+            require(currentOwner > lastOwner && owners[currentOwner] != address(0) && currentOwner != SENTINEL_OWNERS, "GS026");
+            lastOwner = currentOwner;
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/common/Enum.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title Enum - Collection of enums used in Safe contracts.
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract Enum {
+    enum Operation {
+        Call,
+        DelegateCall
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/cryptography/MerkleProof.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev These functions deal with verification of Merkle Tree proofs.
+ *
+ * The tree and the proofs can be generated using our
+ * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].
+ * You will find a quickstart guide in the readme.
+ *
+ * WARNING: You should avoid using leaf values that are 64 bytes long prior to
+ * hashing, or use a hash function other than keccak256 for hashing leaves.
+ * This is because the concatenation of a sorted pair of internal nodes in
+ * the merkle tree could be reinterpreted as a leaf value.
+ * OpenZeppelin's JavaScript library generates merkle trees that are safe
+ * against this attack out of the box.
+ */
+library MerkleProof {
+    /**
+     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree
+     * defined by `root`. For this, a `proof` must be provided, containing
+     * sibling hashes on the branch from the leaf to the root of the tree. Each
+     * pair of leaves and each pair of pre-images are assumed to be sorted.
+     */
+    function verify(
+        bytes32[] memory proof,
+        bytes32 root,
+        bytes32 leaf
+    ) internal pure returns (bool) {
+        return processProof(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Calldata version of {verify}
+     *
+     * _Available since v4.7._
+     */
+    function verifyCalldata(
+        bytes32[] calldata proof,
+        bytes32 root,
+        bytes32 leaf
+    ) internal pure returns (bool) {
+        return processProofCalldata(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up
+     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt
+     * hash matches the root of the tree. When processing the proof, the pairs
+     * of leafs & pre-images are assumed to be sorted.
+     *
+     * _Available since v4.4._
+     */
+    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            computedHash = _hashPair(computedHash, proof[i]);
+        }
+        return computedHash;
+    }
+
+    /**
+     * @dev Calldata version of {processProof}
+     *
+     * _Available since v4.7._
+     */
+    function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            computedHash = _hashPair(computedHash, proof[i]);
+        }
+        return computedHash;
+    }
+
+    /**
+     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a merkle tree defined by
+     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.
+     *
+     * CAUTION: Not all merkle trees admit multiproofs. See {processMultiProof} for details.
+     *
+     * _Available since v4.7._
+     */
+    function multiProofVerify(
+        bytes32[] memory proof,
+        bool[] memory proofFlags,
+        bytes32 root,
+        bytes32[] memory leaves
+    ) internal pure returns (bool) {
+        return processMultiProof(proof, proofFlags, leaves) == root;
+    }
+
+    /**
+     * @dev Calldata version of {multiProofVerify}
+     *
+     * CAUTION: Not all merkle trees admit multiproofs. See {processMultiProof} for details.
+     *
+     * _Available since v4.7._
+     */
+    function multiProofVerifyCalldata(
+        bytes32[] calldata proof,
+        bool[] calldata proofFlags,
+        bytes32 root,
+        bytes32[] memory leaves
+    ) internal pure returns (bool) {
+        return processMultiProofCalldata(proof, proofFlags, leaves) == root;
+    }
+
+    /**
+     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction
+     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another
+     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false
+     * respectively.
+     *
+     * CAUTION: Not all merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree
+     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the
+     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).
+     *
+     * _Available since v4.7._
+     */
+    function processMultiProof(
+        bytes32[] memory proof,
+        bool[] memory proofFlags,
+        bytes32[] memory leaves
+    ) internal pure returns (bytes32 merkleRoot) {
+        // This function rebuild the root hash by traversing the tree up from the leaves. The root is rebuilt by
+        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+        // the merkle tree.
+        uint256 leavesLen = leaves.length;
+        uint256 totalHashes = proofFlags.length;
+
+        // Check proof validity.
+        require(leavesLen + proof.length - 1 == totalHashes, "MerkleProof: invalid multiproof");
+
+        // The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+        bytes32[] memory hashes = new bytes32[](totalHashes);
+        uint256 leafPos = 0;
+        uint256 hashPos = 0;
+        uint256 proofPos = 0;
+        // At each step, we compute the next hash using two values:
+        // - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+        //   get the next hash.
+        // - depending on the flag, either another value for the "main queue" (merging branches) or an element from the
+        //   `proof` array.
+        for (uint256 i = 0; i < totalHashes; i++) {
+            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+            bytes32 b = proofFlags[i] ? leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++] : proof[proofPos++];
+            hashes[i] = _hashPair(a, b);
+        }
+
+        if (totalHashes > 0) {
+            return hashes[totalHashes - 1];
+        } else if (leavesLen > 0) {
+            return leaves[0];
+        } else {
+            return proof[0];
+        }
+    }
+
+    /**
+     * @dev Calldata version of {processMultiProof}.
+     *
+     * CAUTION: Not all merkle trees admit multiproofs. See {processMultiProof} for details.
+     *
+     * _Available since v4.7._
+     */
+    function processMultiProofCalldata(
+        bytes32[] calldata proof,
+        bool[] calldata proofFlags,
+        bytes32[] memory leaves
+    ) internal pure returns (bytes32 merkleRoot) {
+        // This function rebuild the root hash by traversing the tree up from the leaves. The root is rebuilt by
+        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+        // the merkle tree.
+        uint256 leavesLen = leaves.length;
+        uint256 totalHashes = proofFlags.length;
+
+        // Check proof validity.
+        require(leavesLen + proof.length - 1 == totalHashes, "MerkleProof: invalid multiproof");
+
+        // The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+        bytes32[] memory hashes = new bytes32[](totalHashes);
+        uint256 leafPos = 0;
+        uint256 hashPos = 0;
+        uint256 proofPos = 0;
+        // At each step, we compute the next hash using two values:
+        // - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+        //   get the next hash.
+        // - depending on the flag, either another value for the "main queue" (merging branches) or an element from the
+        //   `proof` array.
+        for (uint256 i = 0; i < totalHashes; i++) {
+            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+            bytes32 b = proofFlags[i] ? leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++] : proof[proofPos++];
+            hashes[i] = _hashPair(a, b);
+        }
+
+        if (totalHashes > 0) {
+            return hashes[totalHashes - 1];
+        } else if (leavesLen > 0) {
+            return leaves[0];
+        } else {
+            return proof[0];
+        }
+    }
+
+    function _hashPair(bytes32 a, bytes32 b) private pure returns (bytes32) {
+        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);
+    }
+
+    function _efficientHash(bytes32 a, bytes32 b) private pure returns (bytes32 value) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            value := keccak256(0x00, 0x40)
+        }
+    }
+}
+
+
+// File: src/WaymontSafePolicyGuardianSigner.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+import "lib/safe-contracts/contracts/Safe.sol";
+import "lib/safe-contracts/contracts/EIP712DomainSeparator.sol";
+
+/// @title WaymontSafePolicyGuardianSigner
+/// @notice Smart contract signer (via ERC-1271) for Safes wrapping an EOA and supporting changing the EOA or bypassing this signer (for all Safes) from a global manager address as well as bypassing this signer after a timelock on a specific Safe.
+/// This contract is meant to be used with Safe contracts v1.4.1 (https://github.com/safe-global/safe-contracts/tree/v1.4.1). It can also be used with v1.4.0.
+contract WaymontSafePolicyGuardianSigner is EIP712DomainSeparator {
+    /// @dev Typehash for `queueDisablePolicyGuardian`: `keccak256("QueueDisablePolicyGuardian(uint256 nonce)")`.
+    bytes32 private constant QUEUE_DISABLE_POLICY_GUARDIAN_TYPEHASH = 0xd5fa5ce164fba34243c3b3b9c5346acc2eae6f31655b86516d465566d0ba53f7;
+
+    /// @dev Typehash for `unqueueDisablePolicyGuardian`: `keccak256("UnqueueDisablePolicyGuardian(uint256 nonce)")`.
+    bytes32 private constant UNQUEUE_DISABLE_POLICY_GUARDIAN_TYPEHASH = 0x16dda714d491dced303c8770c04d1539fd0000764e8745d3fe40945bb0d59dcf;
+
+    /// @dev Typehash for `disablePolicyGuardian`: `keccak256("DisablePolicyGuardian(uint256 nonce)")`.
+    bytes32 private constant DISABLE_POLICY_GUARDIAN_TYPEHASH = 0x1fa738809572ae202e6e8b28ae7d08f5972c3ae85e70f8bc386515bb47925975;
+
+    /// @notice Default policy guardian timelock (in seconds): 2 weeks.
+    uint256 public constant DEFAULT_POLICY_GUARDIAN_TIMELOCK = 2 weeks;
+
+    /// @notice Minimum policy guardian timelock (in seconds): 15 minutes.
+    uint256 public constant MIN_POLICY_GUARDIAN_TIMELOCK = 15 minutes;
+
+    /// @notice Maximum policy guardian timelock (in seconds): 180 days.
+    uint256 public constant MAX_POLICY_GUARDIAN_TIMELOCK = 180 days;
+
+    /// @notice Time to expiry after a signature has been queued (in seconds): 1 week.
+    uint256 public constant QUEUED_SIGNATURE_EXPIRATION = 1 weeks;
+
+    /// @notice The primary policy guardian address.
+    /// WARNING: If this variable is set to the zero address, wallets will not require signatures from either policy guardian address--so do NOT set this variable to the zero address unless you are sure you want to allow all transactions to bypass the policy guardian's firewall.
+    /// The (primary or secondary) policy guardian must sign all transactions for a `Wallet`, unless the policy guardian is deactivated on a `Wallet` or if the primary `policyGuardian` is set to the zero address here, in which case all transactinos will bypass the policy guardian's firewall.
+    /// The (primary or secondary) policy guardian can act as off-chain transaction policy node(s) permitting realtime/AI-based fraud detection, symmetric/access-token-based authentication mechanisms, and/or instant onboarding to the Waymont chain.
+    /// The (primary or secondary) policy guardian can be disabled/enabled via a user-specified timelock on the `Wallet`.
+    address public policyGuardian;
+
+    /// @notice The secondary policy guardian address.
+    /// WARNING: Even if the secondary guardian address is set, if the primary guardian address is not set, the `Wallet` contract does not require a signature from either policy guardian address.
+    /// The secondary policy guardian is used as a fallback guardian.
+    /// If using a secondary policy guardian, ideally, it is the less-used of the two guardians to conserve some gas.
+    address public secondaryPolicyGuardian;
+
+    /// @notice Whether or not the policy guardian has been permanently disabled across all wallets.
+    bool public policyGuardianPermanentlyDisabled;
+
+    /// @notice The pending policy guardian manager.
+    address public pendingPolicyGuardianManager;
+
+    /// @notice The policy guardian manager.
+    address public policyGuardianManager;
+
+    /// @notice For each `Safe`, custom timelock after which the policy guardian can be disabled (in seconds). If not set for a specific `Safe`, defaults to `DEFAULT_POLICY_GUARDIAN_TIMELOCK`.
+    mapping(Safe => uint256) public customPolicyGuardianTimelocks;
+
+    /// @notice For each `Safe`, whether or not the policy guardian is disabled.
+    mapping(Safe => bool) public policyGuardianDisabled;
+
+    /// @notice For each safe, last timestamp disabling the policy guardian was queued/requested.
+    mapping(Safe => uint256) public disablePolicyGuardianQueueTimestamps;
+
+    /// @notice For each safe, incremental nonce to prevent signature reuse on this contract.
+    mapping(Safe => uint256) public nonces;
+
+    /// @dev Temporarily approved data hash.
+    bytes32 internal _tempApprovedDataHash;
+
+    /// @notice Event emitted when the primary policy guardian is changed.
+    event PolicyGuardianChanged(address _policyGuardian);
+
+    /// @notice Event emitted when the policy guardian is disabled globally.
+    /// @param permanently Whether or not the policy guardian was globally disabled permanently (if not, if it can be re-enabled later on).
+    event PolicyGuardianDisabledGlobally(bool permanently);
+
+    /// @notice Event emitted when the secondary policy guardian is changed.
+    event SecondaryPolicyGuardianChanged(address _policyGuardian);
+
+    /// @notice Event emitted when the policy guardian manager is changed.
+    event PolicyGuardianManagerChanged(address _policyGuardianManager);
+
+    /// @notice Event emitted when the pending policy guardian manager is changed.
+    event PendingPolicyGuardianManagerChanged(address _pendingPolicyGuardianManager);
+
+    /// @notice Event emitted when queuing the action of disabling the policy guardian on a `Safe`.
+    /// Useful for sending security notifications to `Safe` owners if the policy guardian cannot find record of itself sending the transaction hash associated with a `DisablePolicyGuardianQueued` event.
+    event DisablePolicyGuardianQueued(Safe indexed safe);
+
+    /// @notice Event emitted when unqueuing the action of disabling the policy guardian on a `Safe`.
+    event DisablePolicyGuardianUnqueued(Safe indexed safe);
+
+    /// @notice Event emitted when executing the action of disabling the policy guardian on a `Safe`.
+    event PolicyGuardianDisabledOnSafe(Safe indexed safe, bool withoutPolicyGuardian);
+
+    /// @notice Event emitted when the policy guardian timelock is changed for a `Safe`.
+    event PolicyGuardianTimelockChanged(Safe indexed safe, uint256 policyGuardianTimelock);
+
+    /// @dev Constructor to initialize the contract by setting the policy guardian manager.
+    constructor(address _policyGuardianManager) {
+        require(_policyGuardianManager != address(0), "Invalid policy guardian manager.");
+        policyGuardianManager = _policyGuardianManager;
+        emit PolicyGuardianManagerChanged(_policyGuardianManager);
+    }
+
+    /// @dev Access control for the policy guardian manager.
+    modifier onlyPolicyGuardianManager() {
+        require(msg.sender == policyGuardianManager, "Sender is not the policy guardian manager.");
+        _;
+    }
+
+    /// @notice Sets the primary policy guardian address.
+    function setPolicyGuardian(address _policyGuardian) external onlyPolicyGuardianManager {
+        require(!policyGuardianPermanentlyDisabled, "Policy guardian has been permanently disabled.");
+        require(_policyGuardian != address(0), "Cannot set policy guardian to the zero address. Use the disablePolicyGuardianGlobally function instead.");
+        policyGuardian = _policyGuardian;
+        emit PolicyGuardianChanged(_policyGuardian);
+    }
+
+    /// @notice Sets the secondary policy guardian address.
+    /// WARNING: Even if the secondary guardian address is set, if the primary guardian address is not set, the `Wallet` contract will not require signatures from either policy guardian address.
+    function setSecondaryPolicyGuardian(address _policyGuardian) external onlyPolicyGuardianManager {
+        secondaryPolicyGuardian = _policyGuardian;
+        emit SecondaryPolicyGuardianChanged(_policyGuardian);
+    }
+    
+    /// @notice Globally disables the policy guardian: i.e., makes it so that any and ALL wallets will NOT require signatures from either policy guardian address.
+    /// WARNING: Do NOT call this function unless you are sure you want to allow all transactions through the policy guardian's firewall on ALL `Safe`s using this `WaymontSafePolicyGuardianSigner`.
+    function disablePolicyGuardianGlobally() external onlyPolicyGuardianManager {
+        require(policyGuardian != address(0), "Policy guardian already disabled.");
+        policyGuardian = address(0);
+        emit PolicyGuardianChanged(address(0));
+        emit PolicyGuardianDisabledGlobally(false); // Emit with flag `permanently` equal to `false` since the policy guardian can be re-enabled later on
+    }
+
+    /// @notice Permanently disables the policy guardian on all wallets.
+    /// WARNING: Do NOT call this function unless you are sure you want to PERMANENTLY allow all transactions through the policy guardian's firewall on ALL `Safe`s using this `WaymontSafePolicyGuardianSigner`.
+    function disablePolicyGuardianPermanently() external onlyPolicyGuardianManager {
+        require(!policyGuardianPermanentlyDisabled, "Policy guardian already permanently disabled.");
+        policyGuardianPermanentlyDisabled = true;
+        policyGuardian = address(0);
+        emit PolicyGuardianChanged(address(0));
+        emit PolicyGuardianDisabledGlobally(true); // Emit with flag `permanently` equal to `true` since the policy guardian can NOT be re-enabled later on
+    }
+
+    /// @notice Sets the pending policy guardian manager.
+    function setPendingPolicyGuardianManager(address _policyGuardianManager) external onlyPolicyGuardianManager {
+        pendingPolicyGuardianManager = _policyGuardianManager;
+        emit PendingPolicyGuardianManagerChanged(_policyGuardianManager);
+    }
+
+    /// @notice Accepts the policy guardian manager role.
+    function acceptPolicyGuardianManager() external {
+        require(msg.sender == pendingPolicyGuardianManager, "Sender is not the pending policy guardian manager.");
+        policyGuardianManager = msg.sender;
+        pendingPolicyGuardianManager = address(0);
+        emit PolicyGuardianManagerChanged(msg.sender);
+    }
+
+    /// @dev Validates `signatures` on `underlyingTypehash`.
+    /// @param signatures Signatures from `threshold - 1` signers (excluding the policy guardian).
+    function _validateSignatures(Safe safe, bytes32 underlyingTypehash, bytes memory signatures) internal {
+        // Generate underlying hash
+        bytes32 underlyingHash = keccak256(abi.encode(underlyingTypehash, safe, nonces[safe]++));
+
+        // Generate overlying signed data
+        bytes memory data = abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator(), underlyingHash);
+
+        // Validate threshold
+        require(safe.getThreshold() > 1, "Cannot disable the policy guardian since the threshold on the Safe is one.");
+
+        // Mark data as signed so the call inside `safe.checkSignatures` to `this.isValidSignature` will succeed
+        _tempApprovedDataHash = keccak256(data);
+
+        // Check that `data` has been signed by `signatures` across all signers including this contract
+        safe.checkSignatures(keccak256(data), data, signatures);
+
+        // Delete temporary storage for gas refund
+        delete _tempApprovedDataHash;
+    }
+
+    /// @notice Returns the policy guardian timelock for `safe`.
+    /// @dev When `customPolicyGuardianTimelocks[safe]` is set to 0, the default timelock is used for `safe`.
+    function getPolicyGuardianTimelock(Safe safe) public view returns (uint256 policyGuardianTimelock) {
+        policyGuardianTimelock = customPolicyGuardianTimelocks[safe];
+        if (policyGuardianTimelock == 0) policyGuardianTimelock = DEFAULT_POLICY_GUARDIAN_TIMELOCK;
+    }
+
+    /// @notice Change the policy guardian timelock.
+    /// Also enables validation of the policy guardian signature (if not already enabled). 
+    /// Off chain policy guardian logic: if changing the timelock when the policy guardian is already enabled, require that the user waits for the old timelock to pass after queueing it off-chain.
+    /// @param policyGuardianTimelock The desired timelock required to disable the policy guardian without the policy guardian's signature.
+    function setPolicyGuardianTimelock(uint256 policyGuardianTimelock) external {
+        require(policyGuardianTimelock >= MIN_POLICY_GUARDIAN_TIMELOCK, "Policy guardian timelock must be at least 15 minutes. Call disablePolicyGuardian to disable it.");
+        require(policyGuardianTimelock <= MAX_POLICY_GUARDIAN_TIMELOCK, "Policy guardian timelock cannot be more than 180 days.");
+        Safe safe = Safe(payable(msg.sender));
+        customPolicyGuardianTimelocks[safe] = policyGuardianTimelock;
+        policyGuardianDisabled[safe] = false;
+        disablePolicyGuardianQueueTimestamps[safe] = 0;
+        emit PolicyGuardianTimelockChanged(safe, policyGuardianTimelock);
+    }
+
+    /// @notice Disable validation of the policy guardian signature.
+    /// WARNING: Do NOT call this function unless you are sure you want to allow all transactions from `Safe(msg.sender)` through the policy guardian's firewall.
+    /// Off chain policy guardian logic: require that the user waits for the old timelock to pass after queueing it off-chain.
+    function disablePolicyGuardian() external {
+        Safe safe = Safe(payable(msg.sender));
+        policyGuardianDisabled[safe] = true;
+        disablePolicyGuardianQueueTimestamps[safe] = 0;
+        emit PolicyGuardianDisabledOnSafe(safe, false);
+    }
+
+    /// @notice Queues a timelocked action.
+    /// @param signatures Signatures from `threshold - 1` signers (excluding the policy guardian).
+    function queueDisablePolicyGuardian(Safe safe, bytes calldata signatures) external {
+        // Ensure not already disabled
+        require(!policyGuardianDisabled[safe], "Policy guardian already disabled.");
+
+        // Validate signatures
+        _validateSignatures(safe, QUEUE_DISABLE_POLICY_GUARDIAN_TYPEHASH, signatures);
+
+        // Mark down queue timestamp
+        disablePolicyGuardianQueueTimestamps[safe] = block.timestamp;
+
+        // Emit event
+        emit DisablePolicyGuardianQueued(safe);
+    }
+
+    /// @notice Unqueues a timelocked action.
+    /// @param signatures Signatures from `threshold - 1` signers (excluding the policy guardian).
+    function unqueueDisablePolicyGuardian(Safe safe, bytes calldata signatures) external {
+        // Ensure not already disabled
+        require(!policyGuardianDisabled[safe], "Policy guardian already disabled.");
+
+        // Validate signatures
+        _validateSignatures(safe, UNQUEUE_DISABLE_POLICY_GUARDIAN_TYPEHASH, signatures);
+
+        // Reset queue timestamp
+        disablePolicyGuardianQueueTimestamps[safe] = 0;
+
+        // Emit event
+        emit DisablePolicyGuardianUnqueued(safe);
+    }
+
+    /// @notice Disable the policy guardian (by setting `policyGuardianDisabled[safe] = true`) after the on-chain timelock has passed (without needing a signature from the policy guardian).
+    /// Requires that the user waits for the old timelock to pass (after calling `queueAction`).
+    /// @param signatures Signatures from `threshold - 1` signers (excluding the policy guardian).
+    function disablePolicyGuardianWithoutPolicyGuardian(Safe safe, bytes calldata signatures) external {
+        // Ensure not already disabled
+        require(!policyGuardianDisabled[safe], "Policy guardian already disabled.");
+
+        // Validate signatures
+        _validateSignatures(safe, DISABLE_POLICY_GUARDIAN_TYPEHASH, signatures);
+
+        // Check timelock
+        uint256 timestamp = disablePolicyGuardianQueueTimestamps[safe];
+        require(timestamp > 0, "Action not queued.");
+        uint256 minExecutionTimestamp = timestamp + getPolicyGuardianTimelock(safe);
+        require(block.timestamp >= minExecutionTimestamp, "Timelock not satisfied.");
+        require(block.timestamp <= minExecutionTimestamp + QUEUED_SIGNATURE_EXPIRATION, "Queued signatures are only usable for 1 week until they expire.");
+
+        // Disable it
+        policyGuardianDisabled[safe] = true;
+
+        // Emit event
+        emit PolicyGuardianDisabledOnSafe(safe, true);
+    }
+
+    /// @notice Signature validation function used by the `Safe` overlying this contract to validate underlying signers attached to this contract.
+    /// @param _data Data signed in `_signature`.
+    /// @param _signature Signature byte array associated with `_data`.
+    /// @dev MUST return the bytes4 magic value 0x20c13b0b when function passes.
+    /// MUST NOT modify state (using STATICCALL for solc < 0.5, view modifier for solc > 0.5).
+    /// MUST allow external calls.
+    function isValidSignature(bytes calldata _data, bytes memory _signature) external view returns (bytes4) {
+        // Require signature is 65 bytes
+        require(_signature.length == 65, "Invalid signature length.");
+
+        // Decode signature from bytes
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+
+        assembly {
+            r := mload(add(_signature, 0x20))
+            s := mload(add(_signature, 0x40))
+            v := byte(0, mload(add(_signature, 0x60)))
+        }
+
+        // Recover signer from signature
+        bytes32 dataHash = keccak256(_data);
+        address signer = ecrecover(dataHash, v, r, s);
+
+        // Check that signer is policy guardian or that policy guardian is disabled (and return success if so)
+        address _policyGuardian = policyGuardian;
+        if (signer == _policyGuardian || (signer == secondaryPolicyGuardian && signer != address(0)) || _policyGuardian == address(0) || policyGuardianPermanentlyDisabled || policyGuardianDisabled[Safe(payable(msg.sender))]) return bytes4(0x20c13b0b);
+        
+        // Otherwise, check `_tempApprovedDataHash` (and return success if equal)
+        if (dataHash != 0 && _tempApprovedDataHash == dataHash) return bytes4(0x20c13b0b);
+
+        // Return failure by default
+        revert("Invalid policy guardian signature.");
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/base/ModuleManager.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+import "../common/Enum.sol";
+import "../common/SelfAuthorized.sol";
+import "./Executor.sol";
+
+/**
+ * @title Module Manager - A contract managing Safe modules
+ * @notice Modules are extensions with unlimited access to a Safe that can be added to a Safe by its owners.
+           ⚠️ WARNING: Modules are a security risk since they can execute arbitrary transactions, 
+           so only trusted and audited modules should be added to a Safe. A malicious module can
+           completely takeover a Safe.
+ * @author Stefan George - @Georgi87
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract ModuleManager is SelfAuthorized, Executor {
+    event EnabledModule(address indexed module);
+    event DisabledModule(address indexed module);
+    event ExecutionFromModuleSuccess(address indexed module);
+    event ExecutionFromModuleFailure(address indexed module);
+
+    address internal constant SENTINEL_MODULES = address(0x1);
+
+    mapping(address => address) internal modules;
+
+    /**
+     * @notice Setup function sets the initial storage of the contract.
+     *         Optionally executes a delegate call to another contract to setup the modules.
+     * @param to Optional destination address of call to execute.
+     * @param data Optional data of call to execute.
+     */
+    function setupModules(address to, bytes memory data) internal {
+        require(modules[SENTINEL_MODULES] == address(0), "GS100");
+        modules[SENTINEL_MODULES] = SENTINEL_MODULES;
+        if (to != address(0)) {
+            require(isContract(to), "GS002");
+            // Setup has to complete successfully or transaction fails.
+            require(execute(to, 0, data, Enum.Operation.DelegateCall, gasleft()), "GS000");
+        }
+    }
+
+    /**
+     * @notice Enables the module `module` for the Safe.
+     * @dev This can only be done via a Safe transaction.
+     * @param module Module to be whitelisted.
+     */
+    function enableModule(address module) public authorized {
+        // Module address cannot be null or sentinel.
+        require(module != address(0) && module != SENTINEL_MODULES, "GS101");
+        // Module cannot be added twice.
+        require(modules[module] == address(0), "GS102");
+        modules[module] = modules[SENTINEL_MODULES];
+        modules[SENTINEL_MODULES] = module;
+        emit EnabledModule(module);
+    }
+
+    /**
+     * @notice Disables the module `module` for the Safe.
+     * @dev This can only be done via a Safe transaction.
+     * @param prevModule Previous module in the modules linked list.
+     * @param module Module to be removed.
+     */
+    function disableModule(address prevModule, address module) public authorized {
+        // Validate module address and check that it corresponds to module index.
+        require(module != address(0) && module != SENTINEL_MODULES, "GS101");
+        require(modules[prevModule] == module, "GS103");
+        modules[prevModule] = modules[module];
+        modules[module] = address(0);
+        emit DisabledModule(module);
+    }
+
+    /**
+     * @notice Execute `operation` (0: Call, 1: DelegateCall) to `to` with `value` (Native Token)
+     * @dev Function is virtual to allow overriding for L2 singleton to emit an event for indexing.
+     * @param to Destination address of module transaction.
+     * @param value Ether value of module transaction.
+     * @param data Data payload of module transaction.
+     * @param operation Operation type of module transaction.
+     * @return success Boolean flag indicating if the call succeeded.
+     */
+    function execTransactionFromModule(
+        address to,
+        uint256 value,
+        bytes memory data,
+        Enum.Operation operation
+    ) public virtual returns (bool success) {
+        // Only whitelisted modules are allowed.
+        require(msg.sender != SENTINEL_MODULES && modules[msg.sender] != address(0), "GS104");
+        // Execute transaction without further confirmations.
+        success = execute(to, value, data, operation, type(uint256).max);
+        if (success) emit ExecutionFromModuleSuccess(msg.sender);
+        else emit ExecutionFromModuleFailure(msg.sender);
+    }
+
+    /**
+     * @notice Execute `operation` (0: Call, 1: DelegateCall) to `to` with `value` (Native Token) and return data
+     * @param to Destination address of module transaction.
+     * @param value Ether value of module transaction.
+     * @param data Data payload of module transaction.
+     * @param operation Operation type of module transaction.
+     * @return success Boolean flag indicating if the call succeeded.
+     * @return returnData Data returned by the call.
+     */
+    function execTransactionFromModuleReturnData(
+        address to,
+        uint256 value,
+        bytes memory data,
+        Enum.Operation operation
+    ) public returns (bool success, bytes memory returnData) {
+        success = execTransactionFromModule(to, value, data, operation);
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            // Load free memory location
+            let ptr := mload(0x40)
+            // We allocate memory for the return data by setting the free memory location to
+            // current free memory location + data size + 32 bytes for data size value
+            mstore(0x40, add(ptr, add(returndatasize(), 0x20)))
+            // Store the size
+            mstore(ptr, returndatasize())
+            // Store the data
+            returndatacopy(add(ptr, 0x20), 0, returndatasize())
+            // Point the return data to the correct memory location
+            returnData := ptr
+        }
+    }
+
+    /**
+     * @notice Returns if an module is enabled
+     * @return True if the module is enabled
+     */
+    function isModuleEnabled(address module) public view returns (bool) {
+        return SENTINEL_MODULES != module && modules[module] != address(0);
+    }
+
+    /**
+     * @notice Returns an array of modules.
+     *         If all entries fit into a single page, the next pointer will be 0x1.
+     *         If another page is present, next will be the last element of the returned array.
+     * @param start Start of the page. Has to be a module or start pointer (0x1 address)
+     * @param pageSize Maximum number of modules that should be returned. Has to be > 0
+     * @return array Array of modules.
+     * @return next Start of the next page.
+     */
+    function getModulesPaginated(address start, uint256 pageSize) external view returns (address[] memory array, address next) {
+        require(start == SENTINEL_MODULES || isModuleEnabled(start), "GS105");
+        require(pageSize > 0, "GS106");
+        // Init array with max page size
+        array = new address[](pageSize);
+
+        // Populate return array
+        uint256 moduleCount = 0;
+        next = modules[start];
+        while (next != address(0) && next != SENTINEL_MODULES && moduleCount < pageSize) {
+            array[moduleCount] = next;
+            next = modules[next];
+            moduleCount++;
+        }
+
+        /**
+          Because of the argument validation, we can assume that the loop will always iterate over the valid module list values
+          and the `next` variable will either be an enabled module or a sentinel address (signalling the end). 
+          
+          If we haven't reached the end inside the loop, we need to set the next pointer to the last element of the modules array
+          because the `next` variable (which is a module by itself) acting as a pointer to the start of the next page is neither 
+          included to the current page, nor will it be included in the next one if you pass it as a start.
+        */
+        if (next != SENTINEL_MODULES) {
+            next = array[moduleCount - 1];
+        }
+        // Set correct size of returned array
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            mstore(array, moduleCount)
+        }
+    }
+
+    /**
+     * @notice Returns true if `account` is a contract.
+     * @dev This function will return false if invoked during the constructor of a contract,
+     *      as the code is not actually created until after the constructor finishes.
+     * @param account The address being queried
+     */
+    function isContract(address account) internal view returns (bool) {
+        uint256 size;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            size := extcodesize(account)
+        }
+        return size > 0;
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/base/OwnerManager.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+import "../common/SelfAuthorized.sol";
+
+/**
+ * @title OwnerManager - Manages Safe owners and a threshold to authorize transactions.
+ * @dev Uses a linked list to store the owners because the code generate by the solidity compiler
+ *      is more efficient than using a dynamic array.
+ * @author Stefan George - @Georgi87
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract OwnerManager is SelfAuthorized {
+    event AddedOwner(address indexed owner);
+    event RemovedOwner(address indexed owner);
+    event ChangedThreshold(uint256 threshold);
+
+    address internal constant SENTINEL_OWNERS = address(0x1);
+
+    mapping(address => address) internal owners;
+    uint256 internal ownerCount;
+    uint256 internal threshold;
+
+    /**
+     * @notice Sets the initial storage of the contract.
+     * @param _owners List of Safe owners.
+     * @param _threshold Number of required confirmations for a Safe transaction.
+     */
+    function setupOwners(address[] memory _owners, uint256 _threshold) internal {
+        // Threshold can only be 0 at initialization.
+        // Check ensures that setup function can only be called once.
+        require(threshold == 0, "GS200");
+        // Validate that threshold is smaller than number of added owners.
+        require(_threshold <= _owners.length, "GS201");
+        // There has to be at least one Safe owner.
+        require(_threshold >= 1, "GS202");
+        // Initializing Safe owners.
+        address currentOwner = SENTINEL_OWNERS;
+        for (uint256 i = 0; i < _owners.length; i++) {
+            // Owner address cannot be null.
+            address owner = _owners[i];
+            require(owner != address(0) && owner != SENTINEL_OWNERS && owner != address(this) && currentOwner != owner, "GS203");
+            // No duplicate owners allowed.
+            require(owners[owner] == address(0), "GS204");
+            owners[currentOwner] = owner;
+            currentOwner = owner;
+        }
+        owners[currentOwner] = SENTINEL_OWNERS;
+        ownerCount = _owners.length;
+        threshold = _threshold;
+    }
+
+    /**
+     * @notice Adds the owner `owner` to the Safe and updates the threshold to `_threshold`.
+     * @dev This can only be done via a Safe transaction.
+     * @param owner New owner address.
+     * @param _threshold New threshold.
+     */
+    function addOwnerWithThreshold(address owner, uint256 _threshold) public authorized {
+        // Owner address cannot be null, the sentinel or the Safe itself.
+        require(owner != address(0) && owner != SENTINEL_OWNERS && owner != address(this), "GS203");
+        // No duplicate owners allowed.
+        require(owners[owner] == address(0), "GS204");
+        owners[owner] = owners[SENTINEL_OWNERS];
+        owners[SENTINEL_OWNERS] = owner;
+        ownerCount++;
+        emit AddedOwner(owner);
+        // Change threshold if threshold was changed.
+        if (threshold != _threshold) changeThreshold(_threshold);
+    }
+
+    /**
+     * @notice Removes the owner `owner` from the Safe and updates the threshold to `_threshold`.
+     * @dev This can only be done via a Safe transaction.
+     * @param prevOwner Owner that pointed to the owner to be removed in the linked list
+     * @param owner Owner address to be removed.
+     * @param _threshold New threshold.
+     */
+    function removeOwner(address prevOwner, address owner, uint256 _threshold) public authorized {
+        // Only allow to remove an owner, if threshold can still be reached.
+        require(ownerCount - 1 >= _threshold, "GS201");
+        // Validate owner address and check that it corresponds to owner index.
+        require(owner != address(0) && owner != SENTINEL_OWNERS, "GS203");
+        require(owners[prevOwner] == owner, "GS205");
+        owners[prevOwner] = owners[owner];
+        owners[owner] = address(0);
+        ownerCount--;
+        emit RemovedOwner(owner);
+        // Change threshold if threshold was changed.
+        if (threshold != _threshold) changeThreshold(_threshold);
+    }
+
+    /**
+     * @notice Replaces the owner `oldOwner` in the Safe with `newOwner`.
+     * @dev This can only be done via a Safe transaction.
+     * @param prevOwner Owner that pointed to the owner to be replaced in the linked list
+     * @param oldOwner Owner address to be replaced.
+     * @param newOwner New owner address.
+     */
+    function swapOwner(address prevOwner, address oldOwner, address newOwner) public authorized {
+        // Owner address cannot be null, the sentinel or the Safe itself.
+        require(newOwner != address(0) && newOwner != SENTINEL_OWNERS && newOwner != address(this), "GS203");
+        // No duplicate owners allowed.
+        require(owners[newOwner] == address(0), "GS204");
+        // Validate oldOwner address and check that it corresponds to owner index.
+        require(oldOwner != address(0) && oldOwner != SENTINEL_OWNERS, "GS203");
+        require(owners[prevOwner] == oldOwner, "GS205");
+        owners[newOwner] = owners[oldOwner];
+        owners[prevOwner] = newOwner;
+        owners[oldOwner] = address(0);
+        emit RemovedOwner(oldOwner);
+        emit AddedOwner(newOwner);
+    }
+
+    /**
+     * @notice Changes the threshold of the Safe to `_threshold`.
+     * @dev This can only be done via a Safe transaction.
+     * @param _threshold New threshold.
+     */
+    function changeThreshold(uint256 _threshold) public authorized {
+        // Validate that threshold is smaller than number of owners.
+        require(_threshold <= ownerCount, "GS201");
+        // There has to be at least one Safe owner.
+        require(_threshold >= 1, "GS202");
+        threshold = _threshold;
+        emit ChangedThreshold(threshold);
+    }
+
+    /**
+     * @notice Returns the number of required confirmations for a Safe transaction aka the threshold.
+     * @return Threshold number.
+     */
+    function getThreshold() public view returns (uint256) {
+        return threshold;
+    }
+
+    /**
+     * @notice Returns if `owner` is an owner of the Safe.
+     * @return Boolean if owner is an owner of the Safe.
+     */
+    function isOwner(address owner) public view returns (bool) {
+        return owner != SENTINEL_OWNERS && owners[owner] != address(0);
+    }
+
+    /**
+     * @notice Returns a list of Safe owners.
+     * @return Array of Safe owners.
+     */
+    function getOwners() public view returns (address[] memory) {
+        address[] memory array = new address[](ownerCount);
+
+        // populate return array
+        uint256 index = 0;
+        address currentOwner = owners[SENTINEL_OWNERS];
+        while (currentOwner != SENTINEL_OWNERS) {
+            array[index] = currentOwner;
+            currentOwner = owners[currentOwner];
+            index++;
+        }
+        return array;
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/base/FallbackManager.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+import "../common/SelfAuthorized.sol";
+
+/**
+ * @title Fallback Manager - A contract managing fallback calls made to this contract
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract FallbackManager is SelfAuthorized {
+    event ChangedFallbackHandler(address indexed handler);
+
+    // keccak256("fallback_manager.handler.address")
+    bytes32 internal constant FALLBACK_HANDLER_STORAGE_SLOT = 0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5;
+
+    /**
+     *  @notice Internal function to set the fallback handler.
+     *  @param handler contract to handle fallback calls.
+     */
+    function internalSetFallbackHandler(address handler) internal {
+        /*
+            If a fallback handler is set to self, then the following attack vector is opened:
+            Imagine we have a function like this:
+            function withdraw() internal authorized {
+                withdrawalAddress.call.value(address(this).balance)("");
+            }
+
+            If the fallback method is triggered, the fallback handler appends the msg.sender address to the calldata and calls the fallback handler.
+            A potential attacker could call a Safe with the 3 bytes signature of a withdraw function. Since 3 bytes do not create a valid signature,
+            the call would end in a fallback handler. Since it appends the msg.sender address to the calldata, the attacker could craft an address 
+            where the first 3 bytes of the previous calldata + the first byte of the address make up a valid function signature. The subsequent call would result in unsanctioned access to Safe's internal protected methods.
+            For some reason, solidity matches the first 4 bytes of the calldata to a function signature, regardless if more data follow these 4 bytes.
+        */
+        require(handler != address(this), "GS400");
+
+        bytes32 slot = FALLBACK_HANDLER_STORAGE_SLOT;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            sstore(slot, handler)
+        }
+    }
+
+    /**
+     * @notice Set Fallback Handler to `handler` for the Safe.
+     * @dev Only fallback calls without value and with data will be forwarded.
+     *      This can only be done via a Safe transaction.
+     *      Cannot be set to the Safe itself.
+     * @param handler contract to handle fallback calls.
+     */
+    function setFallbackHandler(address handler) public authorized {
+        internalSetFallbackHandler(handler);
+        emit ChangedFallbackHandler(handler);
+    }
+
+    // @notice Forwards all calls to the fallback handler if set. Returns 0 if no handler is set.
+    // @dev Appends the non-padded caller address to the calldata to be optionally used in the handler
+    //      The handler can make us of `HandlerContext.sol` to extract the address.
+    //      This is done because in the next call frame the `msg.sender` will be FallbackManager's address
+    //      and having the original caller address may enable additional verification scenarios.
+    // solhint-disable-next-line payable-fallback,no-complex-fallback
+    fallback() external {
+        bytes32 slot = FALLBACK_HANDLER_STORAGE_SLOT;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            let handler := sload(slot)
+            if iszero(handler) {
+                return(0, 0)
+            }
+            calldatacopy(0, 0, calldatasize())
+            // The msg.sender address is shifted to the left by 12 bytes to remove the padding
+            // Then the address without padding is stored right after the calldata
+            mstore(calldatasize(), shl(96, caller()))
+            // Add 20 bytes for the address appended add the end
+            let success := call(gas(), handler, 0, 0, add(calldatasize(), 20), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            if iszero(success) {
+                revert(0, returndatasize())
+            }
+            return(0, returndatasize())
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/base/GuardManager.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+import "../common/Enum.sol";
+import "../common/SelfAuthorized.sol";
+import "../interfaces/IERC165.sol";
+
+interface Guard is IERC165 {
+    function checkTransaction(
+        address to,
+        uint256 value,
+        bytes memory data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory signatures,
+        address msgSender
+    ) external;
+
+    function checkAfterExecution(bytes32 txHash, bool success) external;
+}
+
+abstract contract BaseGuard is Guard {
+    function supportsInterface(bytes4 interfaceId) external view virtual override returns (bool) {
+        return
+            interfaceId == type(Guard).interfaceId || // 0xe6d7a83a
+            interfaceId == type(IERC165).interfaceId; // 0x01ffc9a7
+    }
+}
+
+/**
+ * @title Guard Manager - A contract managing transaction guards which perform pre and post-checks on Safe transactions.
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract GuardManager is SelfAuthorized {
+    event ChangedGuard(address indexed guard);
+
+    // keccak256("guard_manager.guard.address")
+    bytes32 internal constant GUARD_STORAGE_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
+
+    /**
+     * @dev Set a guard that checks transactions before execution
+     *      This can only be done via a Safe transaction.
+     *      ⚠️ IMPORTANT: Since a guard has full power to block Safe transaction execution,
+     *        a broken guard can cause a denial of service for the Safe. Make sure to carefully
+     *        audit the guard code and design recovery mechanisms.
+     * @notice Set Transaction Guard `guard` for the Safe. Make sure you trust the guard.
+     * @param guard The address of the guard to be used or the 0 address to disable the guard
+     */
+    function setGuard(address guard) external authorized {
+        if (guard != address(0)) {
+            require(Guard(guard).supportsInterface(type(Guard).interfaceId), "GS300");
+        }
+        bytes32 slot = GUARD_STORAGE_SLOT;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            sstore(slot, guard)
+        }
+        emit ChangedGuard(guard);
+    }
+
+    /**
+     * @dev Internal method to retrieve the current guard
+     *      We do not have a public method because we're short on bytecode size limit,
+     *      to retrieve the guard address, one can use `getStorageAt` from `StorageAccessible` contract
+     *      with the slot `GUARD_STORAGE_SLOT`
+     * @return guard The address of the guard
+     */
+    function getGuard() internal view returns (address guard) {
+        bytes32 slot = GUARD_STORAGE_SLOT;
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            guard := sload(slot)
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/common/NativeCurrencyPaymentFallback.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title NativeCurrencyPaymentFallback - A contract that has a fallback to accept native currency payments.
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract NativeCurrencyPaymentFallback {
+    event SafeReceived(address indexed sender, uint256 value);
+
+    /**
+     * @notice Receive function accepts native currency transactions.
+     * @dev Emits an event with sender and received value.
+     */
+    receive() external payable {
+        emit SafeReceived(msg.sender, msg.value);
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/common/Singleton.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title Singleton - Base for singleton contracts (should always be the first super contract)
+ *        This contract is tightly coupled to our proxy contract (see `proxies/SafeProxy.sol`)
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract Singleton {
+    // singleton always has to be the first declared variable to ensure the same location as in the Proxy contract.
+    // It should also always be ensured the address is stored alone (uses a full word)
+    address private singleton;
+}
+
+
+// File: lib/safe-contracts/contracts/common/SignatureDecoder.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title SignatureDecoder - Decodes signatures encoded as bytes
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract SignatureDecoder {
+    /**
+     * @notice Splits signature bytes into `uint8 v, bytes32 r, bytes32 s`.
+     * @dev Make sure to perform a bounds check for @param pos, to avoid out of bounds access on @param signatures
+     *      The signature format is a compact form of {bytes32 r}{bytes32 s}{uint8 v}
+     *      Compact means uint8 is not padded to 32 bytes.
+     * @param pos Which signature to read.
+     *            A prior bounds check of this parameter should be performed, to avoid out of bounds access.
+     * @param signatures Concatenated {r, s, v} signatures.
+     * @return v Recovery ID or Safe signature type.
+     * @return r Output value r of the signature.
+     * @return s Output value s of the signature.
+     */
+    function signatureSplit(bytes memory signatures, uint256 pos) internal pure returns (uint8 v, bytes32 r, bytes32 s) {
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            let signaturePos := mul(0x41, pos)
+            r := mload(add(signatures, add(signaturePos, 0x20)))
+            s := mload(add(signatures, add(signaturePos, 0x40)))
+            /**
+             * Here we are loading the last 32 bytes, including 31 bytes
+             * of 's'. There is no 'mload8' to do this.
+             * 'byte' is not working due to the Solidity parser, so lets
+             * use the second best option, 'and'
+             */
+            v := and(mload(add(signatures, add(signaturePos, 0x41))), 0xff)
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/common/SecuredTokenTransfer.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title SecuredTokenTransfer - Secure token transfer.
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract SecuredTokenTransfer {
+    /**
+     * @notice Transfers a token and returns a boolean if it was a success
+     * @dev It checks the return data of the transfer call and returns true if the transfer was successful.
+     *      It doesn't check if the `token` address is a contract or not.
+     * @param token Token that should be transferred
+     * @param receiver Receiver to whom the token should be transferred
+     * @param amount The amount of tokens that should be transferred
+     * @return transferred Returns true if the transfer was successful
+     */
+    function transferToken(address token, address receiver, uint256 amount) internal returns (bool transferred) {
+        // 0xa9059cbb - keccack("transfer(address,uint256)")
+        bytes memory data = abi.encodeWithSelector(0xa9059cbb, receiver, amount);
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            // We write the return value to scratch space.
+            // See https://docs.soliditylang.org/en/v0.7.6/internals/layout_in_memory.html#layout-in-memory
+            let success := call(sub(gas(), 10000), token, 0, add(data, 0x20), mload(data), 0, 0x20)
+            switch returndatasize()
+            case 0 {
+                transferred := success
+            }
+            case 0x20 {
+                transferred := iszero(or(iszero(success), iszero(mload(0))))
+            }
+            default {
+                transferred := 0
+            }
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/common/StorageAccessible.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title StorageAccessible - A generic base contract that allows callers to access all internal storage.
+ * @notice See https://github.com/gnosis/util-contracts/blob/bb5fe5fb5df6d8400998094fb1b32a178a47c3a1/contracts/StorageAccessible.sol
+ *         It removes a method from the original contract not needed for the Safe contracts.
+ * @author Gnosis Developers
+ */
+abstract contract StorageAccessible {
+    /**
+     * @notice Reads `length` bytes of storage in the currents contract
+     * @param offset - the offset in the current contract's storage in words to start reading from
+     * @param length - the number of words (32 bytes) of data to read
+     * @return the bytes that were read.
+     */
+    function getStorageAt(uint256 offset, uint256 length) public view returns (bytes memory) {
+        bytes memory result = new bytes(length * 32);
+        for (uint256 index = 0; index < length; index++) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                let word := sload(add(offset, index))
+                mstore(add(add(result, 0x20), mul(index, 0x20)), word)
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Performs a delegatecall on a targetContract in the context of self.
+     * Internally reverts execution to avoid side effects (making it static).
+     *
+     * This method reverts with data equal to `abi.encode(bool(success), bytes(response))`.
+     * Specifically, the `returndata` after a call to this method will be:
+     * `success:bool || response.length:uint256 || response:bytes`.
+     *
+     * @param targetContract Address of the contract containing the code to execute.
+     * @param calldataPayload Calldata that should be sent to the target contract (encoded method name and arguments).
+     */
+    function simulateAndRevert(address targetContract, bytes memory calldataPayload) external {
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            let success := delegatecall(gas(), targetContract, add(calldataPayload, 0x20), mload(calldataPayload), 0, 0)
+
+            mstore(0x00, success)
+            mstore(0x20, returndatasize())
+            returndatacopy(0x40, 0, returndatasize())
+            revert(0, add(returndatasize(), 0x40))
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/interfaces/ISignatureValidator.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+contract ISignatureValidatorConstants {
+    // bytes4(keccak256("isValidSignature(bytes,bytes)")
+    bytes4 internal constant EIP1271_MAGIC_VALUE = 0x20c13b0b;
+}
+
+abstract contract ISignatureValidator is ISignatureValidatorConstants {
+    /**
+     * @notice Legacy EIP1271 method to validate a signature.
+     * @param _data Arbitrary length data signed on the behalf of address(this).
+     * @param _signature Signature byte array associated with _data.
+     *
+     * MUST return the bytes4 magic value 0x20c13b0b when function passes.
+     * MUST NOT modify state (using STATICCALL for solc < 0.5, view modifier for solc > 0.5)
+     * MUST allow external calls
+     */
+    function isValidSignature(bytes memory _data, bytes memory _signature) public view virtual returns (bytes4);
+}
+
+
+// File: lib/safe-contracts/contracts/external/SafeMath.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title SafeMath
+ * @notice Math operations with safety checks that revert on error (overflow/underflow)
+ */
+library SafeMath {
+    /**
+     * @notice Multiplies two numbers, reverts on overflow.
+     * @param a First number
+     * @param b Second number
+     * @return Product of a and b
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+        // benefit is lost if 'b' is also tested.
+        // See: https://github.com/OpenZeppelin/openzeppelin-solidity/pull/522
+        if (a == 0) {
+            return 0;
+        }
+
+        uint256 c = a * b;
+        require(c / a == b);
+
+        return c;
+    }
+
+    /**
+     * @notice Subtracts two numbers, reverts on overflow (i.e. if subtrahend is greater than minuend).
+     * @param a First number
+     * @param b Second number
+     * @return Difference of a and b
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b <= a);
+        uint256 c = a - b;
+
+        return c;
+    }
+
+    /**
+     * @notice Adds two numbers, reverts on overflow.
+     * @param a First number
+     * @param b Second number
+     * @return Sum of a and b
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a);
+
+        return c;
+    }
+
+    /**
+     * @notice Returns the largest of two numbers.
+     * @param a First number
+     * @param b Second number
+     * @return Largest of a and b
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a >= b ? a : b;
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/base/IsolatedOwnerManager.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+import "../common/SafeAuthorized.sol";
+
+/**
+ * @title IsolatedOwnerManager - Manages Safe owners and a threshold to authorize transactions.
+ * @dev Uses a linked list to store the owners because the code generate by the solidity compiler
+ *      is more efficient than using a dynamic array.
+ * @author Stefan George - @Georgi87
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract IsolatedOwnerManager is SafeAuthorized {
+    event AddedOwner(address indexed owner);
+    event RemovedOwner(address indexed owner);
+    event ChangedThreshold(uint256 threshold);
+
+    address internal constant SENTINEL_OWNERS = address(0x1);
+
+    mapping(address => address) internal owners;
+    uint256 internal ownerCount;
+    uint256 internal threshold;
+
+    /**
+     * @notice Sets the initial storage of the contract.
+     * @param _owners List of Safe owners.
+     * @param _threshold Number of required confirmations for a Safe transaction.
+     */
+    function setupOwners(address[] memory _owners, uint256 _threshold) internal {
+        // Threshold can only be 0 at initialization.
+        // Check ensures that setup function can only be called once.
+        require(threshold == 0, "GS200");
+        // Validate that threshold is smaller than number of added owners.
+        require(_threshold <= _owners.length, "GS201");
+        // There has to be at least one Safe owner.
+        require(_threshold >= 1, "GS202");
+        // Initializing Safe owners.
+        address currentOwner = SENTINEL_OWNERS;
+        for (uint256 i = 0; i < _owners.length; i++) {
+            // Owner address cannot be null.
+            address owner = _owners[i];
+            require(owner != address(0) && owner != SENTINEL_OWNERS && owner != address(this) && currentOwner != owner, "GS203");
+            // No duplicate owners allowed.
+            require(owners[owner] == address(0), "GS204");
+            owners[currentOwner] = owner;
+            currentOwner = owner;
+        }
+        owners[currentOwner] = SENTINEL_OWNERS;
+        ownerCount = _owners.length;
+        threshold = _threshold;
+    }
+
+    /**
+     * @notice Adds the owner `owner` to the Safe and updates the threshold to `_threshold`.
+     * @dev This can only be done via a Safe transaction.
+     * @param owner New owner address.
+     * @param _threshold New threshold.
+     */
+    function addOwnerWithThreshold(address owner, uint256 _threshold) public authorized {
+        // Owner address cannot be null, the sentinel or the Safe itself.
+        require(owner != address(0) && owner != SENTINEL_OWNERS && owner != address(this), "GS203");
+        // No duplicate owners allowed.
+        require(owners[owner] == address(0), "GS204");
+        owners[owner] = owners[SENTINEL_OWNERS];
+        owners[SENTINEL_OWNERS] = owner;
+        ownerCount++;
+        emit AddedOwner(owner);
+        // Change threshold if threshold was changed.
+        if (threshold != _threshold) changeThreshold(_threshold);
+    }
+
+    /**
+     * @notice Removes the owner `owner` from the Safe and updates the threshold to `_threshold`.
+     * @dev This can only be done via a Safe transaction.
+     * @param prevOwner Owner that pointed to the owner to be removed in the linked list
+     * @param owner Owner address to be removed.
+     * @param _threshold New threshold.
+     */
+    function removeOwner(address prevOwner, address owner, uint256 _threshold) public authorized {
+        // Only allow to remove an owner, if threshold can still be reached.
+        require(ownerCount - 1 >= _threshold, "GS201");
+        // Validate owner address and check that it corresponds to owner index.
+        require(owner != address(0) && owner != SENTINEL_OWNERS, "GS203");
+        require(owners[prevOwner] == owner, "GS205");
+        owners[prevOwner] = owners[owner];
+        owners[owner] = address(0);
+        ownerCount--;
+        emit RemovedOwner(owner);
+        // Change threshold if threshold was changed.
+        if (threshold != _threshold) changeThreshold(_threshold);
+    }
+
+    /**
+     * @notice Replaces the owner `oldOwner` in the Safe with `newOwner`.
+     * @dev This can only be done via a Safe transaction.
+     * @param prevOwner Owner that pointed to the owner to be replaced in the linked list
+     * @param oldOwner Owner address to be replaced.
+     * @param newOwner New owner address.
+     */
+    function swapOwner(address prevOwner, address oldOwner, address newOwner) public authorized {
+        // Owner address cannot be null, the sentinel or the Safe itself.
+        require(newOwner != address(0) && newOwner != SENTINEL_OWNERS && newOwner != address(this), "GS203");
+        // No duplicate owners allowed.
+        require(owners[newOwner] == address(0), "GS204");
+        // Validate oldOwner address and check that it corresponds to owner index.
+        require(oldOwner != address(0) && oldOwner != SENTINEL_OWNERS, "GS203");
+        require(owners[prevOwner] == oldOwner, "GS205");
+        owners[newOwner] = owners[oldOwner];
+        owners[prevOwner] = newOwner;
+        owners[oldOwner] = address(0);
+        emit RemovedOwner(oldOwner);
+        emit AddedOwner(newOwner);
+    }
+
+    /**
+     * @notice Changes the threshold of the Safe to `_threshold`.
+     * @dev This can only be done via a Safe transaction.
+     * @param _threshold New threshold.
+     */
+    function changeThreshold(uint256 _threshold) public authorized {
+        // Validate that threshold is smaller than number of owners.
+        require(_threshold <= ownerCount, "GS201");
+        // There has to be at least one Safe owner.
+        require(_threshold >= 1, "GS202");
+        threshold = _threshold;
+        emit ChangedThreshold(threshold);
+    }
+
+    /**
+     * @notice Returns the number of required confirmations for a Safe transaction aka the threshold.
+     * @return Threshold number.
+     */
+    function getThreshold() public view returns (uint256) {
+        return threshold;
+    }
+
+    /**
+     * @notice Returns if `owner` is an owner of the Safe.
+     * @return Boolean if owner is an owner of the Safe.
+     */
+    function isOwner(address owner) public view returns (bool) {
+        return owner != SENTINEL_OWNERS && owners[owner] != address(0);
+    }
+
+    /**
+     * @notice Returns a list of Safe owners.
+     * @return Array of Safe owners.
+     */
+    function getOwners() public view returns (address[] memory) {
+        address[] memory array = new address[](ownerCount);
+
+        // populate return array
+        uint256 index = 0;
+        address currentOwner = owners[SENTINEL_OWNERS];
+        while (currentOwner != SENTINEL_OWNERS) {
+            array[index] = currentOwner;
+            currentOwner = owners[currentOwner];
+            index++;
+        }
+        return array;
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/interfaces/IStandardSignatureValidator.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+// Code here is for the standard EIP-1271 interface, copied from newer commit `1cfa95710057e33832600e6b9ad5ececca8f7839` to `safe-global/safe-contracts`
+pragma solidity >=0.7.0 <0.9.0;
+
+contract IStandardSignatureValidatorConstants {
+    // bytes4(keccak256("isValidSignature(bytes32,bytes)")
+    bytes4 internal constant EIP1271_MAGIC_VALUE = 0x1626ba7e;
+}
+
+abstract contract IStandardSignatureValidator is IStandardSignatureValidatorConstants {
+    /**
+     * @notice EIP1271 method to validate a signature.
+     * @param _hash Hash of the data signed on the behalf of address(this).
+     * @param _signature Signature byte array associated with _data.
+     *
+     * MUST return the bytes4 magic value 0x1626ba7e when function passes.
+     * MUST NOT modify state (using STATICCALL for solc < 0.5, view modifier for solc > 0.5)
+     * MUST allow external calls
+     */
+    function isValidSignature(bytes32 _hash, bytes memory _signature) external view virtual returns (bytes4);
+}
+
+
+// File: lib/safe-contracts/contracts/common/SelfAuthorized.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/**
+ * @title SelfAuthorized - Authorizes current contract to perform actions to itself.
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract SelfAuthorized {
+    function requireSelfCall() private view {
+        require(msg.sender == address(this), "GS031");
+    }
+
+    modifier authorized() {
+        // Modifiers are copied around during compilation. This is a function call as it minimized the bytecode size
+        requireSelfCall();
+        _;
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/base/Executor.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+import "../common/Enum.sol";
+
+/**
+ * @title Executor - A contract that can execute transactions
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract Executor {
+    /**
+     * @notice Executes either a delegatecall or a call with provided parameters.
+     * @dev This method doesn't perform any sanity check of the transaction, such as:
+     *      - if the contract at `to` address has code or not
+     *      It is the responsibility of the caller to perform such checks.
+     * @param to Destination address.
+     * @param value Ether value.
+     * @param data Data payload.
+     * @param operation Operation type.
+     * @return success boolean flag indicating if the call succeeded.
+     */
+    function execute(
+        address to,
+        uint256 value,
+        bytes memory data,
+        Enum.Operation operation,
+        uint256 txGas
+    ) internal returns (bool success) {
+        if (operation == Enum.Operation.DelegateCall) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                success := delegatecall(txGas, to, add(data, 0x20), mload(data), 0, 0)
+            }
+        } else {
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                success := call(txGas, to, value, add(data, 0x20), mload(data), 0, 0)
+            }
+        }
+    }
+}
+
+
+// File: lib/safe-contracts/contracts/interfaces/IERC165.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+/// @notice More details at https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/introspection/IERC165.sol
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by `interfaceId`.
+     * See the corresponding EIP section
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: lib/safe-contracts/contracts/common/SafeAuthorized.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+import "../Safe.sol";
+
+/**
+ * @title SafeAuthorized - Authorizes a `Safe` to perform actions to the current contract.
+ * @author Richard Meissner - @rmeissner
+ */
+abstract contract SafeAuthorized {
+    Safe public safe;
+
+    function requireSafeCall() private view {
+        require(msg.sender == address(safe), "GS031");
+    }
+
+    modifier authorized() {
+        // Modifiers are copied around during compilation. This is a function call as it minimized the bytecode size
+        requireSafeCall();
+        _;
+    }
+}
+

@@ -1,0 +1,485 @@
+
+// File: src/TLUniversalDeployer.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.22;
+
+import {Ownable} from "openzeppelin/access/Ownable.sol";
+import {Clones} from "openzeppelin/proxy/Clones.sol";
+
+/// @title TLUniversalDeployer.sol
+/// @notice Transient Labs universal deployer - a contract factory allowing for easy deployment of TL contracts
+/// @dev This contract uses deterministic contract deployments (CREATE2)
+/// @author transientlabs.xyz
+/// @custom:version 1.0.0
+contract TLUniversalDeployer is Ownable {
+    /*//////////////////////////////////////////////////////////////////////////
+                                Custom Types
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @dev Struct defining a contract version that is deployable
+    /// @param id A human readable string showing the version identifier
+    /// @param address The implementation address
+    struct ContractVersion {
+        string id;
+        address implementation;
+    }
+
+    /// @dev Struct defining a contract that is deployable
+    /// @param created A boolean spcifying if the cloneable contract struct has been created or not
+    /// @param cType The contract type (human readable - ex: ERC721TL)
+    /// @param versions An array of `ContractVersion` structs that are deployable
+    struct DeployableContract {
+        bool created;
+        string cType;
+        ContractVersion[] versions;
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                State Variables
+    //////////////////////////////////////////////////////////////////////////*/
+
+    string public constant VERSION = "1.0.0";
+    mapping(bytes32 => DeployableContract) private _deployableContracts; // keccak256(name) -> DeployableContract
+    bytes32[] private _deployableContractKeys;
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                    Events
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @dev Event emitted whenever a contract is deployed
+    /// @param sender The msg sender
+    /// @param deployedContract The address of the deployed contract
+    /// @param implementation The address of the implementation contract
+    /// @param cType The type of contract deployed
+    /// @param version The version of contract deployed
+    event ContractDeployed(
+        address indexed sender,
+        address indexed deployedContract,
+        address indexed implementation,
+        string cType,
+        string version
+    );
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Custom Errors
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @dev Not a valid contract name
+    error InvalidDeployableContract();
+
+    /// @dev Initialization failed
+    error InitializationFailed();
+
+    /// @dev Contract already created
+    error ContractAlreadyCreated();
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Constructor
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @param initOwner The initial owner of the contract
+    constructor(address initOwner) Ownable(initOwner) {}
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Deploy Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to deploy the latest version of a deployable contract
+    /// @param contractType The contract type to deploy
+    /// @param initializationCode The initialization code to call after contract deployment
+    function deploy(string calldata contractType, bytes calldata initializationCode) external {
+        // get DeployableContract
+        bytes32 dcId = keccak256(bytes(contractType));
+        DeployableContract memory dc = _deployableContracts[dcId];
+
+        // verify contract is valid
+        if (!dc.created) revert InvalidDeployableContract();
+
+        // get latest version
+        ContractVersion memory cv = dc.versions[dc.versions.length - 1];
+
+        // deploy
+        _deploy(dc, cv, initializationCode);
+    }
+
+    /// @notice Function to deploy the latest version of a cloneable contract
+    /// @param contractType The contract type to deploy
+    /// @param initializationCode The initialization code to call after contract deployment
+    /// @param versionIndex The indeex of the `ContractVersion` to deploy
+    function deploy(string calldata contractType, bytes calldata initializationCode, uint256 versionIndex) external {
+        // get DeployableContract
+        bytes32 dcId = keccak256(bytes(contractType));
+        DeployableContract memory dc = _deployableContracts[dcId];
+
+        // verify cloneable contract is valid
+        if (!dc.created) revert InvalidDeployableContract();
+        if (versionIndex >= dc.versions.length) revert InvalidDeployableContract();
+
+        // get latest version
+        ContractVersion memory cv = dc.versions[versionIndex];
+
+        // deploy
+        _deploy(dc, cv, initializationCode);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Admin Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to add a contract type and/or version
+    /// @dev Restricted to only owner
+    /// @param contractType The contract type to save this under
+    /// @param version The version to push to the DeployableContract struct
+    function addDeployableContract(string calldata contractType, ContractVersion calldata version) external onlyOwner {
+        // get DeployableContract
+        bytes32 dcId = keccak256(bytes(contractType));
+        DeployableContract storage dc = _deployableContracts[dcId];
+
+        // if the contract type has not been created, create. e
+        // else, skip and just push version.
+        if (!dc.created) {
+            dc.created = true;
+            dc.cType = contractType;
+            _deployableContractKeys.push(dcId);
+        }
+
+        // push version
+        dc.versions.push(version);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Public Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Function to get contracts that can be deployed
+    function getDeployableContracts() external view returns (string[] memory) {
+        string[] memory dcs = new string[](_deployableContractKeys.length);
+        for (uint256 i = 0; i < _deployableContractKeys.length; i++) {
+            dcs[i] = _deployableContracts[_deployableContractKeys[i]].cType;
+        }
+
+        return dcs;
+    }
+
+    /// @notice Function to get a specific contract type
+    /// @dev Does not revert for a `contractType` that doesn't exist
+    /// @param contractType The contract type to look up
+    function getDeployableContract(string calldata contractType) external view returns (DeployableContract memory) {
+        bytes32 dcId = keccak256(bytes(contractType));
+        DeployableContract memory dc = _deployableContracts[dcId];
+
+        return dc;
+    }
+
+    /// @notice Function to predict the address at which a contract would be deployed
+    /// @dev Predicts for the latest implementation
+    /// @param sender The sender of the contract deployment transaction
+    /// @param contractType The contract type to deploy
+    /// @param initializationCode The initialization code to call after contract deployment
+    function predictDeployedContractAddress(
+        address sender,
+        string calldata contractType,
+        bytes calldata initializationCode
+    ) external view returns (address) {
+        // get DeployableContract
+        bytes32 dcId = keccak256(bytes(contractType));
+        DeployableContract memory dc = _deployableContracts[dcId];
+
+        // verify contract is valid
+        if (!dc.created) revert InvalidDeployableContract();
+
+        // get latest version
+        ContractVersion memory cv = dc.versions[dc.versions.length - 1];
+
+        // create salt by hashing the sender and init code
+        bytes32 salt = keccak256(abi.encodePacked(sender, initializationCode));
+
+        // predict
+        return Clones.predictDeterministicAddress(cv.implementation, salt);
+    }
+
+    /// @notice Function to predict the address at which a contract would be deployed
+    /// @dev Predicts for a specific implementation
+    /// @param sender The sender of the contract deployment transaction
+    /// @param contractType The contract type to deploy
+    /// @param initializationCode The initialization code to call after contract deployment
+    /// @param versionIndex The indeex of the `ContractVersion` to deploy
+    function predictDeployedContractAddress(
+        address sender,
+        string calldata contractType,
+        bytes calldata initializationCode,
+        uint256 versionIndex
+    ) external view returns (address) {
+        // get DeployableContract
+        bytes32 dcId = keccak256(bytes(contractType));
+        DeployableContract memory dc = _deployableContracts[dcId];
+
+        // verify contract is valid
+        if (!dc.created) revert InvalidDeployableContract();
+        if (versionIndex >= dc.versions.length) revert InvalidDeployableContract();
+
+        // get latest version
+        ContractVersion memory cv = dc.versions[versionIndex];
+
+        // create salt by hashing the sender and init code
+        bytes32 salt = keccak256(abi.encodePacked(sender, initializationCode));
+
+        // predict
+        return Clones.predictDeterministicAddress(cv.implementation, salt);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+                                Private Functions
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Private function to deploy contracts
+    function _deploy(DeployableContract memory dc, ContractVersion memory cv, bytes memory initializationCode)
+        private
+    {
+        // create salt by hashing the sender and init code
+        bytes32 salt = keccak256(abi.encodePacked(msg.sender, initializationCode));
+
+        // clone
+        address deployedContract = Clones.cloneDeterministic(cv.implementation, salt);
+
+        // initialize
+        (bool success,) = deployedContract.call(initializationCode);
+        if (!success) revert InitializationFailed();
+
+        // emit event
+        emit ContractDeployed(msg.sender, deployedContract, cv.implementation, dc.cType, cv.id);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/proxy/Clones.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (proxy/Clones.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for
+ * deploying minimal proxy contracts, also known as "clones".
+ *
+ * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies
+ * > a minimal bytecode implementation that delegates all calls to a known, fixed address.
+ *
+ * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`
+ * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the
+ * deterministic method.
+ */
+library Clones {
+    /**
+     * @dev A clone instance deployment failed.
+     */
+    error ERC1167FailedCreateClone();
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create opcode, which should never revert.
+     */
+    function clone(address implementation) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create(0, 0x09, 0x37)
+        }
+        if (instance == address(0)) {
+            revert ERC1167FailedCreateClone();
+        }
+    }
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create2 opcode and a `salt` to deterministically deploy
+     * the clone. Using the same `implementation` and `salt` multiple time will revert, since
+     * the clones cannot be deployed twice at the same address.
+     */
+    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create2(0, 0x09, 0x37, salt)
+        }
+        if (instance == address(0)) {
+            revert ERC1167FailedCreateClone();
+        }
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt,
+        address deployer
+    ) internal pure returns (address predicted) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(add(ptr, 0x38), deployer)
+            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)
+            mstore(add(ptr, 0x14), implementation)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)
+            mstore(add(ptr, 0x58), salt)
+            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))
+            predicted := keccak256(add(ptr, 0x43), 0x55)
+        }
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt
+    ) internal view returns (address predicted) {
+        return predictDeterministicAddress(implementation, salt, address(this));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+

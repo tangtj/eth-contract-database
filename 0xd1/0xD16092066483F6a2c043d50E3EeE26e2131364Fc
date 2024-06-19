@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+/// Standard IERC20 interface
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function name() external view returns(string memory);
+    function symbol() external view returns(string memory);
+    function balanceOf(address user) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface sdep{
+    function sdOwner() external view returns(address);
+    function BackingLogicAddress() external view returns(address);
+    function backingAsset() external view returns(address);
+}
+
+interface stakeDeployer{
+    function isReward(address addy) external view returns(bool);
+    function setIsReward(address addy) external;
+    function readyMigrate(address addy) external view returns(bool);
+    function migrateAddress(address addy) external view returns(address);
+    function distributeBulk() external;
+}
+
+interface Reader {
+    function isAdmin(address addy) external view returns (bool);
+    function isSetter(address addy) external view returns (bool);
+    function setIsSD(address addy) external;
+    function protocolAddy() external view returns (address);    
+    function feeConverter() external view returns (address);
+    function sdDepAddy() external view returns (address);
+    function getProtocolFee() external view returns (uint256);
+    function breaker() external view returns (bool); //circuit breaked in case of an exploit to handle
+    function dataAddress() external view returns (address);
+    function isWhitelistContract(address addy) external view returns (bool);
+    function setWhitelistContract(address addy, bool _bool) external;
+    function stakeDeployerAddress() external view returns(address);
+    function FEGstake() external view returns(address);
+}
+
+interface StakeLogics{    
+    function start() external;
+    function balanceOf(address user) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function amountStaked(address user) external view returns (uint256 StakedSD);  
+    function isStakeholder(address user) external view returns (bool);
+    function stake(address user, uint256 amt) external returns (uint256 poolAmountOut, uint256 afterFee);
+    function withdraw(address user, uint256 amt) external returns (uint256);
+    function setWithdrawalFee(uint256 amt) external;
+    function withdrawFee() external view returns(uint256);
+    function setDepositFee(uint256 amt) external;
+    function depositFee() external view returns(uint256);
+    function addReward(address reward, uint256 amt) external;
+    function getTotalRewards(address reward) external view returns(uint256);
+    function getRewardRound(address reward) external view returns(uint256);
+    function claimRewardTokenEarned(address user, address reward) external returns (uint256 owing);
+    function claimAllReward(address user) external;
+    function pendingRewardTokenEarned(address user, address reward) external view returns (uint256 _pendingReward);
+    function syncRewards() external;
+    function userRewardCheck(address user) external view returns(bool owed);
+    function setRewardToken(address reward, uint256 _syncLevel) external;
+    function setSyncLevel(address reward, uint256 amt) external;
+    function getSyncLevel(address reward) external view returns(uint256);
+    function setDelay(uint256 amt) external;
+    function delay() external view returns(uint256);
+    function setMatureDelay(bool _bool) external;    
+    function matureDelay() external view returns(bool);
+    function setBoost(uint256 amt) external;
+    function boost() external view returns(uint256);
+    function setBoostBacking(bool _bool) external;
+    function boostBacking() external view returns(bool);
+    function setBurnWDFee(bool _bool) external;
+    function burnWDFee() external view returns(bool);
+    function setSacrificeEnabled(bool _bool) external;
+    function sacrificeEnabled() external view returns(bool);
+    function setSacrificeLevel(address user, uint256 amt) external;
+    function parent() external view returns(address);
+    function stakers(address user) external view returns(uint256, uint256, uint256, bool, bool);
+    function rewards(address user) external view returns(bool, bool, uint256, uint256, uint256, uint256);
+    function userRewards(address reward, address user) external view returns(uint256, uint256, uint256);
+    function rewardRounds(address reward, uint256 round) external view returns(uint256, uint256, uint256);
+    function rewardAddresses(uint256 amount) external view returns(address);
+    function isRewardToken(address reward) external view returns(bool);
+    function rewardLength() external view returns(uint256);
+    function getAllPendingRewardTokenEarned(address user) external view returns (uint256[] memory, address[] memory);
+    function live() external view returns(bool);
+    function getStakeTime(address user) external view returns(uint256);
+    function transferOwnership(address newowner) external;
+    function sacrificed(address user) external view returns(uint256);
+    function setOffRewardToken(address reward, bool _bool) external;
+}
+
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+/// Transfer Helper to ensure the correct transfer of the tokens or ETH
+library SafeTransfer {
+    using Address for address;
+    /** Safe Transfer asset from one wallet with approval of the wallet
+    * @param erc20: the contract address of the erc20 token
+    * @param from: the wallet to take from
+    * @param amount: the amount to take from the wallet
+    **/
+    function _pullUnderlying(IERC20 erc20, address from, uint amount) internal
+    {
+        safeTransferFrom(erc20,from,address(this),amount);
+    }
+
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /** Safe Transfer asset to one wallet from within the contract
+    * @param erc20: the contract address of the erc20 token
+    * @param to: the wallet to send to
+    * @param amount: the amount to send from the contract
+    **/
+    function _pushUnderlying(IERC20 erc20, address to, uint amount) internal
+    {
+        safeTransfer(erc20,to,amount);
+    }
+
+    /** Safe Transfer ETH to one wallet from within the contract
+    * @param to: the wallet to send to
+    * @param value: the amount to send from the contract
+    **/
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success,) = to.call{value : value}(new bytes(0));
+        require(success, 'TransferHelper::safeTransferETH: ETH transfer failed');
+    }
+
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+contract ReentrancyGuard {
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
+
+    constructor () {
+        _status = _NOT_ENTERED;
+    }
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+}
+
+interface Dataport {
+    function DATA_READ() external view returns(address);
+}
+
+contract stakeInterface is ReentrancyGuard{
+    address public SD;
+    address public _owner;
+    address public stakeLogic;
+    string  private _name;
+    string  private _symbol;
+    bool    public paused;
+    uint8   private _decimals = 18;
+    mapping(address => uint256) public staked;
+    mapping(address => uint256) public accu;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(address user, address token, string memory tname, string memory tsymbol) {
+        SD = token;
+        _name = tname;
+        _symbol = tsymbol;
+        _owner = user;
+    }
+    
+    event STAKED(address staker, uint256 tokens);
+    event ADDREWARD(address reward, uint256 amount);
+    event WITHDRAW(address staker, uint256 tokens);
+    event PAYOUT(uint256 round, uint256 tokens, address sender);
+    event CLAIMEDREWARD(address staker, address reward, uint256 amount);
+    event CLAIMEDSDEARNED(address staker, uint256 reward); 
+    event CLAIMALLREWARD(address staker); 
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    modifier live() {
+        require(!paused, "Paused");
+        _;
+    }
+
+    modifier dist() {
+        if(address(this) != Reader(DATA_READ()).FEGstake()){
+        stakeDeployer(stakeDeployerAddress()).distributeBulk();
+        }
+        _;
+    }
+
+    function stakeDeployerAddress() public view returns(address) {
+        return Reader(DATA_READ()).stakeDeployerAddress();
+    }
+    
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */    
+
+    modifier onlyOwner {
+        if(_owner != address(0)) {
+        require(msg.sender == _owner, "owner");
+        }
+        if(_owner == address(0)) {
+        require(Reader(DATA_READ()).isAdmin(msg.sender));
+        }
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "use renounce");
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+        StakeLogics(stakeLogic).transferOwnership(newOwner);
+    }
+
+    function DATA_READ() public view returns(address) {
+       return Dataport(0xcCeD1a96321B2B2a06E8F3F4B0B883dDD059968c).DATA_READ();
+    }
+
+    function name() public view returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public view returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view returns(uint8) {
+        return _decimals;
+    }
+
+    function isLive() public view returns(bool) {
+        return StakeLogics(stakeLogic).live();
+    }
+
+    function setPause(bool _bool) external onlyOwner {
+        require(stakeDeployer(stakeDeployerAddress()).readyMigrate(SD), "Not ready");
+        paused = _bool;
+    }
+
+    function setLogics(address addy) external {
+        require(stakeLogic == address(0), "0x");
+        stakeLogic = addy;
+    }
+
+    function userRewardCheck(address user) public view returns(bool) {
+        return StakeLogics(stakeLogic).userRewardCheck(user);
+    }
+
+    function getStakeTime(address user) public view returns(uint256) {
+        return StakeLogics(stakeLogic).getStakeTime(user);
+    }
+
+    function getTotalRewards(address reward) external view returns(uint256) {
+        return StakeLogics(stakeLogic).getTotalRewards(reward);        
+    }
+
+    function sendTokens(address user, uint256 amt, uint256 amt0) external {
+        require(msg.sender == stakeLogic, "Not SL");
+        SafeTransfer.safeTransfer(IERC20(SD), user, amt);
+        uint256 ts = staked[user];
+        uint256 us = accu[user];
+        staked[user] = amt0 > ts ? 0 : ts - amt0;
+        accu[user] = amt0 > us ? 0 : us - amt0;
+    }
+
+    function sendReward(address reward, address user, uint256 amt) external {
+        require(msg.sender == stakeLogic, "Not SL");
+        SafeTransfer.safeTransfer(IERC20(reward), user, amt);
+    }
+
+    function setStakeLogic() external onlyOwner {
+        require(stakeDeployer(stakeDeployerAddress()).readyMigrate(SD), "Not ready");
+        stakeLogic = stakeDeployer(stakeDeployerAddress()).migrateAddress(SD);
+    }
+
+    function setWithdrawalFee(uint256 amt) external onlyOwner {
+        StakeLogics(stakeLogic).setWithdrawalFee(amt);
+    }
+
+    function withdrawalFee() external view returns(uint256) {
+        return StakeLogics(stakeLogic).withdrawFee();
+    }
+
+    function setDepositFee(uint256 amt) external onlyOwner {
+        StakeLogics(stakeLogic).setDepositFee(amt);
+    }
+
+    function depositFee() external view returns(uint256) {
+        return StakeLogics(stakeLogic).depositFee();
+    }
+
+    function balanceOf(address user) external view returns(uint256) {
+        return StakeLogics(stakeLogic).balanceOf(user);
+    }
+
+    function totalSupply() public view returns (uint256) {
+        return StakeLogics(stakeLogic).totalSupply();
+    }
+
+    function isStaker(address user) public view returns(bool) {
+        return StakeLogics(stakeLogic).isStakeholder(user);
+    }
+    
+    function start() external {
+        require(msg.sender == _owner, "owner");
+        StakeLogics(stakeLogic).start();
+    }
+
+    function sacrificed(address user) external view returns(uint256) {
+        return StakeLogics(stakeLogic).sacrificed(user);
+    }
+
+    function stake(uint256 amount) public nonReentrant returns(uint256) { 
+        require(isLive(), "not live");
+        SafeTransfer.safeTransferFrom(IERC20(SD), msg.sender, stakeLogic, amount); 
+        (uint256 poolAmountOut, uint256 afterFee) = StakeLogics(stakeLogic).stake(msg.sender, amount);
+        staked[msg.sender] += afterFee;
+        accu[msg.sender] += afterFee;
+        emit STAKED(msg.sender, amount);
+        emit Transfer(msg.sender, address(this), poolAmountOut);
+        return poolAmountOut;        
+    }
+
+    function stake(address user, uint256 amount) public nonReentrant returns(uint256) { 
+        require(isLive(), "not live");
+        SafeTransfer.safeTransferFrom(IERC20(SD), msg.sender, stakeLogic, amount); 
+        (uint256 poolAmountOut, uint256 afterFee) = StakeLogics(stakeLogic).stake(user, amount);
+        staked[user] += afterFee;
+        accu[user] += afterFee;
+        emit STAKED(user, amount);
+        emit Transfer(user, address(this), poolAmountOut);
+        return poolAmountOut;        
+    }
+
+    // ------------------------------------------------------------------------
+    // Owners can send the funds to be distributed to stakers using this function
+    // @param tokens number of tokens to distribute
+    // ------------------------------------------------------------------------
+    function addReward(address reward, uint256 amt) public nonReentrant {   
+        SafeTransfer.safeTransferFrom(IERC20(reward), msg.sender, address(this), amt); 
+        StakeLogics(stakeLogic).addReward(reward, amt);
+        emit ADDREWARD(reward, amt);  
+    }
+    
+    function setOffRewardToken(address reward, bool _bool) external nonReentrant onlyOwner {
+        StakeLogics(stakeLogic).setOffRewardToken(reward, _bool);
+    }
+
+    function claimRewardTokenEarned(address reward) public nonReentrant  live returns(uint256 owing) {      
+        owing = StakeLogics(stakeLogic).claimRewardTokenEarned(msg.sender, reward);   
+        emit CLAIMEDREWARD(msg.sender, reward, owing);
+        return owing;
+    }    
+    
+    function claimAllReward() public nonReentrant live {    
+        StakeLogics(stakeLogic).claimAllReward(msg.sender);
+        emit CLAIMALLREWARD(msg.sender);
+    }
+
+    // ------------------------------------------------------------------------
+    // Get the pending rewards of the staker
+    // @param _staker the address of the staker
+    // ------------------------------------------------------------------------    
+    
+    function pendingRewardTokenEarned(address staker, address reward) public view returns(uint256 _pendingReward) {
+        require(staker != address(0), "ERC20: sending to the zero address");
+        return StakeLogics(stakeLogic).pendingRewardTokenEarned(staker, reward);
+    }
+    
+    // ------------------------------------------------------------------------
+    // Get the SST balance of the token holder
+    // @param user the address of the token holder includes earned SD tokens from staking
+    // ------------------------------------------------------------------------
+    function amountStaked(address user) public view returns(uint256 StakedSD) {
+        require(user != address(0), "ERC20: sending to the zero address");
+        uint256 a = StakeLogics(stakeLogic).amountStaked(user);
+        StakedSD = a < staked[user] ? staked[user] : a;
+    }
+    
+    // ------------------------------------------------------------------------
+    // Stakers can un stake the staked tokens using this function
+    // @param tokens the number of tokens to withdraw
+    // ------------------------------------------------------------------------
+    function withdraw(uint256 amount) public nonReentrant live dist returns (uint256 tokenAmountOut) {
+        require(isLive(), "not live");
+        tokenAmountOut = StakeLogics(stakeLogic).withdraw(msg.sender, amount); 
+        emit WITHDRAW(msg.sender, amount);
+        emit Transfer(address(this), msg.sender, tokenAmountOut);
+        return tokenAmountOut;
+    }
+
+    function stk(address user, uint256 amount, bool _bool) public nonReentrant live {
+        require(msg.sender == stakeLogic, "SL");
+        staked[user] = _bool ? staked[user] + amount : staked[user] - amount;
+    }
+
+    function accumulated(address user) external view returns(uint256) {
+        uint256 a = accu[user];
+        uint256 c = amountStaked(user);
+        return c > a ? c - a : 0; 
+    }
+    
+    function resetAccumulated() external {
+        accu[msg.sender] = amountStaked(msg.sender);
+    }
+
+    function emergencySaveLostTokens(address to, address _token, uint256 _amt) public dist onlyOwner {
+        require(_token != SD, "Can't remove Main Token");
+        require(!stakeDeployer(stakeDeployerAddress()).isReward(_token), "Cannot remove rewards");
+        IERC20(_token).transfer(to, _amt);
+    }
+
+    function setRewardToken(address reward, uint256 _syncLevel) external{ // Incase wraps ever update
+        if(msg.sender != stakeDeployerAddress()){
+        require(msg.sender == owner(), "OO");
+    }
+        if(!stakeDeployer(stakeDeployerAddress()).isReward(reward)){
+        stakeDeployer(stakeDeployerAddress()).setIsReward(reward);
+        }
+        StakeLogics(stakeLogic).setRewardToken(reward, _syncLevel);
+    }
+    
+    function syncRewards() public nonReentrant {
+        StakeLogics(stakeLogic).syncRewards();
+    }
+
+    function setSacrificeLevel(uint256 amt) external {
+        StakeLogics(stakeLogic).setSacrificeLevel(msg.sender, amt);
+    }
+    
+    function setSacrificeEnabled(bool _bool) external onlyOwner {
+        StakeLogics(stakeLogic).setSacrificeEnabled(_bool);
+    }
+
+    function setBurnWDFee(bool _bool) external onlyOwner {
+        StakeLogics(stakeLogic).setBurnWDFee(_bool);
+    }
+
+    function setBoostBacking(bool _bool) external onlyOwner {
+        StakeLogics(stakeLogic).setBoostBacking(_bool);
+    }
+    
+    function setBoost(uint256 amt) external onlyOwner {
+        StakeLogics(stakeLogic).setBoost(amt);
+    }
+    
+    function setSyncLevel(address reward, uint256 amt) external onlyOwner {
+        require(amt > 1e7, " 1e7");
+        StakeLogics(stakeLogic).setSyncLevel(reward, amt);
+    }
+
+    function getSyncLevel(address reward) external view returns(uint256) {
+        return StakeLogics(stakeLogic).getSyncLevel(reward);
+    }
+    
+    function delay() external view returns(uint256) {
+        return StakeLogics(stakeLogic).delay();
+    }
+    
+    function getRewardRound(address reward) external view returns(uint256) {
+        return StakeLogics(stakeLogic).getRewardRound(reward);
+    }
+    
+    function boost() external view returns(uint256) {
+        return StakeLogics(stakeLogic).boost();
+    }
+    
+    function boostBacking() external view returns(bool) {
+        return StakeLogics(stakeLogic).boostBacking();
+    }
+    
+    function burnWDFee() external view returns(bool) {
+        return StakeLogics(stakeLogic).burnWDFee();
+    }
+    
+    function sacrificeEnabled() external view returns(bool) {
+        return StakeLogics(stakeLogic).sacrificeEnabled();
+    }
+    
+    function matureDelay() external view returns(bool) {
+        return StakeLogics(stakeLogic).matureDelay();
+    }
+
+    function setMatureDelay(bool _bool) external onlyOwner {
+        StakeLogics(stakeLogic).setMatureDelay(_bool);
+    }
+    
+    function setDelay(uint256 amt) external onlyOwner {
+        StakeLogics(stakeLogic).setDelay(amt);
+    }
+
+    function getStakers(address user) external view returns(uint256 stakeTime, uint256 sacrificeLevel, uint256 withdrawFee, bool initialized, bool preDelay) {
+        return StakeLogics(stakeLogic).stakers(user);
+    }
+
+    function getRewards(address reward) external view returns(bool islive, bool isOn, uint256 round, uint256 totalDividends, uint256 totalRewards, uint256 _syncLevel) {
+        return StakeLogics(stakeLogic).rewards(reward);
+    }
+
+    function getUserRewards(address reward, address user) external view returns(uint256 entryRound, uint256 lastEarned, uint256 totalEarned) {
+        return StakeLogics(stakeLogic).userRewards(reward, user);
+    }
+    
+    function getRewardRounds(address reward, uint256 round) external view returns(uint256 entryRound, uint256 lastEarned, uint256 totalEarned) {
+        return StakeLogics(stakeLogic).rewardRounds(reward, round);
+    }
+
+    function rewardAddresses(uint256 reward) public view returns(address) {        
+        return StakeLogics(stakeLogic).rewardAddresses(reward);
+    }
+
+    function rewardLength() public view returns(uint256) {
+        return StakeLogics(stakeLogic).rewardLength();
+    }
+
+    function getAllPendingRewardTokenEarned(address user) public view returns (uint256[] memory amounts, address[] memory reward, string[] memory name_, string[] memory symbol_, uint8[] memory decimals_) {
+        uint256 rl = rewardLength();
+        address rw;
+        reward = new address[](rl);
+        amounts = new uint256[](rl);
+        name_ = new string[](rl);
+        symbol_ = new string[](rl);
+        decimals_ = new uint8[](rl);
+        for (uint256 j = 0; j < rl; j++) {
+            rw = rewardAddresses(j);
+            reward[j] = rw;
+            amounts[j] = pendingRewardTokenEarned(user, rw);
+            name_[j] = IERC20(rw).name();
+            symbol_[j] = IERC20(rw).symbol();
+            decimals_[j] = IERC20(rw).decimals();
+        }
+    }
+
+    function getPaginatedPendingRewardTokenEarned(address user, uint256 starting, uint256 amount) public view returns (uint256[] memory amounts, address[] memory reward, string[] memory name_, string[] memory symbol_, uint8[] memory decimals_) {
+        uint256 rl = amount;
+        address rw;
+        starting -= 1;
+        reward = new address[](rl);
+        amounts = new uint256[](rl);
+        name_ = new string[](rl);
+        symbol_ = new string[](rl);
+        decimals_ = new uint8[](rl);
+        for (uint256 j = starting; j < rl + starting; j++) {
+            rw = rewardAddresses(j);
+            reward[j] = rw;
+            amounts[j] = pendingRewardTokenEarned(user, rw);
+            name_[j] = IERC20(rw).name();
+            symbol_[j] = IERC20(rw).symbol();
+            decimals_[j] = IERC20(rw).decimals();
+        }
+    }
+
+    function getRewardList() external view returns(address[] memory reward, string[] memory name_, string[] memory symbol_) {
+        uint256 rl = rewardLength();
+        address rw;
+        reward = new address[](rl);
+        name_ = new string[](rl);
+        symbol_ = new string[](rl);
+        for (uint256 j = 0; j < rl; j++) {
+            rw = rewardAddresses(j);
+            reward[j] = rw;
+            name_[j] = IERC20(rw).name();
+            symbol_[j] = IERC20(rw).symbol();
+        }
+    }
+}
