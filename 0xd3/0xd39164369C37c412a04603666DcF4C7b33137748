@@ -1,0 +1,539 @@
+
+// File: DelegationFactory.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.23;
+
+import "Clones.sol";
+import "IBoostCallback.sol";
+import "IDelegationFactory.sol";
+import "IVault.sol";
+import "IForwarder.sol";
+import "DelegatedOps.sol";
+
+contract DelegationFactory is IDelegationFactory, DelegatedOps {
+    using Clones for address;
+
+    IPrismaVault public immutable vault;
+    address public immutable forwarderImplementation;
+
+    mapping(address => address) public forwarder;
+    mapping(address delegate => IBoostCallback) public feeCallback;
+    mapping(address delegate => IBoostCallback) public delegateCallback;
+    mapping(address receiver => IBoostCallback) public receiverCallback;
+
+    event ForwarderDeployed(address boostDelegate, address forwarder);
+    event ForwarderConfigured(
+        address indexed boostDelegate,
+        address feeCallback,
+        address delegateCallback,
+        address receiverCallback
+    );
+
+    constructor(IPrismaVault _vault, address _fwdImplementation) {
+        vault = _vault;
+        forwarderImplementation = _fwdImplementation;
+    }
+
+    /**
+        @notice Configure boost delegate forwarder for the caller
+        @dev Deploys a new `Forwarder` contract on the first call from a new address.
+             To activate the forwarder, the caller must set it as their delegate callback
+             with `Vault.setBoostDelegationParams`.
+        @param _feeCallback If set, the forwarder calls `IBoostCallback.getFeePct` at this address
+                            to retrieve the delegation fee percent. You must additionally set the
+                            `feePct` to `type(uint16).max` when configuring boost delegation params
+                            in the vault.
+        @param _delegateCallback If set, the forwarder calls `IBoostCallback.delegateCallback` at this
+                                address when `msg.sender` is specified as `boostDelegate` during a call
+                                to `Vault.batchClaimRewards`
+        @param _receiverCallback If set, the forwarder calls `IBoostCallback.receiverCallback` at this
+                                address when `msg.sender` is specified as `receiver` during a call
+                                to `Vault.batchClaimRewards`.
+     */
+    function configureForwarder(
+        address account,
+        address _feeCallback,
+        address _delegateCallback,
+        address _receiverCallback
+    ) external callerOrDelegated(account) returns (bool) {
+        if (forwarder[account] == address(0)) {
+            address fwd = forwarderImplementation.cloneDeterministic(bytes32(bytes20(account)));
+            IForwarder(fwd).initialize(account);
+            forwarder[account] = fwd;
+            emit ForwarderDeployed(account, fwd);
+        }
+
+        feeCallback[account] = IBoostCallback(_feeCallback);
+        delegateCallback[account] = IBoostCallback(_delegateCallback);
+        receiverCallback[account] = IBoostCallback(_receiverCallback);
+
+        emit ForwarderConfigured(account, _feeCallback, _delegateCallback, _receiverCallback);
+
+        return true;
+    }
+
+    /**
+        @notice Returns `true` if the given `boostDelegate` has set their forwarder
+                as the callback address within the vault.
+        @dev Receivers that have configured a callback should only be used in combination
+             with delegates that have an active forwarder, otherwise the receiver callback
+             will not occur.
+     */
+    function isForwarderActive(address boostDelegate) external view returns (bool) {
+        if (forwarder[boostDelegate] == address(0)) return false;
+        (, , address callback) = vault.boostDelegation(boostDelegate);
+        return callback == forwarder[boostDelegate];
+    }
+
+    /**
+        @notice Forwards a call to the fee callback set by `boostDelegate`
+     */
+    function forwardFeePct(
+        address claimant,
+        address receiver,
+        address boostDelegate,
+        uint amount,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external view returns (uint256 feePct) {
+        return
+            feeCallback[boostDelegate].getFeePct(
+                claimant,
+                receiver,
+                boostDelegate,
+                amount,
+                previousAmount,
+                totalWeeklyEmissions
+            );
+    }
+
+    /**
+        @notice Forwards delegate and receiver callbacks
+     */
+    function forwardCallback(
+        address claimant,
+        address receiver,
+        address boostDelegate,
+        uint amount,
+        uint adjustedAmount,
+        uint fee,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external returns (bool success) {
+        require(msg.sender == forwarder[boostDelegate], "!forwarder");
+
+        IBoostCallback callback = delegateCallback[boostDelegate];
+        if (address(callback) != address(0)) {
+            callback.delegateCallback(
+                claimant,
+                receiver,
+                boostDelegate,
+                amount,
+                adjustedAmount,
+                fee,
+                previousAmount,
+                totalWeeklyEmissions
+            );
+        }
+
+        callback = receiverCallback[receiver];
+        if (address(callback) != address(0)) {
+            callback.receiverCallback(claimant, receiver, adjustedAmount);
+        }
+
+        return true;
+    }
+}
+
+
+// File: Clones.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (proxy/Clones.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for
+ * deploying minimal proxy contracts, also known as "clones".
+ *
+ * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies
+ * > a minimal bytecode implementation that delegates all calls to a known, fixed address.
+ *
+ * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`
+ * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the
+ * deterministic method.
+ *
+ * _Available since v3.4._
+ */
+library Clones {
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create opcode, which should never revert.
+     */
+    function clone(address implementation) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create(0, 0x09, 0x37)
+        }
+        require(instance != address(0), "ERC1167: create failed");
+    }
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create2 opcode and a `salt` to deterministically deploy
+     * the clone. Using the same `implementation` and `salt` multiple time will revert, since
+     * the clones cannot be deployed twice at the same address.
+     */
+    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create2(0, 0x09, 0x37, salt)
+        }
+        require(instance != address(0), "ERC1167: create2 failed");
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt,
+        address deployer
+    ) internal pure returns (address predicted) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(add(ptr, 0x38), deployer)
+            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)
+            mstore(add(ptr, 0x14), implementation)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)
+            mstore(add(ptr, 0x58), salt)
+            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))
+            predicted := keccak256(add(ptr, 0x43), 0x55)
+        }
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt
+    ) internal view returns (address predicted) {
+        return predictDeterministicAddress(implementation, salt, address(this));
+    }
+}
+
+
+// File: IBoostCallback.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+    @title Prisma Boost Forwarder Callback interface
+    @notice Optional callback functions that can be set within `DelegationFactory`
+ */
+interface IBoostCallback {
+    /**
+        @notice Get the current fee percent charged to use this boost delegate
+        @dev Only called if the feePct is set to `type(uint16).max` when
+             enabling delegation within the vault, and `feeCallback` is set within
+             `DelegationFactory`.
+        @param claimant Address that will perform the claim
+        @param receiver Address that will receive the claimed rewards
+        @param boostDelegate Address to be used as a boost delegate during the claim
+        @param amount Amount to be claimed (before applying boost or fee)
+        @param previousAmount Previous amount claimed this week by this contract
+        @param totalWeeklyEmissions Total weekly emissions released this week
+        @return feePct Fee % charged for claims that use this contracts' delegated boost.
+                      Given as a whole number out of 10000. If a claim would be rejected,
+                      the preferred return value is `type(uint256).max`.
+     */
+    function getFeePct(
+        address claimant,
+        address receiver,
+        address boostDelegate,
+        uint amount,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external view returns (uint256 feePct);
+
+    /**
+        @notice Callback function for boost delegators
+        @dev Only called if `delegateCallback` is set within `DelegationFactory`
+        @param claimant Address that performed the claim
+        @param receiver Address that is receiving the claimed rewards
+        @param boostDelegate Address of the boost delegate used during the claim.
+                             THIS ADDRESS CAN BE INCORRECT IF THE VAULT DELEGATION
+                             PARAMS ARE MISCONFIGURED. Logic within the function
+                             should not rely on it's correctness.
+        @param amount Amount being claimed (before applying boost or fee)
+        @param adjustedAmount Actual amount received by `claimant`
+        @param fee Fee amount paid by `claimant`
+        @param previousAmount Previous amount claimed this week by this contract
+        @param totalWeeklyEmissions Total weekly emissions released this week
+     */
+    function delegateCallback(
+        address claimant,
+        address receiver,
+        address boostDelegate,
+        uint amount,
+        uint adjustedAmount,
+        uint fee,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external returns (bool success);
+
+    /**
+        @notice Callback to the reward receiver upon a successful reward claim
+        @dev Only called if `receiverCallback` is set within `DelegationFactory`.
+     */
+    function receiverCallback(address claimant, address receiver, uint amount) external returns (bool success);
+}
+
+
+// File: IDelegationFactory.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IDelegationFactory {
+    function forwardFeePct(
+        address claimant,
+        address receiver,
+        address boostDelegate,
+        uint amount,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external view returns (uint256 feePct);
+
+    function forwardCallback(
+        address claimant,
+        address receiver,
+        address boostDelegate,
+        uint amount,
+        uint adjustedAmount,
+        uint fee,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external returns (bool success);
+}
+
+
+// File: IVault.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IPrismaVault {
+    struct InitialAllowance {
+        address receiver;
+        uint256 amount;
+    }
+
+    event BoostCalculatorSet(address boostCalculator);
+    event BoostDelegationSet(address indexed boostDelegate, bool isEnabled, uint256 feePct, address callback);
+    event EmissionScheduleSet(address emissionScheduler);
+    event IncreasedAllocation(address indexed receiver, uint256 increasedAmount);
+    event NewReceiverRegistered(address receiver, uint256 id);
+    event ReceiverIsActiveStatusModified(uint256 indexed id, bool isActive);
+    event UnallocatedSupplyIncreased(uint256 increasedAmount, uint256 unallocatedTotal);
+    event UnallocatedSupplyReduced(uint256 reducedAmount, uint256 unallocatedTotal);
+
+    function allocateNewEmissions(uint256 id) external returns (uint256);
+
+    function batchClaimRewards(
+        address receiver,
+        address boostDelegate,
+        address[] calldata rewardContracts,
+        uint256 maxFeePct
+    ) external returns (bool);
+
+    function increaseUnallocatedSupply(uint256 amount) external returns (bool);
+
+    function registerReceiver(address receiver, uint256 count) external returns (bool);
+
+    function setBoostCalculator(address _boostCalculator) external returns (bool);
+
+    function setBoostDelegationParams(bool isEnabled, uint256 feePct, address callback) external returns (bool);
+
+    function setEmissionSchedule(address _emissionSchedule) external returns (bool);
+
+    function setInitialParameters(
+        address _emissionSchedule,
+        address _boostCalculator,
+        uint256 totalSupply,
+        uint64 initialLockWeeks,
+        uint128[] calldata _fixedInitialAmounts,
+        InitialAllowance[] calldata initialAllowances
+    ) external;
+
+    function setReceiverIsActive(uint256 id, bool isActive) external returns (bool);
+
+    function transferAllocatedTokens(address claimant, address receiver, uint256 amount) external returns (bool);
+
+    function transferTokens(address token, address receiver, uint256 amount) external returns (bool);
+
+    function PRISMA_CORE() external view returns (address);
+
+    function allocated(address) external view returns (uint256);
+
+    function boostCalculator() external view returns (address);
+
+    function boostDelegation(address) external view returns (bool isEnabled, uint16 feePct, address callback);
+
+    function claimableRewardAfterBoost(
+        address account,
+        address receiver,
+        address boostDelegate,
+        address rewardContract
+    ) external view returns (uint256 adjustedAmount, uint256 feeToDelegate);
+
+    function emissionSchedule() external view returns (address);
+
+    function getClaimableWithBoost(address claimant) external view returns (uint256 maxBoosted, uint256 boosted);
+
+    function getWeek() external view returns (uint256 week);
+
+    function guardian() external view returns (address);
+
+    function idToReceiver(uint256) external view returns (address account, bool isActive);
+
+    function lockWeeks() external view returns (uint64);
+
+    function locker() external view returns (address);
+
+    function owner() external view returns (address);
+
+    function claimableBoostDelegationFees(address claimant) external view returns (uint256 amount);
+
+    function prismaToken() external view returns (address);
+
+    function receiverUpdatedWeek(uint256) external view returns (uint16);
+
+    function totalUpdateWeek() external view returns (uint64);
+
+    function unallocatedTotal() external view returns (uint128);
+
+    function voter() external view returns (address);
+
+    function weeklyEmissions(uint256) external view returns (uint128);
+}
+
+
+// File: IForwarder.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.23;
+
+import "IBoostDelegate.sol";
+
+interface IForwarder is IBoostDelegate {
+    function initialize(address _delegate) external returns (bool);
+}
+
+
+// File: IBoostDelegate.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+    @title Prisma Boost Delegate Interface
+    @notice When enabling boost delegation via `Vault.setBoostDelegationParams`,
+            you may optionally set a `callback` contract. If set, it should adhere
+            to the following interface.
+ */
+interface IBoostDelegate {
+    /**
+        @notice Get the current fee percent charged to use this boost delegate
+        @dev Optional. Only called if the feePct is set to `type(uint16).max` when
+             enabling delegation.
+        @param claimant Address that will perform the claim
+        @param amount Amount to be claimed (before applying boost or fee)
+        @param previousAmount Previous amount claimed this week by this contract
+        @param totalWeeklyEmissions Total weekly emissions released this week
+        @return feePct Fee % charged for claims that use this contracts' delegated boost.
+                      Given as a whole number out of 10000. If a claim would be rejected,
+                      the preferred return value is `type(uint256).max`.
+     */
+    function getFeePct(
+        address claimant,
+        address receiver,
+        uint amount,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external view returns (uint256 feePct);
+
+    /**
+        @notice Callback function for boost delegators
+        @dev MUST BE INCLUDED. Called after each successful claim which used
+             this contract's delegated boost.
+        @param claimant Address that performed the claim
+        @param amount Amount that claimed (before applying boost or fee)
+        @param adjustedAmount Actual amount received by `claimant`
+        @param fee Fee amount paid by `claimant`
+        @param previousAmount Previous amount claimed this week by this contract
+        @param totalWeeklyEmissions Total weekly emissions released this week
+     */
+    function delegatedBoostCallback(
+        address claimant,
+        address receiver,
+        uint amount,
+        uint adjustedAmount,
+        uint fee,
+        uint previousAmount,
+        uint totalWeeklyEmissions
+    ) external returns (bool success);
+}
+
+
+// File: DelegatedOps.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+    @title Prisma Delegated Operations
+    @notice Allows delegation to specific contract functionality. Useful for creating
+            wrapper contracts to bundle multiple interactions into a single call.
+
+            Functions that supports delegation should include an `account` input allowing
+            the delegated caller to indicate who they are calling on behalf of. In executing
+            the call, all internal state updates should be applied for `account` and all
+            value transfers should occur to or from the caller.
+
+            For example: a delegated call to `openTrove` should transfer collateral
+            from the caller, create the debt position for `account`, and send newly
+            minted tokens to the caller.
+ */
+abstract contract DelegatedOps {
+    event DelegateApprovalSet(address indexed caller, address indexed delegate, bool isApproved);
+
+    mapping(address owner => mapping(address caller => bool isApproved)) public isApprovedDelegate;
+
+    modifier callerOrDelegated(address _account) {
+        require(msg.sender == _account || isApprovedDelegate[_account][msg.sender], "Delegate not approved");
+        _;
+    }
+
+    function setDelegateApproval(address _delegate, bool _isApproved) external {
+        isApprovedDelegate[msg.sender][_delegate] = _isApproved;
+        emit DelegateApprovalSet(msg.sender, _delegate, _isApproved);
+    }
+}
+

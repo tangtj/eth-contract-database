@@ -1,0 +1,2679 @@
+
+// File: src/crosschain-liquidity/DstSwapper.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+import { LiquidityHandler } from "src/crosschain-liquidity/LiquidityHandler.sol";
+import { IDstSwapper } from "src/interfaces/IDstSwapper.sol";
+import { ISuperRegistry } from "src/interfaces/ISuperRegistry.sol";
+import { IBaseStateRegistry } from "src/interfaces/IBaseStateRegistry.sol";
+import { IBridgeValidator } from "src/interfaces/IBridgeValidator.sol";
+import { ISuperRBAC } from "src/interfaces/ISuperRBAC.sol";
+import { IERC4626Form } from "src/forms/interfaces/IERC4626Form.sol";
+import { Error } from "src/libraries/Error.sol";
+import { DataLib } from "src/libraries/DataLib.sol";
+import { InitSingleVaultData, InitMultiVaultData, PayloadState } from "src/types/DataTypes.sol";
+import { IERC20 } from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import { ReentrancyGuard } from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+
+/// @title DstSwapper
+/// @dev Handles all destination chain swaps
+/// @author Zeropoint Labs
+contract DstSwapper is IDstSwapper, ReentrancyGuard, LiquidityHandler {
+    using SafeERC20 for IERC20;
+
+    //////////////////////////////////////////////////////////////
+    //                         CONSTANTS                         //
+    //////////////////////////////////////////////////////////////
+
+    ISuperRegistry public immutable superRegistry;
+    uint64 public immutable CHAIN_ID;
+    uint256 internal constant ENTIRE_SLIPPAGE = 10_000;
+
+    //////////////////////////////////////////////////////////////
+    //                     STATE VARIABLES                      //
+    //////////////////////////////////////////////////////////////
+
+    mapping(uint256 payloadId => mapping(uint256 index => FailedSwap)) internal failedSwap;
+    mapping(uint256 payloadId => mapping(uint256 index => uint256 amount)) public swappedAmount;
+
+    //////////////////////////////////////////////////////////////
+    //                           STRUCTS                         //
+    //////////////////////////////////////////////////////////////
+
+    struct ProcessTxVars {
+        address finalDst;
+        address to;
+        address underlying;
+        address approvalToken;
+        address interimToken;
+        uint256 amount;
+        uint256 expAmount;
+        uint256 maxSlippage;
+        uint256 balanceBefore;
+        uint256 balanceAfter;
+        uint256 balanceDiff;
+        uint64 chainId;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                       MODIFIERS                          //
+    //////////////////////////////////////////////////////////////
+
+    modifier onlySwapper() {
+        bytes32 role = keccak256("DST_SWAPPER_ROLE");
+        if (!ISuperRBAC(superRegistry.getAddress(keccak256("SUPER_RBAC"))).hasRole(role, msg.sender)) {
+            revert Error.NOT_PRIVILEGED_CALLER(role);
+        }
+        _;
+    }
+
+    modifier onlyCoreStateRegistry() {
+        if (superRegistry.getAddress(keccak256("CORE_STATE_REGISTRY")) != msg.sender) {
+            revert Error.NOT_CORE_STATE_REGISTRY();
+        }
+        _;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                      CONSTRUCTOR                         //
+    //////////////////////////////////////////////////////////////
+
+    /// @param superRegistry_ superform registry contract
+    constructor(address superRegistry_) {
+        if (superRegistry_ == address(0)) {
+            revert Error.ZERO_ADDRESS();
+        }
+
+        if (block.chainid > type(uint64).max) {
+            revert Error.BLOCK_CHAIN_ID_OUT_OF_BOUNDS();
+        }
+
+        CHAIN_ID = uint64(block.chainid);
+        superRegistry = ISuperRegistry(superRegistry_);
+    }
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    /// @inheritdoc IDstSwapper
+    function getPostDstSwapFailureUpdatedTokenAmount(
+        uint256 payloadId_,
+        uint256 index_
+    )
+        external
+        view
+        override
+        returns (address interimToken, uint256 amount)
+    {
+        interimToken = failedSwap[payloadId_][index_].interimToken;
+        amount = failedSwap[payloadId_][index_].amount;
+
+        if (amount == 0) {
+            revert Error.INVALID_DST_SWAPPER_FAILED_SWAP();
+        } else {
+            if (interimToken == NATIVE) {
+                if (address(this).balance < amount) {
+                    revert Error.INVALID_DST_SWAPPER_FAILED_SWAP_NO_NATIVE_BALANCE();
+                }
+            } else {
+                if (IERC20(interimToken).balanceOf(address(this)) < amount) {
+                    revert Error.INVALID_DST_SWAPPER_FAILED_SWAP_NO_TOKEN_BALANCE();
+                }
+            }
+        }
+    }
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL WRITE FUNCTIONS                    //
+    //////////////////////////////////////////////////////////////
+
+    /// @notice receive enables processing native token transfers into the smart contract.
+    /// @dev liquidity bridge fails without a native receive function.
+    receive() external payable { }
+
+    /// @inheritdoc IDstSwapper
+    function processTx(
+        uint256 payloadId_,
+        uint8 bridgeId_,
+        bytes calldata txData_
+    )
+        external
+        override
+        nonReentrant
+        onlySwapper
+    {
+        IBaseStateRegistry coreStateRegistry = _getCoreStateRegistry();
+
+        _isValidPayloadId(payloadId_, coreStateRegistry);
+
+        (,, uint8 multi,,,) = DataLib.decodeTxInfo(coreStateRegistry.payloadHeader(payloadId_));
+
+        if (multi != 0) revert Error.INVALID_PAYLOAD_TYPE();
+
+        _processTx(
+            payloadId_,
+            0,
+            /// index is always 0 for single vault payload
+            bridgeId_,
+            txData_,
+            abi.decode(coreStateRegistry.payloadBody(payloadId_), (InitSingleVaultData)).liqData.interimToken,
+            coreStateRegistry
+        );
+    }
+
+    /// @inheritdoc IDstSwapper
+    function batchProcessTx(
+        uint256 payloadId_,
+        uint256[] calldata indices_,
+        uint8[] calldata bridgeIds_,
+        bytes[] calldata txData_
+    )
+        external
+        override
+        nonReentrant
+        onlySwapper
+    {
+        uint256 len = txData_.length;
+        if (len == 0) revert Error.ZERO_INPUT_VALUE();
+        if (len != indices_.length || len != bridgeIds_.length) revert Error.ARRAY_LENGTH_MISMATCH();
+
+        IBaseStateRegistry coreStateRegistry = _getCoreStateRegistry();
+        _isValidPayloadId(payloadId_, coreStateRegistry);
+
+        (,, uint8 multi,,,) = DataLib.decodeTxInfo(coreStateRegistry.payloadHeader(payloadId_));
+        if (multi != 1) revert Error.INVALID_PAYLOAD_TYPE();
+
+        InitMultiVaultData memory data = abi.decode(coreStateRegistry.payloadBody(payloadId_), (InitMultiVaultData));
+
+        uint256 maxIndex = data.liqData.length;
+        uint256 index;
+
+        for (uint256 i; i < len; ++i) {
+            index = indices_[i];
+
+            if (index >= maxIndex) revert Error.INDEX_OUT_OF_BOUNDS();
+            if (i > 0 && index <= indices_[i - 1]) {
+                revert Error.DUPLICATE_INDEX();
+            }
+
+            _processTx(
+                payloadId_, index, bridgeIds_[i], txData_[i], data.liqData[index].interimToken, coreStateRegistry
+            );
+        }
+    }
+
+    /// @inheritdoc IDstSwapper
+    function updateFailedTx(uint256 payloadId_, address interimToken_, uint256 amount_) external override onlySwapper {
+        IBaseStateRegistry coreStateRegistry = _getCoreStateRegistry();
+
+        _isValidPayloadId(payloadId_, coreStateRegistry);
+
+        (,, uint8 multi,,,) = DataLib.decodeTxInfo(coreStateRegistry.payloadHeader(payloadId_));
+
+        if (multi != 0) revert Error.INVALID_PAYLOAD_TYPE();
+
+        _updateFailedTx(
+            payloadId_,
+            0,
+            /// index is always zero for single vault payload
+            interimToken_,
+            abi.decode(coreStateRegistry.payloadBody(payloadId_), (InitSingleVaultData)).liqData.interimToken,
+            amount_,
+            coreStateRegistry
+        );
+    }
+
+    /// @inheritdoc IDstSwapper
+    function batchUpdateFailedTx(
+        uint256 payloadId_,
+        uint256[] calldata indices_,
+        address[] calldata interimTokens_,
+        uint256[] calldata amounts_
+    )
+        external
+        override
+        onlySwapper
+    {
+        uint256 len = indices_.length;
+
+        if (len != interimTokens_.length || len != amounts_.length) {
+            revert Error.ARRAY_LENGTH_MISMATCH();
+        }
+
+        IBaseStateRegistry coreStateRegistry = _getCoreStateRegistry();
+
+        _isValidPayloadId(payloadId_, coreStateRegistry);
+
+        (,, uint8 multi,,,) = DataLib.decodeTxInfo(coreStateRegistry.payloadHeader(payloadId_));
+        if (multi != 1) revert Error.INVALID_PAYLOAD_TYPE();
+
+        InitMultiVaultData memory data = abi.decode(coreStateRegistry.payloadBody(payloadId_), (InitMultiVaultData));
+
+        uint256 maxIndex = data.liqData.length;
+        uint256 index;
+
+        for (uint256 i; i < len; ++i) {
+            index = indices_[i];
+            if (index >= maxIndex) revert Error.INDEX_OUT_OF_BOUNDS();
+            if (i > 0 && index <= indices_[i - 1]) {
+                revert Error.DUPLICATE_INDEX();
+            }
+
+            _updateFailedTx(
+                payloadId_,
+                indices_[index],
+                interimTokens_[i],
+                data.liqData[index].interimToken,
+                amounts_[i],
+                coreStateRegistry
+            );
+        }
+    }
+
+    /// @inheritdoc IDstSwapper
+    function processFailedTx(
+        address user_,
+        address interimToken_,
+        uint256 amount_
+    )
+        external
+        override
+        onlyCoreStateRegistry
+    {
+        if (user_ == address(0)) revert Error.ZERO_ADDRESS();
+        if (interimToken_ != NATIVE) {
+            IERC20(interimToken_).safeTransfer(user_, amount_);
+        } else {
+            (bool success,) = payable(user_).call{ value: amount_ }("");
+            if (!success) revert Error.FAILED_TO_SEND_NATIVE();
+        }
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                  INTERNAL FUNCTIONS                      //
+    //////////////////////////////////////////////////////////////
+
+    function _getCoreStateRegistry() internal view returns (IBaseStateRegistry) {
+        return IBaseStateRegistry(superRegistry.getAddress(keccak256("CORE_STATE_REGISTRY")));
+    }
+
+    function _isValidPayloadId(uint256 payloadId_, IBaseStateRegistry coreStateRegistry) internal view {
+        if (payloadId_ > coreStateRegistry.payloadsCount()) {
+            revert Error.INVALID_PAYLOAD_ID();
+        }
+    }
+
+    function _processTx(
+        uint256 payloadId_,
+        uint256 index_,
+        uint8 bridgeId_,
+        bytes calldata txData_,
+        address userSuppliedInterimToken_,
+        IBaseStateRegistry coreStateRegistry_
+    )
+        internal
+    {
+        if (swappedAmount[payloadId_][index_] != 0) {
+            revert Error.DST_SWAP_ALREADY_PROCESSED();
+        }
+
+        ProcessTxVars memory v;
+        v.chainId = CHAIN_ID;
+
+        IBridgeValidator validator = IBridgeValidator(superRegistry.getBridgeValidator(bridgeId_));
+        (v.approvalToken, v.amount) = validator.decodeDstSwap(txData_);
+
+        if (userSuppliedInterimToken_ != v.approvalToken) {
+            revert Error.INVALID_INTERIM_TOKEN();
+        }
+        if (userSuppliedInterimToken_ == NATIVE) {
+            if (address(this).balance < v.amount) {
+                revert Error.INSUFFICIENT_BALANCE();
+            }
+        } else {
+            if (IERC20(userSuppliedInterimToken_).balanceOf(address(this)) < v.amount) {
+                revert Error.INSUFFICIENT_BALANCE();
+            }
+        }
+        v.finalDst = address(coreStateRegistry_);
+
+        /// @dev validates the bridge data
+        validator.validateTxData(
+            IBridgeValidator.ValidateTxDataArgs(
+                txData_,
+                v.chainId,
+                v.chainId,
+                v.chainId,
+                false,
+                /// @dev to enter the if-else case of the bridge validator loop
+                address(0),
+                v.finalDst,
+                v.approvalToken,
+                address(0)
+            )
+        );
+
+        /// @dev get the address of the bridge to send the txData to.
+        (v.underlying, v.expAmount, v.maxSlippage) = _getFormUnderlyingFrom(coreStateRegistry_, payloadId_, index_);
+
+        v.balanceBefore = IERC20(v.underlying).balanceOf(v.finalDst);
+        _dispatchTokens(
+            superRegistry.getBridgeAddress(bridgeId_),
+            txData_,
+            v.approvalToken,
+            v.amount,
+            v.approvalToken == NATIVE ? v.amount : 0
+        );
+
+        v.balanceAfter = IERC20(v.underlying).balanceOf(v.finalDst);
+
+        if (v.balanceAfter <= v.balanceBefore) {
+            revert Error.INVALID_SWAP_OUTPUT();
+        }
+
+        v.balanceDiff = v.balanceAfter - v.balanceBefore;
+
+        /// @dev if actual underlying is less than expAmount adjusted with maxSlippage, invariant breaks
+        if (v.balanceDiff * ENTIRE_SLIPPAGE < v.expAmount * (ENTIRE_SLIPPAGE - v.maxSlippage)) {
+            revert Error.SLIPPAGE_OUT_OF_BOUNDS();
+        }
+
+        /// @dev updates swapped amount adjusting for
+        /// @notice in this check, we check if there is negative slippage, for which case, the user is capped to receive
+        /// the v.expAmount of tokens (originally defined)
+        if (v.balanceDiff > v.expAmount) {
+            v.balanceDiff = v.expAmount;
+        }
+        swappedAmount[payloadId_][index_] = v.balanceDiff;
+
+        /// @dev emits final event
+        emit SwapProcessed(payloadId_, index_, bridgeId_, v.balanceDiff);
+    }
+
+    function _updateFailedTx(
+        uint256 payloadId_,
+        uint256 index_,
+        address interimToken_,
+        address userSuppliedInterimToken_,
+        uint256 amount_,
+        IBaseStateRegistry coreStateRegistry
+    )
+        internal
+    {
+        PayloadState currState = coreStateRegistry.payloadTracking(payloadId_);
+
+        if (currState != PayloadState.STORED) {
+            revert Error.INVALID_PAYLOAD_STATUS();
+        }
+
+        if (userSuppliedInterimToken_ != interimToken_) {
+            revert Error.INVALID_INTERIM_TOKEN();
+        }
+
+        if (failedSwap[payloadId_][index_].amount != 0) {
+            revert Error.FAILED_DST_SWAP_ALREADY_UPDATED();
+        }
+
+        if (amount_ == 0) {
+            revert Error.ZERO_AMOUNT();
+        }
+
+        if (interimToken_ != NATIVE) {
+            if (IERC20(interimToken_).balanceOf(address(this)) < amount_) {
+                revert Error.INSUFFICIENT_BALANCE();
+            }
+        } else {
+            if (address(this).balance < amount_) {
+                revert Error.INSUFFICIENT_BALANCE();
+            }
+        }
+
+        /// @dev updates swapped amount
+        failedSwap[payloadId_][index_].amount = amount_;
+        failedSwap[payloadId_][index_].interimToken = interimToken_;
+
+        /// @dev emits final event
+        emit SwapFailed(payloadId_, index_, interimToken_, amount_);
+    }
+
+    function _getFormUnderlyingFrom(
+        IBaseStateRegistry coreStateRegistry_,
+        uint256 payloadId_,
+        uint256 index_
+    )
+        internal
+        view
+        returns (address underlying, uint256 amount, uint256 maxSlippage)
+    {
+        PayloadState currState = coreStateRegistry_.payloadTracking(payloadId_);
+
+        if (currState != PayloadState.STORED) {
+            revert Error.INVALID_PAYLOAD_STATUS();
+        }
+
+        uint256 payloadHeader = coreStateRegistry_.payloadHeader(payloadId_);
+        bytes memory payload = coreStateRegistry_.payloadBody(payloadId_);
+
+        (,, uint8 multi,,,) = DataLib.decodeTxInfo(payloadHeader);
+
+        if (multi == 1) {
+            InitMultiVaultData memory data = abi.decode(payload, (InitMultiVaultData));
+
+            if (index_ >= data.superformIds.length) {
+                revert Error.INVALID_INDEX();
+            }
+
+            (address superform,,) = DataLib.getSuperform(data.superformIds[index_]);
+            underlying = IERC4626Form(superform).getVaultAsset();
+            maxSlippage = data.maxSlippages[index_];
+            amount = data.amounts[index_];
+        } else {
+            InitSingleVaultData memory data = abi.decode(payload, (InitSingleVaultData));
+            (address superform,,) = DataLib.getSuperform(data.superformId);
+            underlying = IERC4626Form(superform).getVaultAsset();
+            maxSlippage = data.maxSlippage;
+            amount = data.amount;
+        }
+    }
+}
+
+
+// File: src/crosschain-liquidity/LiquidityHandler.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+import { Error } from "src/libraries/Error.sol";
+import { IERC20 } from "openzeppelin-contracts/contracts/interfaces/IERC20.sol";
+import { SafeERC20 } from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/// @title LiquidityHandler
+/// @dev Executes an action with tokens to either bridge from Chain A -> Chain B or swap on same chain
+/// @dev To be inherited by contracts that move liquidity
+/// @author ZeroPoint Labs
+abstract contract LiquidityHandler {
+    using SafeERC20 for IERC20;
+
+    //////////////////////////////////////////////////////////////
+    //                         CONSTANTS                        //
+    //////////////////////////////////////////////////////////////
+
+    address constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+
+    //////////////////////////////////////////////////////////////
+    //                  INTERNAL FUNCTIONS                      //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev dispatches tokens via a liquidity bridge or exchange
+    /// @param bridge_ Bridge address to pass tokens to
+    /// @param txData_ liquidity bridge data
+    /// @param token_ Token caller deposits into superform
+    /// @param amount_ Amount of tokens to deposit
+    /// @param nativeAmount_ msg.value or msg.value + native tokens
+    function _dispatchTokens(
+        address bridge_,
+        bytes memory txData_,
+        address token_,
+        uint256 amount_,
+        uint256 nativeAmount_
+    )
+        internal
+        virtual
+    {
+        if (amount_ == 0) {
+            revert Error.ZERO_AMOUNT();
+        }
+
+        if (bridge_ == address(0)) {
+            revert Error.ZERO_ADDRESS();
+        }
+
+        if (token_ != NATIVE) {
+            IERC20(token_).safeIncreaseAllowance(bridge_, amount_);
+        } else {
+            if (nativeAmount_ < amount_) revert Error.INSUFFICIENT_NATIVE_AMOUNT();
+            if (nativeAmount_ > address(this).balance) revert Error.INSUFFICIENT_BALANCE();
+        }
+
+        (bool success,) = payable(bridge_).call{ value: nativeAmount_ }(txData_);
+        if (!success) revert Error.FAILED_TO_EXECUTE_TXDATA(token_);
+
+        if (token_ != NATIVE) {
+            IERC20 token = IERC20(token_);
+            if (token.allowance(address(this), bridge_) > 0) token.forceApprove(bridge_, 0);
+        }
+    }
+}
+
+
+// File: src/interfaces/IDstSwapper.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+/// @title IDstSwapper
+/// @dev Interface for DstSwapper
+/// @author Zeropoint Labs
+interface IDstSwapper {
+    
+    //////////////////////////////////////////////////////////////
+    //                           STRUCTS                         //
+    //////////////////////////////////////////////////////////////
+
+    struct FailedSwap {
+        address interimToken;
+        uint256 amount;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                          EVENTS                          //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev is emitted when the super registry is updated.
+    event SuperRegistryUpdated(address indexed superRegistry);
+
+    /// @dev is emitted when a dst swap transaction is processed
+    event SwapProcessed(
+        uint256 indexed payloadId, uint256 indexed index, uint256 indexed bridgeId, uint256 finalAmount
+    );
+
+    /// @dev is emitted when a dst swap fails and intermediary tokens are sent to CoreStateRegistry for rescue
+    event SwapFailed(
+        uint256 indexed payloadId, uint256 indexed index, address indexed intermediaryToken, uint256 amount
+    );
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    /// @notice returns the swapped amounts (if dst swap is successful)
+    /// @param payloadId_ is the id of payload
+    /// @param index_ represents the index in the payload (0 for single vault payload)
+    /// @return amount is the amount forwarded to core state registry after the swap
+    function swappedAmount(uint256 payloadId_, uint256 index_) external view returns (uint256 amount);
+
+    /// @notice returns the interim amounts (if dst swap is failing)
+    /// @param payloadId_ is the id of payload
+    /// @param index_ represents the index in the payload (0 for single vault payload)
+    /// @return interimToken is the token that is to be refunded
+    /// @return amount is the amount of interim token to be refunded
+    function getPostDstSwapFailureUpdatedTokenAmount(
+        uint256 payloadId_,
+        uint256 index_
+    )
+        external
+        view
+        returns (address interimToken, uint256 amount);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL WRITE FUNCTIONS                    //
+    //////////////////////////////////////////////////////////////
+
+    /// @notice will process dst swap through a liquidity bridge
+    /// @param payloadId_ represents the id of the payload
+    /// @param bridgeId_ represents the id of liquidity bridge used
+    /// @param txData_ represents the transaction data generated by liquidity bridge API.
+    function processTx(uint256 payloadId_, uint8 bridgeId_, bytes calldata txData_) external;
+
+    /// @notice will process dst swaps in batch through a liquidity bridge
+    /// @param payloadId_ represents the array of payload ids used
+    /// @param indices_ represents the index of the superformid in the payload
+    /// @param bridgeIds_ represents the array of ids of liquidity bridges used
+    /// @param txDatas_  represents the array of transaction data generated by liquidity bridge API
+    function batchProcessTx(
+        uint256 payloadId_,
+        uint256[] calldata indices_,
+        uint8[] calldata bridgeIds_,
+        bytes[] calldata txDatas_
+    )
+        external;
+
+    /// @notice updates the amounts of intermediary tokens stuck because of failing dst swap
+    /// @param payloadId_ represents the id of the payload
+    /// @param interimToken_ is the intermediary token that cannot be swapped to the vault underlying
+    /// @param amount_ is the amount of the intermediary token
+    function updateFailedTx(uint256 payloadId_, address interimToken_, uint256 amount_) external;
+
+    /// @notice updates the amounts of intermediary tokens stuck because of failing dst swap in batch
+    /// @param payloadId_ represents the id of the payload
+    /// @param indices_ represents the failing indices in the payload
+    /// @param interimTokens_ is the list of intermediary tokens that cannot be swapped
+    /// @param amounts_ are the amount of intermediary tokens that need to be refunded to the user
+    function batchUpdateFailedTx(
+        uint256 payloadId_,
+        uint256[] calldata indices_,
+        address[] calldata interimTokens_,
+        uint256[] calldata amounts_
+    )
+        external;
+
+    /// @notice is a privileged function that allows Core State Registry to process refunds
+    /// @param user_ is the final refund receiver of the interimToken_
+    /// @param interimToken_ is the refund token
+    /// @param amount_ is the refund amount
+    function processFailedTx(address user_, address interimToken_, uint256 amount_) external;
+}
+
+
+// File: src/interfaces/ISuperRegistry.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+/// @title ISuperRegistry
+/// @dev Interface for SuperRegistry
+/// @author Zeropoint Labs
+interface ISuperRegistry {
+    //////////////////////////////////////////////////////////////
+    //                          EVENTS                          //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev emitted when permit2 is set.
+    event SetPermit2(address indexed permit2);
+
+    /// @dev is emitted when an address is set.
+    event AddressUpdated(
+        bytes32 indexed protocolAddressId, uint64 indexed chainId, address indexed oldAddress, address newAddress
+    );
+
+    /// @dev is emitted when a new token bridge is configured.
+    event SetBridgeAddress(uint256 indexed bridgeId, address indexed bridgeAddress);
+
+    /// @dev is emitted when a new bridge validator is configured.
+    event SetBridgeValidator(uint256 indexed bridgeId, address indexed bridgeValidator);
+
+    /// @dev is emitted when a new amb is configured.
+    event SetAmbAddress(uint8 indexed ambId_, address indexed ambAddress_, bool indexed isBroadcastAMB_);
+
+    /// @dev is emitted when a new state registry is configured.
+    event SetStateRegistryAddress(uint8 indexed registryId_, address indexed registryAddress_);
+
+    /// @dev is emitted when a new delay is configured.
+    event SetDelay(uint256 indexed oldDelay_, uint256 indexed newDelay_);
+
+    /// @dev is emitted when a new vault limit is configured
+    event SetVaultLimitPerDestination(uint64 indexed chainId_, uint256 indexed vaultLimit_);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev gets the deposit rescue delay
+    function delay() external view returns (uint256);
+
+    /// @dev returns the permit2 address
+    function PERMIT2() external view returns (address);
+
+    /// @dev returns the id of the superform router module
+    function SUPERFORM_ROUTER() external view returns (bytes32);
+
+    /// @dev returns the id of the superform factory module
+    function SUPERFORM_FACTORY() external view returns (bytes32);
+
+    /// @dev returns the id of the superform paymaster contract
+    function PAYMASTER() external view returns (bytes32);
+
+    /// @dev returns the id of the superform payload helper contract
+    function PAYMENT_HELPER() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry module
+    function CORE_STATE_REGISTRY() external view returns (bytes32);
+
+    /// @dev returns the id of the timelock form state registry module
+    function TIMELOCK_STATE_REGISTRY() external view returns (bytes32);
+
+    /// @dev returns the id of the broadcast state registry module
+    function BROADCAST_REGISTRY() external view returns (bytes32);
+
+    /// @dev returns the id of the super positions module
+    function SUPER_POSITIONS() external view returns (bytes32);
+
+    /// @dev returns the id of the super rbac module
+    function SUPER_RBAC() external view returns (bytes32);
+
+    /// @dev returns the id of the payload helper module
+    function PAYLOAD_HELPER() external view returns (bytes32);
+
+    /// @dev returns the id of the dst swapper keeper
+    function DST_SWAPPER() external view returns (bytes32);
+
+    /// @dev returns the id of the emergency queue
+    function EMERGENCY_QUEUE() external view returns (bytes32);
+
+    /// @dev returns the id of the superform receiver
+    function SUPERFORM_RECEIVER() external view returns (bytes32);
+
+    /// @dev returns the id of the payment admin keeper
+    function PAYMENT_ADMIN() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry processor keeper
+    function CORE_REGISTRY_PROCESSOR() external view returns (bytes32);
+
+    /// @dev returns the id of the broadcast registry processor keeper
+    function BROADCAST_REGISTRY_PROCESSOR() external view returns (bytes32);
+
+    /// @dev returns the id of the timelock form state registry processor keeper
+    function TIMELOCK_REGISTRY_PROCESSOR() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry updater keeper
+    function CORE_REGISTRY_UPDATER() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry updater keeper
+    function CORE_REGISTRY_RESCUER() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry updater keeper
+    function CORE_REGISTRY_DISPUTER() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry updater keeper
+    function DST_SWAPPER_PROCESSOR() external view returns (bytes32);
+
+    /// @dev gets the address of a contract on current chain
+    /// @param id_ is the id of the contract
+    function getAddress(bytes32 id_) external view returns (address);
+
+    /// @dev gets the address of a contract on a target chain
+    /// @param id_ is the id of the contract
+    /// @param chainId_ is the chain id of that chain
+    function getAddressByChainId(bytes32 id_, uint64 chainId_) external view returns (address);
+
+    /// @dev gets the address of a bridge
+    /// @param bridgeId_ is the id of a bridge
+    /// @return bridgeAddress_ is the address of the form
+    function getBridgeAddress(uint8 bridgeId_) external view returns (address bridgeAddress_);
+
+    /// @dev gets the address of a bridge validator
+    /// @param bridgeId_ is the id of a bridge
+    /// @return bridgeValidator_ is the address of the form
+    function getBridgeValidator(uint8 bridgeId_) external view returns (address bridgeValidator_);
+
+    /// @dev gets the address of a amb
+    /// @param ambId_ is the id of a bridge
+    /// @return ambAddress_ is the address of the form
+    function getAmbAddress(uint8 ambId_) external view returns (address ambAddress_);
+
+    /// @dev gets the id of the amb
+    /// @param ambAddress_ is the address of an amb
+    /// @return ambId_ is the identifier of an amb
+    function getAmbId(address ambAddress_) external view returns (uint8 ambId_);
+
+    /// @dev gets the address of the registry
+    /// @param registryId_ is the id of the state registry
+    /// @return registryAddress_ is the address of the state registry
+    function getStateRegistry(uint8 registryId_) external view returns (address registryAddress_);
+
+    /// @dev gets the id of the registry
+    /// @notice reverts if the id is not found
+    /// @param registryAddress_ is the address of the state registry
+    /// @return registryId_ is the id of the state registry
+    function getStateRegistryId(address registryAddress_) external view returns (uint8 registryId_);
+
+    /// @dev gets the safe vault limit
+    /// @param chainId_ is the id of the remote chain
+    /// @return vaultLimitPerDestination_ is the safe number of vaults to deposit
+    /// without hitting out of gas error
+    function getVaultLimitPerDestination(uint64 chainId_) external view returns (uint256 vaultLimitPerDestination_);
+
+    /// @dev helps validate if an address is a valid state registry
+    /// @param registryAddress_ is the address of the state registry
+    /// @return valid_ a flag indicating if its valid.
+    function isValidStateRegistry(address registryAddress_) external view returns (bool valid_);
+
+    /// @dev helps validate if an address is a valid amb implementation
+    /// @param ambAddress_ is the address of the amb implementation
+    /// @return valid_ a flag indicating if its valid.
+    function isValidAmbImpl(address ambAddress_) external view returns (bool valid_);
+
+    /// @dev helps validate if an address is a valid broadcast amb implementation
+    /// @param ambAddress_ is the address of the broadcast amb implementation
+    /// @return valid_ a flag indicating if its valid.
+    function isValidBroadcastAmbImpl(address ambAddress_) external view returns (bool valid_);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL WRITE FUNCTIONS                    //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev sets the deposit rescue delay
+    /// @param delay_ the delay in seconds before the deposit rescue can be finalized
+    function setDelay(uint256 delay_) external;
+
+    /// @dev sets the permit2 address
+    /// @param permit2_ the address of the permit2 contract
+    function setPermit2(address permit2_) external;
+
+    /// @dev sets the safe vault limit
+    /// @param chainId_ is the remote chain identifier
+    /// @param vaultLimit_ is the max limit of vaults per transaction
+    function setVaultLimitPerDestination(uint64 chainId_, uint256 vaultLimit_) external;
+
+    /// @dev sets new addresses on specific chains.
+    /// @param ids_ are the identifiers of the address on that chain
+    /// @param newAddresses_  are the new addresses on that chain
+    /// @param chainIds_ are the chain ids of that chain
+    function batchSetAddress(
+        bytes32[] calldata ids_,
+        address[] calldata newAddresses_,
+        uint64[] calldata chainIds_
+    )
+        external;
+
+    /// @dev sets a new address on a specific chain.
+    /// @param id_ the identifier of the address on that chain
+    /// @param newAddress_ the new address on that chain
+    /// @param chainId_ the chain id of that chain
+    function setAddress(bytes32 id_, address newAddress_, uint64 chainId_) external;
+
+    /// @dev allows admin to set the bridge address for an bridge id.
+    /// @notice this function operates in an APPEND-ONLY fashion.
+    /// @param bridgeId_         represents the bridge unique identifier.
+    /// @param bridgeAddress_    represents the bridge address.
+    /// @param bridgeValidator_  represents the bridge validator address.
+    function setBridgeAddresses(
+        uint8[] memory bridgeId_,
+        address[] memory bridgeAddress_,
+        address[] memory bridgeValidator_
+    )
+        external;
+
+    /// @dev allows admin to set the amb address for an amb id.
+    /// @notice this function operates in an APPEND-ONLY fashion.
+    /// @param ambId_         represents the bridge unique identifier.
+    /// @param ambAddress_    represents the bridge address.
+    /// @param isBroadcastAMB_ represents whether the amb implementation supports broadcasting
+    function setAmbAddress(
+        uint8[] memory ambId_,
+        address[] memory ambAddress_,
+        bool[] memory isBroadcastAMB_
+    )
+        external;
+
+    /// @dev allows admin to set the state registry address for an state registry id.
+    /// @notice this function operates in an APPEND-ONLY fashion.
+    /// @param registryId_    represents the state registry's unique identifier.
+    /// @param registryAddress_    represents the state registry's address.
+    function setStateRegistryAddress(uint8[] memory registryId_, address[] memory registryAddress_) external;
+}
+
+
+// File: src/interfaces/IBaseStateRegistry.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+import { PayloadState } from "src/types/DataTypes.sol";
+
+/// @title IBaseStateRegistry
+/// @dev Interface for BaseStateRegistry
+/// @author ZeroPoint Labs
+interface IBaseStateRegistry {
+    //////////////////////////////////////////////////////////////
+    //                          EVENTS                          //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev is emitted when a cross-chain payload is received in the state registry
+    event PayloadReceived(uint64 indexed srcChainId, uint64 indexed dstChainId, uint256 indexed payloadId);
+
+    /// @dev is emitted when a cross-chain proof is received in the state registry
+    /// NOTE: comes handy if quorum required is more than 0
+    event ProofReceived(bytes32 indexed proof);
+
+    /// @dev is emitted when a payload id gets updated
+    event PayloadUpdated(uint256 indexed payloadId);
+
+    /// @dev is emitted when a payload id gets processed
+    event PayloadProcessed(uint256 indexed payloadId);
+
+    /// @dev is emitted when the super registry address is updated
+    event SuperRegistryUpdated(address indexed superRegistry);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev allows users to read the total payloads received by the registry
+    function payloadsCount() external view returns (uint256);
+
+    /// @dev allows user to read the payload state
+    /// uint256 payloadId_ is the unique payload identifier allocated on the destination chain
+    function payloadTracking(uint256 payloadId_) external view returns (PayloadState payloadState_);
+
+    /// @dev allows users to read the bytes payload_ stored per payloadId_
+    /// @param payloadId_ is the unique payload identifier allocated on the destination chain
+    /// @return payloadBody_ the crosschain data received
+    function payloadBody(uint256 payloadId_) external view returns (bytes memory payloadBody_);
+
+    /// @dev allows users to read the uint256 payloadHeader stored per payloadId_
+    /// @param payloadId_ is the unique payload identifier allocated on the destination chain
+    /// @return payloadHeader_ the crosschain header received
+    function payloadHeader(uint256 payloadId_) external view returns (uint256 payloadHeader_);
+
+    /// @dev allows users to read the ambs that delivered the payload id
+    /// @param payloadId_ is the unique payload identifier allocated on the destination chain
+    /// @return ambIds_ is the identifier of ambs that delivered the message and proof
+    function getMessageAMB(uint256 payloadId_) external view returns (uint8[] memory ambIds_);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL WRITE FUNCTIONS                    //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev allows core contracts to send payload to a destination chain.
+    /// @param srcSender_ is the caller of the function (used for gas refunds).
+    /// @param ambIds_ is the identifier of the arbitrary message bridge to be used
+    /// @param dstChainId_ is the internal chainId used throughout the protocol
+    /// @param message_ is the crosschain payload to be sent
+    /// @param extraData_ defines all the message bridge related overrides
+    /// NOTE: dstChainId_ is mapped to message bridge's destination id inside it's implementation contract
+    /// NOTE: ambIds_ are superform assigned unique identifier for arbitrary message bridges
+    function dispatchPayload(
+        address srcSender_,
+        uint8[] memory ambIds_,
+        uint64 dstChainId_,
+        bytes memory message_,
+        bytes memory extraData_
+    )
+        external
+        payable;
+
+    /// @dev allows state registry to receive messages from message bridge implementations
+    /// @param srcChainId_ is the superform chainId from which the payload is dispatched/sent
+    /// @param message_ is the crosschain payload received
+    /// NOTE: Only {IMPLEMENTATION_CONTRACT} role can call this function.
+    function receivePayload(uint64 srcChainId_, bytes memory message_) external;
+
+    /// @dev allows privileged actors to process cross-chain payloads
+    /// @param payloadId_ is the identifier of the cross-chain payload
+    /// NOTE: Only {CORE_STATE_REGISTRY_PROCESSOR_ROLE} role can call this function
+    /// NOTE: this should handle reverting the state on source chain in-case of failure
+    /// (or) can implement scenario based reverting like in coreStateRegistry
+    function processPayload(uint256 payloadId_) external payable;
+}
+
+
+// File: src/interfaces/IBridgeValidator.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+/// @title Bridge Validator Interface
+/// @dev Interface all Bridge Validators must follow
+/// @author Zeropoint Labs
+interface IBridgeValidator {
+    //////////////////////////////////////////////////////////////
+    //                           STRUCTS                        //
+    //////////////////////////////////////////////////////////////
+
+    struct ValidateTxDataArgs {
+        bytes txData;
+        uint64 srcChainId;
+        uint64 dstChainId;
+        uint64 liqDstChainId;
+        bool deposit;
+        address superform;
+        address receiverAddress;
+        address liqDataToken;
+        address liqDataInterimToken;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev validates the receiver of the liquidity request
+    /// @param txData_ is the txData of the cross chain deposit
+    /// @param receiver_ is the address of the receiver to validate
+    /// @return valid_ if the address is valid
+    function validateReceiver(bytes calldata txData_, address receiver_) external view returns (bool valid_);
+
+    /// @dev validates the txData of a cross chain deposit
+    /// @param args_ the txData arguments to validate in txData
+    /// @return hasDstSwap if the txData contains a destination swap
+    function validateTxData(ValidateTxDataArgs calldata args_) external view returns (bool hasDstSwap);
+
+    /// @dev decodes the txData and returns the amount of input token on source
+    /// @param txData_ is the txData of the cross chain deposit
+    /// @param genericSwapDisallowed_ true if generic swaps are disallowed
+    /// @return amount_ the amount expected
+    function decodeAmountIn(
+        bytes calldata txData_,
+        bool genericSwapDisallowed_
+    )
+        external
+        view
+        returns (uint256 amount_);
+
+    /// @dev decodes neccesary information for processing swaps on the destination chain
+    /// @param txData_ is the txData to be decoded
+    /// @return token_ is the address of the token
+    /// @return amount_ the amount expected
+    function decodeDstSwap(bytes calldata txData_) external pure returns (address token_, uint256 amount_);
+
+    /// @dev decodes the final output token address (for only direct chain actions!)
+    /// @param txData_ is the txData to be decoded
+    /// @return token_ the address of the token
+    function decodeSwapOutputToken(bytes calldata txData_) external pure returns (address token_);
+}
+
+
+// File: src/interfaces/ISuperRBAC.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+import { IAccessControl } from "openzeppelin-contracts/contracts/access/IAccessControl.sol";
+
+/// @title ISuperRBAC
+/// @dev Interface for SuperRBAC
+/// @author Zeropoint Labs
+interface ISuperRBAC is IAccessControl {
+
+    //////////////////////////////////////////////////////////////
+    //                           STRUCTS                         //
+    //////////////////////////////////////////////////////////////
+
+    struct InitialRoleSetup {
+        address admin;
+        address emergencyAdmin;
+        address paymentAdmin;
+        address csrProcessor;
+        address tlProcessor;
+        address brProcessor;
+        address csrUpdater;
+        address srcVaaRelayer;
+        address dstSwapper;
+        address csrRescuer;
+        address csrDisputer;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //                          EVENTS                          //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev is emitted when superRegistry is set
+    event SuperRegistrySet(address indexed superRegistry);
+
+    /// @dev is emitted when an admin is set for a role
+    event RoleAdminSet(bytes32 role, bytes32 adminRole);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev returns the id of the protocol admin role
+    function PROTOCOL_ADMIN_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the emergency admin role
+    function EMERGENCY_ADMIN_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the payment admin role
+    function PAYMENT_ADMIN_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the broadcaster role
+    function BROADCASTER_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry processor role
+    function CORE_STATE_REGISTRY_PROCESSOR_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the timelock state registry processor role
+    function TIMELOCK_STATE_REGISTRY_PROCESSOR_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the broadcast state registry processor role
+    function BROADCAST_STATE_REGISTRY_PROCESSOR_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry updater role
+    function CORE_STATE_REGISTRY_UPDATER_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the dst swapper role
+    function DST_SWAPPER_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry rescuer role
+    function CORE_STATE_REGISTRY_RESCUER_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of the core state registry rescue disputer role
+    function CORE_STATE_REGISTRY_DISPUTER_ROLE() external view returns (bytes32);
+
+    /// @dev returns the id of wormhole vaa relayer role
+    function WORMHOLE_VAA_RELAYER_ROLE() external view returns (bytes32);
+
+    /// @dev returns whether the given address has the protocol admin role
+    /// @param admin_ the address to check
+    function hasProtocolAdminRole(address admin_) external view returns (bool);
+
+    /// @dev returns whether the given address has the emergency admin role
+    /// @param admin_ the address to check
+    function hasEmergencyAdminRole(address admin_) external view returns (bool);
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL WRITE FUNCTIONS                    //
+    //////////////////////////////////////////////////////////////
+
+    /// @dev updates the super registry address
+    function setSuperRegistry(address superRegistry_) external;
+
+    /// @dev configures a new role in superForm
+    /// @param role_ the role to set
+    /// @param adminRole_ the admin role to set as admin
+    function setRoleAdmin(bytes32 role_, bytes32 adminRole_) external;
+
+    /// @dev revokes the role_ from superRegistryAddressId_ on all chains
+    /// @param role_ the role to revoke
+    /// @param extraData_ amb config if broadcasting is required
+    /// @param superRegistryAddressId_ the super registry address id
+    function revokeRoleSuperBroadcast(
+        bytes32 role_,
+        bytes memory extraData_,
+        bytes32 superRegistryAddressId_
+    )
+        external
+        payable;
+
+    /// @dev allows sync of global roles from different chains using broadcast registry
+    /// @notice may not work for all roles
+    function stateSyncBroadcast(bytes memory data_) external;
+}
+
+
+// File: src/forms/interfaces/IERC4626Form.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+import { IERC20 } from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+
+/// @title IERC4626Form
+/// @dev Interface for ERC4626Form
+/// @author Zeropoint Labs
+interface IERC4626Form is IERC20 {
+
+    //////////////////////////////////////////////////////////////
+    //              EXTERNAL VIEW FUNCTIONS                     //
+    //////////////////////////////////////////////////////////////
+
+    function vaultSharesIsERC20() external pure returns (bool);
+
+    function vaultSharesIsERC4626() external pure returns (bool);
+
+    function getVaultAsset() external view returns (address);
+
+    function getVaultName() external view returns (string memory);
+
+    function getVaultSymbol() external view returns (string memory);
+
+    function getVaultDecimals() external view returns (uint256);
+
+    function getPricePerVaultShare() external view returns (uint256);
+
+    function getVaultShareBalance() external view returns (uint256);
+
+    function getTotalAssets() external view returns (uint256);
+
+    function getTotalSupply() external view returns (uint256);
+
+    function getPreviewPricePerVaultShare() external view returns (uint256);
+
+    function previewDepositTo(uint256 assets_) external view returns (uint256);
+
+    function previewWithdrawFrom(uint256 assets_) external view returns (uint256);
+
+    function previewRedeemFrom(uint256 shares_) external view returns (uint256);
+}
+
+
+// File: src/libraries/Error.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+library Error {
+    //////////////////////////////////////////////////////////////
+    //                  CONFIGURATION ERRORS                    //
+    //////////////////////////////////////////////////////////////
+    ///@notice errors thrown in protocol setup
+
+    /// @dev thrown if chain id exceeds max(uint64)
+    error BLOCK_CHAIN_ID_OUT_OF_BOUNDS();
+
+    /// @dev thrown if not possible to revoke a role in broadcasting
+    error CANNOT_REVOKE_NON_BROADCASTABLE_ROLES();
+
+    /// @dev thrown if not possible to revoke last admin
+    error CANNOT_REVOKE_LAST_ADMIN();
+
+    /// @dev thrown if trying to set again pseudo immutables in super registry
+    error DISABLED();
+
+    /// @dev thrown if rescue delay is not yet set for a chain
+    error DELAY_NOT_SET();
+
+    /// @dev thrown if get native token price estimate in paymentHelper is 0
+    error INVALID_NATIVE_TOKEN_PRICE();
+
+    /// @dev thrown if wormhole refund chain id is not set
+    error REFUND_CHAIN_ID_NOT_SET();
+
+    /// @dev thrown if wormhole relayer is not set
+    error RELAYER_NOT_SET();
+
+    /// @dev thrown if a role to be revoked is not assigned
+    error ROLE_NOT_ASSIGNED();
+
+    //////////////////////////////////////////////////////////////
+    //                  AUTHORIZATION ERRORS                    //
+    //////////////////////////////////////////////////////////////
+    ///@notice errors thrown if functions cannot be called
+
+    /// COMMON AUTHORIZATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if caller is not address(this), internal call
+    error INVALID_INTERNAL_CALL();
+
+    /// @dev thrown if msg.sender is not a valid amb implementation
+    error NOT_AMB_IMPLEMENTATION();
+
+    /// @dev thrown if msg.sender is not an allowed broadcaster
+    error NOT_ALLOWED_BROADCASTER();
+
+    /// @dev thrown if msg.sender is not broadcast amb implementation
+    error NOT_BROADCAST_AMB_IMPLEMENTATION();
+
+    /// @dev thrown if msg.sender is not broadcast state registry
+    error NOT_BROADCAST_REGISTRY();
+
+    /// @dev thrown if msg.sender is not core state registry
+    error NOT_CORE_STATE_REGISTRY();
+
+    /// @dev thrown if msg.sender is not emergency admin
+    error NOT_EMERGENCY_ADMIN();
+
+    /// @dev thrown if msg.sender is not emergency queue
+    error NOT_EMERGENCY_QUEUE();
+
+    /// @dev thrown if msg.sender is not minter
+    error NOT_MINTER();
+
+    /// @dev thrown if msg.sender is not minter state registry
+    error NOT_MINTER_STATE_REGISTRY_ROLE();
+
+    /// @dev thrown if msg.sender is not paymaster
+    error NOT_PAYMASTER();
+
+    /// @dev thrown if msg.sender is not payment admin
+    error NOT_PAYMENT_ADMIN();
+
+    /// @dev thrown if msg.sender is not protocol admin
+    error NOT_PROTOCOL_ADMIN();
+
+    /// @dev thrown if msg.sender is not state registry
+    error NOT_STATE_REGISTRY();
+
+    /// @dev thrown if msg.sender is not super registry
+    error NOT_SUPER_REGISTRY();
+
+    /// @dev thrown if msg.sender is not superform router
+    error NOT_SUPERFORM_ROUTER();
+
+    /// @dev thrown if msg.sender is not a superform
+    error NOT_SUPERFORM();
+
+    /// @dev thrown if msg.sender is not superform factory
+    error NOT_SUPERFORM_FACTORY();
+
+    /// @dev thrown if msg.sender is not timelock form
+    error NOT_TIMELOCK_SUPERFORM();
+
+    /// @dev thrown if msg.sender is not timelock state registry
+    error NOT_TIMELOCK_STATE_REGISTRY();
+
+    /// @dev thrown if msg.sender is not user or disputer
+    error NOT_VALID_DISPUTER();
+
+    /// @dev thrown if the msg.sender is not privileged caller
+    error NOT_PRIVILEGED_CALLER(bytes32 role);
+
+    /// STATE REGISTRY AUTHORIZATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev layerzero adapter specific error, thrown if caller not layerzero endpoint
+    error CALLER_NOT_ENDPOINT();
+
+    /// @dev hyperlane adapter specific error, thrown if caller not hyperlane mailbox
+    error CALLER_NOT_MAILBOX();
+
+    /// @dev wormhole relayer specific error, thrown if caller not wormhole relayer
+    error CALLER_NOT_RELAYER();
+
+    /// @dev thrown if src chain sender is not valid
+    error INVALID_SRC_SENDER();
+
+    //////////////////////////////////////////////////////////////
+    //                  INPUT VALIDATION ERRORS                 //
+    //////////////////////////////////////////////////////////////
+    ///@notice errors thrown if input variables are not valid
+
+    /// COMMON INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if there is an array length mismatch
+    error ARRAY_LENGTH_MISMATCH();
+
+    /// @dev thrown if payload id does not exist
+    error INVALID_PAYLOAD_ID();
+
+    /// @dev error thrown when msg value should be zero in certain payable functions
+    error MSG_VALUE_NOT_ZERO();
+
+    /// @dev thrown if amb ids length is 0
+    error ZERO_AMB_ID_LENGTH();
+
+    /// @dev thrown if address input is address 0
+    error ZERO_ADDRESS();
+
+    /// @dev thrown if amount input is 0
+    error ZERO_AMOUNT();
+
+    /// @dev thrown if final token is address 0
+    error ZERO_FINAL_TOKEN();
+
+    /// @dev thrown if value input is 0
+    error ZERO_INPUT_VALUE();
+
+    /// SUPERFORM ROUTER INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if the vaults data is invalid
+    error INVALID_SUPERFORMS_DATA();
+
+    /// @dev thrown if receiver address is not set
+    error RECEIVER_ADDRESS_NOT_SET();
+
+    /// SUPERFORM FACTORY INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if a form is not ERC165 compatible
+    error ERC165_UNSUPPORTED();
+
+    /// @dev thrown if a form is not form interface compatible
+    error FORM_INTERFACE_UNSUPPORTED();
+
+    /// @dev error thrown if form implementation address already exists
+    error FORM_IMPLEMENTATION_ALREADY_EXISTS();
+
+    /// @dev error thrown if form implementation id already exists
+    error FORM_IMPLEMENTATION_ID_ALREADY_EXISTS();
+
+    /// @dev thrown if a form does not exist
+    error FORM_DOES_NOT_EXIST();
+
+    /// @dev thrown if form id is larger than max uint16
+    error INVALID_FORM_ID();
+
+    /// @dev thrown if superform not on factory
+    error SUPERFORM_ID_NONEXISTENT();
+
+    /// @dev thrown if same vault and form implementation is used to create new superform
+    error VAULT_FORM_IMPLEMENTATION_COMBINATION_EXISTS();
+
+    /// FORM INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if in case of no txData, if liqData.token != vault.asset()
+    /// in case of txData, if token output of swap != vault.asset()
+    error DIFFERENT_TOKENS();
+
+    /// @dev thrown if the amount in direct withdraw is not correct
+    error DIRECT_WITHDRAW_INVALID_LIQ_REQUEST();
+
+    /// @dev thrown if the amount in xchain withdraw is not correct
+    error XCHAIN_WITHDRAW_INVALID_LIQ_REQUEST();
+
+    /// LIQUIDITY BRIDGE INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if route id is blacklisted in socket
+    error BLACKLISTED_ROUTE_ID();
+
+    /// @dev thrown if route id is not blacklisted in socket
+    error NOT_BLACKLISTED_ROUTE_ID();
+
+    /// @dev error thrown when txData selector of lifi bridge is a blacklisted selector
+    error BLACKLISTED_SELECTOR();
+
+    /// @dev error thrown when txData selector of lifi bridge is not a blacklisted selector
+    error NOT_BLACKLISTED_SELECTOR();
+
+    /// @dev thrown if a certain action of the user is not allowed given the txData provided
+    error INVALID_ACTION();
+
+    /// @dev thrown if in deposits, the liqDstChainId doesn't match the stateReq dstChainId
+    error INVALID_DEPOSIT_LIQ_DST_CHAIN_ID();
+
+    /// @dev thrown if index is invalid
+    error INVALID_INDEX();
+
+    /// @dev thrown if the chain id in the txdata is invalid
+    error INVALID_TXDATA_CHAIN_ID();
+
+    /// @dev thrown if the validation of bridge txData fails due to a destination call present
+    error INVALID_TXDATA_NO_DESTINATIONCALL_ALLOWED();
+
+    /// @dev thrown if the validation of bridge txData fails due to wrong receiver
+    error INVALID_TXDATA_RECEIVER();
+
+    /// @dev thrown if the validation of bridge txData fails due to wrong token
+    error INVALID_TXDATA_TOKEN();
+
+    /// @dev thrown if txData is not present (in case of xChain actions)
+    error NO_TXDATA_PRESENT();
+
+    /// STATE REGISTRY INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if payload is being updated with final amounts length different than amounts length
+    error DIFFERENT_PAYLOAD_UPDATE_AMOUNTS_LENGTH();
+
+    /// @dev thrown if payload is being updated with tx data length different than liq data length
+    error DIFFERENT_PAYLOAD_UPDATE_TX_DATA_LENGTH();
+
+    /// @dev thrown if keeper update final token is different than the vault underlying
+    error INVALID_UPDATE_FINAL_TOKEN();
+
+    /// @dev thrown if broadcast finality for wormhole is invalid
+    error INVALID_BROADCAST_FINALITY();
+
+    /// @dev thrown if amb id is not valid leading to an address 0 of the implementation
+    error INVALID_BRIDGE_ID();
+
+    /// @dev thrown if chain id involved in xchain message is invalid
+    error INVALID_CHAIN_ID();
+
+    /// @dev thrown if payload update amount isn't equal to dst swapper amount
+    error INVALID_DST_SWAP_AMOUNT();
+
+    /// @dev thrown if message amb and proof amb are the same
+    error INVALID_PROOF_BRIDGE_ID();
+
+    /// @dev thrown if order of proof AMBs is incorrect, either duplicated or not incrementing
+    error INVALID_PROOF_BRIDGE_IDS();
+
+    /// @dev thrown if rescue data lengths are invalid
+    error INVALID_RESCUE_DATA();
+
+    /// @dev thrown if delay is invalid
+    error INVALID_TIMELOCK_DELAY();
+
+    /// @dev thrown if amounts being sent in update payload mean a negative slippage
+    error NEGATIVE_SLIPPAGE();
+
+    /// @dev thrown if slippage is outside of bounds
+    error SLIPPAGE_OUT_OF_BOUNDS();
+
+    /// SUPERPOSITION INPUT VALIDATION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if src senders mismatch in state sync
+    error SRC_SENDER_MISMATCH();
+
+    /// @dev thrown if src tx types mismatch in state sync
+    error SRC_TX_TYPE_MISMATCH();
+
+    //////////////////////////////////////////////////////////////
+    //                  EXECUTION ERRORS                        //
+    //////////////////////////////////////////////////////////////
+    ///@notice errors thrown due to function execution logic
+
+    /// COMMON EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if the swap in a direct deposit resulted in insufficient tokens
+    error DIRECT_DEPOSIT_SWAP_FAILED();
+
+    /// @dev thrown if payload is not unique
+    error DUPLICATE_PAYLOAD();
+
+    /// @dev thrown if native tokens fail to be sent to superform contracts
+    error FAILED_TO_SEND_NATIVE();
+
+    /// @dev thrown if allowance is not correct to deposit
+    error INSUFFICIENT_ALLOWANCE_FOR_DEPOSIT();
+
+    /// @dev thrown if contract has insufficient balance for operations
+    error INSUFFICIENT_BALANCE();
+
+    /// @dev thrown if native amount is not at least equal to the amount in the request
+    error INSUFFICIENT_NATIVE_AMOUNT();
+
+    /// @dev thrown if payload cannot be decoded
+    error INVALID_PAYLOAD();
+
+    /// @dev thrown if payload status is invalid
+    error INVALID_PAYLOAD_STATUS();
+
+    /// @dev thrown if payload type is invalid
+    error INVALID_PAYLOAD_TYPE();
+
+    /// LIQUIDITY BRIDGE EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if we try to decode the final swap output token in a xChain liquidity bridging action
+    error CANNOT_DECODE_FINAL_SWAP_OUTPUT_TOKEN();
+
+    /// @dev thrown if liquidity bridge fails for erc20 or native tokens
+    error FAILED_TO_EXECUTE_TXDATA(address token);
+
+    /// @dev thrown if asset being used for deposit mismatches in multivault deposits
+    error INVALID_DEPOSIT_TOKEN();
+
+    /// STATE REGISTRY EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if bridge tokens haven't arrived to destination
+    error BRIDGE_TOKENS_PENDING();
+
+    /// @dev thrown if withdrawal tx data cannot be updated
+    error CANNOT_UPDATE_WITHDRAW_TX_DATA();
+
+    /// @dev thrown if rescue passed dispute deadline
+    error DISPUTE_TIME_ELAPSED();
+
+    /// @dev thrown if message failed to reach the specified level of quorum needed
+    error INSUFFICIENT_QUORUM();
+
+    /// @dev thrown if broadcast payload is invalid
+    error INVALID_BROADCAST_PAYLOAD();
+
+    /// @dev thrown if broadcast fee is invalid
+    error INVALID_BROADCAST_FEE();
+
+    /// @dev thrown if retry fees is less than required
+    error INVALID_RETRY_FEE();
+
+    /// @dev thrown if broadcast message type is wrong
+    error INVALID_MESSAGE_TYPE();
+
+    /// @dev thrown if payload hash is invalid during `retryMessage` on Layezero implementation
+    error INVALID_PAYLOAD_HASH();
+
+    /// @dev thrown if update payload function was called on a wrong payload
+    error INVALID_PAYLOAD_UPDATE_REQUEST();
+
+    /// @dev thrown if a state registry id is 0
+    error INVALID_REGISTRY_ID();
+
+    /// @dev thrown if a form state registry id is 0
+    error INVALID_FORM_REGISTRY_ID();
+
+    /// @dev thrown if trying to finalize the payload but the withdraw is still locked
+    error LOCKED();
+
+    /// @dev thrown if payload is already updated (during xChain deposits)
+    error PAYLOAD_ALREADY_UPDATED();
+
+    /// @dev thrown if payload is already processed
+    error PAYLOAD_ALREADY_PROCESSED();
+
+    /// @dev thrown if payload is not in UPDATED state
+    error PAYLOAD_NOT_UPDATED();
+
+    /// @dev thrown if rescue is still in timelocked state
+    error RESCUE_LOCKED();
+
+    /// @dev thrown if rescue is already proposed
+    error RESCUE_ALREADY_PROPOSED();
+
+    /// @dev thrown if payload hash is zero during `retryMessage` on Layezero implementation
+    error ZERO_PAYLOAD_HASH();
+
+    /// DST SWAPPER EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if process dst swap is tried for processed payload id
+    error DST_SWAP_ALREADY_PROCESSED();
+
+    /// @dev thrown if indices have duplicates
+    error DUPLICATE_INDEX();
+
+    /// @dev thrown if failed dst swap is already updated
+    error FAILED_DST_SWAP_ALREADY_UPDATED();
+
+    /// @dev thrown if indices are out of bounds
+    error INDEX_OUT_OF_BOUNDS();
+
+    /// @dev thrown if failed swap token amount is 0
+    error INVALID_DST_SWAPPER_FAILED_SWAP();
+
+    /// @dev thrown if failed swap token amount is not 0 and if token balance is less than amount (non zero)
+    error INVALID_DST_SWAPPER_FAILED_SWAP_NO_TOKEN_BALANCE();
+
+    /// @dev thrown if failed swap token amount is not 0 and if native amount is less than amount (non zero)
+    error INVALID_DST_SWAPPER_FAILED_SWAP_NO_NATIVE_BALANCE();
+
+    /// @dev forbid xChain deposits with destination swaps without interim token set (for user protection)
+    error INVALID_INTERIM_TOKEN();
+
+    /// @dev thrown if dst swap output is less than minimum expected
+    error INVALID_SWAP_OUTPUT();
+
+    /// FORM EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if try to forward 4626 share from the superform
+    error CANNOT_FORWARD_4646_TOKEN();
+
+    /// @dev thrown in KYCDAO form if no KYC token is present
+    error NO_VALID_KYC_TOKEN();
+
+    /// @dev thrown in forms where a certain functionality is not allowed or implemented
+    error NOT_IMPLEMENTED();
+
+    /// @dev thrown if form implementation is PAUSED, users cannot perform any action
+    error PAUSED();
+
+    /// @dev thrown if shares != deposit output or assets != redeem output when minting SuperPositions
+    error VAULT_IMPLEMENTATION_FAILED();
+
+    /// @dev thrown if withdrawal tx data is not updated
+    error WITHDRAW_TOKEN_NOT_UPDATED();
+
+    /// @dev thrown if withdrawal tx data is not updated
+    error WITHDRAW_TX_DATA_NOT_UPDATED();
+
+    /// @dev thrown when redeeming from vault yields zero collateral
+    error WITHDRAW_ZERO_COLLATERAL();
+
+    /// PAYMENT HELPER EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if chainlink is reporting an improper price
+    error CHAINLINK_MALFUNCTION();
+
+    /// @dev thrown if chainlink is reporting an incomplete round
+    error CHAINLINK_INCOMPLETE_ROUND();
+
+    /// @dev thrown if feed decimals is not 8
+    error CHAINLINK_UNSUPPORTED_DECIMAL();
+
+    /// EMERGENCY QUEUE EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if emergency withdraw is not queued
+    error EMERGENCY_WITHDRAW_NOT_QUEUED();
+
+    /// @dev thrown if emergency withdraw is already processed
+    error EMERGENCY_WITHDRAW_PROCESSED_ALREADY();
+
+    /// SUPERPOSITION EXECUTION ERRORS
+    /// ---------------------------------------------------------
+
+    /// @dev thrown if uri cannot be updated
+    error DYNAMIC_URI_FROZEN();
+
+    /// @dev thrown if tx history is not found while state sync
+    error TX_HISTORY_NOT_FOUND();
+}
+
+
+// File: src/libraries/DataLib.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+import { Error } from "src/libraries/Error.sol";
+
+library DataLib {
+    function packTxInfo(
+        uint8 txType_,
+        uint8 callbackType_,
+        uint8 multi_,
+        uint8 registryId_,
+        address srcSender_,
+        uint64 srcChainId_
+    )
+        internal
+        pure
+        returns (uint256 txInfo)
+    {
+        txInfo = uint256(txType_);
+        txInfo |= uint256(callbackType_) << 8;
+        txInfo |= uint256(multi_) << 16;
+        txInfo |= uint256(registryId_) << 24;
+        txInfo |= uint256(uint160(srcSender_)) << 32;
+        txInfo |= uint256(srcChainId_) << 192;
+    }
+
+    function decodeTxInfo(uint256 txInfo_)
+        internal
+        pure
+        returns (uint8 txType, uint8 callbackType, uint8 multi, uint8 registryId, address srcSender, uint64 srcChainId)
+    {
+        txType = uint8(txInfo_);
+        callbackType = uint8(txInfo_ >> 8);
+        multi = uint8(txInfo_ >> 16);
+        registryId = uint8(txInfo_ >> 24);
+        srcSender = address(uint160(txInfo_ >> 32));
+        srcChainId = uint64(txInfo_ >> 192);
+    }
+
+    /// @dev returns the vault-form-chain pair of a superform
+    /// @param superformId_ is the id of the superform
+    /// @return superform_ is the address of the superform
+    /// @return formImplementationId_ is the form id
+    /// @return chainId_ is the chain id
+    function getSuperform(uint256 superformId_)
+        internal
+        pure
+        returns (address superform_, uint32 formImplementationId_, uint64 chainId_)
+    {
+        superform_ = address(uint160(superformId_));
+        formImplementationId_ = uint32(superformId_ >> 160);
+        chainId_ = uint64(superformId_ >> 192);
+
+        if (chainId_ == 0) {
+            revert Error.INVALID_CHAIN_ID();
+        }
+    }
+
+    /// @dev returns the vault-form-chain pair of an array of superforms
+    /// @param superformIds_  array of superforms
+    /// @return superforms_ are the address of the vaults
+    function getSuperforms(uint256[] memory superformIds_) internal pure returns (address[] memory superforms_) {
+        uint256 len = superformIds_.length;
+        superforms_ = new address[](len);
+
+        for (uint256 i; i < len; ++i) {
+            (superforms_[i],,) = getSuperform(superformIds_[i]);
+        }
+    }
+
+    /// @dev returns the destination chain of a given superform
+    /// @param superformId_ is the id of the superform
+    /// @return chainId_ is the chain id
+    function getDestinationChain(uint256 superformId_) internal pure returns (uint64 chainId_) {
+        chainId_ = uint64(superformId_ >> 192);
+
+        if (chainId_ == 0) {
+            revert Error.INVALID_CHAIN_ID();
+        }
+    }
+
+    /// @dev generates the superformId
+    /// @param superform_ is the address of the superform
+    /// @param formImplementationId_ is the type of the form
+    /// @param chainId_ is the chain id on which the superform is deployed
+    function packSuperform(
+        address superform_,
+        uint32 formImplementationId_,
+        uint64 chainId_
+    )
+        internal
+        pure
+        returns (uint256 superformId_)
+    {
+        superformId_ = uint256(uint160(superform_));
+        superformId_ |= uint256(formImplementationId_) << 160;
+        superformId_ |= uint256(chainId_) << 192;
+    }
+}
+
+
+// File: src/types/DataTypes.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.23;
+
+/// @dev contains all the common struct and enums used for data communication between chains.
+
+/// @dev There are two transaction types in Superform Protocol
+enum TransactionType {
+    DEPOSIT,
+    WITHDRAW
+}
+
+/// @dev Message types can be INIT, RETURN (for successful Deposits) and FAIL (for failed withdraws)
+enum CallbackType {
+    INIT,
+    RETURN,
+    FAIL
+}
+
+/// @dev Payloads are stored, updated (deposits) or processed (finalized)
+enum PayloadState {
+    STORED,
+    UPDATED,
+    PROCESSED
+}
+
+/// @dev contains all the common struct used for interchain token transfers.
+struct LiqRequest {
+    /// @dev generated data
+    bytes txData;
+    /// @dev input token for deposits, desired output token on target liqDstChainId for withdraws. Must be set for
+    /// txData to be updated on destination for withdraws
+    address token;
+    /// @dev intermediary token on destination. Relevant for xChain deposits where a destination swap is needed for
+    /// validation purposes
+    address interimToken;
+    /// @dev what bridge to use to move tokens
+    uint8 bridgeId;
+    /// @dev dstChainId = liqDstchainId for deposits. For withdraws it is the target chain id for where the underlying
+    /// is to be delivered
+    uint64 liqDstChainId;
+    /// @dev currently this amount is used as msg.value in the txData call.
+    uint256 nativeAmount;
+}
+
+/// @dev main struct that holds required multi vault data for an action
+struct MultiVaultSFData {
+    // superformids must have same destination. Can have different underlyings
+    uint256[] superformIds;
+    uint256[] amounts; // on deposits, amount of token to deposit on dst, on withdrawals, superpositions to burn
+    uint256[] outputAmounts; // on deposits, amount of shares to receive, on withdrawals, amount of assets to receive
+    uint256[] maxSlippages;
+    LiqRequest[] liqRequests; // if length = 1; amount = sum(amounts) | else  amounts must match the amounts being sent
+    bytes permit2data;
+    bool[] hasDstSwaps;
+    bool[] retain4626s; // if true, we don't mint SuperPositions, and send the 4626 back to the user instead
+    address receiverAddress;
+    /// this address must always be an EOA otherwise funds may be lost
+    address receiverAddressSP;
+    /// this address can be a EOA or a contract that implements onERC1155Receiver. must always be set for deposits
+    bytes extraFormData; // extraFormData
+}
+
+/// @dev main struct that holds required single vault data for an action
+struct SingleVaultSFData {
+    // superformids must have same destination. Can have different underlyings
+    uint256 superformId;
+    uint256 amount;
+    uint256 outputAmount; // on deposits, amount of shares to receive, on withdrawals, amount of assets to receive
+    uint256 maxSlippage;
+    LiqRequest liqRequest; // if length = 1; amount = sum(amounts)| else  amounts must match the amounts being sent
+    bytes permit2data;
+    bool hasDstSwap;
+    bool retain4626; // if true, we don't mint SuperPositions, and send the 4626 back to the user instead
+    address receiverAddress;
+    /// this address must always be an EOA otherwise funds may be lost
+    address receiverAddressSP;
+    /// this address can be a EOA or a contract that implements onERC1155Receiver. must always be set for deposits
+    bytes extraFormData; // extraFormData
+}
+
+/// @dev overarching struct for multiDst requests with multi vaults
+struct MultiDstMultiVaultStateReq {
+    uint8[][] ambIds;
+    uint64[] dstChainIds;
+    MultiVaultSFData[] superformsData;
+}
+
+/// @dev overarching struct for single cross chain requests with multi vaults
+struct SingleXChainMultiVaultStateReq {
+    uint8[] ambIds;
+    uint64 dstChainId;
+    MultiVaultSFData superformsData;
+}
+
+/// @dev overarching struct for multiDst requests with single vaults
+struct MultiDstSingleVaultStateReq {
+    uint8[][] ambIds;
+    uint64[] dstChainIds;
+    SingleVaultSFData[] superformsData;
+}
+
+/// @dev overarching struct for single cross chain requests with single vaults
+struct SingleXChainSingleVaultStateReq {
+    uint8[] ambIds;
+    uint64 dstChainId;
+    SingleVaultSFData superformData;
+}
+
+/// @dev overarching struct for single direct chain requests with single vaults
+struct SingleDirectSingleVaultStateReq {
+    SingleVaultSFData superformData;
+}
+
+/// @dev overarching struct for single direct chain requests with multi vaults
+struct SingleDirectMultiVaultStateReq {
+    MultiVaultSFData superformData;
+}
+
+/// @dev struct for SuperRouter with re-arranged data for the message (contains the payloadId)
+/// @dev realize that receiverAddressSP is not passed, only needed on source chain to mint
+struct InitMultiVaultData {
+    uint256 payloadId;
+    uint256[] superformIds;
+    uint256[] amounts;
+    uint256[] outputAmounts;
+    uint256[] maxSlippages;
+    LiqRequest[] liqData;
+    bool[] hasDstSwaps;
+    bool[] retain4626s;
+    address receiverAddress;
+    bytes extraFormData;
+}
+
+/// @dev struct for SuperRouter with re-arranged data for the message (contains the payloadId)
+struct InitSingleVaultData {
+    uint256 payloadId;
+    uint256 superformId;
+    uint256 amount;
+    uint256 outputAmount;
+    uint256 maxSlippage;
+    LiqRequest liqData;
+    bool hasDstSwap;
+    bool retain4626;
+    address receiverAddress;
+    bytes extraFormData;
+}
+
+/// @dev struct for Emergency Queue
+struct QueuedWithdrawal {
+    address receiverAddress;
+    uint256 superformId;
+    uint256 amount;
+    uint256 srcPayloadId;
+    bool isProcessed;
+}
+
+/// @dev all statuses of the timelock payload
+enum TimelockStatus {
+    UNAVAILABLE,
+    PENDING,
+    PROCESSED
+}
+
+/// @dev holds information about the timelock payload
+struct TimelockPayload {
+    uint8 isXChain;
+    uint64 srcChainId;
+    uint256 lockedTill;
+    InitSingleVaultData data;
+    TimelockStatus status;
+}
+
+/// @dev struct that contains the type of transaction, callback flags and other identification, as well as the vaults
+/// data in params
+struct AMBMessage {
+    uint256 txInfo; // tight packing of  TransactionType txType,  CallbackType flag  if multi/single vault, registry id,
+        // srcSender and srcChainId
+    bytes params; // decoding txInfo will point to the right datatype of params. Refer PayloadHelper.sol
+}
+
+/// @dev struct that contains the information required for broadcasting changes
+struct BroadcastMessage {
+    bytes target;
+    bytes32 messageType;
+    bytes message;
+}
+
+/// @dev struct that contains info on returned data from destination
+struct ReturnMultiData {
+    uint256 payloadId;
+    uint256[] superformIds;
+    uint256[] amounts;
+}
+
+/// @dev struct that contains info on returned data from destination
+struct ReturnSingleData {
+    uint256 payloadId;
+    uint256 superformId;
+    uint256 amount;
+}
+
+/// @dev struct that contains the data on the fees to pay to the AMBs
+struct AMBExtraData {
+    uint256[] gasPerAMB;
+    bytes[] extraDataPerAMB;
+}
+
+/// @dev struct that contains the data on the fees to pay to the AMBs on broadcasts
+struct BroadCastAMBExtraData {
+    uint256[] gasPerDst;
+    bytes[] extraDataPerDst;
+}
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC-20 standard as defined in the ERC.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../IERC20.sol";
+import {IERC20Permit} from "../extensions/IERC20Permit.sol";
+import {Address} from "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC-20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev An operation with an ERC-20 token failed.
+     */
+    error SafeERC20FailedOperation(address token);
+
+    /**
+     * @dev Indicates a failed `decreaseAllowance` request.
+     */
+    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        forceApprove(token, spender, oldAllowance + value);
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no
+     * value, non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {
+        unchecked {
+            uint256 currentAllowance = token.allowance(address(this), spender);
+            if (currentAllowance < requestedDecrease) {
+                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);
+            }
+            forceApprove(token, spender, currentAllowance - requestedDecrease);
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data);
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20FailedOperation(address(token));
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return success && (returndata.length == 0 || abi.decode(returndata, (bool))) && address(token).code.length > 0;
+    }
+}
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../token/ERC20/IERC20.sol";
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/IAccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC-165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev The `account` is missing a role.
+     */
+    error AccessControlUnauthorizedAccount(address account, bytes32 neededRole);
+
+    /**
+     * @dev The caller of a function is not the expected one.
+     *
+     * NOTE: Don't confuse with {AccessControlUnauthorizedAccount}.
+     */
+    error AccessControlBadConfirmation();
+
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) external;
+}
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC-20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[ERC-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC-20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/ERC1155A/lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error AddressInsufficientBalance(address account);
+
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedInnerCall();
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert AddressInsufficientBalance(address(this));
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert FailedInnerCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {FailedInnerCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert AddressInsufficientBalance(address(this));
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {FailedInnerCall}) in case of an
+     * unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {FailedInnerCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {FailedInnerCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert FailedInnerCall();
+        }
+    }
+}
+

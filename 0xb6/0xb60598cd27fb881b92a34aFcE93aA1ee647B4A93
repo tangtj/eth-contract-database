@@ -1,0 +1,2283 @@
+
+// File: src/MevEthRouter.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+/// ============ Imports ============
+import "./interfaces/IWETH.sol";
+import "./interfaces/IVault.sol";
+import "./interfaces/IGyro.sol";
+import "./interfaces/ICurveV2Pool.sol";
+import "./interfaces/IMevEth.sol";
+import "./interfaces/IRateProvider.sol";
+import "./interfaces/IGyroECLPMath.sol";
+import "./interfaces/IMevEthRouter.sol";
+import "./interfaces/IUniswapV3SwapCallback.sol";
+import "./libraries/MevEthLibrary.sol";
+import { ERC20 } from "solmate/tokens/ERC20.sol";
+import { WETH } from "solmate/tokens/WETH.sol";
+import { SafeTransferLib } from "solmate/utils/SafeTransferLib.sol";
+
+/// @title MevEthRouter
+/// @author Manifold Finance
+/// @notice mevETH Stake / Redeem optimzed router
+/// @dev V1 optimized for 2 routes; Eth (or Weth) => mevEth or mevEth => Eth (or Weth)
+///      Aggregated routes are from mevEth deposits / withdraws, Balancer Gyro ECLP, Curve V2 and Uniswap V3 / V2 and Sushiswap
+contract MevEthRouter is IUniswapV3SwapCallback, IMevEthRouter {
+    using SafeTransferLib for ERC20;
+    using SafeTransferLib for WETH;
+
+    // Custom errors save gas, encoding to 4 bytes
+    error Expired();
+    error ZeroAmount();
+    error ZeroAddress();
+    error ExecuteNotAuthorized();
+    error InsufficientOutputAmount();
+
+    /// @dev UniswapV2 / Sushiswap pool 4 byte swap selector
+    bytes4 internal constant SWAP_SELECTOR = bytes4(keccak256("swap(uint256,uint256,address,bytes)"));
+    /// @dev Wrapped native token address
+    WETH internal constant WETH09 = WETH(payable(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2));
+    /// @dev Wrapped native token address
+    IMevEth internal constant MEVETH = IMevEth(0x24Ae2dA0f361AA4BE46b48EB19C91e02c5e4f27E);
+    /// @dev Balancer vault
+    IVault internal constant BAL = IVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
+    /// @dev Gyro ECLP Math lib
+    IGyroECLPMath internal constant gyroMath = IGyroECLPMath(0xF89A1713998593A441cdA571780F0900Dbef20f9);
+    /// @dev Sushiswap factory address
+    address internal constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    /// @dev UniswapV2 factory address
+    address internal constant UNIV2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f; // uniswap v2 factory
+    /// @dev The minimum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MIN_TICK)
+    uint160 internal constant MIN_SQRT_RATIO = 4_295_128_739;
+    /// @dev The maximum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MAX_TICK)
+    uint160 internal constant MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
+    /// @dev Sushiswap factory init pair code hash
+    bytes32 internal constant SUSHI_FACTORY_HASH = 0xe18a34eb0e04b04f7a0ac29a6e80748dca96319b42c54d679cb821dca90c6303;
+    /// @dev UniswapV2 factory init pair code hash
+    bytes32 internal constant UNIV2_FACTORY_HASH = 0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f;
+    uint256 internal constant MIN_LIQUIDITY = 1 ether;
+
+    /// @dev Governence for sweeping dust
+    address internal gov;
+    /// @dev Curve V2 pool address
+    address internal curveV2Pool = 0x429cCFCCa8ee06D2B41DAa6ee0e4F0EdBB77dFad;
+    /// @dev Gyro pool
+    IGyro internal constant gyro = IGyro(0xb3b675a9A3CB0DF8F66Caf08549371BfB76A9867);
+
+    IRateProvider internal constant rateProvider0 = IRateProvider(0xf518f2EbeA5df8Ca2B5E9C7996a2A25e8010014b);
+
+    /// @dev Balancer pool id
+    bytes32 internal poolId = 0xb3b675a9a3cb0df8f66caf08549371bfb76a9867000200000000000000000611;
+
+    uint256[3] internal uniV3Caps = [0, 0, 15 ether];
+
+    IGyroECLPMath.Params internal params;
+    IGyroECLPMath.DerivedParams internal derived;
+
+    /// @notice struct for pool reserves
+    /// @param reserveIn amount of reserves (or virtual reserves) in pool for tokenIn
+    /// @param reserveOut amount of reserves (or virtual reserves) in pool for tokenOut
+    struct Reserve {
+        uint256 reserveIn;
+        uint256 reserveOut;
+    }
+
+    constructor(address _gov) {
+        if (_gov == address(0)) {
+            gov = tx.origin;
+        } else {
+            gov = _gov;
+        }
+
+        (params, derived) = gyro.getECLPParams();
+    }
+
+    function checkInputs(address receiver, uint256 amountIn, uint256 deadline) internal view {
+        // check receiver
+        if (receiver == address(0)) revert ZeroAddress();
+        // check block.timestamp > deadline (timestamp in seconds)
+        ensure(deadline);
+        // check amountIn
+        if (amountIn == 0) revert ZeroAmount();
+    }
+
+    /// @notice Gas efficient stakeEthForMevEth
+    /// @dev requires calling getStakeRoute first
+    /// @param receiver Address of MevEth receiver
+    /// @param amountIn Amount of eth or weth to deposit
+    /// @param amountOutMin Min amount of MevEth to receive
+    /// @param deadline Timestamp deadline
+    /// @param swaps output of getStakeRoute
+    /// @return shares Amount of MevEth received
+    function stakeEthForMevEth(
+        address receiver,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 deadline,
+        Swap calldata swaps
+    )
+        external
+        payable
+        returns (uint256 shares)
+    {
+        // check inputs
+        checkInputs(receiver, amountIn, deadline);
+        // check eth or weth deposit
+        if (msg.value != amountIn) {
+            // either weth or wrong amount
+            // transfer weth amountIn from sender, will revert if insufficient allowance
+            WETH09.safeTransferFrom(msg.sender, address(this), amountIn);
+        } else {
+            WETH09.deposit{ value: amountIn }();
+        }
+
+        // UniV2 / Sushi require amounts transfered directly to pool
+        for (uint256 i; i < 2; i = _inc(i)) {
+            if (_isNonZero(swaps.pools[i].amountIn)) {
+                WETH09.safeTransfer(swaps.pools[i].pair, swaps.pools[i].amountIn);
+            }
+        }
+
+        // execute swaps, retreive actual amounts
+        uint256[] memory amounts = _swap(true, receiver, deadline, swaps);
+        // check output is sufficient
+        if (amountOutMin > amounts[1]) revert InsufficientOutputAmount();
+        // assign returned shares
+        shares = amounts[1];
+        //  refund V3 dust if any
+        if (amounts[0] < amountIn && (amountIn - amounts[0]) > 50_000 * block.basefee) {
+            WETH09.safeTransfer(msg.sender, amountIn - amounts[0]);
+        }
+    }
+
+    /// @notice Gas efficient redeemMevEthForEth
+    /// @dev requires calling getRedeemRoute first
+    /// @param receiver Address of Eth receiver
+    /// @param shares Amount of meveth to redeem
+    /// @param amountOutMin Min amount of eth to receive
+    /// @param deadline Timestamp deadline
+    /// @param swaps output of getRedeemRoute
+    /// @return assets Eth received
+    function redeemMevEthForEth(
+        bool useQueue,
+        address receiver,
+        uint256 shares,
+        uint256 amountOutMin,
+        uint256 deadline,
+        Swap calldata swaps
+    )
+        external
+        returns (uint256 assets)
+    {
+        // check inputs
+        checkInputs(receiver, shares, deadline);
+        // check eth or weth deposit
+        ERC20(address(MEVETH)).safeTransferFrom(msg.sender, address(this), shares);
+
+        // UniV2 / Sushi require amounts transfered directly to pool
+        for (uint256 i; i < 2; i = _inc(i)) {
+            if (_isNonZero(swaps.pools[i].amountIn)) {
+                ERC20(address(MEVETH)).safeTransfer(swaps.pools[i].pair, swaps.pools[i].amountIn);
+            }
+        }
+
+        // execute swaps, retreive actual amounts
+        uint256[] memory amounts = _swap(useQueue, receiver, deadline, swaps);
+        // check output is sufficient
+        if (amountOutMin > amounts[1]) revert InsufficientOutputAmount();
+        // assign returned shares
+        assets = amounts[1];
+        //  refund V3 dust if any
+        if (amounts[0] < shares && (shares - amounts[0]) > 50_000 * block.basefee) {
+            ERC20(address(MEVETH)).safeTransfer(msg.sender, shares - amounts[0]);
+        }
+    }
+
+    /// @dev calculate pool addresses for token0/1 & factory/fee
+    function _getPools() internal view returns (Pool[8] memory pools) {
+        pools[0].pair = MevEthLibrary._asmPairFor(SUSHI_FACTORY, address(MEVETH), address(WETH09), SUSHI_FACTORY_HASH); // sushi
+        pools[1].pair = MevEthLibrary._asmPairFor(UNIV2_FACTORY, address(MEVETH), address(WETH09), UNIV2_FACTORY_HASH); // univ2
+        pools[2].pair = MevEthLibrary.uniswapV3PoolAddress(address(MEVETH), address(WETH09), 3000); // univ3 0.3 %
+        pools[3].pair = MevEthLibrary.uniswapV3PoolAddress(address(MEVETH), address(WETH09), 500); // univ3 0.05 %
+        pools[4].pair = MevEthLibrary.uniswapV3PoolAddress(address(MEVETH), address(WETH09), 10_000); // univ3 1 %
+        pools[5].pair = MevEthLibrary._getBalancerPoolAddress(poolId);
+        pools[6].pair = curveV2Pool;
+        pools[7].pair = address(MEVETH);
+    }
+
+    function balancerInvariant(uint256[] memory balances) internal view returns (IGyroECLPMath.Vector2 memory inv) {
+        // for some reason GyroECLPMath lib has a different selector
+        // bytes memory data = abi.encodeWithSelector(0x78ace857, balances, params, derived);
+        (, bytes memory returnData) = address(gyroMath).staticcall(abi.encodeWithSelector(0x78ace857, balances, params, derived));
+        (int256 invariant, int256 err) = abi.decode(returnData, (int256, int256));
+        // (int256 invariant, int256 err) = gyroMath.calculateInvariantWithError(balances, params, derived);
+        inv = IGyroECLPMath.Vector2(invariant + 2 * err, invariant);
+    }
+
+    /// @notice Fetches swap data for each pair and amounts given an input amount
+    /// @param amountIn Amount in for first token in path
+    /// @param amountOutMin Min amount out
+    /// @return swaps struct for split order details
+    function getStakeRoute(uint256 amountIn, uint256 amountOutMin) internal view returns (Swap memory swaps) {
+        swaps.isDeposit = true;
+        swaps.pools = _getPools();
+        swaps.tokenIn = address(WETH09);
+        swaps.tokenOut = address(MEVETH);
+        uint256[8] memory amountsIn;
+        uint256[8] memory amountsOut;
+        {
+            Reserve[8] memory reserves = _getReserves(true, swaps.pools);
+            // find optimal route
+            (amountsIn, amountsOut) = _optimalRouteOut(false, true, amountIn, amountOutMin, reserves);
+        }
+        for (uint256 j; j < 8; j = _inc(j)) {
+            swaps.pools[j].amountIn = amountsIn[j];
+            swaps.pools[j].amountOut = amountsOut[j];
+        }
+    }
+
+    /// @notice Fetches swap data for each pair and amounts given an input amount
+    /// @param useQueue Use redeem queue
+    /// @param amountIn Amount in for first token in path
+    /// @param amountOutMin Min amount out
+    /// @return swaps struct for split order details
+    function getRedeemRoute(bool useQueue, uint256 amountIn, uint256 amountOutMin) internal view returns (Swap memory swaps) {
+        swaps.pools = _getPools();
+        swaps.tokenIn = address(MEVETH);
+        swaps.tokenOut = address(WETH09);
+        uint256[8] memory amountsIn;
+        uint256[8] memory amountsOut;
+        {
+            Reserve[8] memory reserves = _getReserves(false, swaps.pools);
+
+            // find optimal route
+            (amountsIn, amountsOut) = _optimalRouteOut(useQueue, false, amountIn, amountOutMin, reserves);
+        }
+        for (uint256 j; j < 8; j = _inc(j)) {
+            swaps.pools[j].amountIn = amountsIn[j];
+            swaps.pools[j].amountOut = amountsOut[j];
+        }
+    }
+
+    /// @notice Amount out expected from stake
+    /// @param amountIn Amount in for first token in path
+    /// @return amountOut Expected amountOut
+    /// @return swaps struct for split order details
+    function amountOutStake(uint256 amountIn) external view returns (uint256 amountOut, Swap memory swaps) {
+        swaps = getStakeRoute(amountIn, 1);
+        for (uint256 j; j < 8; j = _inc(j)) {
+            amountOut += swaps.pools[j].amountOut;
+        }
+    }
+
+    /// @notice Amount out expected from redeem
+    /// @param useQueue Use redeem queue
+    /// @param amountIn Amount in for first token in path
+    /// @return amountOut Expected amountOut
+    /// @return swaps struct for split order details
+    function amountOutRedeem(bool useQueue, uint256 amountIn) external view returns (uint256 amountOut, Swap memory swaps) {
+        swaps = getRedeemRoute(useQueue, amountIn, 1);
+        for (uint256 j; j < 8; j = _inc(j)) {
+            amountOut += swaps.pools[j].amountOut;
+        }
+    }
+
+    /// @dev populates and returns Reserve struct array for each pool address
+    /// @param isDeposit true if deposit eth, false if redeem
+    /// @param pools 5 element array of Pool structs populated with pool addresses
+    function _getReserves(bool isDeposit, Pool[8] memory pools) internal view returns (Reserve[8] memory reserves) {
+        // 2 V2 pools
+        for (uint256 i; i < 2; i = _inc(i)) {
+            if (!MevEthLibrary.isContract(pools[i].pair)) continue;
+            (uint256 reserve0, uint256 reserve1,) = IUniswapV2Pair(pools[i].pair).getReserves();
+            (reserves[i].reserveIn, reserves[i].reserveOut) = isDeposit ? (reserve1, reserve0) : (reserve0, reserve1);
+        }
+        // 3 V3 pools
+        for (uint256 i = 2; i < 5; i = _inc(i)) {
+            if (!MevEthLibrary.isContract(pools[i].pair)) continue;
+            (uint160 sqrtPriceX96, int24 tick) = IUniswapV3Pool(pools[i].pair).slot0();
+            if (tick == 0) continue;
+            uint256 liquidity = uint256(IUniswapV3Pool(pools[i].pair).liquidity());
+            if (_isNonZero(liquidity) && _isNonZero(sqrtPriceX96)) {
+                unchecked {
+                    uint256 reserve0 = (liquidity * uint256(2 ** 96)) / uint256(sqrtPriceX96);
+                    uint256 reserve1 = (liquidity * uint256(sqrtPriceX96)) / uint256(2 ** 96);
+                    (reserves[i].reserveIn, reserves[i].reserveOut) = isDeposit ? (reserve1, reserve0) : (reserve0, reserve1);
+                }
+            }
+        }
+        // Balancer (i=5)
+        {
+            uint256[] memory balances = _getAllBalances();
+            (reserves[5].reserveIn, reserves[5].reserveOut) = isDeposit ? (balances[1], balances[0]) : (balances[0], balances[1]);
+        }
+        // Curve CryptoV2 (i=6)
+        // Note: Curve token order is opposite from balancer / uni / sushi
+        {
+            uint256 reserve0 = ICurveV2Pool(pools[6].pair).balances(0);
+            uint256 reserve1 = ICurveV2Pool(pools[6].pair).balances(1);
+            (reserves[6].reserveIn, reserves[6].reserveOut) = isDeposit ? (reserve0, reserve1) : (reserve1, reserve0);
+        }
+        // MevEth (i=7)
+        // Note: MevEth token order is opposite from balancer / uni / sushi
+        {
+            (uint256 reserve0, uint256 reserve1) = MEVETH.fraction();
+            (reserves[7].reserveIn, reserves[7].reserveOut) = isDeposit ? (reserve0, reserve1) : (reserve1, reserve0);
+        }
+    }
+
+    /// @dev sorts possible swaps by best price, then assigns optimal split
+    function _optimalRouteOut(
+        bool useQueue,
+        bool isDeposit,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Reserve[8] memory reserves
+    )
+        internal
+        view
+        returns (uint256[8] memory amountsIn, uint256[8] memory amountsOut)
+    {
+        // calculate best rate for a single swap (i.e. no splitting)
+        uint256[8] memory amountsOutSingleSwap;
+        // get ref rate for splits
+        uint256[8] memory amountsOutSingleEth;
+
+        // calc balancer invariant
+        uint256[] memory balances = new uint256[](2);
+        balances[0] = isDeposit ? reserves[5].reserveOut : reserves[5].reserveIn;
+        balances[1] = isDeposit ? reserves[5].reserveIn : reserves[5].reserveOut;
+        IGyroECLPMath.Vector2 memory inv = balancerInvariant(balances);
+
+        // first 2 pools have fee of 0.3%
+        for (uint256 i; i < 2; i = _inc(i)) {
+            if (reserves[i].reserveOut > amountOutMin) {
+                amountsOutSingleSwap[i] = amountOutCall(isDeposit, i, amountIn, reserves[i].reserveIn, reserves[i].reserveOut, inv);
+            }
+            if (reserves[i].reserveOut > MIN_LIQUIDITY && reserves[i].reserveIn > MIN_LIQUIDITY && amountIn > MIN_LIQUIDITY) {
+                amountsOutSingleEth[i] = amountOutCall(isDeposit, i, 1 ether, reserves[i].reserveIn, reserves[i].reserveOut, inv);
+            }
+        }
+        // next 3 pools have variable rates
+        for (uint256 i = 2; i < 5; i = _inc(i)) {
+            if (reserves[i].reserveOut > amountOutMin && reserves[i].reserveIn > amountIn) {
+                amountsOutSingleSwap[i] = amountOutCall(isDeposit, i, amountIn, reserves[i].reserveIn, reserves[i].reserveOut, inv);
+            }
+            if (reserves[i].reserveOut > MIN_LIQUIDITY && reserves[i].reserveIn > MIN_LIQUIDITY && amountIn > MIN_LIQUIDITY) {
+                amountsOutSingleEth[i] = amountOutCall(isDeposit, i, 1 ether, reserves[i].reserveIn, reserves[i].reserveOut, inv);
+            }
+        }
+        // Balancer pool (todo: embed amount out calc)
+        if (reserves[5].reserveOut > amountOutMin) {
+            amountsOutSingleSwap[5] = amountOutCall(isDeposit, 5, amountIn, reserves[5].reserveIn, reserves[5].reserveOut, inv);
+        }
+        if (reserves[5].reserveOut > MIN_LIQUIDITY && amountIn > MIN_LIQUIDITY) {
+            amountsOutSingleEth[5] = amountOutCall(isDeposit, 5, 1 ether, reserves[5].reserveIn, reserves[5].reserveOut, inv);
+        }
+
+        // Curve pool (todo: embed amount out calc)
+        if (reserves[6].reserveOut > amountOutMin) {
+            amountsOutSingleSwap[6] = amountOutCall(isDeposit, 6, amountIn, reserves[6].reserveIn, reserves[6].reserveOut, inv);
+        }
+        if (reserves[6].reserveOut > MIN_LIQUIDITY && amountIn > MIN_LIQUIDITY) {
+            amountsOutSingleEth[6] = amountOutCall(isDeposit, 6, 1 ether, reserves[6].reserveIn, reserves[6].reserveOut, inv);
+        }
+        // MevEth
+        if (isDeposit) {
+            amountsOutSingleSwap[7] = reserves[7].reserveOut * amountIn / reserves[7].reserveIn;
+            if (amountIn > MIN_LIQUIDITY) {
+                amountsOutSingleEth[7] = reserves[7].reserveOut * 1 ether / (reserves[7].reserveIn);
+            }
+        } else {
+            if (useQueue) {
+                amountsOutSingleSwap[7] = reserves[7].reserveOut * amountIn * 9999 / (10_000 * reserves[7].reserveIn);
+                if (amountIn > MIN_LIQUIDITY) {
+                    amountsOutSingleEth[7] = reserves[7].reserveOut * 1 ether * 9999 / (10_000 * reserves[7].reserveIn);
+                }
+            }
+        }
+
+        (amountsIn, amountsOut) = _splitSwapOut(isDeposit, amountIn, inv, amountsOutSingleSwap, amountsOutSingleEth, reserves);
+    }
+
+    function _scalingFactor(bool token0) internal view returns (uint256 scalingFactor) {
+        scalingFactor = 1 ether;
+        if (token0) {
+            scalingFactor = rateProvider0.getRate();
+        }
+    }
+
+    /**
+     * @dev Reads the balance of a token from the balancer vault and returns the scaled amount. Smaller storage access
+     * compared to getVault().getPoolTokens().
+     * Copied from the 3CLP *except* that for the 2CLP, the scalingFactor is interpreted as a regular integer, not a
+     * FixedPoint number. This is an inconsistency between the base contracts.
+     */
+    function _getScaledTokenBalance(address token, uint256 scalingFactor) internal view returns (uint256 balance) {
+        // Signature of getPoolTokenInfo(): (pool id, token) -> (cash, managed, lastChangeBlock, assetManager)
+        // and total amount = cash + managed. See balancer repo, PoolTokens.sol and BalanceAllocation.sol
+        (uint256 cash, uint256 managed,,) = BAL.getPoolTokenInfo(poolId, token);
+        balance = cash + managed; // can't overflow, see BalanceAllocation.sol::total() in the Balancer repo.
+        balance = balance * scalingFactor / 1 ether;
+    }
+
+    /**
+     * @dev Get all balances in the pool, scaled by the appropriate scaling factors, in a relatively gas-efficient way.
+     * Essentially copied from the 3CLP.
+     */
+    function _getAllBalances() internal view returns (uint256[] memory balances) {
+        balances = new uint256[](2);
+        balances[0] = _getScaledTokenBalance(address(MEVETH), _scalingFactor(true));
+        balances[1] = _getScaledTokenBalance(address(WETH09), _scalingFactor(false));
+        return balances;
+    }
+
+    function balancerAmountOut(
+        bool isDeposit,
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut,
+        IGyroECLPMath.Vector2 memory inv
+    )
+        internal
+        view
+        returns (uint256 amountOut)
+    {
+
+        uint256[] memory balances = new uint256[](2);
+        balances[0] = isDeposit ? reserveOut : reserveIn;
+        balances[1] = isDeposit ? reserveIn : reserveOut;
+
+        amountIn = (amountIn - amountIn * MevEthLibrary.getFee(5) / 1_000_000) * _scalingFactor(!isDeposit) / 1 ether;
+
+        // same selector workaround here
+        (, bytes memory returnData) = address(gyroMath).staticcall(abi.encodeWithSelector(0x61ff4236, balances, amountIn, !isDeposit, params, derived, inv));
+
+        amountOut = abi.decode(returnData, (uint256)) * 1 ether / _scalingFactor(isDeposit);
+    }
+
+    function amountOutCall(
+        bool isDeposit,
+        uint256 i,
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut,
+        IGyroECLPMath.Vector2 memory inv
+    )
+        internal
+        view
+        returns (uint256 amountOut)
+    {
+        if (i < 2) {
+            if (reserveOut > MIN_LIQUIDITY && amountIn < reserveOut) {
+                amountOut = MevEthLibrary.getAmountOut(amountIn, reserveIn, reserveOut);
+            }
+        } else if (i < 5) {
+            if (reserveOut > MIN_LIQUIDITY && reserveIn > MIN_LIQUIDITY && amountIn < reserveOut / 4 && amountIn < uniV3Caps[i - 2]) {
+                amountOut = MevEthLibrary.getAmountOutFee(amountIn, reserveIn, reserveOut, MevEthLibrary.getFee(i));
+            }
+        }
+        // Balancer pool
+        if (i == 5) {
+            if (reserveOut > MIN_LIQUIDITY && amountIn < reserveOut / 2) {
+                amountOut = balancerAmountOut(isDeposit, amountIn, reserveIn, reserveOut, inv);
+            }
+        }
+
+        // Curve pool (todo: embed amount out calc)
+        if (i == 6) {
+            if (reserveOut > MIN_LIQUIDITY && amountIn < reserveOut / 2) {
+                amountOut = isDeposit ? ICurveV2Pool(curveV2Pool).get_dy(0, 1, amountIn) : ICurveV2Pool(curveV2Pool).get_dy(1, 0, amountIn);
+            }
+        }
+
+        // MevEth
+        if (i == 7) {
+            amountOut = isDeposit ? reserveOut * amountIn / reserveIn : reserveOut * amountIn * 9999 / (10_000 * reserveIn);
+        }
+    }
+
+    /// @notice assigns optimal route for maximum amount out, given pool reserves
+    function _splitSwapOut(
+        bool isDeposit,
+        uint256 amountIn,
+        IGyroECLPMath.Vector2 memory inv,
+        uint256[8] memory amountsOutSingleSwap,
+        uint256[8] memory amountsOutSingleEth,
+        Reserve[8] memory reserves
+    )
+        internal
+        view
+        returns (uint256[8] memory amountsIn, uint256[8] memory amountsOut)
+    {
+        uint256[8] memory index = MevEthLibrary._sortArray(amountsOutSingleSwap); // sorts in ascending order (i.e. best price is last)
+        // First check best single swap price and return if no split is needed
+        if (_isNonZero(amountsOutSingleSwap[index[7]]) && amountIn <= MIN_LIQUIDITY) {
+            amountsIn[index[7]] = amountIn; // use best single swap price
+            amountsOut[index[7]] = amountsOutSingleSwap[index[7]];
+            return (amountsIn, amountsOut);
+        }
+
+        uint256[8] memory index2 = MevEthLibrary._sortArray(amountsOutSingleEth); // sorts in ascending order (i.e. best price is last)
+        if (_isNonZero(amountsOutSingleEth[index2[7]])) {
+            uint256 cumulativeAmount;
+            // calculate amount to sync prices cascading through each pool with best prices first, while cumulative amount < amountIn
+            for (uint256 i = 7; _isNonZero(i); i = _dec(i)) {
+                if (index2[i] == 7 || _isZero(amountsOutSingleEth[index2[_dec(i)]])) {
+                    // meveth rate is fixed so no more iterations required
+                    // other case is there are no more viable pools to swap
+                    amountsIn[index2[i]] = amountIn - cumulativeAmount;
+                    amountsOut[index2[i]] =
+                        amountOutCall(isDeposit, index2[i], amountsIn[index2[i]], reserves[index2[i]].reserveIn, reserves[index2[i]].reserveOut, inv);
+                    // return (amountsIn, amountsOut);
+                } else {
+                    (amountsIn[index2[i]], amountsOut[index2[i]]) = amountToSync(
+                        isDeposit,
+                        amountIn,
+                        cumulativeAmount,
+                        index2[i],
+                        amountsOutSingleEth[index2[_dec(i)]],
+                        reserves[index2[i]].reserveIn,
+                        reserves[index2[i]].reserveOut,
+                        inv
+                    );
+
+                }
+
+                cumulativeAmount = cumulativeAmount + amountsIn[index2[i]];
+                if (cumulativeAmount == amountIn) break;
+                if (_isZero(amountsOutSingleEth[index2[_dec(i)]])) break;
+            }
+        }
+    }
+
+    function amountToSync(
+        bool isDeposit,
+        uint256 amountIn,
+        uint256 cumulativeAmount,
+        uint256 index,
+        uint256 amountsOutSingleEthTarget,
+        uint256 reserveIn,
+        uint256 reserveOut,
+        IGyroECLPMath.Vector2 memory inv
+    )
+        internal
+        view
+        returns (uint256 amountInToSync, uint256 amountOut)
+    {
+        uint256 amount;
+        uint256 chunk = amountIn / 10;
+        // uint256 precision = 0.1 ether;
+        if (chunk < 0.1 ether) {
+            chunk = 0.1 ether;
+        }
+
+        for (uint256 i; i < 10; i = _inc(i)) {
+            amount = amount + chunk;
+
+            bool endLoop;
+            if (index > 1 && index < 5 && amount > uniV3Caps[index - 2]) {
+                amount = uniV3Caps[index - 2];
+                endLoop = true;
+                // hard cap univ3 amounts as they become more unpredictable
+            }
+            if (amount + 0.1 ether > amountIn - cumulativeAmount) {
+                amount = amountIn - cumulativeAmount;
+                endLoop = true;
+            }
+
+            {
+                uint256 amountOutTmp = amountOutCall(isDeposit, index, amount, reserveIn, reserveOut, inv);
+                if (amountOutTmp * 1 ether / amountsOutSingleEthTarget < amount) break;
+                amountOut = amountOutTmp;
+            }
+
+            amountInToSync = amount;
+
+            if (endLoop) return (amountInToSync, amountOut);
+        }
+        // refine
+        if (chunk > 0.1 ether) {
+            amount = amountInToSync;
+
+            chunk = chunk / 10;
+            for (uint256 i; i < 10; i = _inc(i)) {
+                amount = amount + chunk;
+                bool endLoop;
+                if (amount > amountIn - cumulativeAmount) {
+                    amount = amountIn - cumulativeAmount;
+                    endLoop = true;
+                }
+
+                {
+                    uint256 amountOutTmp = amountOutCall(isDeposit, index, amount, reserveIn, reserveOut, inv);
+                    if (amountOutTmp * 1 ether / amountsOutSingleEthTarget < amount) break;
+                    amountOut = amountOutTmp;
+                }
+
+                amountInToSync = amount;
+
+                if (endLoop) return (amountInToSync, amountOut);
+            }
+        }
+
+        if (amountInToSync == 0) {
+            amountOut = 0;
+        }
+    }
+
+    /// @dev Callback for Uniswap V3 pool.
+    /// @param amount0Delta amount of token0 (-ve indicates amountOut i.e. already transferred from v3 pool to here)
+    /// @param amount1Delta amount of token0 (-ve indicates amountOut i.e. already transferred from v3 pool to here)
+    /// @param data tokenIn,tokenOut and fee packed bytes
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external override {
+        address pool;
+        address tokenIn;
+        {
+            uint24 fee;
+            address tokenOut;
+            (tokenIn, tokenOut, fee) = _decode(data); // custom decode packed (address, address, uint24)
+            (address token0, address token1) = MevEthLibrary.sortTokens(tokenIn, tokenOut);
+            pool = MevEthLibrary.uniswapV3PoolAddress(token0, token1, fee); // safest way to check pool address is valid and pool was the msg sender
+        }
+        if (msg.sender != pool) revert ExecuteNotAuthorized();
+        // uni v3 optimistically sends tokenOut funds, then calls this function for the tokenIn amount
+        if (amount0Delta > 0) ERC20(tokenIn).safeTransfer(msg.sender, uint256(amount0Delta));
+        if (amount1Delta > 0) ERC20(tokenIn).safeTransfer(msg.sender, uint256(amount1Delta));
+    }
+
+    /// @notice Ensures deadline is not passed, otherwise revert.
+    /// @dev Modifier has been replaced with a function for gas efficiency
+    /// @param deadline Unix timestamp in seconds for transaction to execute before
+    function ensure(uint256 deadline) internal view {
+        if (deadline < block.timestamp) revert Expired();
+    }
+
+    /// @dev single swap for uni v2 pair. Requires the initial amount to have already been sent to the first pair.
+    /// @param isReverse true if token0 == tokenOut
+    /// @param to swap recipient
+    /// @param pair pair address
+    /// @param amountOut expected amount out
+    function _swapSingle(bool isReverse, address to, address pair, uint256 amountOut) internal virtual {
+        (uint256 amount0Out, uint256 amount1Out) = isReverse ? (amountOut, uint256(0)) : (uint256(0), amountOut);
+        _asmSwap(pair, amount0Out, amount1Out, to);
+    }
+
+    /// @dev single swap for uni v3 pool
+    /// @param isReverse true if token0 == tokenOut
+    /// @param fee fee of pool as a ratio of 1000000
+    /// @param to swap recipient
+    /// @param tokenIn token in address
+    /// @param tokenOut token out address
+    /// @param pair pair address
+    /// @param amountIn amount of tokenIn
+    function _swapUniV3(
+        bool isReverse,
+        uint24 fee,
+        address to,
+        address tokenIn,
+        address tokenOut,
+        address pair,
+        uint256 amountIn
+    )
+        internal
+        virtual
+        returns (uint256 amountInActual, uint256 amountOut)
+    {
+
+        try IUniswapV3Pool(pair).swap(
+            to, !isReverse, int256(amountIn), isReverse ? MAX_SQRT_RATIO - 1 : MIN_SQRT_RATIO + 1, abi.encodePacked(tokenIn, tokenOut, fee)
+        ) returns (int256 amount0, int256 amount1) {
+            amountOut = isReverse ? uint256(-(amount0)) : uint256(-(amount1));
+            amountInActual = isReverse ? uint256(amount1) : uint256(amount0);
+        } catch {
+            amountOut = 0;
+        }
+    }
+
+
+    /// @dev Internal core swap. Requires the initial amount to have already been sent to the first pair (for v2 pairs).
+    /// @param useQueue Use queue or not for withdrawals
+    /// @param to Address of receiver
+    /// @param deadline timstamp of expiry
+    /// @param swaps Array of user swap data
+    function _swap(bool useQueue, address to, uint256 deadline, Swap memory swaps) internal virtual returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        uint256 amountIn;
+        for (uint256 i; i < 8; i = _inc(i)) {
+            amounts[0] = amounts[0] + swaps.pools[i].amountIn; // gather amounts in from each route
+        }
+
+        // V2 swaps
+        for (uint256 j; j < 2; j = _inc(j)) {
+            amountIn = swaps.pools[j].amountIn;
+            if (_isNonZero(amountIn)) {
+                _swapSingle(swaps.isDeposit, to, swaps.pools[j].pair, swaps.pools[j].amountOut); // single v2 swap
+                amounts[1] = amounts[1] + swaps.pools[j].amountOut;
+            }
+        }
+        // V3 swaps
+        for (uint256 j = 2; j < 5; j = _inc(j)) {
+            amountIn = swaps.pools[j].amountIn;
+            if (_isNonZero(amountIn)) {
+                (, uint256 amountOut) =
+                    _swapUniV3(swaps.isDeposit, uint24(MevEthLibrary.getFee(j)), to, swaps.tokenIn, swaps.tokenOut, swaps.pools[j].pair, amountIn); // single v3
+                    // swap
+                amounts[1] = amounts[1] + amountOut;
+                if (amountOut == 0) {
+                    // uniV3 swap failed if here
+                    if (useQueue) {
+                        // add to mevEth order
+                        swaps.pools[7].amountIn = swaps.pools[7].amountIn + amountIn;
+                    } else {
+                        // try adding to balancer for buy or curve for sell
+                        if (swaps.tokenIn == address(WETH09)) {
+                            swaps.pools[5].amountIn = swaps.pools[5].amountIn + amountIn;
+                        } else {
+                            swaps.pools[6].amountIn = swaps.pools[6].amountIn + amountIn;
+                        }
+                    }
+                }
+            }
+        }
+        // Balancer swap
+        amountIn = swaps.pools[5].amountIn;
+        if (_isNonZero(amountIn)) {
+            IVault.SingleSwap memory singleSwap = IVault.SingleSwap(poolId, IVault.SwapKind.GIVEN_IN, swaps.tokenIn, swaps.tokenOut, amountIn, new bytes(0));
+            IVault.FundManagement memory fund = IVault.FundManagement(address(this), false, payable(to), false);
+            if (swaps.tokenIn == address(WETH09)) {
+                WETH09.approve(address(BAL), amountIn);
+            } else {
+                ERC20(address(MEVETH)).approve(address(BAL), amountIn);
+            }
+            amounts[1] = amounts[1] + BAL.swap(singleSwap, fund, 1, deadline);
+        }
+        // Curve swap
+        amountIn = swaps.pools[6].amountIn;
+        if (_isNonZero(amountIn)) {
+            if (swaps.tokenIn == address(WETH09)) {
+                // Contrary to the other pools, token order is WETH / MEVETH
+                WETH09.approve(curveV2Pool, amountIn);
+                amounts[1] = amounts[1] + ICurveV2Pool(curveV2Pool).exchange(0, 1, amountIn, 1, false, to);
+            } else {
+                ERC20(address(MEVETH)).approve(curveV2Pool, amountIn);
+                amounts[1] = amounts[1] + ICurveV2Pool(curveV2Pool).exchange(1, 0, amountIn, 1, false, to);
+            }
+        }
+        // MevEth deposit / redeem
+        amountIn = swaps.pools[7].amountIn;
+        if (_isNonZero(swaps.pools[7].amountIn)) {
+            if (swaps.tokenIn == address(WETH09)) {
+                WETH09.approve(address(MEVETH), amountIn);
+                amounts[1] = amounts[1] + MEVETH.deposit(amountIn, to);
+            } else {
+                ERC20(address(MEVETH)).approve(address(MEVETH), amountIn);
+                if (useQueue) {
+                    MEVETH.withdrawQueue(MEVETH.previewRedeem(amountIn) - 1, to, address(this));
+                    amounts[1] = amounts[1] + MEVETH.previewRedeem(amountIn);
+                }
+            }
+        }
+    }
+
+    /// @custom:assembly Efficient single swap call
+    /// @notice Internal call to perform single swap
+    /// @param pair Address of pair to swap in
+    /// @param amount0Out AmountOut for token0 of pair
+    /// @param amount1Out AmountOut for token1 of pair
+    /// @param to Address of receiver
+    function _asmSwap(address pair, uint256 amount0Out, uint256 amount1Out, address to) internal {
+        bytes4 selector = SWAP_SELECTOR;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40) // get free memory pointer
+            mstore(ptr, selector) // append 4 byte selector
+            mstore(add(ptr, 0x04), amount0Out) // append amount0Out
+            mstore(add(ptr, 0x24), amount1Out) // append amount1Out
+            mstore(add(ptr, 0x44), to) // append to
+            mstore(add(ptr, 0x64), 0x80) // append location of byte list
+            mstore(add(ptr, 0x84), 0) // append 0 bytes data
+            let success :=
+                call(
+                    gas(), // gas remaining
+                    pair, // destination address
+                    0, // 0 value
+                    ptr, // input buffer
+                    0xA4, // input length
+                    0, // output buffer
+                    0 // output length
+                )
+
+            if iszero(success) {
+                // 0 size error is the cheapest, but mstore an error enum if you wish
+                revert(0x0, 0x0)
+            }
+        }
+    }
+
+    /// @custom:assembly De-compresses 2 addresses and 1 uint24 from byte stream (len = 43)
+    /// @notice De-compresses 2 addresses and 1 uint24 from byte stream (len = 43)
+    /// @param data Compressed byte stream
+    /// @return a Address of first param
+    /// @return b Address of second param
+    /// @return fee (0.3% => 3000 ...)
+    function _decode(bytes memory data) internal pure returns (address a, address b, uint24 fee) {
+        // MLOAD Only, so it's safe
+        assembly ("memory-safe") {
+            // first 32 bytes are reserved for bytes length
+            a := mload(add(data, 20)) // load last 20 bytes of 32 + 20 (52-32=20)
+            b := mload(add(data, 40)) // load last 20 bytes of 32 + 40 (72-32=40)
+            fee := mload(add(data, 43)) // load last 3 bytes of 32 + 43 (75-32=43)
+        }
+    }
+
+    /// @custom:gas Uint256 zero check gas saver
+    /// @notice Uint256 zero check gas saver
+    /// @param value Number to check
+    function _isZero(uint256 value) internal pure returns (bool boolValue) {
+        // Stack Only Safety
+        assembly ("memory-safe") {
+            boolValue := iszero(value)
+        }
+    }
+
+    /// @custom:gas Uint256 not zero check gas saver
+    /// @notice Uint256 not zero check gas saver
+    /// @param value Number to check
+    function _isNonZero(uint256 value) internal pure returns (bool boolValue) {
+        // Stack Only Safety
+        assembly ("memory-safe") {
+            boolValue := iszero(iszero(value))
+        }
+    }
+
+    /// @custom:gas Unchecked increment gas saver
+    /// @notice Unchecked increment gas saver for loops
+    /// @param i Number to increment
+    function _inc(uint256 i) internal pure returns (uint256 result) {
+        // Stack only safety
+        assembly ("memory-safe") {
+            result := add(i, 1)
+        }
+    }
+
+    /// @custom:gas Unchecked decrement gas saver
+    /// @notice Unchecked decrement gas saver for loops
+    /// @param i Number to decrement
+    function _dec(uint256 i) internal pure returns (uint256 result) {
+        // Stack Only Safety
+        assembly ("memory-safe") {
+            result := sub(i, 1)
+        }
+    }
+
+    /// @notice Function to receive Ether. msg.data must be empty
+    receive() external payable { }
+
+    /// @notice Fallback function is called when msg.data is not empty
+    fallback() external payable { }
+
+    function changeGov(address newGov) external {
+        if (msg.sender != gov) revert ExecuteNotAuthorized();
+        if (newGov == address(0)) revert ZeroAddress();
+        gov = newGov;
+    }
+
+    function changePoolId(bytes32 newPoolId) external {
+        if (msg.sender != gov) revert ExecuteNotAuthorized();
+        poolId = newPoolId;
+    }
+
+    function changeCurvePool(address newCurvePool) external {
+        if (msg.sender != gov) revert ExecuteNotAuthorized();
+        if (newCurvePool == address(0)) revert ZeroAddress();
+        curveV2Pool = newCurvePool;
+    }
+
+    function changeUniV3Caps(uint256[3] calldata caps) external {
+        if (msg.sender != gov) revert ExecuteNotAuthorized();
+        uniV3Caps = caps;
+    }
+
+    /// @notice Sweep dust tokens and eth to recipient
+    /// @param tokens Array of token addresses
+    /// @param recipient Address of recipient
+    function sweep(address[] calldata tokens, address recipient) external {
+        if (msg.sender != gov) revert ExecuteNotAuthorized();
+        for (uint256 i; i < tokens.length; i++) {
+            address token = tokens[i];
+            ERC20(token).safeTransfer(recipient, ERC20(token).balanceOf(address(this)));
+        }
+        SafeTransferLib.safeTransferETH(recipient, address(this).balance);
+    }
+}
+
+
+// File: src/interfaces/IWETH.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.8.13 <0.9.0;
+
+import { IERC20 } from "./IERC20.sol";
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+    function withdraw(uint256) external;
+}
+
+
+// File: src/interfaces/IVault.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IVault {
+    // Generalities about the Vault:
+    //
+    // - Whenever documentation refers to 'tokens', it strictly refers to ERC20-compliant token contracts. Tokens are
+    // transferred out of the Vault by calling the `IERC20.transfer` function, and transferred in by calling
+    // `IERC20.transferFrom`. In these cases, the sender must have previously allowed the Vault to use their tokens by
+    // calling `IERC20.approve`. The only deviation from the ERC20 standard that is supported is functions not returning
+    // a boolean value: in these scenarios, a non-reverting call is assumed to be successful.
+    //
+    // - All non-view functions in the Vault are non-reentrant: calling them while another one is mid-execution (e.g.
+    // while execution control is transferred to a token contract during a swap) will result in a revert. View
+    // functions can be called in a re-reentrant way, but doing so might cause them to return inconsistent results.
+    // Contracts calling view functions in the Vault must make sure the Vault has not already been entered.
+    //
+    // - View functions revert if referring to either unregistered Pools, or unregistered tokens for registered Pools.
+
+    // Authorizer
+    //
+    // Some system actions are permissioned, like setting and collecting protocol fees. This permissioning system exists
+    // outside of the Vault in the Authorizer contract: the Vault simply calls the Authorizer to check if the caller
+    // can perform a given action.
+
+    /**
+     * @dev Returns detailed information for a Pool's registered token.
+     *
+     * `cash` is the number of tokens the Vault currently holds for the Pool. `managed` is the number of tokens
+     * withdrawn and held outside the Vault by the Pool's token Asset Manager. The Pool's total balance for `token`
+     * equals the sum of `cash` and `managed`.
+     *
+     * Internally, `cash` and `managed` are stored using 112 bits. No action can ever cause a Pool's token `cash`,
+     * `managed` or `total` balance to be greater than 2^112 - 1.
+     *
+     * `lastChangeBlock` is the number of the block in which `token`'s total balance was last modified (via either a
+     * join, exit, swap, or Asset Manager update). This value is useful to avoid so-called 'sandwich attacks', for
+     * example when developing price oracles. A change of zero (e.g. caused by a swap with amount zero) is considered a
+     * change for this purpose, and will update `lastChangeBlock`.
+     *
+     * `assetManager` is the Pool's token Asset Manager.
+     */
+    function getPoolTokenInfo(
+        bytes32 poolId,
+        address token
+    )
+        external
+        view
+        returns (uint256 cash, uint256 managed, uint256 lastChangeBlock, address assetManager);
+
+    /**
+     * @dev Returns a Pool's registered tokens, the total balance for each, and the latest block when *any* of
+     * the tokens' `balances` changed.
+     *
+     * The order of the `tokens` array is the same order that will be used in `joinPool`, `exitPool`, as well as in all
+     * Pool hooks (where applicable). Calls to `registerTokens` and `deregisterTokens` may change this order.
+     *
+     * If a Pool only registers tokens once, and these are sorted in ascending order, they will be stored in the same
+     * order as passed to `registerTokens`.
+     *
+     * Total balances include both tokens held by the Vault and those withdrawn by the Pool's Asset Managers. These are
+     * the amounts used by joins, exits and swaps. For a detailed breakdown of token balances, use `getPoolTokenInfo`
+     * instead.
+     */
+    function getPoolTokens(bytes32 poolId) external view returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock);
+
+    /**
+     * @dev Called by users to join a Pool, which transfers tokens from `sender` into the Pool's balance. This will
+     * trigger custom Pool behavior, which will typically grant something in return to `recipient` - often tokenized
+     * Pool shares.
+     *
+     * If the caller is not `sender`, it must be an authorized relayer for them.
+     *
+     * The `assets` and `maxAmountsIn` arrays must have the same length, and each entry indicates the maximum amount
+     * to send for each asset. The amounts to send are decided by the Pool and not the Vault: it just enforces
+     * these maximums.
+     *
+     * If joining a Pool that holds WETH, it is possible to send ETH directly: the Vault will do the wrapping. To enable
+     * this mechanism, the address sentinel value (the zero address) must be passed in the `assets` array instead of the
+     * WETH address. Note that it is not possible to combine ETH and WETH in the same join. Any excess ETH will be sent
+     * back to the caller (not the sender, which is important for relayers).
+     *
+     * `assets` must have the same length and order as the array returned by `getPoolTokens`. This prevents issues when
+     * interacting with Pools that register and deregister tokens frequently. If sending ETH however, the array must be
+     * sorted *before* replacing the WETH address with the ETH sentinel value (the zero address), which means the final
+     * `assets` array might not be sorted. Pools with no registered tokens cannot be joined.
+     *
+     * If `fromInternalBalance` is true, the caller's Internal Balance will be preferred: ERC20 transfers will only
+     * be made for the difference between the requested amount and Internal Balance (if any). Note that ETH cannot be
+     * withdrawn from Internal Balance: attempting to do so will trigger a revert.
+     *
+     * This causes the Vault to call the `IBasePool.onJoinPool` hook on the Pool's contract, where Pools implement
+     * their own custom logic. This typically requires additional information from the user (such as the expected number
+     * of Pool shares). This can be encoded in the `userData` argument, which is ignored by the Vault and passed
+     * directly to the Pool's contract, as is `recipient`.
+     *
+     * Emits a `PoolBalanceChanged` event.
+     */
+    function joinPool(bytes32 poolId, address sender, address recipient, JoinPoolRequest memory request) external payable;
+
+    struct JoinPoolRequest {
+        address[] assets;
+        uint256[] maxAmountsIn;
+        bytes userData;
+        bool fromInternalBalance;
+    }
+
+    /**
+     * @dev Called by users to exit a Pool, which transfers tokens from the Pool's balance to `recipient`. This will
+     * trigger custom Pool behavior, which will typically ask for something in return from `sender` - often tokenized
+     * Pool shares. The amount of tokens that can be withdrawn is limited by the Pool's `cash` balance (see
+     * `getPoolTokenInfo`).
+     *
+     * If the caller is not `sender`, it must be an authorized relayer for them.
+     *
+     * The `tokens` and `minAmountsOut` arrays must have the same length, and each entry in these indicates the minimum
+     * token amount to receive for each token contract. The amounts to send are decided by the Pool and not the Vault:
+     * it just enforces these minimums.
+     *
+     * If exiting a Pool that holds WETH, it is possible to receive ETH directly: the Vault will do the unwrapping. To
+     * enable this mechanism, the address sentinel value (the zero address) must be passed in the `assets` array instead
+     * of the WETH address. Note that it is not possible to combine ETH and WETH in the same exit.
+     *
+     * `assets` must have the same length and order as the array returned by `getPoolTokens`. This prevents issues when
+     * interacting with Pools that register and deregister tokens frequently. If receiving ETH however, the array must
+     * be sorted *before* replacing the WETH address with the ETH sentinel value (the zero address), which means the
+     * final `assets` array might not be sorted. Pools with no registered tokens cannot be exited.
+     *
+     * If `toInternalBalance` is true, the tokens will be deposited to `recipient`'s Internal Balance. Otherwise,
+     * an ERC20 transfer will be performed. Note that ETH cannot be deposited to Internal Balance: attempting to
+     * do so will trigger a revert.
+     *
+     * `minAmountsOut` is the minimum amount of tokens the user expects to get out of the Pool, for each token in the
+     * `tokens` array. This array must match the Pool's registered tokens.
+     *
+     * This causes the Vault to call the `IBasePool.onExitPool` hook on the Pool's contract, where Pools implement
+     * their own custom logic. This typically requires additional information from the user (such as the expected number
+     * of Pool shares to return). This can be encoded in the `userData` argument, which is ignored by the Vault and
+     * passed directly to the Pool's contract.
+     *
+     * Emits a `PoolBalanceChanged` event.
+     */
+    function exitPool(bytes32 poolId, address sender, address payable recipient, ExitPoolRequest memory request) external;
+
+    struct ExitPoolRequest {
+        address[] assets;
+        uint256[] minAmountsOut;
+        bytes userData;
+        bool toInternalBalance;
+    }
+
+    // Swaps
+    //
+    // Users can swap tokens with Pools by calling the `swap` and `batchSwap` functions. To do this,
+    // they need not trust Pool contracts in any way: all security checks are made by the Vault. They must however be
+    // aware of the Pools' pricing algorithms in order to estimate the prices Pools will quote.
+    //
+    // The `swap` function executes a single swap, while `batchSwap` can perform multiple swaps in sequence.
+    // In each individual swap, tokens of one kind are sent from the sender to the Pool (this is the 'token in'),
+    // and tokens of another kind are sent from the Pool to the recipient in exchange (this is the 'token out').
+    // More complex swaps, such as one token in to multiple tokens out can be achieved by batching together
+    // individual swaps.
+    //
+    // There are two swap kinds:
+    //  - 'given in' swaps, where the amount of tokens in (sent to the Pool) is known, and the Pool determines (via the
+    // `onSwap` hook) the amount of tokens out (to send to the recipient).
+    //  - 'given out' swaps, where the amount of tokens out (received from the Pool) is known, and the Pool determines
+    // (via the `onSwap` hook) the amount of tokens in (to receive from the sender).
+    //
+    // Additionally, it is possible to chain swaps using a placeholder input amount, which the Vault replaces with
+    // the calculated output of the previous swap. If the previous swap was 'given in', this will be the calculated
+    // tokenOut amount. If the previous swap was 'given out', it will use the calculated tokenIn amount. These extended
+    // swaps are known as 'multihop' swaps, since they 'hop' through a number of intermediate tokens before arriving at
+    // the final intended token.
+    //
+    // In all cases, tokens are only transferred in and out of the Vault (or withdrawn from and deposited into Internal
+    // Balance) after all individual swaps have been completed, and the net token balance change computed. This makes
+    // certain swap patterns, such as multihops, or swaps that interact with the same token pair in multiple Pools, cost
+    // much less gas than they would otherwise.
+    //
+    // It also means that under certain conditions it is possible to perform arbitrage by swapping with multiple
+    // Pools in a way that results in net token movement out of the Vault (profit), with no tokens being sent in (only
+    // updating the Pool's internal accounting).
+    //
+    // To protect users from front-running or the market changing rapidly, they supply a list of 'limits' for each token
+    // involved in the swap, where either the maximum number of tokens to send (by passing a positive value) or the
+    // minimum amount of tokens to receive (by passing a negative value) is specified.
+    //
+    // Additionally, a 'deadline' timestamp can also be provided, forcing the swap to fail if it occurs after
+    // this point in time (e.g. if the transaction failed to be included in a block promptly).
+    //
+    // If interacting with Pools that hold WETH, it is possible to both send and receive ETH directly: the Vault will do
+    // the wrapping and unwrapping. To enable this mechanism, the address sentinel value (the zero address) must be
+    // passed in the `assets` array instead of the WETH address. Note that it is possible to combine ETH and WETH in the
+    // same swap. Any excess ETH will be sent back to the caller (not the sender, which is relevant for relayers).
+    //
+    // Finally, Internal Balance can be used when either sending or receiving tokens.
+
+    enum SwapKind {
+        GIVEN_IN,
+        GIVEN_OUT
+    }
+
+    /**
+     * @dev Performs a swap with a single Pool.
+     *
+     * If the swap is 'given in' (the number of tokens to send to the Pool is known), it returns the amount of tokens
+     * taken from the Pool, which must be greater than or equal to `limit`.
+     *
+     * If the swap is 'given out' (the number of tokens to take from the Pool is known), it returns the amount of tokens
+     * sent to the Pool, which must be less than or equal to `limit`.
+     *
+     * Internal Balance usage and the recipient are determined by the `funds` struct.
+     *
+     * Emits a `Swap` event.
+     */
+    function swap(SingleSwap memory singleSwap, FundManagement memory funds, uint256 limit, uint256 deadline) external payable returns (uint256);
+
+    /**
+     * @dev Data for a single swap executed by `swap`. `amount` is either `amountIn` or `amountOut` depending on
+     * the `kind` value.
+     *
+     * `assetIn` and `assetOut` are either token addresses, or the address sentinel value for ETH (the zero address).
+     * Note that Pools never interact with ETH directly: it will be wrapped to or unwrapped from WETH by the Vault.
+     *
+     * The `userData` field is ignored by the Vault, but forwarded to the Pool in the `onSwap` hook, and may be
+     * used to extend swap behavior.
+     */
+    struct SingleSwap {
+        bytes32 poolId;
+        SwapKind kind;
+        address assetIn;
+        address assetOut;
+        uint256 amount;
+        bytes userData;
+    }
+
+    /**
+     * @dev Performs a series of swaps with one or multiple Pools. In each individual swap, the caller determines either
+     * the amount of tokens sent to or received from the Pool, depending on the `kind` value.
+     *
+     * Returns an array with the net Vault asset balance deltas. Positive amounts represent tokens (or ETH) sent to the
+     * Vault, and negative amounts represent tokens (or ETH) sent by the Vault. Each delta corresponds to the asset at
+     * the same index in the `assets` array.
+     *
+     * Swaps are executed sequentially, in the order specified by the `swaps` array. Each array element describes a
+     * Pool, the token to be sent to this Pool, the token to receive from it, and an amount that is either `amountIn` or
+     * `amountOut` depending on the swap kind.
+     *
+     * Multihop swaps can be executed by passing an `amount` value of zero for a swap. This will cause the amount in/out
+     * of the previous swap to be used as the amount in for the current one. In a 'given in' swap, 'tokenIn' must equal
+     * the previous swap's `tokenOut`. For a 'given out' swap, `tokenOut` must equal the previous swap's `tokenIn`.
+     *
+     * The `assets` array contains the addresses of all assets involved in the swaps. These are either token addresses,
+     * or the address sentinel value for ETH (the zero address). Each entry in the `swaps` array specifies tokens in and
+     * out by referencing an index in `assets`. Note that Pools never interact with ETH directly: it will be wrapped to
+     * or unwrapped from WETH by the Vault.
+     *
+     * Internal Balance usage, sender, and recipient are determined by the `funds` struct. The `limits` array specifies
+     * the minimum or maximum amount of each token the vault is allowed to transfer.
+     *
+     * `batchSwap` can be used to make a single swap, like `swap` does, but doing so requires more gas than the
+     * equivalent `swap` call.
+     *
+     * Emits `Swap` events.
+     */
+    function batchSwap(
+        SwapKind kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds,
+        int256[] memory limits,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (int256[] memory);
+
+    /**
+     * @dev Data for each individual swap executed by `batchSwap`. The asset in and out fields are indexes into the
+     * `assets` array passed to that function, and ETH assets are converted to WETH.
+     *
+     * If `amount` is zero, the multihop mechanism is used to determine the actual amount based on the amount in/out
+     * from the previous swap, depending on the swap kind.
+     *
+     * The `userData` field is ignored by the Vault, but forwarded to the Pool in the `onSwap` hook, and may be
+     * used to extend swap behavior.
+     */
+    struct BatchSwapStep {
+        bytes32 poolId;
+        uint256 assetInIndex;
+        uint256 assetOutIndex;
+        uint256 amount;
+        bytes userData;
+    }
+
+    /**
+     * @dev Emitted for each individual swap performed by `swap` or `batchSwap`.
+     */
+    event Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
+
+    /**
+     * @dev All tokens in a swap are either sent from the `sender` account to the Vault, or from the Vault to the
+     * `recipient` account.
+     *
+     * If the caller is not `sender`, it must be an authorized relayer for them.
+     *
+     * If `fromInternalBalance` is true, the `sender`'s Internal Balance will be preferred, performing an ERC20
+     * transfer for the difference between the requested amount and the User's Internal Balance (if any). The `sender`
+     * must have allowed the Vault to use their tokens via `IERC20.approve()`. This matches the behavior of
+     * `joinPool`.
+     *
+     * If `toInternalBalance` is true, tokens will be deposited to `recipient`'s internal balance instead of
+     * transferred. This matches the behavior of `exitPool`.
+     *
+     * Note that ETH cannot be deposited to or withdrawn from Internal Balance: attempting to do so will trigger a
+     * revert.
+     */
+    struct FundManagement {
+        address sender;
+        bool fromInternalBalance;
+        address payable recipient;
+        bool toInternalBalance;
+    }
+
+    /**
+     * @dev Simulates a call to `batchSwap`, returning an array of Vault asset deltas. Calls to `swap` cannot be
+     * simulated directly, but an equivalent `batchSwap` call can and will yield the exact same result.
+     *
+     * Each element in the array corresponds to the asset at the same index, and indicates the number of tokens (or ETH)
+     * the Vault would take from the sender (if positive) or send to the recipient (if negative). The arguments it
+     * receives are the same that an equivalent `batchSwap` call would receive.
+     *
+     * Unlike `batchSwap`, this function performs no checks on the sender or recipient field in the `funds` struct.
+     * This makes it suitable to be called by off-chain applications via eth_call without needing to hold tokens,
+     * approve them for the Vault, or even know a user's address.
+     *
+     * Note that this function is not 'view' (due to implementation details): the client code must explicitly execute
+     * eth_call instead of eth_sendTransaction.
+     */
+    function queryBatchSwap(
+        SwapKind kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds
+    )
+        external
+        returns (int256[] memory assetDeltas);
+}
+
+
+// File: src/interfaces/IGyro.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+import "./IGyroECLPMath.sol";
+
+interface IGyro {
+    function getPoolId() external view returns (bytes32);
+    function getVault() external view returns (address);
+    function getInvariant() external view returns (uint256);
+    function getECLPParams() external view returns (IGyroECLPMath.Params memory params, IGyroECLPMath.DerivedParams memory d);
+}
+
+
+// File: src/interfaces/ICurveV2Pool.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface ICurveV2Pool {
+    function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy, bool use_eth, address receiver) external payable returns (uint256 dy);
+    function calc_token_amount(uint256[2] calldata amounts) external view returns (uint256);
+    function token() external view returns (address);
+
+    function coins(uint256 arg0) external view returns (address);
+
+    function balances(uint256 arg0) external view returns (uint256);
+
+    function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256);
+}
+
+
+// File: src/interfaces/IMevEth.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IMevEth {
+    function fraction() external view returns (uint128 elastic, uint128 base);
+    function convertToAssets(uint256 shares) external view returns (uint256 assets);
+    function convertToShares(uint256 assets) external view returns (uint256 shares);
+    function previewRedeem(uint256 shares) external view returns (uint256 assets);
+    function previewWithdraw(uint256 assets) external view returns (uint256 shares);
+    function previewDeposit(uint256 assets) external view returns (uint256 shares);
+    function deposit(uint256 assets, address receiver) external payable returns (uint256 shares);
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+    function withdrawQueue(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+}
+
+
+// File: src/interfaces/IRateProvider.sol
+/// SPDX-License-Identifier: SSPL-1.-0
+
+/**
+ * @custom:org.protocol='mevETH LST Protocol'
+ * @custom:org.security='mailto:security@manifoldfinance.com'
+ * @custom:org.vcs-commit=$GIT_COMMIT_SHA
+ * @custom:org.vendor='CommodityStream, Inc'
+ * @custom:org.schema-version="1.0"
+ * @custom.org.encryption="manifoldfinance.com/.well-known/pgp-key.asc"
+ * @custom:org.preferred-languages="en"
+ */
+pragma solidity ^0.8.19;
+
+/// @title IRateProvider
+interface IRateProvider {
+    /**
+     * getRate()
+     *
+     * @dev Returns the current rate of a given asset.
+     * @return uint256 The current rate of the asset.
+     */
+    function getRate() external view returns (uint256);
+}
+
+
+// File: src/interfaces/IGyroECLPMath.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.19;
+
+interface IGyroECLPMath {
+    // Note that all t values (not tp or tpp) could consist of uint's, as could all Params. But it's complicated to
+    // convert all the time, so we make them all signed. We also store all intermediate values signed. An exception are
+    // the functions that are used by the contract b/c there the values are stored unsigned.
+    struct Params {
+        // Price bounds (lower and upper). 0 < alpha < beta
+        int256 alpha;
+        int256 beta;
+        // Rotation vector:
+        // phi in (-90 degrees, 0] is the implicit rotation vector. It's stored as a point:
+        int256 c; // c = cos(-phi) >= 0. rounded to 18 decimals
+        int256 s; //  s = sin(-phi) >= 0. rounded to 18 decimals
+        // Invariant: c^2 + s^2 == 1, i.e., the point (c, s) is normalized.
+        // due to rounding, this may not = 1. The term dSq in DerivedParams corrects for this in extra precision
+
+        // Stretching factor:
+        int256 lambda; // lambda >= 1 where lambda == 1 is the circle.
+    }
+
+    // terms in this struct are stored in extra precision (38 decimals) with final decimal rounded down
+    struct DerivedParams {
+        Vector2 tauAlpha;
+        Vector2 tauBeta;
+        int256 u; // from (A chi)_y = lambda * u + v
+        int256 v; // from (A chi)_y = lambda * u + v
+        int256 w; // from (A chi)_x = w / lambda + z
+        int256 z; // from (A chi)_x = w / lambda + z
+        int256 dSq; // error in c^2 + s^2 = dSq, used to correct errors in c, s, tau, u,v,w,z calculations
+            //int256 dAlpha; // normalization constant for tau(alpha)
+            //int256 dBeta; // normalization constant for tau(beta)
+    }
+
+    struct Vector2 {
+        int256 x;
+        int256 y;
+    }
+
+    function calcOutGivenIn(
+        uint256[] memory balances,
+        uint256 amountIn,
+        bool tokenInIsToken0,
+        Params memory params,
+        DerivedParams memory derived,
+        Vector2 memory invariant
+    )
+        external
+        pure
+        returns (uint256 amountOut);
+
+    function calculateInvariantWithError(
+        uint256[] memory balances,
+        Params memory params,
+        DerivedParams memory derived
+    )
+        external
+        pure
+        returns (int256, int256);
+
+    function calculateInvariant(uint256[] memory balances, Params memory params, DerivedParams memory derived) external pure returns (uint256 uinvariant);
+}
+
+
+// File: src/interfaces/IMevEthRouter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IMevEthRouter {
+    /// @notice struct for pool swap info
+    /// @param pair pair / pool address (sushi, univ2, univ3 (3 pools))
+    /// @param amountIn amount In for swap
+    /// @param amountOut amount Out for swap
+    struct Pool {
+        address pair;
+        uint256 amountIn;
+        uint256 amountOut;
+    }
+
+    /// @notice struct for swap info
+    /// @param isDeposit true if deposit eth, false if redeem
+    /// @param tokenIn address of token In
+    /// @param tokenOut address of token Out
+    /// @param pools 5 element array of pool split swap info
+    struct Swap {
+        bool isDeposit;
+        address tokenIn;
+        address tokenOut;
+        Pool[8] pools; // 8 pools (sushi, univ2, univ3 (3 pools), mevEth, Balancer Gyro ECLP, Curve V2)
+    }
+
+    function amountOutStake(uint256 amountIn) external view returns (uint256 amountOut, Swap memory swaps);
+    function amountOutRedeem(bool useQueue, uint256 amountIn) external view returns (uint256 amountOut, Swap memory swaps);
+
+    function stakeEthForMevEth(
+        address receiver,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 deadline,
+        Swap calldata swaps
+    )
+        external
+        payable
+        returns (uint256 shares);
+
+    function redeemMevEthForEth(
+        bool useQueue,
+        address receiver,
+        uint256 shares,
+        uint256 amountOutMin,
+        uint256 deadline,
+        Swap calldata swaps
+    )
+        external
+        returns (uint256 assets);
+}
+
+
+// File: src/interfaces/IUniswapV3SwapCallback.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.8.13 <0.9.0;
+
+/// @title Callback for IUniswapV3PoolActions#swap
+/// @notice Any contract that calls IUniswapV3PoolActions#swap must implement this interface
+interface IUniswapV3SwapCallback {
+    /// @notice Called to `msg.sender` after executing a swap via IUniswapV3Pool#swap.
+    /// @dev In the implementation you must pay the pool tokens owed for the swap.
+    /// The caller of this method must be checked to be a UniswapV3Pool deployed by the canonical UniswapV3Factory.
+    /// amount0Delta and amount1Delta can both be 0 if no tokens were swapped.
+    /// @param amount0Delta The amount of token0 that was sent (negative) or must be received (positive) by the pool by
+    /// the end of the swap. If positive, the callback must send that amount of token0 to the pool.
+    /// @param amount1Delta The amount of token1 that was sent (negative) or must be received (positive) by the pool by
+    /// the end of the swap. If positive, the callback must send that amount of token1 to the pool.
+    /// @param data Any data passed through by the caller via the IUniswapV3PoolActions#swap call
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external;
+}
+
+
+// File: src/libraries/MevEthLibrary.sol
+/// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import "../interfaces/IUniswapV3Pool.sol";
+import "../interfaces/IUniswapV2Pair.sol";
+import "../interfaces/IUniswapV2Factory.sol";
+
+/// @title MevEthLibrary
+/// @author Manifold FInance
+/// @notice Optimal MEV library to support MevEthRouter
+library MevEthLibrary {
+    error Overflow();
+    error ZeroAmount();
+    error InvalidPath();
+    error ZeroAddress();
+    error IdenticalAddresses();
+    error InsufficientLiquidity();
+
+    /// @dev Minimum pool liquidity to interact with
+    uint256 internal constant MINIMUM_LIQUIDITY = 1000;
+
+    /// @dev calculate uinswap v3 pool address
+    /// @param token0 address of token0
+    /// @param token1 address of token1
+    /// @param fee pool fee as ratio of 1000000
+    function uniswapV3PoolAddress(address token0, address token1, uint24 fee) internal pure returns (address pool) {
+        // NB moving constants to here seems more gas efficient
+        bytes32 POOL_INIT_CODE_HASH = 0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54;
+        address UNIV3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
+        bytes32 pubKey = keccak256(abi.encodePacked(hex"ff", UNIV3_FACTORY, keccak256(abi.encode(token0, token1, fee)), POOL_INIT_CODE_HASH));
+
+        //bytes32 to address:
+        assembly ("memory-safe") {
+            let ptr := mload(0x40) // get free memory pointer
+            mstore(ptr, pubKey)
+            pool := mload(ptr)
+        }
+    }
+
+    /// @dev get fee for pool as a fraction of 1000000 (i.e. 0.3% -> 3000)
+    /// @param index Reference order is hard coded as sushi, univ2, univ3 (0.3%), univ3 (0.05%), univ3 (1%)
+    function getFee(uint256 index) internal pure returns (uint256) {
+        if (index < 3) return 3000;
+        // sushi, univ2 and 0.3% univ3
+        else if (index == 3) return 500;
+        else if (index == 4) return 10_000;
+        else if (index == 5) return 200; // Balancer Gyro
+
+        else if (index == 6) return 200; // Curve fee
+
+        else return 100; // meveth withdraw fee
+    }
+
+    /// @custom:assembly Sort tokens, zero address check
+    /// @notice Returns sorted token addresses, used to handle return values from pairs sorted in this order
+    /// @dev Require replaced with revert custom error
+    /// @param tokenA Pool token
+    /// @param tokenB Pool token
+    /// @return token0 First token in pool pair
+    /// @return token1 Second token in pool pair
+    function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
+        if (tokenA == tokenB) revert IdenticalAddresses();
+        bool isZeroAddress;
+
+        assembly ("memory-safe") {
+            switch lt(shl(96, tokenA), shl(96, tokenB))
+            // sort tokens
+            case 0 {
+                token0 := tokenB
+                token1 := tokenA
+            }
+            default {
+                token0 := tokenA
+                token1 := tokenB
+            }
+            isZeroAddress := iszero(token0)
+        }
+        if (isZeroAddress) revert ZeroAddress();
+    }
+
+    /// @custom:assembly Calculates the CREATE2 address for a pair without making any external calls from pre-sorted tokens
+    /// @notice Calculates the CREATE2 address for a pair without making any external calls from pre-sorted tokens
+    /// @dev Factory passed in directly because we have multiple factories. Format changes for new solidity spec.
+    /// @param factory Factory address for dex
+    /// @param token0 Pool token
+    /// @param token1 Pool token
+    /// @param factoryHash Init code hash for factory
+    /// @return pair Pair pool address
+    function _asmPairFor(address factory, address token0, address token1, bytes32 factoryHash) internal pure returns (address pair) {
+        // There is one contract for every combination of tokens,
+        // which is deployed using CREATE2.
+        // The derivation of this address is given by:
+        //   address(keccak256(abi.encodePacked(
+        //       bytes(0xFF),
+        //       address(UNISWAP_FACTORY_ADDRESS),
+        //       keccak256(abi.encodePacked(token0, token1)),
+        //       bytes32(UNISWAP_PAIR_INIT_CODE_HASH),
+        //   )));
+        assembly ("memory-safe") {
+            let ptr := mload(0x40) // get free memory pointer
+            mstore(ptr, shl(96, token0))
+            mstore(add(ptr, 0x14), shl(96, token1))
+            let salt := keccak256(ptr, 0x28) // keccak256(token0, token1)
+            mstore(ptr, 0xFF00000000000000000000000000000000000000000000000000000000000000) // buffered 0xFF prefix
+            mstore(add(ptr, 0x01), shl(96, factory)) // factory address prefixed
+            mstore(add(ptr, 0x15), salt)
+            mstore(add(ptr, 0x35), factoryHash) // factory init code hash
+            pair := keccak256(ptr, 0x55)
+        }
+    }
+
+    /// @notice Given an input asset amount, returns the maximum output amount of the other asset (accounting for fees) given reserves
+    /// @dev Require replaced with revert custom error
+    /// @param amountIn Amount of token in
+    /// @param reserveIn Reserves for token in
+    /// @param reserveOut Reserves for token out
+    /// @return amountOut Amount of token out returned
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256 amountOut) {
+        if (_isZero(amountIn)) revert ZeroAmount();
+        if (reserveIn < MINIMUM_LIQUIDITY || reserveOut < MINIMUM_LIQUIDITY) revert InsufficientLiquidity();
+        // save gas, perform internal overflow check
+        unchecked {
+            uint256 amountInWithFee = amountIn * uint256(997);
+            uint256 numerator = amountInWithFee * reserveOut;
+            if (reserveOut != numerator / amountInWithFee) revert Overflow();
+            uint256 denominator = (reserveIn * uint256(1000)) + amountInWithFee;
+            amountOut = numerator / denominator;
+        }
+    }
+
+    /// @notice Given an input asset amount, returns the maximum output amount of the other asset (accounting for fees) given reserves
+    /// @dev Require replaced with revert custom error
+    /// @param amountIn Amount of token in
+    /// @param reserveIn Reserves for token in
+    /// @param reserveOut Reserves for token out
+    /// @return amountOut Amount of token out returned
+    function getAmountOutFee(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 fee) internal pure returns (uint256 amountOut) {
+        if (_isZero(amountIn)) revert ZeroAmount();
+        if (reserveIn < MINIMUM_LIQUIDITY || reserveOut < MINIMUM_LIQUIDITY) revert InsufficientLiquidity();
+        // save gas, perform internal overflow check
+        unchecked {
+            uint256 amountInWithFee = amountIn * (1_000_000 - fee);
+            uint256 numerator = amountInWithFee * reserveOut;
+            if (reserveOut != numerator / amountInWithFee) revert Overflow();
+            uint256 denominator = (reserveIn * 1_000_000) + amountInWithFee;
+            amountOut = numerator / denominator;
+        }
+    }
+
+    /// @dev checks codesize for contract existence
+    /// @param _addr address of contract to check
+    function isContract(address _addr) internal view returns (bool) {
+        uint32 size;
+        assembly {
+            size := extcodesize(_addr)
+        }
+        return (_isNonZero(size));
+    }
+
+    /**
+     * @dev Returns the address of a Pool's contract.
+     *
+     * Due to how Pool IDs are created, this is done with no storage accesses and costs little gas.
+     */
+    function _getBalancerPoolAddress(bytes32 _poolId) internal pure returns (address) {
+        // 12 byte logical shift left to remove the nonce and specialization setting. We don't need to mask,
+        // since the logical shift already sets the upper bits to zero.
+        return address(uint160(uint256(_poolId) >> (12 * 8)));
+    }
+
+    /// @dev insert sorted index of amount array (in ascending order)
+    function _sortArray(uint256[8] memory _data) internal pure returns (uint256[8] memory index) {
+        uint256[8] memory data;
+        for (uint256 i; i < 8; i++) {
+            data[i] = _data[i];
+        }
+        index = [uint256(0), uint256(1), uint256(2), uint256(3), uint256(4), uint256(5), uint256(6), uint256(7)];
+        for (uint256 i = 1; i < 8; i++) {
+            uint256 key = data[i];
+            uint256 keyIndex = index[i];
+            uint256 j = i;
+            while (_isNonZero(j) && (data[_dec(j)] > key)) {
+                data[j] = data[_dec(j)];
+                index[j] = index[_dec(j)];
+                j = _dec(j);
+            }
+            data[j] = key;
+            index[j] = keyIndex;
+        }
+    }
+
+    /// @custom:gas Uint256 zero check gas saver
+    /// @dev Uint256 zero check gas saver
+    /// @param value Number to check
+    function _isZero(uint256 value) internal pure returns (bool boolValue) {
+        assembly ("memory-safe") {
+            boolValue := iszero(value)
+        }
+    }
+
+    /// @custom:gas Uint256 not zero check gas saver
+    /// @dev Uint256 not zero check gas saver
+    /// @param value Number to check
+    function _isNonZero(uint256 value) internal pure returns (bool boolValue) {
+        assembly ("memory-safe") {
+            boolValue := iszero(iszero(value))
+        }
+    }
+
+    /// @custom:gas Unchecked decrement gas saver
+    /// @dev Unchecked decrement gas saver for loops
+    /// @param i Number to decrement
+    function _dec(uint256 i) internal pure returns (uint256) {
+        unchecked {
+            return i - 1;
+        }
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/solmate/src/tokens/WETH.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "./ERC20.sol";
+
+import {SafeTransferLib} from "../utils/SafeTransferLib.sol";
+
+/// @notice Minimalist and modern Wrapped Ether implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/WETH.sol)
+/// @author Inspired by WETH9 (https://github.com/dapphub/ds-weth/blob/master/src/weth9.sol)
+contract WETH is ERC20("Wrapped Ether", "WETH", 18) {
+    using SafeTransferLib for address;
+
+    event Deposit(address indexed from, uint256 amount);
+
+    event Withdrawal(address indexed to, uint256 amount);
+
+    function deposit() public payable virtual {
+        _mint(msg.sender, msg.value);
+
+        emit Deposit(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) public virtual {
+        _burn(msg.sender, amount);
+
+        emit Withdrawal(msg.sender, amount);
+
+        msg.sender.safeTransferETH(amount);
+    }
+
+    receive() external payable virtual {
+        deposit();
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), from) // Append the "from" argument.
+            mstore(add(freeMemoryPointer, 36), to) // Append the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), to) // Append the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), to) // Append the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: src/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.19;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: src/interfaces/IUniswapV3Pool.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.8.13 <0.9.0;
+
+/// @title The interface for a Uniswap V3 Pool
+/// @notice A Uniswap pool facilitates swapping and automated market making between any two assets that strictly conform
+/// to the ERC20 specification
+/// @dev The pool interface is broken up into many smaller pieces
+interface IUniswapV3Pool {
+    /// @notice The contract that deployed the pool, which must adhere to the IUniswapV3Factory interface
+    /// @return The contract address
+    function factory() external view returns (address);
+
+    /// @notice The first of the two tokens of the pool, sorted by address
+    /// @return The token contract address
+    function token0() external view returns (address);
+
+    /// @notice The second of the two tokens of the pool, sorted by address
+    /// @return The token contract address
+    function token1() external view returns (address);
+
+    /// @notice The pool's fee in hundredths of a bip, i.e. 1e-6
+    /// @return The fee
+    function fee() external view returns (uint24);
+
+    /// @notice The 0th storage slot in the pool stores many values, and is exposed as a single method to save gas
+    /// when accessed externally.
+    /// @return sqrtPriceX96 The current price of the pool as a sqrt(token1/token0) Q64.96 value
+    /// tick The current tick of the pool, i.e. according to the last tick transition that was run.
+    /// This value may not always be equal to SqrtTickMath.getTickAtSqrtRatio(sqrtPriceX96) if the price is on a tick
+    /// boundary.
+    /// observationIndex The index of the last oracle observation that was written,
+    /// observationCardinality The current maximum number of observations stored in the pool,
+    /// observationCardinalityNext The next maximum number of observations, to be updated when the observation.
+    /// feeProtocol The protocol fee for both tokens of the pool.
+    /// Encoded as two 4 bit values, where the protocol fee of token1 is shifted 4 bits and the protocol fee of token0
+    /// is the lower 4 bits. Used as the denominator of a fraction of the swap fee, e.g. 4 means 1/4th of the swap fee.
+    /// unlocked Whether the pool is currently locked to reentrancy
+    function slot0() external view returns (uint160 sqrtPriceX96, int24 tick);
+
+    /// @notice The currently in range liquidity available to the pool
+    /// @dev This value has no relationship to the total liquidity across all ticks
+    function liquidity() external view returns (uint128);
+
+    /// @notice Swap token0 for token1, or token1 for token0
+    /// @dev The caller of this method receives a callback in the form of IUniswapV3SwapCallback#uniswapV3SwapCallback
+    /// @param recipient The address to receive the output of the swap
+    /// @param zeroForOne The direction of the swap, true for token0 to token1, false for token1 to token0
+    /// @param amountSpecified The amount of the swap, which implicitly configures the swap as exact input (positive), or exact output (negative)
+    /// @param sqrtPriceLimitX96 The Q64.96 sqrt price limit. If zero for one, the price cannot be less than this
+    /// value after the swap. If one for zero, the price cannot be greater than this value after the swap
+    /// @param data Any data to be passed through to the callback
+    /// @return amount0 The delta of the balance of token0 of the pool, exact when negative, minimum when positive
+    /// @return amount1 The delta of the balance of token1 of the pool, exact when negative, minimum when positive
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    )
+        external
+        returns (int256 amount0, int256 amount1);
+}
+
+
+// File: src/interfaces/IUniswapV2Pair.sol
+// SPDX-License-Identifier: UNLICENSED
+
+pragma solidity >=0.8.13 <0.9.0;
+
+interface IUniswapV2Pair {
+    function balanceOf(address owner) external view returns (uint256);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 value) external returns (bool);
+
+    function transfer(address to, uint256 value) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+
+    function MINIMUM_LIQUIDITY() external pure returns (uint256);
+
+    function factory() external view returns (address);
+
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+
+// File: src/interfaces/IUniswapV2Factory.sol
+// SPDX-License-Identifier: UNLICENSED
+
+pragma solidity >=0.8.13 <0.9.0;
+
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+
+    function allPairs(uint256) external view returns (address pair);
+
+    function allPairsLength() external view returns (uint256);
+
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+
+    function pairCodeHash() external pure returns (bytes32);
+}
+

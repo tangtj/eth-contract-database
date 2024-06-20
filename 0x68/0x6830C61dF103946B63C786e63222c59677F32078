@@ -1,0 +1,1727 @@
+
+// File: src/RelayerV2.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+// Core
+import {QuarantineList} from "./core/QuarantineList.sol";
+
+// Structs
+import {UserRequest, RequestData, ProcessParam, AssetInfo} from "./core/Structs.sol";
+
+// Utils
+import {Ownable} from "./utils/Ownable.sol";
+import {PercentageMath} from "./utils/PercentageMath.sol";
+import {SafeERC20} from "openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
+
+// Interfaces
+import {IERC20} from "openzeppelin-contracts/token/ERC20/IERC20.sol";
+import {IFyde} from "./interfaces/IFyde.sol";
+import {IGovernanceModule} from "./interfaces/IGovernanceModule.sol";
+import {IOracle} from "./interfaces/IOracle.sol";
+import {ITaxModule} from "./interfaces/ITaxModule.sol";
+
+///@title RelayerV2
+///@notice The relayer is the entry point contract for users to interact with the protocol.
+///        The relayer is monitored by an off-chain keeper that will update the protocol AUM.
+
+contract RelayerV2 is QuarantineList {
+  using SafeERC20 for IERC20;
+  /*//////////////////////////////////////////////////////////////
+                                 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice Fyde contract
+  IFyde public fyde;
+
+  ///@notice OracleModule contract
+  IOracle public oracleModule;
+
+  //@notice GovernanceModule contract
+  IGovernanceModule public immutable GOVERNANCE_MODULE;
+
+  //@notice calculates the tax for protocol actions
+  ITaxModule public taxModule;
+
+  ///@dev Only used for tracking events offchain
+  uint32 public nonce;
+
+  ///@notice Threshold of deviation for updating AUM
+  uint16 public deviationThreshold;
+
+  ///@notice State of the protocol
+  bool public paused;
+
+  //@notice Swap state
+  bool public swapPaused;
+
+  /*//////////////////////////////////////////////////////////////
+                                 ERROR
+    //////////////////////////////////////////////////////////////*/
+
+  error ValueOutOfBounds();
+  error ActionPaused();
+  error SlippageExceed();
+  error SwapDisabled(address asset);
+  error AssetNotAllowedInGovernancePool(address asset);
+  error DuplicatesAssets();
+
+  /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+  event Pause(uint256 timestamp);
+  event Unpause(uint256 timestamp);
+  event Deposit(uint32 requestId, RequestData request);
+  event Withdraw(uint32 requestId, RequestData request);
+  event Swap(uint32 requestId, RequestData request);
+
+  /*//////////////////////////////////////////////////////////////
+                            CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+  constructor(address _oracleModule, address _govModule, uint8 _deviationThreshold)
+    Ownable(msg.sender)
+  {
+    oracleModule = IOracle(_oracleModule);
+    GOVERNANCE_MODULE = IGovernanceModule(_govModule);
+    updateDeviationThreshold(_deviationThreshold);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                                GUARD
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice Pause the protocol
+  function pauseProtocol() public onlyGuard {
+    paused = true;
+    emit Pause(block.timestamp);
+  }
+
+  ///@notice Pause the swaps
+  function pauseSwap() external onlyGuard {
+    swapPaused = true;
+    emit Pause(block.timestamp);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                                 OWNER
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice sets the addres of fyde contract
+  ///@param _fyde address of fyde
+  function setFyde(address _fyde) external onlyOwner {
+    fyde = IFyde(_fyde);
+  }
+
+  ///@notice Set the oracle module
+  function setOracleModule(address _oracleModule) external onlyOwner {
+    oracleModule = IOracle(_oracleModule);
+  }
+
+  ///@notice Set the tax module
+  function setTaxModule(address _taxModule) external onlyOwner {
+    taxModule = ITaxModule(_taxModule);
+  }
+
+  ///@notice Change the deviation threshold
+  ///@dev 50 = 0.5 % of deviation
+  function updateDeviationThreshold(uint16 _threshold) public onlyOwner {
+    // We bound the threshold between 0.1 % to 10%
+    if (_threshold < 10 || _threshold > 1000) revert ValueOutOfBounds();
+    deviationThreshold = _threshold;
+  }
+
+  ///@notice Approve Fyde to transfer token from relayer, should be called once per asset
+  function approveFyde(address[] calldata _assets) external onlyOwner {
+    for (uint256 i; i < _assets.length; ++i) {
+      IERC20(_assets[i]).safeApprove(address(fyde), type(uint256).max);
+    }
+  }
+
+  ///@notice Collect and send token fees (from tax fees) to an external address
+  ///@param _asset Address to send fees to
+  ///@param _recipient Address to send fees to
+  ///@param _amount Amount to send
+  function collectFees(address _asset, address _recipient, uint256 _amount) external onlyOwner {
+    IERC20(_asset).safeTransfer(_recipient, _amount);
+  }
+
+  ///@notice Unpause the protocol
+  function unpauseProtocol() external onlyOwner {
+    paused = false;
+    emit Unpause(block.timestamp);
+  }
+
+  ///@notice Unpause the swaps
+  function unpauseSwap() external onlyOwner {
+    swapPaused = false;
+    emit Unpause(block.timestamp);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                            EXT USER ENTRY POINT
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice Entry function for depositing, can be a standard deposit or a governance
+  /// deposit
+  ///@param _userRequest struct containing data
+  ///@param _keepGovRights If true make a governance
+  ///@param _minTRSYExpected Slippage parameter ensuring minimum amout of TRSY to be received
+  function deposit(
+    UserRequest[] calldata _userRequest,
+    bool _keepGovRights,
+    uint256 _minTRSYExpected
+  ) external whenNotPaused onlyUser {
+    address[] memory assetIn = new address[](_userRequest.length);
+    uint256[] memory amountIn = new uint256[](_userRequest.length);
+
+    for (uint256 i; i < _userRequest.length; ++i) {
+      // Unpack data
+      assetIn[i] = _userRequest[i].asset;
+      amountIn[i] = _userRequest[i].amount;
+    }
+
+    _checkForDuplicates(assetIn);
+
+    if (_keepGovRights) _checkIsAllowedInGov(assetIn);
+
+    RequestData memory req = RequestData({
+      id: nonce,
+      requestor: address(this),
+      assetIn: assetIn,
+      amountIn: amountIn,
+      assetOut: new address[](0),
+      amountOut: new uint256[](0),
+      keepGovRights: _keepGovRights,
+      slippageChecker: _minTRSYExpected
+    });
+
+    nonce++;
+
+    uint256 currentAUM = fyde.getProtocolAUM();
+
+    // Cache prices in oracle (gas savings when fyde reads prices)
+    _enableOracleCache(assetIn);
+
+    // get params for tax calculation from tax module
+    (ProcessParam[] memory processParam, uint256 sharesToMint,,) =
+      taxModule.getProcessParamDeposit(req, currentAUM);
+
+    // Slippage checker
+    if (req.slippageChecker > sharesToMint) revert SlippageExceed();
+
+    // Transfer assets to Relayer
+    for (uint256 i; i < req.assetIn.length; ++i) {
+      IERC20(req.assetIn[i]).safeTransferFrom(msg.sender, address(this), req.amountIn[i]);
+    }
+
+    // Deposit
+    fyde.processDeposit(currentAUM, req);
+
+    if (_keepGovRights) {
+      for (uint256 i; i < processParam.length; ++i) {
+        // send staked trsy to the user
+        address sTrsy = GOVERNANCE_MODULE.assetToStrsy(req.assetIn[i]);
+        uint256 strsyBal = IERC20(sTrsy).balanceOf(address(this));
+        uint256 toTransfer =
+          strsyBal >= processParam[i].sharesAfterTax ? processParam[i].sharesAfterTax : strsyBal;
+        IERC20(sTrsy).transfer(msg.sender, toTransfer);
+
+        // unstake tax amount to get standard trsy
+        uint256 taxTrsy = strsyBal - toTransfer;
+        if (taxTrsy != 0) GOVERNANCE_MODULE.unstakeGov(taxTrsy, req.assetIn[i]);
+      }
+    } else {
+      // send trsy to user
+      IERC20(address(fyde)).transfer(msg.sender, sharesToMint);
+    }
+
+    _disableOracleCache();
+
+    emit Deposit(req.id, req);
+  }
+
+  ///@notice Entry function for withdrawing
+  ///@param _userRequest struct containing data
+  ///@param _maxTRSYToPay Slippage parameter ensure maximum amout of TRSY willing to pay
+  function withdraw(UserRequest[] calldata _userRequest, uint256 _maxTRSYToPay)
+    external
+    whenNotPaused
+    onlyUser
+  {
+    address[] memory assetOut = new address[](_userRequest.length);
+    uint256[] memory amountOut = new uint256[](_userRequest.length);
+
+    for (uint256 i; i < _userRequest.length; i++) {
+      assetOut[i] = _userRequest[i].asset;
+      amountOut[i] = _userRequest[i].amount;
+    }
+
+    _checkForDuplicates(assetOut);
+
+    RequestData memory req = RequestData({
+      id: nonce,
+      requestor: address(this),
+      assetIn: new address[](0),
+      amountIn: new uint256[](0),
+      assetOut: assetOut,
+      amountOut: amountOut,
+      keepGovRights: false,
+      slippageChecker: _maxTRSYToPay
+    });
+
+    nonce++;
+
+    uint256 currentAUM = fyde.getProtocolAUM();
+
+    _enableOracleCache(assetOut);
+
+    // get params for tax calculation from tax module
+    (, uint256 totalSharesToBurn,,,) = taxModule.getProcessParamWithdraw(req, currentAUM);
+
+    if (totalSharesToBurn > req.slippageChecker) revert SlippageExceed();
+
+    // Transfer TRSY to Relayer
+    IERC20(address(fyde)).transferFrom(msg.sender, address(this), totalSharesToBurn);
+
+    // Withdraw
+    fyde.processWithdraw(currentAUM, req);
+
+    // Transfer assets to user
+    for (uint256 i; i < req.assetOut.length; ++i) {
+      IERC20(req.assetOut[i]).safeTransfer(msg.sender, req.amountOut[i]);
+    }
+
+    _disableOracleCache();
+
+    emit Withdraw(req.id, req);
+  }
+
+  ///@notice Function used by user to make a (single-token) withdrawal from their governance proxy
+  ///@param _userRequest struct containing data
+  ///@param _user address of user who makes the withdraw
+  ///@param _maxTRSYToPay maximum amout of stTRSY willing to pay, otherwise withdraw reverts
+  ///@dev owner of fyde can force withdraw for other users
+  function governanceWithdraw(UserRequest memory _userRequest, address _user, uint256 _maxTRSYToPay)
+    external
+    whenNotPaused
+    onlyUser
+  {
+    if (msg.sender != _user && msg.sender != owner) revert Unauthorized();
+
+    address[] memory assetOut = new address[](1);
+    uint256[] memory amountOut = new uint256[](1);
+
+    assetOut[0] = _userRequest.asset;
+    amountOut[0] = _userRequest.amount;
+
+    // for withdraw, assetIn and amountIn are set to empty array
+    RequestData memory request = RequestData({
+      id: nonce,
+      requestor: _user,
+      assetIn: new address[](0),
+      amountIn: new uint256[](0),
+      assetOut: assetOut,
+      amountOut: amountOut,
+      keepGovRights: true,
+      slippageChecker: _maxTRSYToPay
+    });
+
+    nonce++;
+
+    uint256 currentAUM = fyde.getProtocolAUM();
+
+    fyde.processWithdraw(currentAUM, request);
+    emit Withdraw(request.id, request);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                               SWAP
+    //////////////////////////////////////////////////////////////*/
+
+  function swap(address _assetIn, uint256 _amountIn, address _assetOut, uint256 _minAmountOut)
+    external
+    whenSwapNotPaused
+    onlySwapper
+  {
+    address[] memory assetIn = new address[](1);
+    uint256[] memory amountIn = new uint256[](1);
+    address[] memory assetOut = new address[](1);
+    uint256[] memory amountOut = new uint256[](1);
+
+    assetIn[0] = _assetIn;
+    amountIn[0] = _amountIn;
+    assetOut[0] = _assetOut;
+
+    RequestData memory req = RequestData({
+      id: nonce,
+      requestor: address(this),
+      assetIn: assetIn,
+      amountIn: amountIn,
+      assetOut: assetOut,
+      amountOut: amountOut,
+      keepGovRights: false,
+      slippageChecker: _minAmountOut
+    });
+
+    nonce++;
+
+    uint256 currentAUM = fyde.getProtocolAUM();
+
+    address[] memory assetsSwap = new address[](2);
+    assetsSwap[0] = _assetIn;
+    assetsSwap[1] = _assetOut;
+
+    _enableOracleCache(assetsSwap);
+
+    // get params for tax calculation from taxModule
+    (uint256 amountOutTaxed,) =
+      taxModule.getSwapAmountOut(req.assetIn[0], req.amountIn[0], req.assetOut[0], currentAUM);
+
+    // Transfer asset to Relayer
+    IERC20(req.assetIn[0]).safeTransferFrom(msg.sender, address(this), req.amountIn[0]);
+
+    fyde.processSwap(currentAUM, req);
+
+    uint256 tokenBalance = IERC20(assetOut[0]).balanceOf(address(this));
+
+    amountOutTaxed = amountOutTaxed > tokenBalance ? tokenBalance : amountOutTaxed;
+    if (amountOutTaxed < req.slippageChecker) revert SlippageExceed();
+
+    // Transfer assets to swapper
+    IERC20(req.assetOut[0]).safeTransfer(msg.sender, amountOutTaxed);
+
+    emit Swap(req.id, req);
+
+    // deposit tax to receive trsy
+    amountIn[0] = tokenBalance - amountOutTaxed;
+    if (amountIn[0] > 0) {
+      req = RequestData({
+        id: nonce,
+        requestor: address(this),
+        assetIn: assetOut,
+        amountIn: amountIn,
+        assetOut: new address[](0),
+        amountOut: new uint256[](0),
+        keepGovRights: false,
+        slippageChecker: 0
+      });
+
+      nonce++;
+
+      currentAUM = fyde.getProtocolAUM();
+      fyde.processDeposit(currentAUM, req);
+    }
+
+    _disableOracleCache();
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                            Keeper FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice Offchain checker for AUM deviation
+  function checkUpkeep(bytes calldata checkData)
+    external
+    view
+    returns (bool upkeepNeeded, bytes memory performData)
+  {
+    (uint256 updateFactor, uint256 pauseFactor, bool isChainlink) =
+      abi.decode(checkData, (uint256, uint256, bool));
+
+    uint256 aum = fyde.getProtocolAUM();
+    uint256 nAum = fyde.computeProtocolAUM();
+
+    // AUM in range of deviation threshold times update factor do nothing
+    if (PercentageMath._isInRange(aum, nAum, updateFactor * deviationThreshold / 100)) {
+      return (false, "AUM is in range");
+    }
+
+    // if stored AUM exceeds the maximum deviation threshold by the pause factor
+    // something is wrong and we stop the protocol
+    if (!PercentageMath._isInRange(aum, nAum, pauseFactor * deviationThreshold / 100) && !paused) {
+      if (isChainlink) return (true, abi.encode(false, 0));
+      return (true, abi.encodeCall(this.performUpkeep, (abi.encode(false, 0))));
+    }
+
+    // if not in range and not outside the wider range, update AUM
+    int256 diffAUM = int256(nAum) - int256(aum);
+    if (isChainlink) return (true, abi.encode(true, diffAUM));
+    return (true, abi.encodeCall(this.performUpkeep, (abi.encode(true, diffAUM))));
+  }
+
+  function performUpkeep(bytes calldata performData) external {
+    (bool updateAum, int256 diffAUM) = abi.decode(performData, (bool, int256));
+
+    if (!updateAum) {
+      pauseProtocol();
+    } else {
+      uint256 nAum = uint256(int256(fyde.getProtocolAUM()) + diffAUM);
+      updateProtocolAUM(nAum);
+    }
+  }
+
+  ///@notice Update the protocol AUM, called by Keeper
+  function updateProtocolAUM(uint256 nAum) public onlyKeeper {
+    fyde.updateProtocolAUM(nAum);
+  }
+  /*//////////////////////////////////////////////////////////////
+                                 INTERNAL
+    //////////////////////////////////////////////////////////////*/
+
+  function _enableOracleCache(address[] memory assets) internal {
+    AssetInfo[] memory assetInfos = new AssetInfo[](assets.length);
+    for (uint256 i; i < assets.length; ++i) {
+      assetInfos[i] = fyde.assetInfo(assets[i]);
+    }
+    oracleModule.useCache(assets, assetInfos);
+  }
+
+  function _disableOracleCache() internal {
+    oracleModule.disableCache();
+  }
+
+  function _checkIsAllowedInGov(address[] memory _assets) internal view {
+    address notAllowedInGovAsset = GOVERNANCE_MODULE.isAnyNotOnGovWhitelist(_assets);
+    if (notAllowedInGovAsset != address(0x0)) {
+      revert AssetNotAllowedInGovernancePool(notAllowedInGovAsset);
+    }
+  }
+
+  function _checkForDuplicates(address[] memory _assetList) internal pure {
+    for (uint256 idx; idx < _assetList.length - 1; idx++) {
+      for (uint256 idx2 = idx + 1; idx2 < _assetList.length; idx2++) {
+        if (_assetList[idx] == _assetList[idx2]) revert DuplicatesAssets();
+      }
+    }
+  }
+
+  function _uint2str(uint256 _i) internal pure returns (string memory) {
+    if (_i == 0) return "0";
+    uint256 j = _i;
+    uint256 len;
+    while (j != 0) {
+      len++;
+      j /= 10;
+    }
+    bytes memory bstr = new bytes(len);
+    uint256 k = len;
+    while (_i != 0) {
+      k = k - 1;
+      uint8 temp = (48 + uint8(_i - (_i / 10) * 10));
+      bytes1 b1 = bytes1(temp);
+      bstr[k] = b1;
+      _i /= 10;
+    }
+    return string(bstr);
+  }
+
+  modifier whenNotPaused() {
+    if (paused) revert ActionPaused();
+    _;
+  }
+
+  modifier whenSwapNotPaused() {
+    if (swapPaused) revert ActionPaused();
+    _;
+  }
+}
+
+
+// File: src/core/QuarantineList.sol
+// SPDX-License-Identifier: BUSL-1.1
+
+pragma solidity 0.8.19;
+
+import {AccessControl} from "./AccessControl.sol";
+
+///@title QuarantineList contract
+///@notice Handle the logic for the quarantine list
+abstract contract QuarantineList is AccessControl {
+  /// -----------------------------
+  ///         Storage
+  /// -----------------------------
+  uint256 public min_quarantine_duration = 1 days;
+  mapping(address => uint128) public quarantineList;
+
+  /// -----------------------------
+  ///         Events
+  /// -----------------------------
+
+  event AddedToQuarantine(address asset, uint128 expirationTime);
+  event RemovedFromQuarantine(address asset);
+  /// -----------------------------
+  ///         Errors
+  /// -----------------------------
+
+  error AssetIsQuarantined(address asset);
+  error AssetIsNotQuarantined(address asset);
+  error ShortenedExpiration(uint128 currentExpiration, uint128 expiration);
+  error ShortQurantineDuration(uint128 duration);
+
+  /// -----------------------------
+  ///         Admin external
+  /// -----------------------------
+
+  ///@notice Set the minimum quarantine duration
+  ///@param _min_quarantine_duration the new minimum quarantine duration
+  function set_min_quarantine_duration(uint256 _min_quarantine_duration) external onlyOwner {
+    min_quarantine_duration = _min_quarantine_duration;
+  }
+
+  ///@notice Add an asset to the quarantine list
+  ///@param _asset the address of the assset to be added to the quarantine list
+  ///@param _duration the time (in seconds) that the asset should stay in quarantine
+  function addToQuarantine(address _asset, uint128 _duration) external onlyGuard {
+    if (_duration < min_quarantine_duration) revert ShortQurantineDuration(_duration);
+
+    // gas savings
+    uint128 expiration = uint128(block.timestamp) + _duration;
+    uint128 currentExpiration = quarantineList[_asset];
+
+    // the new expiration cannot be before the curent one i.e. expiration cannot be reduced, just
+    // extended
+    if (expiration <= currentExpiration) revert ShortenedExpiration(currentExpiration, expiration);
+
+    quarantineList[_asset] = expiration;
+
+    emit AddedToQuarantine(_asset, expiration);
+  }
+
+  ///@notice Remove an asset from the quarantine list
+  ///@param _asset the address of the assset to be removed from the quarantine list
+  function removeFromQuarantine(address _asset) external onlyGuard {
+    // If the asset has nto been quarantined or the duarion period has expired then revert
+    if (quarantineList[_asset] < uint128(block.timestamp)) revert AssetIsNotQuarantined(_asset);
+
+    // just set the duration to zero to remove from quarantine
+    quarantineList[_asset] = 0;
+    emit RemovedFromQuarantine(_asset);
+  }
+
+  /// -----------------------------
+  ///    External view functions
+  /// -----------------------------
+
+  ///@notice Check if an asset is quarantined
+  ///@param _asset the address of the assset to be checked
+  function isQuarantined(address _asset) public view returns (bool) {
+    return quarantineList[_asset] >= uint128(block.timestamp);
+  }
+
+  ///@notice Check if any asset from a given list is quarantined
+  ///@param _assets an array of asset addresses that need to be checked
+  ///@return address of first quarantined asset or address(0x0) if none quarantined
+  function isAnyQuarantined(address[] memory _assets) public view returns (address) {
+    for (uint256 i = 0; i < _assets.length;) {
+      if (isQuarantined(_assets[i])) return _assets[i];
+
+      unchecked {
+        ++i;
+      }
+    }
+    return address(0x0);
+  }
+}
+
+
+// File: src/core/Structs.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+struct AssetInfo {
+  uint72 targetConcentration;
+  address uniswapPool;
+  int72 incentiveFactor;
+  uint8 assetDecimals;
+  uint8 quoteTokenDecimals;
+  address uniswapQuoteToken;
+  bool isSupported;
+}
+
+struct ProtocolData {
+  ///@notice Protocol AUM in USD
+  uint256 aum;
+  ///@notice multiplicator for the tax equation, 100% = 100e18
+  uint72 taxFactor;
+  ///@notice Max deviation allowed between AUM from keeper and registry
+  uint16 maxAumDeviationAllowed; // Default val 200 == 2 %
+  ///@notice block number where AUM was last updated
+  uint48 lastAUMUpdateBlock;
+  ///@notice annual fee on AUM, in % per year 100% = 100e18
+  uint72 managementFee;
+  ///@notice last block.timestamp when fee was collected
+  uint48 lastFeeCollectionTime;
+}
+
+struct UserRequest {
+  address asset;
+  uint256 amount;
+}
+
+struct RequestData {
+  uint32 id;
+  address requestor;
+  address[] assetIn;
+  uint256[] amountIn;
+  address[] assetOut;
+  uint256[] amountOut;
+  bool keepGovRights;
+  uint256 slippageChecker;
+}
+
+struct RequestQ {
+  uint64 start;
+  uint64 end;
+  mapping(uint64 => RequestData) requestData;
+}
+
+struct ProcessParam {
+  uint256 targetConc;
+  uint256 currentConc;
+  uint256 usdValue;
+  uint256 taxableAmount;
+  uint256 taxInUSD;
+  uint256 sharesBeforeTax;
+  uint256 sharesAfterTax;
+}
+
+struct RebalanceParam {
+  address asset;
+  uint256 assetTotalAmount;
+  uint256 assetProxyAmount;
+  uint256 assetPrice;
+  uint256 sTrsyTotalSupply;
+  uint256 trsyPrice;
+}
+
+
+// File: src/utils/Ownable.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+///@title Ownable contract
+/// @notice Simple 2step owner authorization combining solmate and OZ implementation
+abstract contract Ownable {
+  /*//////////////////////////////////////////////////////////////
+                             STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice Address of the owner
+  address public owner;
+
+  ///@notice Address of the pending owner
+  address public pendingOwner;
+
+  /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+  event OwnershipTransferred(address indexed user, address indexed newOner);
+  event OwnershipTransferStarted(address indexed user, address indexed newOwner);
+  event OwnershipTransferCanceled(address indexed pendingOwner);
+
+  /*//////////////////////////////////////////////////////////////
+                                 ERROR
+    //////////////////////////////////////////////////////////////*/
+
+  error Unauthorized();
+
+  /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+  constructor(address _owner) {
+    owner = _owner;
+
+    emit OwnershipTransferred(address(0), _owner);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                             OWNERSHIP LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice Transfer ownership to a new address
+  ///@param newOwner address of the new owner
+  ///@dev newOwner have to acceptOwnership
+  function transferOwnership(address newOwner) external onlyOwner {
+    pendingOwner = newOwner;
+    emit OwnershipTransferStarted(msg.sender, pendingOwner);
+  }
+
+  ///@notice NewOwner accept the ownership, it transfer the ownership to newOwner
+  function acceptOwnership() external {
+    if (msg.sender != pendingOwner) revert Unauthorized();
+    address oldOwner = owner;
+    owner = pendingOwner;
+    delete pendingOwner;
+    emit OwnershipTransferred(oldOwner, owner);
+  }
+
+  ///@notice Cancel the ownership transfer
+  function cancelTransferOwnership() external onlyOwner {
+    emit OwnershipTransferCanceled(pendingOwner);
+    delete pendingOwner;
+  }
+
+  modifier onlyOwner() {
+    if (msg.sender != owner) revert Unauthorized();
+    _;
+  }
+}
+
+
+// File: src/utils/PercentageMath.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+library PercentageMath {
+  ///	CONSTANTS ///
+
+  uint256 internal constant PERCENTAGE_FACTOR = 1e4; // 100.00%
+  uint256 internal constant HALF_PERCENTAGE_FACTOR = 0.5e4; // 50.00%
+  uint256 internal constant MAX_UINT256 = 2 ** 256 - 1;
+  uint256 internal constant MAX_UINT256_MINUS_HALF_PERCENTAGE = 2 ** 256 - 1 - 0.5e4;
+
+  /// INTERNAL ///
+
+  ///@notice Check if value are within the range
+  function _isInRange(uint256 valA, uint256 valB, uint256 deviationThreshold)
+    internal
+    pure
+    returns (bool)
+  {
+    uint256 lowerBound = percentSub(valA, deviationThreshold);
+    uint256 upperBound = percentAdd(valA, deviationThreshold);
+    if (valB < lowerBound || valB > upperBound) return false;
+    else return true;
+  }
+
+  /// @notice Executes a percentage addition (x * (1 + p)), rounded up.
+  /// @param x The value to which to add the percentage.
+  /// @param percentage The percentage of the value to add.
+  /// @return y The result of the addition.
+  function percentAdd(uint256 x, uint256 percentage) internal pure returns (uint256 y) {
+    // Must revert if
+    // PERCENTAGE_FACTOR + percentage > type(uint256).max
+    //     or x * (PERCENTAGE_FACTOR + percentage) + HALF_PERCENTAGE_FACTOR > type(uint256).max
+    // <=> percentage > type(uint256).max - PERCENTAGE_FACTOR
+    //     or x > (type(uint256).max - HALF_PERCENTAGE_FACTOR) / (PERCENTAGE_FACTOR + percentage)
+    // Note: PERCENTAGE_FACTOR + percentage >= PERCENTAGE_FACTOR > 0
+    assembly {
+      y := add(PERCENTAGE_FACTOR, percentage) // Temporary assignment to save gas.
+
+      if or(
+        gt(percentage, sub(MAX_UINT256, PERCENTAGE_FACTOR)),
+        gt(x, div(MAX_UINT256_MINUS_HALF_PERCENTAGE, y))
+      ) { revert(0, 0) }
+
+      y := div(add(mul(x, y), HALF_PERCENTAGE_FACTOR), PERCENTAGE_FACTOR)
+    }
+  }
+
+  /// @notice Executes a percentage subtraction (x * (1 - p)), rounded up.
+  /// @param x The value to which to subtract the percentage.
+  /// @param percentage The percentage of the value to subtract.
+  /// @return y The result of the subtraction.
+  function percentSub(uint256 x, uint256 percentage) internal pure returns (uint256 y) {
+    // Must revert if
+    // percentage > PERCENTAGE_FACTOR
+    //     or x * (PERCENTAGE_FACTOR - percentage) + HALF_PERCENTAGE_FACTOR > type(uint256).max
+    // <=> percentage > PERCENTAGE_FACTOR
+    //     or ((PERCENTAGE_FACTOR - percentage) > 0 and x > (type(uint256).max -
+    // HALF_PERCENTAGE_FACTOR) / (PERCENTAGE_FACTOR - percentage))
+    assembly {
+      y := sub(PERCENTAGE_FACTOR, percentage) // Temporary assignment to save gas.
+
+      if or(
+        gt(percentage, PERCENTAGE_FACTOR), mul(y, gt(x, div(MAX_UINT256_MINUS_HALF_PERCENTAGE, y)))
+      ) { revert(0, 0) }
+
+      y := div(add(mul(x, y), HALF_PERCENTAGE_FACTOR), PERCENTAGE_FACTOR)
+    }
+  }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.3) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../extensions/IERC20Permit.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20 token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && Address.isContract(address(token));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: src/interfaces/IFyde.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+import {RequestData, RebalanceParam, ProcessParam, AssetInfo} from "src/core/Structs.sol";
+
+interface IFyde {
+  function protocolData() external view returns (uint256, uint72, uint16, uint48, uint72, uint48);
+
+  function assetInfo(address) external view returns (AssetInfo memory);
+
+  function isAnyNotSupported(address[] calldata _assets) external view returns (address);
+
+  function isSwapAllowed(address[] calldata _assets) external view returns (address);
+
+  function computeProtocolAUM() external view returns (uint256);
+
+  function getProtocolAUM() external view returns (uint256);
+
+  function updateProtocolAUM(uint256) external;
+
+  function processDeposit(uint256, RequestData calldata) external returns (uint256);
+
+  function processWithdraw(uint256, RequestData calldata) external returns (uint256);
+
+  function totalSupply() external view returns (uint256);
+
+  function setOracleModule(address _oracle) external;
+
+  function oracleModule() external view returns (address);
+
+  function setRelayer(address _relayer) external;
+
+  function RELAYER() external view returns (address);
+
+  function totalAssetAccounting(address) external view returns (uint256);
+
+  function proxyAssetAccounting(address) external view returns (uint256);
+
+  function standardAssetAccounting(address) external view returns (uint256);
+
+  function getQuote(address, uint256) external view returns (uint256);
+
+  function getAssetDecimals(address) external view returns (uint8);
+
+  function collectManagementFee() external;
+
+  function getAssetsListLength() external view returns (uint256);
+
+  function assetsList(uint256 index) external view returns (address);
+
+  function processSwap(uint256, RequestData calldata) external returns (int256);
+
+  function owner() external view returns (address);
+
+  function getProcessParamDeposit(RequestData memory _req, uint256 _protocolAUM)
+    external
+    view
+    returns (
+      ProcessParam[] memory processParam,
+      uint256 sharesToMint,
+      uint256 taxInTRSY,
+      uint256 totalUsdDeposit
+    );
+
+  function getProcessParamWithdraw(RequestData calldata _req, uint256 _protocolAUM)
+    external
+    view
+    returns (
+      ProcessParam[] memory processParam,
+      uint256 totalSharesToBurn,
+      uint256 sharesToBurnBeforeTax,
+      uint256 taxInTRSY,
+      uint256 totalUsdWithdraw
+    );
+
+  function acceptOwnership() external;
+
+  // GOVERNANCE ACCESS FUNCTIONS
+
+  function transferAsset(address _asset, address _recipient, uint256 _amount) external;
+
+  function getRebalanceParams(address _asset) external view returns (RebalanceParam memory);
+
+  function updateAssetProxyAmount(address _asset, uint256 _amount) external;
+}
+
+
+// File: src/interfaces/IGovernanceModule.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+interface IGovernanceModule {
+  function fyde() external view returns (address);
+
+  function proxyImplementation() external view returns (address);
+
+  function proxyBalance(address proxy, address asset) external view returns (uint256);
+
+  function strsyBalance(address _user, address _govToken) external view returns (uint256 balance);
+
+  function assetToStrsy(address _asset) external view returns (address);
+
+  function userToProxy(address _user) external view returns (address);
+
+  function proxyToUser(address _proxy) external view returns (address);
+
+  function isOnGovernanceWhitelist(address _asset) external view returns (bool);
+
+  function getAllGovUsers() external view returns (address[] memory);
+
+  function isAnyNotOnGovWhitelist(address[] calldata _assets) external view returns (address);
+
+  function getUserGTAllowance(uint256 _TRSYAmount, address _token) external view returns (uint256);
+
+  function govDeposit(
+    address _depositor,
+    address[] calldata _govToken,
+    uint256[] calldata _amount,
+    uint256[] calldata _amountTRSY,
+    uint256 _totalTRSY
+  ) external returns (address proxy);
+
+  function govWithdraw(
+    address _user,
+    address _asset,
+    uint256 _amountToWithdraw,
+    uint256 _trsyToBurn
+  ) external;
+
+  function onStrsyTransfer(address sender, address _recipient) external;
+
+  function unstakeGov(uint256 _amount, address _asset) external;
+
+  function rebalanceProxy(address _proxy, address _asset, address[] memory _usersToRebalance)
+    external;
+
+  function acceptOwnership() external;
+}
+
+
+// File: src/interfaces/IOracle.sol
+//SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+import {AssetInfo} from "../core/Structs.sol";
+
+interface IOracle {
+  function getPriceInUSD(address, AssetInfo calldata) external view returns (uint256);
+
+  function getGweiPrice() external view returns (uint256);
+
+  function useCache(address[] calldata addr, AssetInfo[] calldata assetInfo) external;
+
+  function disableCache() external;
+}
+
+
+// File: src/interfaces/ITaxModule.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.19;
+
+import {RequestData, ProcessParam} from "src/core/Structs.sol";
+
+interface ITaxModule {
+  function getProcessParamDeposit(RequestData memory _req, uint256 _protocolAUM)
+    external
+    view
+    returns (
+      ProcessParam[] memory processParam,
+      uint256 sharesToMint,
+      uint256 taxInTRSY,
+      uint256 totalUsdDeposit
+    );
+
+  function getProcessParamWithdraw(RequestData calldata _req, uint256 _protocolAUM)
+    external
+    view
+    returns (
+      ProcessParam[] memory processParam,
+      uint256 totalSharesToBurn,
+      uint256 sharesToBurnBeforeTax,
+      uint256 taxInTRSY,
+      uint256 totalUsdWithdraw
+    );
+
+  function getSwapAmountOut(
+    address _assetIn,
+    uint256 _amountIn,
+    address _assetOut,
+    uint256 _protocolAUM
+  ) external view returns (uint256, int256);
+}
+
+
+// File: src/core/AccessControl.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+import {Ownable} from "src/utils/Ownable.sol";
+
+///@title AccessControl
+/// @notice Handles the different access authorizations for the relayer
+abstract contract AccessControl is Ownable {
+  /*//////////////////////////////////////////////////////////////
+                             STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice exclusive user - when != address(0x0), other users are removed from whitelist
+  ///        intended for short term use during incidence response, escrow, migration
+  address public exclusiveUser;
+
+  ///@notice guard authorization
+  mapping(address => bool) public isGuard;
+
+  ///@notice keeper authorization
+  mapping(address => bool) public isKeeper;
+
+  ///@notice user authorization, can use deposit, withdraw
+  mapping(address => bool) public isUser;
+
+  ///@notice swapper authorization, can use swap
+  mapping(address => bool) public isSwapper;
+
+  ///@notice incentive manager authorization, can set incentives for swaps on Fyde
+  mapping(address => bool) public isIncentiveManager;
+
+  /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+  event ExclusiveUserSet(address indexed);
+  event GuardAdded(address indexed);
+  event GuardRemoved(address indexed);
+  event KeeperAdded(address indexed);
+  event KeeperRemoved(address indexed);
+  event UserAdded(address indexed);
+  event UserRemoved(address indexed);
+  event IncentiveManagerAdded(address indexed);
+  event IncentiveManagerRemoved(address indexed);
+  event SwapperAdded(address indexed);
+  event SwapperRemoved(address indexed);
+
+  /*//////////////////////////////////////////////////////////////
+                               SETTER
+    //////////////////////////////////////////////////////////////*/
+
+  function setExclusiveUser(address _exclusiveUser) external onlyOwner {
+    exclusiveUser = _exclusiveUser;
+    emit ExclusiveUserSet(_exclusiveUser);
+  }
+
+  function addGuard(address _guard) external onlyOwner {
+    isGuard[_guard] = true;
+    emit GuardAdded(_guard);
+  }
+
+  function removeGuard(address _guard) external onlyOwner {
+    isGuard[_guard] = false;
+    emit GuardRemoved(_guard);
+  }
+
+  function addKeeper(address _keeper) external onlyOwner {
+    isKeeper[_keeper] = true;
+    emit KeeperAdded(_keeper);
+  }
+
+  function removeKeeper(address _keeper) external onlyOwner {
+    isKeeper[_keeper] = false;
+    emit KeeperRemoved(_keeper);
+  }
+
+  function addUser(address[] calldata _user) external onlyOwner {
+    for (uint256 i; i < _user.length; ++i) {
+      isUser[_user[i]] = true;
+      emit UserAdded(_user[i]);
+    }
+  }
+
+  function removeUser(address[] calldata _user) external onlyOwner {
+    for (uint256 i; i < _user.length; ++i) {
+      isUser[_user[i]] = false;
+      emit UserRemoved(_user[i]);
+    }
+  }
+
+  function addIncentiveManager(address _incentiveManager) external onlyOwner {
+    isIncentiveManager[_incentiveManager] = true;
+    emit IncentiveManagerAdded(_incentiveManager);
+  }
+
+  function removeIncentiveManager(address _incentiveManager) external onlyOwner {
+    isIncentiveManager[_incentiveManager] = false;
+    emit IncentiveManagerRemoved(_incentiveManager);
+  }
+
+  function addSwapper(address _swapper) external onlyOwner {
+    isSwapper[_swapper] = true;
+    emit SwapperAdded(_swapper);
+  }
+
+  function removeSwapper(address _swapper) external onlyOwner {
+    isSwapper[_swapper] = false;
+    emit SwapperRemoved(_swapper);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                               MODIFIER
+    //////////////////////////////////////////////////////////////*/
+
+  ///@notice only a registered keeper can access
+  modifier onlyKeeper() {
+    if (!isKeeper[msg.sender]) revert Unauthorized();
+    _;
+  }
+
+  ///@notice only a registered guard can access
+  modifier onlyGuard() {
+    if (!isGuard[msg.sender]) revert Unauthorized();
+    _;
+  }
+
+  ///@dev whitelisting address(0x0) disables whitelist -> full permissionless access
+  ///@dev setting exclusiveUser to != address(0x0) blocks everyone else
+  ///     - intended for escrow, incidence response and migration
+  modifier onlyUser() {
+    // if whitelist is not disabeld and user not whitelisted -> no access
+    if (!isUser[address(0x0)] && !isUser[msg.sender]) revert Unauthorized();
+    // if exclusive user exists and is not user -> no accesss
+    if (exclusiveUser != address(0x0) && exclusiveUser != msg.sender) revert Unauthorized();
+    _;
+  }
+
+  ///@dev whitelisting address(0x0) disables whitelist -> full permissionless access
+  ///@dev setting exclusiveUser to != address(0x0) blocks everyone else
+  ///     - intended for escrow, incidence response and migration
+  modifier onlySwapper() {
+    if (!isSwapper[address(0x0)] && !isSwapper[msg.sender]) revert Unauthorized();
+    if (exclusiveUser != address(0x0) && exclusiveUser != msg.sender) revert Unauthorized();
+    _;
+  }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+

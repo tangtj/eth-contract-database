@@ -1,0 +1,365 @@
+
+// File: src/PSMVariant1Actions.sol
+// SPDX-License-Identifier: AGPL-3.0-or-later
+pragma solidity ^0.8.25;
+
+import { IERC20 }   from "lib/forge-std/src/interfaces/IERC20.sol";
+import { IERC4626 } from "lib/forge-std/src/interfaces/IERC4626.sol";
+
+interface PSMVariant1Like {
+    function dai() external view returns (address);
+    function gemJoin() external view returns (GemJoinLike);
+    function buyGem(address usr, uint256 gemAmt) external;
+    function sellGem(address usr, uint256 gemAmt) external;
+    function tout() external view returns (uint256);
+}
+
+interface GemJoinLike {
+    function gem() external view returns (address);
+}
+
+/**
+ * @notice Actions for swapping in PSM and depositing in an ERC4626 token.
+ * @dev    This is for the first version of the PSM.
+ *         Code: https://github.com/makerdao/dss-psm/blob/222c96d4047e76680ed6803f07dd61aa2590e42b/src/psm.sol
+ */
+contract PSMVariant1Actions {
+
+    uint256 private immutable GEM_CONVERSION_FACTOR;
+
+    PSMVariant1Like public immutable psm;
+    IERC20          public immutable dai;
+    IERC20          public immutable gem;
+    IERC4626        public immutable savingsToken;
+
+    constructor(address _psm, address _savingsToken) {
+        psm          = PSMVariant1Like(_psm);
+        dai          = IERC20(psm.dai());
+        gem          = IERC20(psm.gemJoin().gem());
+        savingsToken = IERC4626(_savingsToken);
+
+        GEM_CONVERSION_FACTOR = 10 ** (dai.decimals() - gem.decimals());
+
+        // Infinite approvals
+        gem.approve(address(psm.gemJoin()), type(uint256).max);  // For psm.sellGem()
+        dai.approve(address(psm),           type(uint256).max);  // For psm.buyGem()
+        dai.approve(address(savingsToken),  type(uint256).max);  // For savingsToken.deposit()
+    }
+
+    /**
+     * @notice Swap `gem` for `dai` in the PSM and deposit in the `savingsToken`.
+     * @dev    Please note that `minAmountOut` is measured in `dai` due to increasing value of the `savingsToken`.
+     *         `minAmountOut` is used to protect in the case PSM fees change.
+     * @param  receiver     The receiver of the `savingsToken`.
+     * @param  amountIn     The amount of the `gem` to swap.
+     * @param  minAmountOut The minimum amount of `dai` to receive.
+     * @return amountOut    The amount of `dai` deposited into the `savingsToken`.
+     */
+    function swapAndDeposit(
+        address receiver,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) external returns (uint256 amountOut) {
+        gem.transferFrom(msg.sender, address(this), amountIn);
+
+        // There may be a balance in this contract, so we determine the difference
+        uint256 balanceBefore = dai.balanceOf(address(this));
+        psm.sellGem(address(this), amountIn);
+        amountOut = dai.balanceOf(address(this)) - balanceBefore;
+        require(amountOut >= minAmountOut, "PSMVariant1Actions/amount-out-too-low");
+
+        savingsToken.deposit(amountOut, receiver);
+    }
+
+    /**
+     * @notice Withdraw a specified amount of output `gem` with a maximum limit of `savingsToken` (in DAI units).
+     *         Use this if you want an exact amount of `gem` tokens out. IE pay someone 10k exactly.
+     * @dev    Please note that `maxAmountIn` is measured in `dai` due to increasing value of the `savingsToken`.
+     *         `maxAmountIn` is used to protect in the case PSM fees change.
+     * @param  receiver    The receiver of the `gem`.
+     * @param  amountOut   The amount of `gem` you want to receive.
+     * @param  maxAmountIn The maximum amount of `dai` to pay for this swap.
+     * @return amountIn    The amount of `dai` used for the swap.
+     */
+    function withdrawAndSwap(
+        address receiver,
+        uint256 amountOut,
+        uint256 maxAmountIn
+    ) external returns (uint256 amountIn) {
+        // Calculate the exact amount of required dai based on the expected output
+        // We are performing the calculation at https://github.com/makerdao/dss-psm/blob/222c96d4047e76680ed6803f07dd61aa2590e42b/src/psm.sol#L121
+        uint256 amountOut18 = amountOut * GEM_CONVERSION_FACTOR;
+        savingsToken.withdraw(amountOut18 + amountOut18 * psm.tout() / 1e18, address(this), msg.sender);
+
+        // There may be a balance in this contract, so we determine the difference
+        uint256 balanceBefore = dai.balanceOf(address(this));
+        psm.buyGem(receiver, amountOut);
+        amountIn = balanceBefore - dai.balanceOf(address(this));
+        require(amountIn <= maxAmountIn, "PSMVariant1Actions/amount-in-too-high");
+    }
+
+    /**
+     * @notice Redeem a specified amount of `savingsToken` from the `savingsToken` for `dai` and swap for `gem` in the PSM.
+     *         Use this if you want to withdraw everything.
+     * @dev    Please note that this will leave dust due to rounding error in this contract.
+     * @param  receiver     The receiver of the `gem`.
+     * @param  shares       The amount of shares to redeem.
+     * @param  minAmountOut The minimum amount of `gem` to receive.
+     * @return amountOut    The amount of `gem` tokens received.
+     */
+    function redeemAndSwap(
+        address receiver,
+        uint256 shares,
+        uint256 minAmountOut
+    ) external returns (uint256 amountOut) {
+        uint256 assets = savingsToken.redeem(shares, address(this), msg.sender);
+
+        // Calculate the exact amount of gems we expect to receive given this amount of assets
+        // We are reversing the calculation at https://github.com/makerdao/dss-psm/blob/222c96d4047e76680ed6803f07dd61aa2590e42b/src/psm.sol#L121
+        // Note: Due to rounding, this may leave dai dust in the contract
+        amountOut = assets * 1e18 / (GEM_CONVERSION_FACTOR * (1e18 + psm.tout()));
+        require(amountOut >= minAmountOut, "PSMVariant1Actions/amount-out-too-low");
+        psm.buyGem(receiver, amountOut);
+    }
+
+}
+
+
+// File: lib/forge-std/src/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2;
+
+/// @dev Interface of the ERC20 standard as defined in the EIP.
+/// @dev This includes the optional name, symbol, and decimals metadata.
+interface IERC20 {
+    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`
+    /// is the new allowance.
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /// @notice Returns the amount of tokens in existence.
+    function totalSupply() external view returns (uint256);
+
+    /// @notice Returns the amount of tokens owned by `account`.
+    function balanceOf(address account) external view returns (uint256);
+
+    /// @notice Moves `amount` tokens from the caller's account to `to`.
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /// @notice Returns the remaining number of tokens that `spender` is allowed
+    /// to spend on behalf of `owner`
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.
+    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.
+    /// `amount` is then deducted from the caller's allowance.
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+    /// @notice Returns the name of the token.
+    function name() external view returns (string memory);
+
+    /// @notice Returns the symbol of the token.
+    function symbol() external view returns (string memory);
+
+    /// @notice Returns the decimals places of the token.
+    function decimals() external view returns (uint8);
+}
+
+
+// File: lib/forge-std/src/interfaces/IERC4626.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2;
+
+import "./IERC20.sol";
+
+/// @dev Interface of the ERC4626 "Tokenized Vault Standard", as defined in
+/// https://eips.ethereum.org/EIPS/eip-4626
+interface IERC4626 is IERC20 {
+    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
+
+    event Withdraw(
+        address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares
+    );
+
+    /// @notice Returns the address of the underlying token used for the Vault for accounting, depositing, and withdrawing.
+    /// @dev
+    /// - MUST be an ERC-20 token contract.
+    /// - MUST NOT revert.
+    function asset() external view returns (address assetTokenAddress);
+
+    /// @notice Returns the total amount of the underlying asset that is “managed” by Vault.
+    /// @dev
+    /// - SHOULD include any compounding that occurs from yield.
+    /// - MUST be inclusive of any fees that are charged against assets in the Vault.
+    /// - MUST NOT revert.
+    function totalAssets() external view returns (uint256 totalManagedAssets);
+
+    /// @notice Returns the amount of shares that the Vault would exchange for the amount of assets provided, in an ideal
+    /// scenario where all the conditions are met.
+    /// @dev
+    /// - MUST NOT be inclusive of any fees that are charged against assets in the Vault.
+    /// - MUST NOT show any variations depending on the caller.
+    /// - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.
+    /// - MUST NOT revert.
+    ///
+    /// NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the
+    /// “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and
+    /// from.
+    function convertToShares(uint256 assets) external view returns (uint256 shares);
+
+    /// @notice Returns the amount of assets that the Vault would exchange for the amount of shares provided, in an ideal
+    /// scenario where all the conditions are met.
+    /// @dev
+    /// - MUST NOT be inclusive of any fees that are charged against assets in the Vault.
+    /// - MUST NOT show any variations depending on the caller.
+    /// - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.
+    /// - MUST NOT revert.
+    ///
+    /// NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the
+    /// “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and
+    /// from.
+    function convertToAssets(uint256 shares) external view returns (uint256 assets);
+
+    /// @notice Returns the maximum amount of the underlying asset that can be deposited into the Vault for the receiver,
+    /// through a deposit call.
+    /// @dev
+    /// - MUST return a limited value if receiver is subject to some deposit limit.
+    /// - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of assets that may be deposited.
+    /// - MUST NOT revert.
+    function maxDeposit(address receiver) external view returns (uint256 maxAssets);
+
+    /// @notice Allows an on-chain or off-chain user to simulate the effects of their deposit at the current block, given
+    /// current on-chain conditions.
+    /// @dev
+    /// - MUST return as close to and no more than the exact amount of Vault shares that would be minted in a deposit
+    ///   call in the same transaction. I.e. deposit should return the same or more shares as previewDeposit if called
+    ///   in the same transaction.
+    /// - MUST NOT account for deposit limits like those returned from maxDeposit and should always act as though the
+    ///   deposit would be accepted, regardless if the user has enough tokens approved, etc.
+    /// - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.
+    /// - MUST NOT revert.
+    ///
+    /// NOTE: any unfavorable discrepancy between convertToShares and previewDeposit SHOULD be considered slippage in
+    /// share price or some other type of condition, meaning the depositor will lose assets by depositing.
+    function previewDeposit(uint256 assets) external view returns (uint256 shares);
+
+    /// @notice Mints shares Vault shares to receiver by depositing exactly amount of underlying tokens.
+    /// @dev
+    /// - MUST emit the Deposit event.
+    /// - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+    ///   deposit execution, and are accounted for during deposit.
+    /// - MUST revert if all of assets cannot be deposited (due to deposit limit being reached, slippage, the user not
+    ///   approving enough underlying tokens to the Vault contract, etc).
+    ///
+    /// NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+
+    /// @notice Returns the maximum amount of the Vault shares that can be minted for the receiver, through a mint call.
+    /// @dev
+    /// - MUST return a limited value if receiver is subject to some mint limit.
+    /// - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of shares that may be minted.
+    /// - MUST NOT revert.
+    function maxMint(address receiver) external view returns (uint256 maxShares);
+
+    /// @notice Allows an on-chain or off-chain user to simulate the effects of their mint at the current block, given
+    /// current on-chain conditions.
+    /// @dev
+    /// - MUST return as close to and no fewer than the exact amount of assets that would be deposited in a mint call
+    ///   in the same transaction. I.e. mint should return the same or fewer assets as previewMint if called in the
+    ///   same transaction.
+    /// - MUST NOT account for mint limits like those returned from maxMint and should always act as though the mint
+    ///   would be accepted, regardless if the user has enough tokens approved, etc.
+    /// - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.
+    /// - MUST NOT revert.
+    ///
+    /// NOTE: any unfavorable discrepancy between convertToAssets and previewMint SHOULD be considered slippage in
+    /// share price or some other type of condition, meaning the depositor will lose assets by minting.
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+
+    /// @notice Mints exactly shares Vault shares to receiver by depositing amount of underlying tokens.
+    /// @dev
+    /// - MUST emit the Deposit event.
+    /// - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the mint
+    ///   execution, and are accounted for during mint.
+    /// - MUST revert if all of shares cannot be minted (due to deposit limit being reached, slippage, the user not
+    ///   approving enough underlying tokens to the Vault contract, etc).
+    ///
+    /// NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+
+    /// @notice Returns the maximum amount of the underlying asset that can be withdrawn from the owner balance in the
+    /// Vault, through a withdraw call.
+    /// @dev
+    /// - MUST return a limited value if owner is subject to some withdrawal limit or timelock.
+    /// - MUST NOT revert.
+    function maxWithdraw(address owner) external view returns (uint256 maxAssets);
+
+    /// @notice Allows an on-chain or off-chain user to simulate the effects of their withdrawal at the current block,
+    /// given current on-chain conditions.
+    /// @dev
+    /// - MUST return as close to and no fewer than the exact amount of Vault shares that would be burned in a withdraw
+    ///   call in the same transaction. I.e. withdraw should return the same or fewer shares as previewWithdraw if
+    ///   called
+    ///   in the same transaction.
+    /// - MUST NOT account for withdrawal limits like those returned from maxWithdraw and should always act as though
+    ///   the withdrawal would be accepted, regardless if the user has enough shares, etc.
+    /// - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.
+    /// - MUST NOT revert.
+    ///
+    /// NOTE: any unfavorable discrepancy between convertToShares and previewWithdraw SHOULD be considered slippage in
+    /// share price or some other type of condition, meaning the depositor will lose assets by depositing.
+    function previewWithdraw(uint256 assets) external view returns (uint256 shares);
+
+    /// @notice Burns shares from owner and sends exactly assets of underlying tokens to receiver.
+    /// @dev
+    /// - MUST emit the Withdraw event.
+    /// - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+    ///   withdraw execution, and are accounted for during withdraw.
+    /// - MUST revert if all of assets cannot be withdrawn (due to withdrawal limit being reached, slippage, the owner
+    ///   not having enough shares, etc).
+    ///
+    /// Note that some implementations will require pre-requesting to the Vault before a withdrawal may be performed.
+    /// Those methods should be performed separately.
+    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+
+    /// @notice Returns the maximum amount of Vault shares that can be redeemed from the owner balance in the Vault,
+    /// through a redeem call.
+    /// @dev
+    /// - MUST return a limited value if owner is subject to some withdrawal limit or timelock.
+    /// - MUST return balanceOf(owner) if owner is not subject to any withdrawal limit or timelock.
+    /// - MUST NOT revert.
+    function maxRedeem(address owner) external view returns (uint256 maxShares);
+
+    /// @notice Allows an on-chain or off-chain user to simulate the effects of their redeemption at the current block,
+    /// given current on-chain conditions.
+    /// @dev
+    /// - MUST return as close to and no more than the exact amount of assets that would be withdrawn in a redeem call
+    ///   in the same transaction. I.e. redeem should return the same or more assets as previewRedeem if called in the
+    ///   same transaction.
+    /// - MUST NOT account for redemption limits like those returned from maxRedeem and should always act as though the
+    ///   redemption would be accepted, regardless if the user has enough shares, etc.
+    /// - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.
+    /// - MUST NOT revert.
+    ///
+    /// NOTE: any unfavorable discrepancy between convertToAssets and previewRedeem SHOULD be considered slippage in
+    /// share price or some other type of condition, meaning the depositor will lose assets by redeeming.
+    function previewRedeem(uint256 shares) external view returns (uint256 assets);
+
+    /// @notice Burns exactly shares from owner and sends assets of underlying tokens to receiver.
+    /// @dev
+    /// - MUST emit the Withdraw event.
+    /// - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+    ///   redeem execution, and are accounted for during redeem.
+    /// - MUST revert if all of shares cannot be redeemed (due to withdrawal limit being reached, slippage, the owner
+    ///   not having enough shares, etc).
+    ///
+    /// NOTE: some implementations will require pre-requesting to the Vault before a withdrawal may be performed.
+    /// Those methods should be performed separately.
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+}
+

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity 0.8.0;
+
+contract HowMuchYouLikeEth {
+
+    event HowMuchYouLikeETH(uint8 aNumberBetween_0_And_255);
+
+    function howMuchYouLikeETH(uint8 ANumberBetween_0_And_255) public {
+        emit HowMuchYouLikeETH(ANumberBetween_0_And_255);
+    }
+
+}

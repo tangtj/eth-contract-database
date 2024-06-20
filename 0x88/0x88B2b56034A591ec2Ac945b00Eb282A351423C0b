@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: MIT
+
+/*
+ * x: https://x.com/trumphamsterERC
+ * web: https://hamstertrump.vip
+ * tg: https://t.me/trumphamster
+ */
+pragma solidity ^0.8.20;
+
+
+interface Callable {
+	function tokenCallback(address _from, uint256 _tokens, bytes calldata _data) external returns (bool);
+}
+
+interface Router {
+	function factory() external view returns (address);
+	function positionManager() external view returns (address);
+	function WETH9() external view returns (address);
+}
+
+interface Factory {
+	function createPool(address _tokenA, address _tokenB, uint24 _fee) external returns (address);
+}
+
+interface Pool {
+	function initialize(uint160 _sqrtPriceX96) external;
+	function token0() external view returns (address);
+	function token1() external view returns (address);
+	function fee() external view returns (uint24);
+	function collect(
+		address recipient,
+		int24 tickLower,
+		int24 tickUpper,
+		uint128 amount0Requested,
+		uint128 amount1Requested
+	) external returns (uint128 amount0, uint128 amount1);
+}
+
+interface IWETH9 {
+	function name() external view returns (string memory);
+	function symbol() external view returns (string memory);
+	function decimals() external view returns (uint8);
+	function balanceOf(address account) external view returns (uint);
+	function allowance(address owner, address spender) external view returns (uint);
+
+	function deposit() external payable;
+	function withdraw(uint wad) external;
+	function totalSupply() external view returns (uint);
+	function approve(address guy, uint wad) external returns (bool);
+	function transfer(address dst, uint wad) external returns (bool);
+	function transferFrom(address src, address dst, uint wad) external returns (bool);
+
+	event Approval(address indexed src, address indexed guy, uint wad);
+	event Transfer(address indexed src, address indexed dst, uint wad);
+	event Deposit(address indexed dst, uint wad);
+	event Withdrawal(address indexed src, uint wad);
+}
+
+interface PositionManager {
+	struct MintParams {
+		address token0;
+		address token1;
+		uint24 fee;
+		int24 tickLower;
+		int24 tickUpper;
+		uint256 amount0Desired;
+		uint256 amount1Desired;
+		uint256 amount0Min;
+		uint256 amount1Min;
+		address recipient;
+		uint256 deadline;
+	}
+	struct CollectParams {
+		uint256 tokenId;
+		address recipient;
+		uint128 amount0Max;
+		uint128 amount1Max;
+	}
+	function mint(MintParams calldata) external payable returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
+	function collect(CollectParams calldata) external payable returns (uint256 amount0, uint256 amount1);
+}
+
+
+contract TrumpHamster {
+
+	uint256 constant private FLOAT_SCALAR = 2**64;
+	uint256 constant private UINT_MAX = type(uint256).max;
+	uint128 constant private UINT128_MAX = type(uint128).max;
+	uint256 constant private INITIAL_SUPPLY = 1e27; // 1 billion
+	Router constant private ROUTER = Router(0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45);
+	uint256 constant private INITIAL_ETH_LIQ = 5 ether; // 5 ETH initial market cap price
+	
+	string constant public name = "Trump Hamster";
+	string constant public symbol = "TRUMPH";
+	uint8 constant public decimals = 18;
+
+	struct User {
+		uint256 balance;
+		mapping(address => uint256) allowance;
+	}
+
+	struct Info {
+		address owner;
+		address pool;
+		uint256 totalSupply;
+		mapping(address => User) users;
+		uint256 positionId;
+		int24 tickLower;
+		int24 tickUpper;
+		
+	}
+	Info private info;
+
+
+	event Transfer(address indexed from, address indexed to, uint256 tokens);
+	event Approval(address indexed owner, address indexed spender, uint256 tokens);
+
+
+	constructor() {
+		address _this = address(this);
+		address _weth = ROUTER.WETH9();
+		(uint256 amount0, uint256 amount1) = _weth > _this ? (INITIAL_SUPPLY, INITIAL_ETH_LIQ) : (INITIAL_ETH_LIQ, INITIAL_SUPPLY);
+		uint160 _initialSqrtPrice = encodeSqrtRatioX96(amount1, amount0);
+		info.pool = Factory(ROUTER.factory()).createPool(_this, _weth, 10000);
+		Pool(pool()).initialize(_initialSqrtPrice);
+		info.owner = tx.origin;
+		info.tickLower = -887200;
+		info.tickUpper = 887200;
+	}
+	
+	function initialize() payable external {
+		require(totalSupply() == 0);
+		require(msg.value >= INITIAL_ETH_LIQ, "not enough liq");
+		address _this = address(this);
+		address _weth = ROUTER.WETH9();
+		IWETH9 _weth_contract = IWETH9(_weth);
+
+		_weth_contract.deposit{value: INITIAL_ETH_LIQ}();
+		_weth_contract.approve(ROUTER.positionManager(), UINT_MAX);
+		require(_weth_contract.balanceOf(_this) == INITIAL_ETH_LIQ, "INSUFFICIENT WETH WRAP");
+		Pool _pool = Pool(info.pool);
+		PositionManager _pm = PositionManager(ROUTER.positionManager());
+		info.totalSupply = INITIAL_SUPPLY;
+		info.users[_this].balance = INITIAL_SUPPLY;
+		emit Transfer(address(0x0), _this, INITIAL_SUPPLY);
+		_approve(_this, address(_pm), INITIAL_SUPPLY);
+		(info.positionId, , , ) = _pm.mint(PositionManager.MintParams({
+			token0: _pool.token0(),
+			token1: _pool.token1(),
+			fee: _pool.fee(),
+			tickLower: info.tickLower,
+			tickUpper: info.tickUpper,
+			amount0Desired: _pool.token0() == _this ? INITIAL_SUPPLY : INITIAL_ETH_LIQ,
+			amount1Desired: _pool.token1() == _this ? INITIAL_SUPPLY : INITIAL_ETH_LIQ,
+			amount0Min: 0,
+			amount1Min: 0,
+			recipient: _this,
+			deadline: block.timestamp
+		}));
+
+		payable(info.owner).transfer(_this.balance);
+		
+	}
+
+	function collectTradingFees() external {
+		PositionManager _pm = PositionManager(ROUTER.positionManager());
+		_pm.collect(PositionManager.CollectParams({
+			tokenId: info.positionId,
+			recipient: address(this),
+			amount0Max: UINT128_MAX,
+			amount1Max: UINT128_MAX
+		}));
+		
+	}
+
+	function transfer(address _to, uint256 _tokens) external returns (bool) {
+		return _transfer(msg.sender, _to, _tokens);
+	}
+
+	function approve(address _spender, uint256 _tokens) external returns (bool) {
+		return _approve(msg.sender, _spender, _tokens);
+	}
+
+	function transferFrom(address _from, address _to, uint256 _tokens) external returns (bool) {
+		uint256 _allowance = allowance(_from, msg.sender);
+		require(_allowance >= _tokens);
+		if (_allowance != UINT_MAX) {
+			info.users[_from].allowance[msg.sender] -= _tokens;
+		}
+		return _transfer(_from, _to, _tokens);
+	}
+
+	function transferAndCall(address _to, uint256 _tokens, bytes calldata _data) external returns (bool) {
+		_transfer(msg.sender, _to, _tokens);
+		uint32 _size;
+		assembly {
+			_size := extcodesize(_to)
+		}
+		if (_size > 0) {
+			require(Callable(_to).tokenCallback(msg.sender, _tokens, _data));
+		}
+		return true;
+	}
+	
+
+	function pool() public view returns (address) {
+		return info.pool;
+	}
+
+	function totalSupply() public view returns (uint256) {
+		return info.totalSupply;
+	}
+
+	function balanceOf(address _user) public view returns (uint256) {
+		return info.users[_user].balance;
+	}
+
+	function allowance(address _user, address _spender) public view returns (uint256) {
+		return info.users[_user].allowance[_spender];
+	}
+
+	function positions() external view returns (uint256 position) {
+		return (info.positionId);
+	}
+
+
+	function _approve(address _owner, address _spender, uint256 _tokens) internal returns (bool) {
+		info.users[_owner].allowance[_spender] = _tokens;
+		emit Approval(_owner, _spender, _tokens);
+		return true;
+	}
+	
+	function _transfer(address _from, address _to, uint256 _tokens) internal returns (bool) {
+		unchecked {
+			require(balanceOf(_from) >= _tokens);
+			info.users[_from].balance -= _tokens;
+			info.users[_to].balance += _tokens;
+			emit Transfer(_from, _to, _tokens);
+			return true;
+		}
+	}
+
+	
+
+	function _sqrt(uint256 y) internal pure returns (uint256 z) {
+		unchecked {
+			if (y == 0) return 0;
+			if (y <= 3) return 1;
+			z = y;
+			uint256 x = y / 2 + 1;
+			while (x < z) {
+				z = x;
+				x = (y / x + x) / 2;
+			}
+		}
+	}
+
+	function encodeSqrtRatioX96(uint256 amount1, uint256 amount0) internal pure returns (uint160) {
+		require(amount0 > 0, "Amount0 must be greater than zero");
+		uint256 numerator = amount1 << 192;
+		uint256 ratioX192 = numerator / amount0;
+		return uint160(_sqrt(ratioX192));
+	}
+
+	
+}

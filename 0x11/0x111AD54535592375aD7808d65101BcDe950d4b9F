@@ -1,0 +1,415 @@
+// SPDX-License-Identifier: GPL-3.0 AND MIT
+
+// File @openzeppelin/contracts/utils/Context.sol@v5.0.1
+
+// Original license: SPDX_License_Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File @openzeppelin/contracts/access/Ownable.sol@v5.0.1
+
+// Original license: SPDX_License_Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File @openzeppelin/contracts/token/ERC20/IERC20.sol@v5.0.1
+
+// Original license: SPDX_License_Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File contracts/PlanetStaking.sol
+
+// Original license: SPDX_License_Identifier: GPL-3.0
+
+pragma solidity >=0.8.20;
+
+
+contract PlanetStaking is Ownable {
+    fallback() external payable{}
+    receive() external payable{}
+
+    struct LockType {
+        uint256 id;
+        address owner;
+        uint256 amount;
+        uint256 lockDate;
+        uint256 unlockDate;
+        uint256 userLockIndex;
+        bool isUnlocked;
+    }
+
+    // address constant WETH_ADDRESS = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c; // WBNB
+    // address constant PLANET_ADDRESS = 0xCa6d678e74f553f0E59cccC03ae644a3c2c5EE7d; // Bsc
+
+    address constant WETH_ADDRESS = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2; // WETH
+    address constant PLANET_ADDRESS = 0x2aD9adDD0d97EC3cDBA27F92bF6077893b76Ab0b; // Eth
+
+    uint256 public lockEnd;
+    uint256 public minimumAmount;
+    uint256 public totalStaked;
+    uint256 public activeLocks;
+    uint256 public locksCount;
+    address public claimContract;
+    address public operator;
+
+    mapping(uint256 => LockType) public locks;
+    mapping(address => uint256[]) public userLocks;
+
+    event Locked(uint256 indexed lockId, address indexed owner, uint256 amount, uint256 from, uint256 to);
+    event Unlocked(uint256 indexed lockId, address indexed owner, uint256 amount, uint256 from, uint256 to);
+    event RewardClaimed(uint256 indexed lockId, address indexed owner);
+
+    constructor(uint256 _lockEnd, uint256 _minimumAmount) Ownable(msg.sender) {
+        lockEnd = _lockEnd;
+        minimumAmount = _minimumAmount;
+        operator = msg.sender;
+    }
+
+    modifier onlyOperator() {
+        require(msg.sender == operator || msg.sender == owner(), "only operator");
+        _;
+    }
+
+    modifier onlyClaimContract() {
+        require(msg.sender == claimContract, "only claimContract");
+        _;
+    }
+
+    function lockAll() external {
+        IERC20 planet = IERC20(PLANET_ADDRESS);
+        lock(planet.balanceOf(msg.sender));
+    }
+
+    function lock(uint256 _amount) public {
+        require(block.timestamp < lockEnd, "Lock period ended");
+        require(_amount > 0, "_amount must be > 0");
+        require(_amount >= minimumAmount, "_amount below minimumAmount");
+
+        IERC20 planet = IERC20(PLANET_ADDRESS);
+        uint256[] storage thisUserLocks = userLocks[msg.sender];
+
+        // Take the tokens
+        uint256 balanceBefore = planet.balanceOf(address(this));
+        planet.transferFrom(msg.sender, address(this), _amount);
+        uint256 balanceAfter = planet.balanceOf(address(this));
+        require(balanceAfter - balanceBefore == _amount, "transferFrom failed");
+
+        // Add a new lock, use the current locksCount as the lock id
+        thisUserLocks.push(locksCount);
+        LockType storage l = locks[locksCount];
+
+        // Save lock data
+        l.id = locksCount;
+        l.owner = msg.sender;
+        l.amount = _amount;
+        l.lockDate = block.timestamp;
+        l.unlockDate = lockEnd;
+        l.userLockIndex = thisUserLocks.length - 1;
+
+        emit Locked(locksCount, msg.sender, _amount, block.timestamp, lockEnd);
+
+        totalStaked += _amount;
+        activeLocks++;
+        locksCount++;
+    }
+
+    function withdraw(uint256 _lockId) external {
+        LockType storage l = locks[_lockId];
+        require(l.owner == msg.sender, "!l.owner");
+        return _withdraw(_lockId);
+    }
+
+    function withdrawOnBehalf(uint256 _lockId, address _owner) external onlyOperator {
+        LockType storage l = locks[_lockId];
+        require(l.owner == _owner, "!l.owner");
+        return _withdraw(_lockId);
+    }
+
+    function _withdraw(uint256 _lockId) internal {
+        LockType storage l = locks[_lockId];
+        require(l.owner != address(0), "l.owner == 0");
+        require(l.unlockDate <= block.timestamp, "!expired");
+        require(l.isUnlocked == false, "l.isUnlocked == true");
+        require(IERC20(PLANET_ADDRESS).balanceOf(address(this)) >= l.amount, "!balance");
+
+        IERC20(PLANET_ADDRESS).transfer(l.owner, l.amount);
+
+        emit Unlocked(_lockId, l.owner, l.amount, l.lockDate, l.unlockDate);
+
+        // Mark the lock as withdrawn, but the lock will remain active until the owner claims his rewards in a separate contract
+        l.isUnlocked = true;
+    }
+
+    function claimRewardOnBehalfOf(uint256 _lockId) external onlyOperator returns (uint256) {
+        return _claimReward(_lockId);
+    }
+
+    function claimReward(uint256 _lockId, address _requester) external onlyClaimContract returns (uint256) {
+        LockType storage l = locks[_lockId];
+        require(l.owner == _requester, "l.owner != _requester");
+        require(l.isUnlocked == true, "l.isUnlocked != true");
+        return _claimReward(_lockId);
+    }
+
+    function _claimReward(uint256 _lockId) internal returns (uint256 amount) {
+        LockType storage l = locks[_lockId];
+
+        amount = l.amount;
+
+        emit RewardClaimed(_lockId, l.owner);
+
+        // The lock is no longer active after the user claims his rewards
+        activeLocks--;
+
+        // Delete the lock id from the userLocks array
+        uint256[] storage thisUserLocks = userLocks[l.owner];
+        thisUserLocks[l.userLockIndex] = thisUserLocks[thisUserLocks.length - 1];
+        locks[thisUserLocks[thisUserLocks.length - 1]].userLockIndex = l.userLockIndex;
+        thisUserLocks.pop();
+
+        // Delete the lock
+        delete locks[_lockId];
+    }
+
+    function userLocksLength(address _user) external view returns (uint256) {
+        return userLocks[_user].length;
+    }
+
+    function getUserLocks(address _user) external view returns (LockType[] memory) {
+        uint256[] storage userLocksIds = userLocks[_user];
+        LockType[] memory result = new LockType[](userLocksIds.length);
+
+        for (uint256 i = 0; i < userLocksIds.length; i++) {
+            result[i] = locks[userLocksIds[i]];
+        }
+
+        return result;
+    }
+
+    function isUnlockable(uint256 _lockId) external view returns (bool) {
+        LockType storage l = locks[_lockId];
+        require(l.owner != address(0), "l.owner == 0");
+        return l.unlockDate <= block.timestamp;
+    }
+
+    function setLockEnd(uint256 _lockEnd) external onlyOperator {
+        lockEnd = _lockEnd;
+    }
+
+    function setMinimumAmount(uint256 _amount) external onlyOperator {
+        require(_amount > 0, "_amount == 0");
+        minimumAmount = _amount;
+    }
+
+    function setClaimContract(address _claimContract) external onlyOperator {
+        claimContract = _claimContract;
+    }
+
+    function rescueTokens(address _token, uint256 _amount) external onlyOwner {
+        IERC20(_token).transfer(msg.sender, _amount);
+    }
+
+    function rescueETH() external onlyOwner {
+        payable(msg.sender).transfer(address(this).balance);
+    }
+}

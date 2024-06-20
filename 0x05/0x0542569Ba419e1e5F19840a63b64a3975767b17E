@@ -1,0 +1,522 @@
+
+// File: src/TatsuStaking.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import {ITatsuStaking} from "./interface/ITatsuStaking.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+
+//======================================================================
+//             CUSTOM ERRORS
+//======================================================================
+error TATSU_Vault____InvalidPoolId(uint256 poolId);
+error TATSU_Vault____NoRewardsAvailable();
+error TATSU_Vault____AlreadyStaked();
+error TATSU_Vault____NothingToClaim();
+error TATSU_Vault_____CantClaimYet();
+error TATSU_Vault_____RewardLimitReached();
+error TATSU_Vault____InvalidPoolParameters();
+
+/**
+ * @title TatsuStaking
+ * @author SemiInvader
+ * @notice This is the staking contract for TATSU token. User can stake their TATSU tokens and earn more TATSU at a fixed rate.
+ *     the APR is exclusively in TATSU, NOT in USD or any other token value.
+ */
+
+contract TatsuStaking is ITatsuStaking, Ownable {
+    mapping(uint256 => PoolInfo) public poolInfo;
+    mapping(address user => mapping(uint256 poolId => StakeInfo)) public stake;
+
+    IERC20 public tatsu;
+    uint256 private maxPool = 1;
+
+    uint256 private constant PERCENTAGE_DECIMALS = 100;
+
+    //======================================================================
+    //             Events
+    //======================================================================
+    event Deposit(address indexed user, uint256 indexed poolId, uint256 amount);
+    event Claim(
+        address indexed user,
+        uint256 indexed poolId,
+        uint256 rewardAmount,
+        uint256 depositAmount
+    );
+    event PoolCreated(
+        uint256 indexed poolId,
+        uint256 rewardRate,
+        uint256 lockTime,
+        uint256 initPool
+    );
+    event AddRewardsToPool(uint256 indexed poolId, uint256 rewardsAdded);
+    event PoolEnableStatusChanged(uint256 indexed poolId, bool enabled);
+
+    //======================================================================
+    //             Constructor
+    //======================================================================
+    constructor(address _tatsuAddress) Ownable(msg.sender) {
+        tatsu = IERC20(_tatsuAddress);
+    }
+
+    //======================================================================
+    //             External / Public Functions
+    //======================================================================
+
+    //===================================
+    //       Staking Functions
+    //===================================
+    function deposit(uint256 poolId, uint256 amount) external {
+        PoolInfo storage pool = poolInfo[poolId];
+        StakeInfo storage userStake = stake[msg.sender][poolId];
+        if (!pool.enabled || amount == 0 || poolId >= maxPool) {
+            revert TATSU_Vault____InvalidPoolId(poolId);
+        }
+        if (userStake.amount > 0) {
+            revert TATSU_Vault____AlreadyStaked();
+        }
+
+        uint rewardToBlock = (amount * pool.rewardRate * pool.lockTime) /
+            (PERCENTAGE_DECIMALS * 365 days);
+
+        userStake.stakeTime = block.timestamp;
+        userStake.unlockTime = block.timestamp + pool.lockTime;
+        userStake.amount = amount;
+        userStake.maxClaimableThisPeriod = rewardToBlock;
+        pool.totalStaked += amount;
+
+        uint availableReward = pool.totalRewards - pool.blockedReward;
+        if (rewardToBlock > availableReward) {
+            revert TATSU_Vault_____RewardLimitReached();
+        }
+        pool.blockedReward += rewardToBlock;
+
+        tatsu.transferFrom(msg.sender, address(this), amount);
+        emit Deposit(msg.sender, poolId, amount);
+    }
+
+    function claim(uint256 _poolId) external {
+        PoolInfo storage pool = poolInfo[_poolId];
+        StakeInfo storage userStake = stake[msg.sender][_poolId];
+        if (userStake.amount == 0 || userStake.maxClaimableThisPeriod == 0) {
+            revert TATSU_Vault____NothingToClaim();
+        }
+        if (block.timestamp < userStake.unlockTime) {
+            revert TATSU_Vault_____CantClaimYet();
+        }
+        uint stakedAmount = userStake.amount;
+        uint rewardAmount = userStake.maxClaimableThisPeriod;
+        userStake.stakeTime = 0;
+        userStake.unlockTime = 0;
+        userStake.maxClaimableThisPeriod = 0;
+        userStake.amount = 0;
+        userStake.totalRewards += rewardAmount;
+        pool.totalStaked -= stakedAmount;
+
+        tatsu.transfer(msg.sender, rewardAmount + stakedAmount);
+
+        emit Claim(msg.sender, _poolId, rewardAmount, stakedAmount);
+    }
+
+    //===================================
+    //       Rewards Functions
+    //===================================
+    function addToRewardPool(uint256 _poolId, uint256 _amount) external {
+        if (_poolId >= maxPool) {
+            // Pool does not exist
+            revert TATSU_Vault____InvalidPoolId(_poolId);
+        }
+        PoolInfo storage pool = poolInfo[_poolId];
+        pool.totalRewards += _amount;
+        tatsu.transferFrom(msg.sender, address(this), _amount);
+        emit AddRewardsToPool(_poolId, _amount);
+    }
+
+    function retrieveRewardFunds(uint256 _poolId) external onlyOwner {
+        PoolInfo storage pool = poolInfo[_poolId];
+        uint rewardsToCollect = pool.totalRewards - pool.blockedReward;
+        tatsu.transfer(owner(), rewardsToCollect);
+        pool.totalRewards = pool.blockedReward;
+        pool.enabled = false;
+    }
+
+    function reenablePool(uint256 _poolId) external onlyOwner {
+        PoolInfo storage pool = poolInfo[_poolId];
+        uint availableRewards = pool.totalRewards - pool.blockedReward;
+        if (availableRewards == 0) revert TATSU_Vault____NoRewardsAvailable();
+        pool.enabled = true;
+    }
+
+    function createPool(
+        uint256 _rate,
+        uint256 lockTime,
+        uint256 _initPool
+    ) external onlyOwner {
+        if (_rate == 0 || lockTime < 1 days)
+            revert TATSU_Vault____InvalidPoolParameters();
+
+        poolInfo[maxPool] = PoolInfo({
+            totalRewards: _initPool,
+            rewardRate: _rate,
+            blockedReward: 0,
+            lockTime: lockTime,
+            enabled: true,
+            totalStaked: 0
+        });
+
+        if (_initPool > 0)
+            tatsu.transferFrom(msg.sender, address(this), _initPool);
+
+        maxPool++;
+        emit PoolCreated(maxPool, _rate, lockTime, _initPool);
+    }
+
+    //======================================================================
+    //             External / Public VIEW Functions
+    //======================================================================
+    function getStakeableAmount(uint _poolId) external view returns (uint256) {
+        PoolInfo storage pool = poolInfo[_poolId];
+        if (!pool.enabled || pool.rewardRate == 0) return 0;
+        return
+            ((pool.totalRewards - pool.blockedReward) *
+                PERCENTAGE_DECIMALS *
+                365 days) / (pool.rewardRate * pool.lockTime);
+    }
+
+    function getCurrentRewards(
+        uint256 _poolId,
+        address _user
+    ) external view returns (uint256) {
+        PoolInfo storage pool = poolInfo[_poolId];
+        StakeInfo storage userStake = stake[_user][_poolId];
+
+        uint stakedTime;
+        if (block.timestamp > userStake.unlockTime) stakedTime = pool.lockTime;
+        else stakedTime = block.timestamp - userStake.stakeTime;
+
+        return (userStake.maxClaimableThisPeriod * stakedTime) / pool.lockTime;
+    }
+
+    /**
+     * @notice this function returns all the active data for a user
+     * @param user The address of the user to check
+     * @return PoolInfo[] memory An array of PoolInfo structs that the user is currently staked in
+     */
+    function getAllUserActivePools(
+        address user
+    ) external view returns (PoolInfo[] memory) {
+        PoolInfo[] memory activePools = new PoolInfo[](maxPool - 1);
+        uint activePoolCount = 0;
+        for (uint i = 1; i < maxPool; i++) {
+            if (stake[user][i].amount > 0) {
+                activePools[activePoolCount] = poolInfo[i];
+                activePoolCount++;
+            }
+        }
+        return activePools;
+    }
+}
+
+
+// File: src/interface/ITatsuStaking.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface ITatsuStaking {
+    struct PoolInfo {
+        uint256 totalRewards; // The rewards available in the pool
+        uint256 rewardRate; // The APR rate of the pool
+        uint256 blockedReward; // Rewards unable to be used;
+        uint256 lockTime; // The lock time to claim rewards
+        uint256 totalStaked; // Total amount of tokens currently staked
+        bool enabled; // If the pool is enabled for more deposits
+    }
+
+    struct StakeInfo {
+        uint256 stakeTime; // Last time the user interacted with the contract
+        uint256 unlockTime; // Time when the user can claim rewards
+        uint256 amount; // Amount of tokens staked
+        uint256 totalRewards; // Total rewards earned
+        uint256 maxClaimableThisPeriod; // Max amount of rewards that can be claimed this staking period
+    }
+
+    //======================================================================
+    //              Rewards Functions
+    //======================================================================
+    /**
+     * @notice Add tokens to the reward pool of a specific staking pool
+     * @param _poolId The pool ID to fund.
+     * @param _amount Amount of tokens to add to reward pool
+     */
+    function addToRewardPool(uint256 _poolId, uint256 _amount) external;
+
+    /**
+     * @notice This is a power user to recover all the funds from a specific pool reward.
+     * @param _poolId The pool id to extract the funds from
+     * @dev this should only be called if a pool will be removed.
+     */
+    function retrieveRewardFunds(uint256 _poolId) external;
+
+    /**
+     * @notice Create a new staking pool with a specific APR
+     * @param _rate the APR to set for the pool
+     * @param lockTime The lock time in seconds for the pool
+     * @param _initPool The initial rewards amount to give to the poolk
+     */
+    function createPool(
+        uint256 _rate,
+        uint256 lockTime,
+        uint256 _initPool
+    ) external;
+
+    function getStakeableAmount(
+        uint256 _poolId
+    ) external view returns (uint256);
+
+    //======================================================================
+    //              Staking Functions
+    //======================================================================
+    /**
+     * @notice Deposit tokens to the staking contract
+     * @param _poolId The poolId to deposit to.
+     * @param _amount The amount of tokens to deposit
+     */
+    function deposit(uint256 _poolId, uint256 _amount) external;
+
+    /**
+     * @notice Claim Rewards from the staking contract
+     * @param _poolId the pool id to claim from
+     * @dev This function will claim rewards and funds from the staking contract
+     * @dev This function can only be called once lock time is over
+     */
+    function claim(uint256 _poolId) external;
+
+    /**
+     * @notice Get the calculation of rewards for a particular user
+     * @param _poolId The pool id to request rewards from
+     * @param _user The address of the user to check
+     * @return The amount of rewards the user has earned so far
+     */
+    function getCurrentRewards(
+        uint256 _poolId,
+        address _user
+    ) external view returns (uint256);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+

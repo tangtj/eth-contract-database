@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// Company: Decrypted Labs
+/// @title QorraICO - Initial Coin Offering contract for Qorra Tokens
+/// @author Rabeeb Aqdas, Umar Farooq
+/// @notice This contract manages the different rounds of the ICO for the Qorra token
+/// @dev Inherits ERC20 standard token functionality from OpenZeppelin and ownership functionality.
+
+interface IERC20 {
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external;
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external;
+}
+
+interface IVesting {
+    function deposit(
+        address _userAddress,
+        uint256 _amount,
+        uint256 _amountToBeGiven,
+        uint256 _cliffTime,
+        address _referral
+    ) external;
+}
+
+interface AggregatorV3Interface {
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
+
+/// @dev Error for when an attempt is made to proceed to a round beyond the defined limits
+/// @param _round The round number that exceeded the limit
+error ICO__RoundsLimitExceeded(uint256 _round);
+
+/// @dev Error for when the user try to send the invalid amount of tokens
+/// @param _tokenAmount The amount that is invalid
+error ICO__InvalidAmount(uint256 _tokenAmount);
+
+/// @dev This error is thrown when the user pass the invalid currency address
+/// @param _currency The address of the currency to buy with
+error ICO__InvalidCurrrency(address _currency);
+
+/// @dev Error for when an invalid price (e.g., zero) is set for a round
+error ICO__InvalidPrice();
+
+/// @dev Error for when eth didn't sent to recipient
+error ICO_EthTransferFailed();
+
+/// @dev Error for when an action is attempted in a round that has already been completed
+error ICO__RoundCompleted();
+
+/// @dev Error for when there are not enough tokens remaining in a round for a purchase
+error ICO__NotEnoughTokens();
+
+/// @dev Error for when an action is attempted in a round that has not yet started
+error ICO__RoundNotStartedYet();
+
+/// @dev This error is thrown when a non-whitelisted address attempts to interact with the contract
+error ICO__YouAreNotWhitelisted();
+
+/// @dev This error is thrown when an action is attempted after all ICO rounds are completed
+error ICO__RoundsHasBeenCompleted();
+
+/// @dev This error is thrown when an action is attempted that requires the ICO to have ended
+error ICO__ICOHasNotEndedYet();
+
+contract QorraICO is Ownable {
+    /// @dev Reference to the Qorra token contract
+    IERC20 private immutable _helperQorra;
+
+    /// @dev Reference to the USDT token contract used for payments
+    IERC20 private immutable _helperUSDT;
+
+    /// @dev Reference to the vesting contract where purchased tokens are sent
+    IVesting private immutable _helperVesting;
+
+    /// @dev Tracks the current round of the ICO
+    uint256 private round;
+
+    /// @dev Tracks the current round number of month amount will be distributed
+    uint256[3] private ROUND_CLIFF_MONTHS = [18, 12, 9];
+
+    /// @dev An array containing the percentage values for immediate withdrawals in different rounds
+    uint256[3] private IMMIDIATE_WITHDRAWAL_PERCENT = [10, 25, 25];
+
+    /// @dev An array containing the token prices for each ICO round
+    uint256[3] private PRICES_PER_ROUND = [125000, 200000, 350000];
+
+    /// @dev The BASE for calculating the percentage
+    uint256 private constant BASE = 100;
+
+    /// @dev The remaining token limit for round one
+    uint256 private roundOneLimitRemaining;
+
+    /// @dev The remaining token limit for round two
+    uint256 private roundTwoLimitRemaining;
+
+    /// @dev The remaining token limit for round three
+    uint256 private roundThreeLimitRemaining;
+
+    /// @dev Flag to indicate if the ICO is paused or not
+    bool private paused;
+
+    /// @notice No of MONTHS in the contract for eact transaction vesting
+    uint256 private constant VESTING_MONTHS = 36;
+
+    /// @notice single month time period
+    uint256 private constant MONTH_TIME = 30 days;
+
+    /// @dev Used to fetch current price data from an external source
+    AggregatorV3Interface private priceFeed;
+
+    /// @dev This boolean is true if the ICO has ended, false otherwise
+    bool private _isICOEnded;
+
+    /// @dev Mapping to keep track of addresses that are excluded from fees
+    mapping(address => bool) private _isWhitelist;
+
+    /// @notice Emitted when the contract is paused
+    /// @param by The address that triggered the paused
+    event Paused(address indexed by);
+    /// @notice Emitted when the contract is unpaused
+    /// @param by The address that triggered the unpausing
+    event UnPaused(address indexed by);
+    /// @notice Emitted when a new round starts
+    /// @param by The address that started the round
+    /// @param round The current round number
+    event RoundStarted(address indexed by, uint256 round);
+    /// @notice Emitted when tokens are bought
+    /// @param by The address that bought the tokens
+    /// @param amount The amount of tokens bought
+    /// @param round The round in which the tokens were bought
+    event TokenBought(address indexed by, uint256 amount, uint256 round);
+
+    /// @dev Ensures the contract is not paused
+    modifier unPaused() {
+        require(paused == false, "contract is paused");
+        _;
+    }
+
+    /**
+     * @notice Fallback function to handle unexpected calls and accept ETH.
+     */
+    fallback() external payable {}
+
+    /**
+     * @notice Receive function to accept ETH transfers.
+     */
+    receive() external payable {}
+
+    /// @notice Creates a new QorraICO contract instance
+    /// @param _qorra Address of the Qorra token contract
+    /// @param _USDT Address of the USDT token contract
+    /// @param _vesting Address of the vesting contract
+    /// @param _owner Address of the admin/owner wallet
+    /// @param _roundOneLimitRemaining Token limit for round one
+    /// @param _roundTwoLimitRemaining Token limit for round two
+    /// @param _roundThreeLimitRemaining Token limit for round three
+    constructor(
+        IERC20 _qorra,
+        IERC20 _USDT,
+        IVesting _vesting,
+        address _owner,
+        uint256 _roundOneLimitRemaining,
+        uint256 _roundTwoLimitRemaining,
+        uint256 _roundThreeLimitRemaining
+    ) Ownable(_owner) {
+        _helperQorra = _qorra;
+        _helperUSDT = _USDT;
+        _helperVesting = _vesting;
+        roundOneLimitRemaining = _roundOneLimitRemaining;
+        roundTwoLimitRemaining = _roundTwoLimitRemaining;
+        roundThreeLimitRemaining = _roundThreeLimitRemaining;
+        priceFeed = AggregatorV3Interface(
+            0xEe9F2375b4bdF6387aa8265dD4FB8F16512A1d46 // usdt => eth
+        );
+    }
+
+    /// @notice Allows a user to buy tokens during the ICO
+    /// @param _recipient The address receiving the tokens
+    /// @param _tokenAmount The amount of tokens to purchase
+    /// @param _payment The address of the payment token (if not ETH)
+    /// @param _referral The address of the referral (if any)
+    /// @dev This function checks the current round and various conditions before allowing a purchase and emits a TokenBought event upon successful purchase
+    /// @custom:modifier unPaused Ensures the contract is not paused
+    function buyToken(
+        address _recipient,
+        uint256 _tokenAmount,
+        address _payment,
+        address _referral
+    ) external payable unPaused {
+        if (_payment != address(0) && _payment != address(_helperUSDT))
+            revert ICO__InvalidCurrrency(_payment);
+        address _payer = _msgSender();
+        if (round == 0) revert ICO__RoundNotStartedYet();
+        if (_isICOEnded) revert ICO__RoundsHasBeenCompleted();
+        if (round == 1) {
+            if (!_isWhitelist[_recipient]) revert ICO__YouAreNotWhitelisted();
+            uint256 _roundOneLimitRemaining = roundOneLimitRemaining;
+
+            if (_roundOneLimitRemaining == 0) revert ICO__RoundCompleted();
+            if (_tokenAmount > _roundOneLimitRemaining)
+                revert ICO__NotEnoughTokens();
+            roundOneLimitRemaining = _roundOneLimitRemaining - _tokenAmount;
+            _buy(_recipient, _payer, _tokenAmount, _payment, _referral);
+        } else if (round == 2) {
+            uint256 _roundTwoLimitRemaining = roundTwoLimitRemaining;
+
+            if (_roundTwoLimitRemaining == 0) revert ICO__RoundCompleted();
+            if (_tokenAmount > _roundTwoLimitRemaining)
+                revert ICO__NotEnoughTokens();
+            roundTwoLimitRemaining = _roundTwoLimitRemaining - _tokenAmount;
+            _buy(_recipient, _payer, _tokenAmount, _payment, _referral);
+        } else {
+            uint256 _roundThreeLimitRemaining = roundThreeLimitRemaining;
+            if (_roundThreeLimitRemaining == 0) revert ICO__RoundCompleted();
+            if (_tokenAmount > _roundThreeLimitRemaining)
+                revert ICO__NotEnoughTokens();
+            roundThreeLimitRemaining = _roundThreeLimitRemaining - _tokenAmount;
+            _buy(_recipient, _payer, _tokenAmount, _payment, _referral);
+        }
+        emit TokenBought(_recipient, _tokenAmount, round);
+    }
+
+    /// @notice Internal function to handle token purchase logic
+    /// @param _recipient The address receiving the tokens
+    /// @param _payer The address paying for the tokens
+    /// @param _inputAmount The amount of payment
+    /// @param _payment The address of the payment token (if not ETH)
+    /// @param _referral The address of the referral (if any)
+    /// @dev This function calculates the token amount, handles payment transfer, and updates vesting schedules
+    function _buy(
+        address _recipient,
+        address _payer,
+        uint256 _inputAmount,
+        address _payment,
+        address _referral
+    ) private {
+        _inputAmount = _payment == address(0) ? msg.value : _inputAmount;
+        uint256 _tokenAmount = getQuote(_inputAmount, _payment);
+        if (_tokenAmount == 0) revert ICO__InvalidAmount(_inputAmount);
+        if (_payment == address(0)) {
+            (bool success, ) = owner().call{value: address(this).balance}("");
+            if (!success) revert ICO_EthTransferFailed();
+        } else _helperUSDT.transferFrom(_payer, owner(), _inputAmount);
+        uint256 amountToBeSend = (_tokenAmount *
+            IMMIDIATE_WITHDRAWAL_PERCENT[round - 1]) / BASE;
+        uint256 remainingAmount = _tokenAmount - amountToBeSend;
+        _helperQorra.transfer(_recipient, amountToBeSend);
+        _helperQorra.transfer(address(_helperVesting), remainingAmount);
+        _helperVesting.deposit(
+            _recipient,
+            remainingAmount,
+            (remainingAmount / VESTING_MONTHS),
+            ROUND_CLIFF_MONTHS[round - 1] * MONTH_TIME,
+            _referral
+        );
+    }
+
+    /// @notice Gets the token amount for a given payment amount
+    /// @param _inputAmount The amount of payment
+    /// @param _payment The address of the payment token (if not ETH)
+    /// @return _tokenAmount The amount of tokens corresponding to the payment
+    /// @dev This function calculates the number of tokens based on the current round and token price
+    function getQuote(
+        uint256 _inputAmount,
+        address _payment
+    ) public view returns (uint256 _tokenAmount) {
+        uint256 _round = round;
+        if (_round > 0) {
+            uint256 _pricePerToken = PRICES_PER_ROUND[_round - 1];
+            if (_payment == address(0)) {
+                (, int256 _oneUsdtPriceInEth, , , ) = priceFeed
+                    .latestRoundData();
+                _inputAmount =
+                    (_inputAmount * 1e6) /
+                    uint256(_oneUsdtPriceInEth);
+            }
+            _tokenAmount = (_inputAmount * 1e18) / _pricePerToken;
+        }
+    }
+
+    /// @notice Converts a given amount of USDT to its equivalent amount in ETH.
+    /// @dev Uses Chainlink's latest price feed data for USDT/ETH conversion.
+    /// @param _amountInUSDT The amount of USDT to be converted.
+    /// @return _ethAmount The equivalent amount of ETH for the given USDT amount.
+    function getETHAmount(
+        uint256 _amountInUSDT
+    ) public view returns (uint256 _ethAmount) {
+        (, int256 _oneUsdtPriceInEth, , , ) = priceFeed.latestRoundData();
+        _ethAmount = (_amountInUSDT * uint256(_oneUsdtPriceInEth)) / 1e6;
+    }
+
+    /// @notice Starts a new round of the ICO
+    /// @custom:modifier onlyOwner Restricts the function access to the contract owner.
+    function manageRounds() external onlyOwner {
+        uint256 _round = round;
+        if (_isICOEnded) revert ICO__RoundsHasBeenCompleted();
+        if (_round > 2) _isICOEnded = true;
+        else {
+            round = _round + 1;
+            emit RoundStarted(_msgSender(), (_round + 1));
+        }
+    }
+
+    /// @notice Withdraws the tokens from the contract
+    /// @param _amountOfTokens The amount of token to withdraw
+    /// @custom:modifier onlyOwner Restricts the function access to the contract owner.
+    function withdrawTokens(uint256 _amountOfTokens) external onlyOwner {
+        if (!_isICOEnded) revert ICO__ICOHasNotEndedYet();
+        _helperQorra.transfer(_msgSender(), _amountOfTokens);
+    }
+
+    /// @notice Pauses the contract
+    /// @custom:modifier onlyOwner Restricts the function access to the contract owner.
+    function pauseContract() external onlyOwner {
+        require(!paused, "Contract is already paused");
+        paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /// @notice Unpauses the contract
+    /// @custom:modifier onlyOwner Restricts the function access to the contract owner.
+    function unPauseContract() external onlyOwner {
+        require(paused, "Contract is already unpaused");
+        paused = false;
+        emit UnPaused(_msgSender());
+    }
+
+    /// @notice Updates the addresses as Whitelists or Non  Whitelists the tokens from the contract
+    /// @param _userAddresses array of user addresses to be changed.
+    /// @param _isWhitelistNow new access for all above addresses array.
+    /// @custom:modifier onlyOwner Restricts the function access to the contract owner.
+    function updateWhitelists(
+        address[] memory _userAddresses,
+        bool _isWhitelistNow
+    ) external onlyOwner {
+        for (uint256 i; i < _userAddresses.length; ++i) {
+            _isWhitelist[_userAddresses[i]] = _isWhitelistNow;
+        }
+    }
+
+    /// @dev Retrieves either give address is whitelist or not.
+    /// @return The boolean state as true or false.
+    function isUserWhitelist(address _user) external view returns (bool) {
+        return _isWhitelist[_user];
+    }
+
+    /// @notice Retrieves the remaining token limit for Round One
+    /// @return The number of tokens still available for purchase in Round One
+    function getRoundOneLimitRemaining() external view returns (uint256) {
+        return roundOneLimitRemaining;
+    }
+
+    /// @notice Retrieves the remaining token limit for Round Two
+    /// @return The number of tokens still available for purchase in Round Two
+    function getRoundTwoLimitRemaining() external view returns (uint256) {
+        return roundTwoLimitRemaining;
+    }
+
+    /// @notice Retrieves the remaining token limit for Round Three
+    /// @return The number of tokens still available for purchase in Round Three
+    function getRoundThreeLimitRemaining() external view returns (uint256) {
+        return roundThreeLimitRemaining;
+    }
+
+    /// @notice Retrieves the current round of the ICO
+    /// @return The current round number of the ICO
+    function getRound() external view returns (uint256) {
+        return round;
+    }
+
+    /// @notice Retrieves the current round's price
+    /// @return _price The price of current round
+    function getCurrentRoundPrice() external view returns (uint256 _price) {
+        if (round > 0) {
+            _price = PRICES_PER_ROUND[round - 1];
+        }
+    }
+
+    /// @notice Checks if the ICO contract is currently paused
+    /// @return True if the contract is paused, false otherwise
+    function isPaused() external view returns (bool) {
+        return paused;
+    }
+}

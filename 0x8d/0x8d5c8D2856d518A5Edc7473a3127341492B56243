@@ -1,0 +1,524 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+// optimize 200
+/// Standard IERC20 interface
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function balanceOf(address account) external view returns (uint256);
+    function owner() external view returns(address);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function symbol() external view returns(string memory);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+/// Transfer Helper to ensure the correct transfer of the tokens or ETH
+library SafeTransfer {
+    using Address for address;
+    function safeApprove(IERC20 token, address spender, uint256 value) 
+    internal {
+    // safeApprove should only be called when setting an initial allowance,
+    // or when resetting it to zero. To increase and decrease it, use
+    // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+    require(
+        (value == 0) || (token.allowance(address(this), spender) == 0),
+        "SafeERC20: approve from non-zero to non-zero allowance"
+    );
+    _callOptionalReturn(token, 
+    abi.encodeWithSelector(token.approve.selector, spender, value));
+}
+    /** Safe Transfer asset from one wallet with approval of the wallet
+    * @param erc20: the contract address of the erc20 token
+    * @param from: the wallet to take from
+    * @param amount: the amount to take from the wallet
+    **/
+    function _pullUnderlying(IERC20 erc20, address from, uint amount) internal
+    {
+        safeTransferFrom(erc20,from,address(this),amount);
+    }
+
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /** Safe Transfer asset to one wallet from within the contract
+    * @param erc20: the contract address of the erc20 token
+    * @param to: the wallet to send to
+    * @param amount: the amount to send from the contract
+    **/
+    function _pushUnderlying(IERC20 erc20, address to, uint amount) internal
+    {
+        safeTransfer(erc20,to,amount);
+    }
+
+    /** Safe Transfer ETH to one wallet from within the contract
+    * @param to: the wallet to send to
+    * @param value: the amount to send from the contract
+    **/
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success,) = to.call{value : value}(new bytes(0));
+        require(success, 'TransferHelper::safeTransferETH: ETH transfer failed');
+    }
+
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+interface dr {
+    function superAdmin(address addy) external view returns(bool);
+    function isAdmin(address addy) external view returns(bool);
+    function bridgeDep() external view returns(address);
+    function isBridge(address addy) external view returns(bool);
+    function setBridgeSD(address who, address addy) external;
+    function wETH() external view returns(address);
+    function bridgeSD(address sd) external view returns(address);
+    function sdDepAddy() external view returns(address);
+    function creatorOfSD(address creator) external view returns(address);
+    function SDOfCreator(address sd) external view returns(address);
+
+}
+
+interface warp {    
+    function sendPayloadToEvm(uint16 targetChain,address targetAddress,bytes memory payload,uint256 receiverValue,uint256 gasLimit,uint16 refundChain,address refundAddress) external payable returns (uint64 sequence);
+}
+
+interface dep {
+    function relayDeposit(uint256 cost, uint16 toChain, bytes calldata payload, uint16 toChain0, address fund) external payable;
+    function relayWithdrawal(uint256 cost, uint16 toChain, bytes calldata payload, uint16 toChain0, address fund) external payable;
+    function registerWithdraw(address ad, uint256 amount, uint16 sourceChain, uint256 depositID) external;
+    function registerBridge(uint256 depositID) external;
+    function fund() external view returns(address);
+    function gas0() external view returns(uint256);
+    function gas1() external view returns(uint256);
+    function recoveryFee() external view returns(uint256);
+    function donation() external view returns(uint256);
+    function quoteEVMDeliveryPrice(uint16 targetChain, uint256 receiverValue, uint256 gasLimit) external view returns (uint256 nativePriceQuote, uint256);
+    function quoteDeposit(uint16 target, uint256 rv) external view returns (uint256 npq);
+    function quoteWithdraw(uint16 target, uint256 rv) external view returns (uint256 npq);
+    function deposit() external payable;
+    function deploy(address sd, address owner) external returns(address bridge);
+    function tokenOnChain(address sd, uint16 chain) external view returns(address);
+    function coolDown() external view returns(uint256);
+}
+
+contract SmartBridge {
+    address public relayer = 0x3A3709b8c67270A84Fe96291B7E384044160C6b1;
+    address public SD;
+    address public dataread = 0xdAE383661587232FBd254b05a395CB8e35E6e7B6;
+    mapping(address => uint256) public lastUse;
+    mapping(address => uint256[]) public myDepositIDs;
+    mapping(address => uint256[]) public myWithdrawIDs;
+    mapping(address => uint256[]) public myClaimedWithdrawIDs;
+    mapping(address => uint256[]) public myDisputeIDs;
+    mapping(address => mapping(uint256 => bool)) public confirmed;
+    mapping(address => bool) public admin;
+    mapping(address => uint256) public balance;
+    address public owner;
+    uint256 public openDisputes;
+    uint256 public maxTx;
+    Deposit[] public deposit;
+    Dispute[] public dispute;
+    Withdraw[] public wd;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
+    event Bridged(address to, uint256 amt, uint256 id);
+    event RecoverDeposit(address to, uint256 amt, uint256 depositID);
+    event RaiseDispute(address to, uint256 amt, uint256 depositID);
+    event Withdrawal(address user, uint256 amount, uint256 chainID, uint256 depositID);
+    /* ChainID's Current List
+    uint16 constant CHAIN_ID_ETHEREUM = 2;
+    uint16 constant CHAIN_ID_BSC = 4;
+    uint16 constant CHAIN_ID_POLYGON = 5;
+    uint16 constant CHAIN_ID_AVALANCHE = 6;
+    uint16 constant CHAIN_ID_FANTOM = 10;
+    uint16 constant CHAIN_ID_NEON = 17;
+    uint16 constant CHAIN_ID_APTOS = 22;
+    uint16 constant CHAIN_ID_ARBITRUM = 23;
+    uint16 constant CHAIN_ID_OPTIMISM = 24;
+    uint16 constant CHAIN_ID_GNOSIS = 25;
+    uint16 constant CHAIN_ID_BASE = 30;
+    */
+    constructor(address sd, address _owner) {
+        SD = sd;
+        admin[_owner] = true;
+        owner = _owner;
+        maxTx = IERC20(SD).totalSupply() / 1000;
+        deposit.push();
+        dispute.push();
+        wd.push();
+        _status = _NOT_ENTERED;
+    }
+
+    receive() external payable {}
+
+    struct Deposit {
+        address user;
+        uint256 amount;
+        uint16 toChainId;
+        uint256 depositTime;
+        uint256 expireTime;
+        uint256 withdrawTime;
+        uint256 cost;
+        uint256 disputeID;
+        bool refunded;
+        bool completed;
+        bytes payload;
+    }
+
+    struct Dispute {
+        address user;
+        uint256 depositID;
+        uint256 amount;
+        uint16 toChain;
+        uint256 confirms;
+        bool refunded;
+        bool closed;
+    }
+
+    struct Withdraw {
+        address user;
+        uint256 amount;
+        uint16 fromChain;
+        uint256 depositID;
+        uint256 expireTime;
+        bool complete;
+    }
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "ReentrancyGuard");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+
+    function deployer() public view returns(address) {
+        return dr(dataread).bridgeDep();
+    }
+
+    function setAdmin(address addy, bool _bool) external {
+        require(msg.sender == owner, "not 1");
+        admin[addy] = _bool;
+    }
+
+    function raiseDispute(uint256 depositID) external nonReentrant {
+        require(!deposit[depositID].refunded, "already");
+        require(!deposit[depositID].completed, "already Complete");
+        require(block.timestamp <= deposit[depositID].expireTime, "expired");
+        require(block.timestamp >= deposit[depositID].depositTime + 4 hours, "not mature");
+        require(deposit[depositID].user == msg.sender, "not user");
+        dispute.push();
+        myDisputeIDs[msg.sender].push(dispute.length - 1);
+        dispute[dispute.length - 1].user = deposit[depositID].user;
+        dispute[dispute.length - 1].depositID = depositID;
+        dispute[dispute.length - 1].toChain = deposit[depositID].toChainId;
+        dispute[dispute.length - 1].amount = deposit[depositID].amount;
+        deposit[depositID].disputeID = dispute.length - 1;
+        openDisputes += 1;
+        emit RaiseDispute(msg.sender, deposit[depositID].amount, depositID);
+    }
+
+    function confirmDispute(uint256 disputeID, bool _bool) external nonReentrant {
+        require(admin[msg.sender], "not admin");
+        require(dispute[disputeID].confirms < 2, "already 2");
+        require(!dispute[disputeID].refunded, "already");
+        require(block.timestamp <= deposit[dispute[disputeID].depositID].expireTime, "expired");
+        require(!confirmed[msg.sender][disputeID], "already disputed");
+        confirmed[msg.sender][disputeID] = true;
+        dispute[disputeID].confirms += 1;
+        if(_bool) {
+        dispute[disputeID].closed = true;
+        }
+    }
+
+    function recoverDeposit(uint256 depositID) external nonReentrant {
+        require(!deposit[depositID].refunded, "already");
+        require(!deposit[depositID].completed, "already Complete");
+        require(deposit[depositID].user == msg.sender, "not user");
+        uint256 dID = deposit[depositID].disputeID;
+        require(dispute[dID].confirms >= 2, "not confirmed");
+        require(!dispute[dID].closed, "closed");
+        uint256 amt = dispute[dID].amount;
+        uint256 fee;
+        address d = deployer();
+        uint256 rf = dep(d).recoveryFee();
+        if(rf > 0) {
+        fee = amt * rf / 100;
+        amt -= fee;
+        SafeTransfer._pushUnderlying(IERC20(SD), dep(d).fund(), fee);
+        }
+        dispute[dID].refunded = true;
+        deposit[depositID].refunded = true;
+        openDisputes = openDisputes > 1 ? openDisputes - 1 : 0;
+        SafeTransfer._pushUnderlying(IERC20(SD), msg.sender, amt);
+        emit RecoverDeposit(msg.sender, amt, depositID);
+    }
+
+    function setMaxTx(uint256 max) external {
+        require(dr(dataread).superAdmin(msg.sender) || admin[msg.sender], "not admin");
+        require(max >= IERC20(SD).totalSupply() / 100000, ">0.0001%");
+        maxTx = max;
+    }
+
+    function getad(address creator, address user, uint256 amount, uint256 tac, uint256 depositID) public pure returns(bytes memory data) {
+        data = abi.encode(creator, user, amount, tac, depositID);
+    }
+
+    function costBridge(uint16 toChain) public view returns(uint256,uint256) {
+        address d = deployer();
+        uint256 a = dep(relayer).quoteDeposit(toChain, 0);
+        uint256 b = dep(d).donation();
+        return (a + b,  b);
+    }
+
+    function costWithdraw(uint16 fromChain) public view returns(uint256,uint256) {
+        address d = deployer();
+        uint256 a = dep(relayer).quoteWithdraw(fromChain, 0);
+        uint256 b = dep(d).donation();
+        return (a + b,  b);
+    }
+
+    function coolDown() public view returns(uint256) {
+        return dep(deployer()).coolDown();
+    }
+
+    function bridge(uint16 toChain, uint256 amount, address user) external payable nonReentrant{
+        if(!admin[msg.sender]) {
+        uint256 cd = coolDown();
+        if(cd > 0) {
+        require(block.timestamp > lastUse[user] + cd, "cool down");
+        }
+        require(amount <= maxTx, "over max tx");
+        }
+        lastUse[user] = block.timestamp;
+        (uint256 cost, uint256 don) = costBridge(toChain);
+        require(msg.value >= cost, "insufficient fee");
+        address sdep = dr(dataread).sdDepAddy();
+        address creator = dr(sdep).creatorOfSD(SD);
+        if(!dr(dataread).superAdmin(msg.sender)) {      
+        require(!dr(dataread).superAdmin(user), "user cannot be admin");
+        }
+        bytes memory payload = getad(creator, user, amount, 0, deposit.length);
+        SafeTransfer.safeTransferFrom(IERC20(SD), msg.sender, address(this), amount);
+        myDepositIDs[user].push(deposit.length);
+        deposit.push(Deposit(user, amount, toChain, block.timestamp, block.timestamp + 30 days, 0, cost, 0, false, false, payload)); // 30 day expire time
+        address d = deployer();
+        dep(relayer).relayDeposit{value: cost}(don,toChain,payload,toChain,dep(d).fund());
+        emit Bridged(user, amount, toChain);
+    }
+
+    function registerWithdraw(address ad, uint256 amount, uint16 sourceChain, uint256 id) external nonReentrant {     
+        require(msg.sender == relayer, "not relayer");   
+        myWithdrawIDs[ad].push(wd.length);
+        wd.push(Withdraw(ad, amount, sourceChain, id, block.timestamp + 30 days, false)); // 30 day expire time
+        balance[ad] += amount;
+        emit Withdrawal(ad, amount, sourceChain, id);
+    }
+
+    function registerBridge(uint256 id) external nonReentrant {
+        require(msg.sender == relayer, "not relayer");   
+        deposit[id].completed = true;
+        deposit[id].withdrawTime = block.timestamp;
+    }
+
+    function allMyWithdrawIDs(address user) external view returns(uint256[] memory ids) {
+        ids = new uint256[](myWithdrawIDs[user].length);
+        for(uint256 i = 0; i < myWithdrawIDs[user].length; i++) {
+        ids[i] = myWithdrawIDs[user][i];
+        }
+    }
+
+    function allMyDepositIDs(address user) external view returns(uint256[] memory ids) {
+        ids = new uint256[](myDepositIDs[user].length);
+        for(uint256 i = 0; i < myDepositIDs[user].length; i++) {
+        ids[i] = myDepositIDs[user][i];
+        }
+    }
+
+    function allMyClaimedWithdrawIDs(address user) external view returns(uint256[] memory ids) {
+        ids = new uint256[](myWithdrawIDs[user].length);
+        for(uint256 i = 0; i < myWithdrawIDs[user].length; i++) {
+        ids[i] = myClaimedWithdrawIDs[user][i];
+        }
+    }
+
+    function allMyOpenWithdrawIDs(address user) external view returns(uint256[] memory oids) {
+        uint256[] memory ids = new uint256[](myWithdrawIDs[user].length);
+        for(uint256 i = 0; i < myWithdrawIDs[user].length; i++) {
+        ids[i] = myWithdrawIDs[user][i];
+        }
+        uint256 a = myWithdrawIDs[user].length - myClaimedWithdrawIDs[user].length;
+        oids = new uint256[](a);
+        for(uint256 i = 0; i < myWithdrawIDs[user].length; i++) {
+        if(!wd[myWithdrawIDs[user][i]].complete && block.timestamp <= wd[myWithdrawIDs[user][i]].expireTime) {
+        oids[i] = myWithdrawIDs[user][i];
+        }
+        }
+    }
+
+    function withdraw(address to, uint256 withdrawID) external payable nonReentrant {
+        uint256 tot;
+        uint256 totCost;
+        require(balance[msg.sender] > 0, "no balance");
+        require(wd[withdrawID].user == msg.sender, "not user");
+        require(!wd[withdrawID].complete, "completed");
+        require(block.timestamp <= wd[withdrawID].expireTime, "expired");
+        tot += wd[withdrawID].amount;
+        uint256 w = withdrawID;
+        balance[msg.sender] -= wd[w].amount;
+        wd[w].complete = true;
+        myClaimedWithdrawIDs[msg.sender].push(w);
+        address sdep = dr(dataread).sdDepAddy();
+        address creator = dr(sdep).creatorOfSD(SD);
+        bytes memory payload = getad(creator, msg.sender, wd[w].amount, 1, wd[withdrawID].depositID);
+        (uint256 cost, uint256 don) = costWithdraw(wd[w].fromChain);
+        totCost += cost;
+        address d = deployer();
+        dep(relayer).relayWithdrawal{value: cost}(don, wd[w].fromChain, payload, wd[w].fromChain, dep(d).fund());
+        require(msg.value >= totCost, "insufficient fee");        
+        SafeTransfer.safeTransfer(IERC20(SD), to, tot);
+    }
+    
+    function saveTokens(address token) public {
+        require(token != SD, "cannot remove SD");
+        uint256 a = IERC20(token).balanceOf(address(this));
+        address d = deployer();
+        if(a > 0) {
+        SafeTransfer._pushUnderlying(IERC20(token), dep(d).fund(), a);
+        }
+        if(address(this).balance > 0) {
+        SafeTransfer.safeTransferETH(dep(d).fund(), address(this).balance);
+        }
+    }
+}

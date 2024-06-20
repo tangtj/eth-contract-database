@@ -1,0 +1,371 @@
+
+// File: src/ConfigRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+import {Auth} from "chronicle-std/auth/Auth.sol";
+
+import {IConfigRegistry} from "./IConfigRegistry.sol";
+
+/**
+ * @title ConfigRegistry
+ *
+ * @notice Registry linking feeds to their offchain provided configs
+ *
+ * @dev Note that this registry is based on the assumption that each feed has a
+ *      unique highest-order byte identifier. For more info, see [FeedRegistry].
+ *
+ * @dev In order to provide maximal flexibility for feed configs, the registry
+ *      manages each feed's config separately, i.e. each feed can have its own
+ *      config.
+ *
+ * @dev Note that due to internal technicalities the registry has a global upper
+ *      limit for config updates of 65,535 - 1.
+ *
+ *      Once this limit is reached, no further config updates can be performed!
+ *
+ * @custom:reference [FeedRegistry]: https://github.com/chronicleprotocol/feed-registry
+ */
+contract ConfigRegistry is IConfigRegistry, Auth {
+    struct Config {
+        string url;
+        bytes32 contentHash;
+        uint32 age;
+    }
+
+    // -- Storage --
+
+    /// @dev Statically allocated array holding the feeds' pointers to their
+    ///      respective config.
+    ///
+    /// @dev Note that pointers are of size uint16. Therefore, the registry
+    ///      supports up to 65,535 - 1 config updates.
+    uint16[256] internal _ptrs;
+
+    /// @dev Append-only array holding Config structs.
+    ///
+    /// @custom:invariant _configs[0] = NULL
+    /// @custom:invariant _configs.length <= type(uint16).max
+    Config[] internal _cfgs;
+
+    // -- Constructor --
+
+    constructor(address initialAuthed) Auth(initialAuthed) {
+        // Ensure uninitialized, ie zero, pointers are invalid.
+        _cfgs.push(Config("", bytes32(0), uint32(0)));
+    }
+
+    // -- Public Read Functions --
+
+    /// @inheritdoc IConfigRegistry
+    function configs(address feed)
+        external
+        view
+        returns (string memory, bytes32, uint)
+    {
+        // Derive feed's feedId.
+        uint8 feedId = uint8(uint(uint160(feed)) >> 152);
+
+        // Load feed's config pointer from storage.
+        uint16 ptr = _ptrs[feedId];
+
+        // Revert if pointer is zero.
+        if (ptr == 0) {
+            revert ConfigDoesNotExist(feedId);
+        }
+
+        // Load feed's config into memory.
+        Config memory cfg = _cfgs[ptr];
+        // assert(cfg.age != 0);
+
+        // Return feed config's url, content hash, and age.
+        return (cfg.url, cfg.contentHash, cfg.age);
+    }
+
+    // -- Auth'ed Functions --
+
+    /// @inheritdoc IConfigRegistry
+    function setConfig(
+        uint feedsBloom,
+        string calldata url,
+        bytes32 contentHash
+    ) external auth {
+        require(_cfgs.length < type(uint16).max);
+
+        // Add config to storage and get pointer.
+        _cfgs.push(Config(url, contentHash, uint32(block.timestamp)));
+        uint16 ptr = uint16(_cfgs.length - 1);
+
+        // Update config pointer for each feed included in feedsBloom.
+        for (uint i; i < 256; i++) {
+            if (feedsBloom & (1 << i) != 0) {
+                _ptrs[i] = ptr;
+            }
+        }
+
+        emit ConfigUpdated({caller: msg.sender, feedsBloom: feedsBloom});
+    }
+
+    /// @inheritdoc IConfigRegistry
+    function unsetConfig(uint feedsBloom) external auth {
+        // Set config pointer to zero for each feed included in feedsBloom.
+        for (uint i; i < 256; i++) {
+            if (feedsBloom & (1 << i) != 0) {
+                delete _ptrs[i];
+            }
+        }
+
+        emit ConfigRemoved({caller: msg.sender, feedsBloom: feedsBloom});
+    }
+}
+
+/**
+ * @dev Contract overwrite to deploy contract instances with specific naming.
+ *
+ *      For more info, see docs/Deployment.md.
+ */
+contract ConfigRegistry_1 is ConfigRegistry {
+    constructor(address initialAuthed) ConfigRegistry(initialAuthed) {}
+}
+
+
+// File: lib/chronicle-std/src/auth/Auth.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+import {IAuth} from "./IAuth.sol";
+
+/**
+ * @title Auth Module
+ *
+ * @dev The `Auth` contract module provides a basic access control mechanism,
+ *      where a set of addresses are granted access to protected functions.
+ *      These addresses are said to be _auth'ed_.
+ *
+ *      Initially, the address given as constructor argument is the only address
+ *      auth'ed. Through the `rely(address)` and `deny(address)` functions,
+ *      auth'ed callers are able to grant/renounce auth to/from addresses.
+ *
+ *      This module is used through inheritance. It will make available the
+ *      modifier `auth`, which can be applied to functions to restrict their
+ *      use to only auth'ed callers.
+ */
+abstract contract Auth is IAuth {
+    /// @dev Mapping storing whether address is auth'ed.
+    /// @custom:invariant Image of mapping is {0, 1}.
+    ///                     ∀x ∊ Address: _wards[x] ∊ {0, 1}
+    /// @custom:invariant Only address given as constructor argument is authenticated after deployment.
+    ///                     deploy(initialAuthed) → (∀x ∊ Address: _wards[x] == 1 → x == initialAuthed)
+    /// @custom:invariant Only functions `rely` and `deny` may mutate the mapping's state.
+    ///                     ∀x ∊ Address: preTx(_wards[x]) != postTx(_wards[x])
+    ///                                     → (msg.sig == "rely" ∨ msg.sig == "deny")
+    /// @custom:invariant Mapping's state may only be mutated by authenticated caller.
+    ///                     ∀x ∊ Address: preTx(_wards[x]) != postTx(_wards[x]) → _wards[msg.sender] = 1
+    mapping(address => uint) private _wards;
+
+    /// @dev List of addresses possibly being auth'ed.
+    /// @dev May contain duplicates.
+    /// @dev May contain addresses not being auth'ed anymore.
+    /// @custom:invariant Every address being auth'ed once is element of the list.
+    ///                     ∀x ∊ Address: authed(x) -> x ∊ _wardsTouched
+    address[] private _wardsTouched;
+
+    /// @dev Ensures caller is auth'ed.
+    modifier auth() {
+        assembly ("memory-safe") {
+            // Compute slot of _wards[msg.sender].
+            mstore(0x00, caller())
+            mstore(0x20, _wards.slot)
+            let slot := keccak256(0x00, 0x40)
+
+            // Revert if caller not auth'ed.
+            let isAuthed := sload(slot)
+            if iszero(isAuthed) {
+                // Store selector of `NotAuthorized(address)`.
+                mstore(0x00, 0x4a0bfec1)
+                // Store msg.sender.
+                mstore(0x20, caller())
+                // Revert with (offset, size).
+                revert(0x1c, 0x24)
+            }
+        }
+        _;
+    }
+
+    constructor(address initialAuthed) {
+        _wards[initialAuthed] = 1;
+        _wardsTouched.push(initialAuthed);
+
+        // Note to use address(0) as caller to indicate address was auth'ed
+        // during deployment.
+        emit AuthGranted(address(0), initialAuthed);
+    }
+
+    /// @inheritdoc IAuth
+    function rely(address who) external auth {
+        if (_wards[who] == 1) return;
+
+        _wards[who] = 1;
+        _wardsTouched.push(who);
+        emit AuthGranted(msg.sender, who);
+    }
+
+    /// @inheritdoc IAuth
+    function deny(address who) external auth {
+        if (_wards[who] == 0) return;
+
+        _wards[who] = 0;
+        emit AuthRenounced(msg.sender, who);
+    }
+
+    /// @inheritdoc IAuth
+    function authed(address who) public view returns (bool) {
+        return _wards[who] == 1;
+    }
+
+    /// @inheritdoc IAuth
+    /// @custom:invariant Only contains auth'ed addresses.
+    ///                     ∀x ∊ authed(): _wards[x] == 1
+    /// @custom:invariant Contains all auth'ed addresses.
+    ///                     ∀x ∊ Address: _wards[x] == 1 → x ∊ authed()
+    function authed() public view returns (address[] memory) {
+        // Initiate array with upper limit length.
+        address[] memory wardsList = new address[](_wardsTouched.length);
+
+        // Iterate through all possible auth'ed addresses.
+        uint ctr;
+        for (uint i; i < wardsList.length; i++) {
+            // Add address only if still auth'ed.
+            if (_wards[_wardsTouched[i]] == 1) {
+                wardsList[ctr++] = _wardsTouched[i];
+            }
+        }
+
+        // Set length of array to number of auth'ed addresses actually included.
+        assembly ("memory-safe") {
+            mstore(wardsList, ctr)
+        }
+
+        return wardsList;
+    }
+
+    /// @inheritdoc IAuth
+    function wards(address who) public view returns (uint) {
+        return _wards[who];
+    }
+}
+
+
+// File: src/IConfigRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+interface IConfigRegistry {
+    /// @notice Thrown if no config exists for feed with id `feedId`.
+    error ConfigDoesNotExist(uint8 feedId);
+
+    /// @notice Emitted when config for feeds `feedsBloom` updated.
+    /// @param caller The caller's address.
+    /// @param feedsBloom The feeds encoded via bloom mechanism which's config
+    ///                   got updated.
+    event ConfigUpdated(address indexed caller, uint indexed feedsBloom);
+
+    /// @notice Emitted when config for feeds `feedsBloom` removed.
+    /// @param caller The caller's address.
+    /// @param feedsBloom The feeds encoded via bloom mechanism which's config
+    ///                   got removed.
+    event ConfigRemoved(address indexed caller, uint indexed feedsBloom);
+
+    // -- Public Read Functions --
+
+    /// @notice Returns the url and metadata of feed `feed`'s config.
+    ///
+    /// @dev Reverts if:
+    ///      - Config does not exist for feed `feed`
+    ///
+    /// @param feed The feed address.
+    /// @return url The url of the feed's config.
+    /// @return contentHash The keccak256 hash of the feed config's content.
+    /// @return age The age of the config.
+    function configs(address feed)
+        external
+        view
+        returns (string memory url, bytes32 contentHash, uint age);
+
+    // -- Auth'ed Functions --
+
+    /// @notice Updates the config's url and config's content hash for feeds
+    ///         encoded in bloom filter `feedsBloom`.
+    ///
+    /// @dev Only callable by auth'ed addresses.
+    ///
+    /// @dev Reverts if:
+    ///      - Maximum number of config updates performed
+    ///
+    /// @param feedsBloom The bloom filter encoding the feeds to update their
+    ///                   config's url and content hash.
+    /// @param url The url of the new config.
+    /// @param contentHash The keccak256 hash of the config's content.
+    function setConfig(
+        uint feedsBloom,
+        string calldata url,
+        bytes32 contentHash
+    ) external;
+
+    /// @notice Removes the config for feeds encoded in bloom filter
+    ///         `feedsBloom`.
+    ///
+    /// @dev Only callable by auth'ed addresses.
+    ///
+    /// @param feedsBloom The bloom filter encoding the feeds to remove their
+    ///                   config.
+    function unsetConfig(uint feedsBloom) external;
+}
+
+
+// File: lib/chronicle-std/src/auth/IAuth.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+interface IAuth {
+    /// @notice Thrown by protected function if caller not auth'ed.
+    /// @param caller The caller's address.
+    error NotAuthorized(address caller);
+
+    /// @notice Emitted when auth granted to address.
+    /// @param caller The caller's address.
+    /// @param who The address auth got granted to.
+    event AuthGranted(address indexed caller, address indexed who);
+
+    /// @notice Emitted when auth renounced from address.
+    /// @param caller The caller's address.
+    /// @param who The address auth got renounced from.
+    event AuthRenounced(address indexed caller, address indexed who);
+
+    /// @notice Grants address `who` auth.
+    /// @dev Only callable by auth'ed address.
+    /// @param who The address to grant auth.
+    function rely(address who) external;
+
+    /// @notice Renounces address `who`'s auth.
+    /// @dev Only callable by auth'ed address.
+    /// @param who The address to renounce auth.
+    function deny(address who) external;
+
+    /// @notice Returns whether address `who` is auth'ed.
+    /// @param who The address to check.
+    /// @return True if `who` is auth'ed, false otherwise.
+    function authed(address who) external view returns (bool);
+
+    /// @notice Returns full list of addresses granted auth.
+    /// @dev May contain duplicates.
+    /// @return List of addresses granted auth.
+    function authed() external view returns (address[] memory);
+
+    /// @notice Returns whether address `who` is auth'ed.
+    /// @custom:deprecated Use `authed(address)(bool)` instead.
+    /// @param who The address to check.
+    /// @return 1 if `who` is auth'ed, 0 otherwise.
+    function wards(address who) external view returns (uint);
+}
+

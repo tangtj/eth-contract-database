@@ -1,0 +1,1832 @@
+
+// File: Automatons.sol
+//
+// Automatons xNFT (AUTO)
+// The first collection to use the xNFT hybrid standard.
+// Created by the CellMates team.
+//
+// - 4096 total supply
+// - 3 LPs created on deployment:
+//  - 256 AUTO + 4 ETH v2 liquidity
+//  - 256 AUTO + 0 wCELL v3 single sided LP
+//  - 1280 AUTO + 0 ETH v3 single sided LP
+// - 1792 AUTO free airdrop claim for CELL/wCELL holders
+// - 512 AUTO @ 0.1 ETH public mint from contract price
+// - sellable on both Uniswap and Opensea
+// - fully on-chain artwork based on cellular automata
+//
+// https://auto.cellmates.io
+// https://discord.com/invite/cellmates
+// https://twitter.com/CellMatesERC
+//
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "./xNFT.sol";
+import "./Metadata.sol";
+
+interface RouterV2 {
+	function factory() external pure returns (address);
+	function addLiquidityETH(address, uint256, uint256, uint256, address, uint256) external payable returns (uint256, uint256, uint256);
+}
+
+interface FactoryV2 {
+	function createPair(address, address) external returns (address);
+}
+
+interface PairV2 {
+	function sync() external;
+}
+
+interface RouterV3 {
+	function factory() external view returns (address);
+	function positionManager() external view returns (address);
+	function WETH9() external view returns (address);
+}
+
+interface FactoryV3 {
+	function createPool(address _tokenA, address _tokenB, uint24 _fee) external returns (address);
+}
+
+interface PoolV3 {
+	function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool);
+	function initialize(uint160 _sqrtPriceX96) external;
+}
+
+interface PositionManager {
+	struct MintParams {
+		address token0;
+		address token1;
+		uint24 fee;
+		int24 tickLower;
+		int24 tickUpper;
+		uint256 amount0Desired;
+		uint256 amount1Desired;
+		uint256 amount0Min;
+		uint256 amount1Min;
+		address recipient;
+		uint256 deadline;
+	}
+	struct CollectParams {
+		uint256 tokenId;
+		address recipient;
+		uint128 amount0Max;
+		uint128 amount1Max;
+	}
+	function mint(MintParams calldata) external payable returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
+	function collect(CollectParams calldata) external payable returns (uint256 amount0, uint256 amount1);
+}
+
+interface ERC20 {
+	function balanceOf(address) external view returns (uint256);
+	function transfer(address, uint256) external returns (bool);
+}
+
+interface IWETH is ERC20 {
+	function withdraw(uint256) external;
+}
+
+
+contract Team {
+
+	RouterV3 constant private ROUTER = RouterV3(0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45);
+	ERC20 constant private WCELL = ERC20(0x18E5F92103d1B34623738Ee79214B1659f2eE109);
+
+	struct Share {
+		address payable user;
+		uint256 shares;
+	}
+	Share[] public shares;
+	uint256 public totalShares;
+	ERC20 immutable public token;
+
+
+	constructor() {
+		token = ERC20(msg.sender);
+		_addShare(0xFaDED72464D6e76e37300B467673b36ECc4d2ccF, 4);
+		_addShare(0xEC513e5959dBB02F314fc2F30041FCA2685119F3, 1);
+	}
+
+	receive() external payable {}
+
+	function withdrawETH() public {
+		uint256 _balance = address(this).balance;
+		if (_balance > 0) {
+			for (uint256 i = 0; i < shares.length; i++) {
+				Share memory _share = shares[i];
+				!_share.user.send(_balance * _share.shares / totalShares);
+			}
+		}
+	}
+
+	function withdrawToken(ERC20 _token) public {
+		IWETH _weth = IWETH(ROUTER.WETH9());
+		if (address(_token) == address(_weth)) {
+			_weth.withdraw(_weth.balanceOf(address(this)));
+			withdrawETH();
+		} else {
+			uint256 _balance = _token.balanceOf(address(this));
+			if (_balance > 0) {
+				if (_token == token) {
+					_token.transfer(shares[0].user, _balance);
+				} else {
+					for (uint256 i = 0; i < shares.length; i++) {
+						Share memory _share = shares[i];
+						_token.transfer(_share.user, _balance * _share.shares / totalShares);
+					}
+				}
+			}
+		}
+	}
+
+	function withdrawWETH() public {
+		withdrawToken(ERC20(ROUTER.WETH9()));
+	}
+
+	function withdrawFees() external {
+		withdrawWETH();
+		withdrawToken(WCELL);
+		withdrawToken(token);
+	}
+
+
+	function _addShare(address _user, uint256 _shares) internal {
+		shares.push(Share(payable(_user), _shares));
+		totalShares += _shares;
+	}
+}
+
+
+contract Automatons is xNFT {
+
+	uint256 constant private TOTAL_SUPPLY = 4096;
+	uint256 constant private V2_LIQUIDITY_TOKENS = 256;
+	uint256 constant private V3_WCELL_LIQUIDITY_TOKENS = 256;
+	uint256 constant private V3_WETH_LIQUIDITY_TOKENS = 1280;
+	RouterV2 constant private ROUTER_V2 = RouterV2(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+	RouterV3 constant private ROUTER_V3 = RouterV3(0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45);
+	PoolV3 constant private WCELL_POOL_V3 = PoolV3(0x685c401540C103631A0ba7f14A3d16Ae3cB4E50B);
+	address constant private WCELL = 0x18E5F92103d1B34623738Ee79214B1659f2eE109;
+	uint256 immutable private ETH_WCELL_RATIO;
+	uint256 immutable private LP_INITIAL_ETH;
+	uint256 constant private LP_UPPER_ETH = 1e8 ether;
+	int24 constant private MIN_TICK = -887272;
+	int24 constant private MAX_TICK = -MIN_TICK;
+	uint160 constant private MIN_SQRT_RATIO = 4295128739;
+	uint160 constant private MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+	uint128 constant private UINT128_MAX = type(uint128).max;
+	bytes32 constant private MERKLE_ROOT = 0x3f856c8d1611023aaa9915c692b07293eea0d4dd7c26df3914d5bfbd430ce84c;
+
+	Metadata public metadata;
+	Team immutable public team;
+	PoolV3 immutable public wcellPoolV3;
+	PoolV3 immutable public wethPoolV3;
+	uint256 public wcellPositionId;
+	uint256 public wethPositionId;
+	PairV2 public pairV2;
+	bytes32 public salt;
+	mapping(address => bool) public hasClaimedAirdrop;
+	uint256 public mintable = 512;
+	uint256 constant public mintCost = 0.1 ether;
+
+	event Claim(address indexed account, uint256 tokens);
+
+
+	constructor() xNFT(address(this), TOTAL_SUPPLY) payable {
+		require(msg.value > 0);
+		info.owner = 0xFaDED72464D6e76e37300B467673b36ECc4d2ccF;
+		team = new Team();
+		metadata = new Metadata();
+		LP_INITIAL_ETH = totalSupply * msg.value / V2_LIQUIDITY_TOKENS;
+		address _this = address(this);
+		address _weth = ROUTER_V3.WETH9();
+		(uint160 _initialSqrtPrice, ) = _getPriceAndTickFromValues(_weth < _this, TOTAL_SUPPLY, LP_INITIAL_ETH);
+		wethPoolV3 = PoolV3(FactoryV3(ROUTER_V3.factory()).createPool(_this, _weth, 10000));
+		wethPoolV3.initialize(_initialSqrtPrice);
+		(uint256 _wcellSqrtPrice, , , , , , ) = WCELL_POOL_V3.slot0();
+		ETH_WCELL_RATIO = (_wcellSqrtPrice * _wcellSqrtPrice * 1e18) >> 192;
+		(_initialSqrtPrice, ) = _getPriceAndTickFromValues(WCELL < _this, TOTAL_SUPPLY, 1e18 * LP_INITIAL_ETH / ETH_WCELL_RATIO);
+		wcellPoolV3 = PoolV3(FactoryV3(ROUTER_V3.factory()).createPool(_this, WCELL, 10000));
+		wcellPoolV3.initialize(_initialSqrtPrice);
+		salt = keccak256(abi.encodePacked("Salt:", blockhash(block.number - 1)));
+	}
+
+	function setMetadata(Metadata _metadata) external _onlyOwner {
+		metadata = _metadata;
+	}
+
+
+	function initialize() external _withoutEventEmits {
+		require(address(pairV2) == address(0x0));
+		address _this = address(this);
+		address _weth = ROUTER_V3.WETH9();
+		_approveERC20(_this, address(ROUTER_V2), V2_LIQUIDITY_TOKENS);
+		pairV2 = PairV2(FactoryV2(ROUTER_V2.factory()).createPair(_weth, _this));
+		ROUTER_V2.addLiquidityETH{value:_this.balance}(_this, V2_LIQUIDITY_TOKENS, 0, 0, owner(), block.timestamp);
+		PositionManager _pm = PositionManager(ROUTER_V3.positionManager());
+		_approveERC20(_this, address(_pm), V3_WCELL_LIQUIDITY_TOKENS + V3_WETH_LIQUIDITY_TOKENS);
+		bool _weth0 = _weth < _this;
+		( , int24 _minTick) = _getPriceAndTickFromValues(_weth0, TOTAL_SUPPLY, LP_INITIAL_ETH);
+		( , int24 _maxTick) = _getPriceAndTickFromValues(_weth0, TOTAL_SUPPLY, LP_UPPER_ETH);
+		(wethPositionId, , , ) = _pm.mint(PositionManager.MintParams({
+			token0: _weth0 ? _weth : _this,
+			token1: !_weth0 ? _weth : _this,
+			fee: 10000,
+			tickLower: _weth0 ? _maxTick : _minTick,
+			tickUpper: !_weth0 ? _maxTick : _minTick,
+			amount0Desired: _weth0 ? 0 : V3_WETH_LIQUIDITY_TOKENS,
+			amount1Desired: !_weth0 ? 0 : V3_WETH_LIQUIDITY_TOKENS,
+			amount0Min: 0,
+			amount1Min: 0,
+			recipient: _this,
+			deadline: block.timestamp
+		}));
+		_weth0 = WCELL < _this;
+		( , _minTick) = _getPriceAndTickFromValues(_weth0, TOTAL_SUPPLY, 1e18 * LP_INITIAL_ETH / ETH_WCELL_RATIO);
+		( , _maxTick) = _getPriceAndTickFromValues(_weth0, TOTAL_SUPPLY, 1e18 * LP_UPPER_ETH / ETH_WCELL_RATIO);
+		(wcellPositionId, , , ) = _pm.mint(PositionManager.MintParams({
+			token0: _weth0 ? WCELL : _this,
+			token1: !_weth0 ? WCELL : _this,
+			fee: 10000,
+			tickLower: _weth0 ? _maxTick : _minTick,
+			tickUpper: !_weth0 ? _maxTick : _minTick,
+			amount0Desired: _weth0 ? 0 : V3_WCELL_LIQUIDITY_TOKENS,
+			amount1Desired: !_weth0 ? 0 : V3_WCELL_LIQUIDITY_TOKENS,
+			amount0Min: 0,
+			amount1Min: 0,
+			recipient: _this,
+			deadline: block.timestamp
+		}));
+	}
+
+	function collectAllTradingFees() external {
+		collectTradingFees(UINT128_MAX, UINT128_MAX, UINT128_MAX, UINT128_MAX);
+	}
+
+	function collectTradingFees(uint128 _wethAmount0Max, uint128 _wethAmount1Max, uint128 _wcellAmount0Max, uint128 _wcellAmount1Max) public {
+		PositionManager _pm = PositionManager(ROUTER_V3.positionManager());
+		_pm.collect(PositionManager.CollectParams({
+			tokenId: wethPositionId,
+			recipient: address(team),
+			amount0Max: _wethAmount0Max,
+			amount1Max: _wethAmount1Max
+		}));
+		_pm.collect(PositionManager.CollectParams({
+			tokenId: wcellPositionId,
+			recipient: address(team),
+			amount0Max: _wcellAmount0Max,
+			amount1Max: _wcellAmount1Max
+		}));
+		team.withdrawFees();
+	}
+
+	function claim(address _account, uint256 _tokens, bytes32[] calldata _proof) external {
+		require(!hasClaimedAirdrop[_account]);
+		require(_verify(_proof, keccak256(abi.encodePacked(_account, _tokens))));
+		hasClaimedAirdrop[_account] = true;
+		_transferERC20(address(this), _account, _tokens);
+		emit Claim(_account, _tokens);
+	}
+
+	function mint(uint256 _tokens) external payable {
+		require(_tokens <= mintable);
+		uint256 _cost = _tokens * mintCost;
+		require(msg.value >= _cost);
+		mintable -= _tokens;
+		_transferERC20(address(this), msg.sender, _tokens);
+		payable(team).transfer(_cost);
+		if (msg.value > _cost) {
+			payable(msg.sender).transfer(msg.value - _cost);
+		}
+	}
+
+
+	function name() external override view returns (string memory) {
+		return metadata.name();
+	}
+
+	function symbol() external override view returns (string memory) {
+		return metadata.symbol();
+	}
+
+	function tokenURI(uint256 _tokenId) public override view returns (string memory) {
+		return metadata.tokenURI(_tokenId);
+	}
+
+
+	function _initialize() internal override _withoutEventEmits {
+		super._initialize();
+	}
+
+
+	function _getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
+		unchecked {
+			uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
+			require(absTick <= uint256(int256(MAX_TICK)), 'T');
+
+			uint256 ratio = absTick & 0x1 != 0 ? 0xfffcb933bd6fad37aa2d162d1a594001 : 0x100000000000000000000000000000000;
+			if (absTick & 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
+			if (absTick & 0x4 != 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) >> 128;
+			if (absTick & 0x8 != 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0) >> 128;
+			if (absTick & 0x10 != 0) ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644) >> 128;
+			if (absTick & 0x20 != 0) ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0) >> 128;
+			if (absTick & 0x40 != 0) ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861) >> 128;
+			if (absTick & 0x80 != 0) ratio = (ratio * 0xfe5dee046a99a2a811c461f1969c3053) >> 128;
+			if (absTick & 0x100 != 0) ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4) >> 128;
+			if (absTick & 0x200 != 0) ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54) >> 128;
+			if (absTick & 0x400 != 0) ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3) >> 128;
+			if (absTick & 0x800 != 0) ratio = (ratio * 0xe7159475a2c29b7443b29c7fa6e889d9) >> 128;
+			if (absTick & 0x1000 != 0) ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825) >> 128;
+			if (absTick & 0x2000 != 0) ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5) >> 128;
+			if (absTick & 0x4000 != 0) ratio = (ratio * 0x70d869a156d2a1b890bb3df62baf32f7) >> 128;
+			if (absTick & 0x8000 != 0) ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6) >> 128;
+			if (absTick & 0x10000 != 0) ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9) >> 128;
+			if (absTick & 0x20000 != 0) ratio = (ratio * 0x5d6af8dedb81196699c329225ee604) >> 128;
+			if (absTick & 0x40000 != 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98) >> 128;
+			if (absTick & 0x80000 != 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2) >> 128;
+
+			if (tick > 0) ratio = type(uint256).max / ratio;
+
+			sqrtPriceX96 = uint160((ratio >> 32) + (ratio % (1 << 32) == 0 ? 0 : 1));
+		}
+	}
+
+	function _getTickAtSqrtRatio(uint160 sqrtPriceX96) internal pure returns (int24 tick) {
+		unchecked {
+			require(sqrtPriceX96 >= MIN_SQRT_RATIO && sqrtPriceX96 < MAX_SQRT_RATIO, 'R');
+			uint256 ratio = uint256(sqrtPriceX96) << 32;
+
+			uint256 r = ratio;
+			uint256 msb = 0;
+
+			assembly {
+				let f := shl(7, gt(r, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := shl(6, gt(r, 0xFFFFFFFFFFFFFFFF))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := shl(5, gt(r, 0xFFFFFFFF))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := shl(4, gt(r, 0xFFFF))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := shl(3, gt(r, 0xFF))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := shl(2, gt(r, 0xF))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := shl(1, gt(r, 0x3))
+				msb := or(msb, f)
+				r := shr(f, r)
+			}
+			assembly {
+				let f := gt(r, 0x1)
+				msb := or(msb, f)
+			}
+
+			if (msb >= 128) r = ratio >> (msb - 127);
+			else r = ratio << (127 - msb);
+
+			int256 log_2 = (int256(msb) - 128) << 64;
+
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(63, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(62, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(61, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(60, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(59, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(58, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(57, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(56, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(55, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(54, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(53, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(52, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(51, f))
+				r := shr(f, r)
+			}
+			assembly {
+				r := shr(127, mul(r, r))
+				let f := shr(128, r)
+				log_2 := or(log_2, shl(50, f))
+			}
+
+			int256 log_sqrt10001 = log_2 * 255738958999603826347141;
+
+			int24 tickLow = int24((log_sqrt10001 - 3402992956809132418596140100660247210) >> 128);
+			int24 tickHi = int24((log_sqrt10001 + 291339464771989622907027621153398088495) >> 128);
+
+			tick = tickLow == tickHi ? tickLow : _getSqrtRatioAtTick(tickHi) <= sqrtPriceX96 ? tickHi : tickLow;
+		}
+	}
+
+	function _sqrt(uint256 _n) internal pure returns (uint256 result) {
+		unchecked {
+			uint256 _tmp = (_n + 1) / 2;
+			result = _n;
+			while (_tmp < result) {
+				result = _tmp;
+				_tmp = (_n / _tmp + _tmp) / 2;
+			}
+		}
+	}
+
+	function _getPriceAndTickFromValues(bool _weth0, uint256 _tokens, uint256 _weth) internal pure returns (uint160 price, int24 tick) {
+		uint160 _tmpPrice = uint160(_sqrt(2**192 / (!_weth0 ? _tokens : _weth) * (_weth0 ? _tokens : _weth)));
+		tick = _getTickAtSqrtRatio(_tmpPrice);
+		tick = tick - (tick % 200);
+		price = _getSqrtRatioAtTick(tick);
+	}
+
+	function _verify(bytes32[] memory _proof, bytes32 _leaf) internal pure returns (bool) {
+		bytes32 _computedHash = _leaf;
+		for (uint256 i = 0; i < _proof.length; i++) {
+			bytes32 _proofElement = _proof[i];
+			if (_computedHash <= _proofElement) {
+				_computedHash = keccak256(abi.encodePacked(_computedHash, _proofElement));
+			} else {
+				_computedHash = keccak256(abi.encodePacked(_proofElement, _computedHash));
+			}
+		}
+		return _computedHash == MERKLE_ROOT;
+	}
+}
+
+
+contract Deploy {
+
+	Automatons immutable public automatons;
+	address constant private weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+	constructor() payable {
+		automatons = new Automatons{ value: msg.value, salt: _findSaltForWETH0() }();
+		automatons.initialize();
+	}
+
+	function _findSaltForWETH0() internal view returns (bytes32) {
+		bytes32 _codehash = keccak256(type(Automatons).creationCode);
+		uint256 _salt = 0;
+		address _predicted;
+		do {
+			_salt++;
+			_predicted = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), bytes32(_salt), _codehash)))));
+		} while (_predicted < weth);
+		return bytes32(_salt);
+	}
+}
+
+// File: Metadata.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface AUTO {
+	function salt() external view returns (bytes32);
+}
+
+contract Metadata {
+	
+	string public name = "Automatons xNFT";
+	string public symbol = "AUTO";
+
+	uint256 constant private TARGET_BIT_COUNT = 13;
+	string constant private TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+	struct Size {
+		uint248 size;
+		uint8 chance;
+	}
+	Size[] private sizes;
+
+	struct Color {
+		bytes3 backgroundColor;
+		bytes3 foregroundColor;
+		uint16 chance;
+		string name;
+	}
+	Color[] private colors;
+
+	struct Reflection {
+		uint8 chance;
+		string name;
+	}
+	Reflection[] private reflections;
+
+	AUTO immutable public automatons;
+
+
+	constructor() {
+		automatons = AUTO(msg.sender);
+
+		// sizes
+		sizes.push(Size(16, 20));
+		sizes.push(Size(32, 200));
+		sizes.push(Size(48, 120));
+		sizes.push(Size(64, 50));
+		sizes.push(Size(96, 10));
+		sizes.push(Size(128, 1));
+		
+		// colors
+		colors.push(Color(0xffffff, 0x000000, 3200, "Clean White"));
+		colors.push(Color(0x000000, 0xffffff, 800, "Deep Black"));
+		colors.push(Color(0x179629, 0x15491f, 100, "Slimy Green"));
+		colors.push(Color(0xc9a91c, 0x5f5120, 75, "Pacific Blue"));
+		colors.push(Color(0x009fff, 0x144d79, 55, "Orange Peel"));
+		colors.push(Color(0x3bb5cf, 0x235763, 35, "Old Gold"));
+		colors.push(Color(0x908070, 0x463f38, 25, "Slate Gray"));
+		colors.push(Color(0xac8fe6, 0x53466d, 15, "Charm Pink"));
+		colors.push(Color(0x2b2ca6, 0x191d52, 10, "Metallic Red"));
+		colors.push(Color(0xa95178, 0x522b3d, 5, "Royal Purple"));
+
+		// reflections
+		reflections.push(Reflection(40, "None"));
+		reflections.push(Reflection(20, "Rotation"));
+		reflections.push(Reflection(10, "Single"));
+		reflections.push(Reflection(5, "Double"));
+	}
+
+	function tokenURI(uint256 _tokenId) external view returns (string memory) {
+		unchecked {
+			( , , uint256 _size, uint256 _colorIndex, uint256 _reflectionIndex) = getTokenInfo(_tokenId);
+			string memory _json = string(abi.encodePacked('{"name":"AUTO #', _uint2str(_tokenId), '","description":"The first collection to use the xNFT hybrid standard. Created by the CellMates team.",'));
+			_json = string(abi.encodePacked(_json, '"image":"', svgURI(_tokenId), '","attributes":['));
+			_json = string(abi.encodePacked(_json, '{"trait_type":"Size","value":"', _uint2str(_size), '"},'));
+			_json = string(abi.encodePacked(_json, '{"trait_type":"Color","value":"', colors[_colorIndex].name, '"},'));
+			_json = string(abi.encodePacked(_json, '{"trait_type":"Reflection","value":"', reflections[_reflectionIndex].name, '"}'));
+			_json = string(abi.encodePacked(_json, ']}'));
+			return string(abi.encodePacked('data:application/json;base64,', _encode(bytes(_json))));
+		}
+	}
+
+	function svgURI(uint256 _tokenId) public view returns (string memory) {
+		return string(abi.encodePacked('data:image/svg+xml;base64,', _encode(bytes(getSVG(_tokenId)))));
+	}
+	
+	function bmpURI(uint256 _tokenId) public view returns (string memory) {
+		return string(abi.encodePacked('data:image/bmp;base64,', _encode(getBMP(_tokenId))));
+	}
+
+	function getSVG(uint256 _tokenId) public view returns (string memory) {
+		( , , , uint256 _colorIndex, ) = getTokenInfo(_tokenId);
+		return string(abi.encodePacked('<svg xmlns="http://www.w3.org/2000/svg" version="1.1" preserveAspectRatio="xMidYMid meet" viewBox="0 0 512 512" width="100%" height="100%"><defs><style type="text/css">svg{image-rendering:optimizeSpeed;image-rendering:-moz-crisp-edges;image-rendering:-o-crisp-edges;image-rendering:-webkit-optimize-contrast;image-rendering:pixelated;image-rendering:optimize-contrast;-ms-interpolation-mode:nearest-neighbor;background-color:', _col2str(colors[_colorIndex].backgroundColor), ';background-image:url(', bmpURI(_tokenId), ');background-repeat:no-repeat;background-size:contain;background-position:50% 50%;}</style></defs></svg>'));
+	}
+	
+	function getBMP(uint256 _tokenId) public view returns (bytes memory) {
+		(bytes32 _seed, uint32 _rule, uint256 _size, uint256 _colorIndex, uint256 _reflectionIndex) = getTokenInfo(_tokenId);
+		return _getBMP(_makePalette(colors[_colorIndex].backgroundColor, colors[_colorIndex].foregroundColor), _convertToColors(_generate(_seed, _rule, _size, _reflectionIndex)), _size + 2 * _getPadding(_size));
+	}
+	
+	function getTokenInfo(uint256 _tokenId) public view returns (bytes32 seed, uint32 rule, uint256 size, uint256 colorIndex, uint256 reflectionIndex) {
+		unchecked {
+			seed = keccak256(abi.encodePacked("Seed:", _tokenId, automatons.salt()));
+			uint256[32] memory _bitIndexes;
+			for (uint256 i = 0; i < _bitIndexes.length; i++) {
+				_bitIndexes[i] = i;
+			}
+			for (uint256 i = 0; i < TARGET_BIT_COUNT; i++) {
+				uint256 _index = i + uint256(keccak256(abi.encodePacked("Shuffle:", i, seed))) % (_bitIndexes.length - i);
+				uint256 tmp = _bitIndexes[_index];
+				_bitIndexes[_index] = _bitIndexes[i];
+				_bitIndexes[i] = tmp;
+			}
+			for (uint256 i = 0; i < TARGET_BIT_COUNT; i++) {
+				rule |= uint32(1 << _bitIndexes[i]);
+			}
+			size = _sampleSize(seed);
+			colorIndex = _sampleColor(seed);
+			reflectionIndex = _sampleReflection(seed);
+		}
+	}
+
+
+	function _sampleSize(bytes32 _seed) internal view returns (uint256 size) {
+		unchecked {
+			uint256 _total = 0;
+			for (uint256 i = 0; i < sizes.length; i++) {
+				_total += sizes[i].chance;
+			}
+			uint256 _target = uint256(keccak256(abi.encodePacked("Size:", _seed))) % _total;
+			_total = 0;
+			for (uint256 i = 0; i < sizes.length; i++) {
+				_total += sizes[i].chance;
+				if (_target < _total) {
+					return sizes[i].size;
+				}
+			}
+		}
+	}
+
+	function _sampleColor(bytes32 _seed) internal view returns (uint256 colorIndex) {
+		unchecked {
+			uint256 _total = 0;
+			for (uint256 i = 0; i < colors.length; i++) {
+				_total += colors[i].chance;
+			}
+			uint256 _target = uint256(keccak256(abi.encodePacked("Color:", _seed))) % _total;
+			_total = 0;
+			for (uint256 i = 0; i < colors.length; i++) {
+				_total += colors[i].chance;
+				if (_target < _total) {
+					return i;
+				}
+			}
+		}
+	}
+
+	function _sampleReflection(bytes32 _seed) internal view returns (uint256 reflectionIndex) {
+		unchecked {
+			uint256 _total = 0;
+			for (uint256 i = 0; i < reflections.length; i++) {
+				_total += reflections[i].chance;
+			}
+			uint256 _target = uint256(keccak256(abi.encodePacked("Reflection:", _seed))) % _total;
+			_total = 0;
+			for (uint256 i = 0; i < reflections.length; i++) {
+				_total += reflections[i].chance;
+				if (_target < _total) {
+					return i;
+				}
+			}
+		}
+	}
+
+	function _getPadding(uint256 _size) internal pure returns (uint256) {
+		return _size / 8;
+	}
+	
+	function _generate(bytes32 _seed, uint32 _rule, uint256 _size, uint256 _reflectionIndex) internal pure returns (uint8[][] memory state) {
+		unchecked {
+			uint256 _randomness = uint256(keccak256(abi.encodePacked("State:", _seed)));
+			uint256 _xSize = _reflectionIndex == 0 ? _size : _size / 2;
+			uint256 _ySize = _reflectionIndex == 3 ? _size / 2 : _size;
+			uint256[] memory _rows = new uint256[](_ySize);
+			for (uint256 y = 0; y < _ySize; y++) {
+				if (y == 0) {
+					_rows[y] = _randomness & ((1 << _xSize) - 1);
+				} else {
+					uint256 _row = 0;
+					uint256 _lastRow = _rows[y - 1];
+					_lastRow |= _lastRow << _xSize;
+					_lastRow <<= 2;
+					_lastRow |= (_lastRow >> _xSize) & 3;
+					for (uint256 x = 0; x < _xSize; x++) {
+						uint8 _config = uint8(_lastRow >> x) & 0x1f;
+						_row |= uint256((_rule >> _config) & 1) << x;
+					}
+					_rows[y] = _row;
+				}
+			}
+			uint256 _padding = _getPadding(_size);
+			state = new uint8[][](_size + 2 * _padding);
+			for (uint256 y = 0; y < state.length; y++) {
+				state[y] = new uint8[](_size + 2 * _padding);
+				if (y >= _padding && y < _size + _padding) {
+					for (uint256 x = _padding; x < state[y].length - _padding; x++) {
+						uint256 _xPos = x - _padding;
+						uint256 _yPos = y - _padding;
+						if (_reflectionIndex != 0 && x >= _xSize + _padding) {
+							_xPos = _size + _padding - x - 1;
+							if (_reflectionIndex == 1) {
+								_yPos = _size + _padding - y - 1;
+							}
+						}
+						if (_reflectionIndex == 3 && y >= _ySize + _padding) {
+							_yPos = _size + _padding - y - 1;
+						}
+						state[y][x] = uint8(_rows[_yPos] >> (_xPos)) & 1;
+					}
+				}
+			}
+		}
+	}
+
+	function _convertToColors(uint8[][] memory _state) internal pure returns (bytes memory cols) {
+		unchecked {
+			uint256 _scanline = _state[0].length;
+			if (_scanline % 4 != 0) {
+				_scanline += 4 - (_scanline % 4);
+			}
+			cols = new bytes(_state.length * _scanline);
+			for (uint256 y = 0; y < _state.length; y++) {
+				for (uint256 x = 0; x < _state[y].length; x++) {
+					cols[(_state.length - y - 1) * _scanline + x] = bytes1(_state[y][x]);
+				}
+			}
+		}
+	}
+	
+	function _makePalette(bytes3 _backgroundColor, bytes3 _foregroundColor) internal pure returns (bytes memory) {
+		unchecked {
+			return abi.encodePacked(_backgroundColor, bytes1(0), _foregroundColor, bytes1(0));
+		}
+	}
+
+	function _getBMP(bytes memory _palette, bytes memory _colors, uint256 _size) internal pure returns (bytes memory) {
+		unchecked {
+			uint32 _bufSize = 14 + 40 + uint32(_palette.length);
+			bytes memory _buf = new bytes(_bufSize - _palette.length);
+			_buf[0] = 0x42;
+			_buf[1] = 0x4d;
+			uint32 _tmp = _bufSize + uint32(_colors.length);
+			uint32 b;
+			for (uint i = 2; i < 6; i++) {
+				assembly {
+					b := and(_tmp, 0xff)
+					_tmp := shr(8, _tmp)
+				}
+				_buf[i] = bytes1(uint8(b));
+			}
+			_tmp = _bufSize;
+			for (uint i = 10; i < 14; i++) {
+				assembly {
+					b := and(_tmp, 0xff)
+					_tmp := shr(8, _tmp)
+				}
+				_buf[i] = bytes1(uint8(b));
+			}
+			_buf[14] = 0x28;
+			_tmp = uint32(_size);
+			for (uint i = 18; i < 22; i++) {
+				assembly {
+					b := and(_tmp, 0xff)
+					_tmp := shr(8, _tmp)
+				}
+				_buf[i] = bytes1(uint8(b));
+				_buf[i + 4] = bytes1(uint8(b));
+			}
+			_buf[26] = 0x01;
+			_buf[28] = 0x08;
+			_tmp = uint32(_colors.length);
+			for (uint i = 34; i < 38; i++) {
+				assembly {
+					b := and(_tmp, 0xff)
+					_tmp := shr(8, _tmp)
+				}
+				_buf[i] = bytes1(uint8(b));
+			}
+			_tmp = uint32(_palette.length / 4);
+			for (uint i = 46; i < 50; i++) {
+				assembly {
+					b := and(_tmp, 0xff)
+					_tmp := shr(8, _tmp)
+				}
+				_buf[i] = bytes1(uint8(b));
+				_buf[i + 4] = bytes1(uint8(b));
+			}
+			return abi.encodePacked(_buf, _palette, _colors);
+		}
+	}
+
+	function _uint2str(uint256 _value) internal pure returns (string memory) {
+		unchecked {
+			uint256 _digits = 1;
+			uint256 _n = _value;
+			while (_n > 9) {
+				_n /= 10;
+				_digits++;
+			}
+			bytes memory _out = new bytes(_digits);
+			for (uint256 i = 0; i < _out.length; i++) {
+				uint256 _dec = (_value / (10**(_out.length - i - 1))) % 10;
+				_out[i] = bytes1(uint8(_dec) + 48);
+			}
+			return string(_out);
+		}
+	}
+
+	function _col2str(bytes3 _col) internal pure returns (string memory str) {
+		unchecked {
+			str = "#";
+			for (uint256 i = 0; i < 6; i++) {
+				uint256 _hex = (uint24(_col) >> (4 * (i + 1 - 2 * (i % 2)))) % 16;
+				bytes memory _char = new bytes(1);
+				_char[0] = bytes1(uint8(_hex) + (_hex > 9 ? 87 : 48));
+				str = string(abi.encodePacked(str, string(_char)));
+			}
+		}
+	}
+
+	function _encode(bytes memory _data) internal pure returns (string memory result) {
+		unchecked {
+			if (_data.length == 0) return '';
+			string memory _table = TABLE;
+			uint256 _encodedLen = 4 * ((_data.length + 2) / 3);
+			result = new string(_encodedLen + 32);
+
+			assembly {
+				mstore(result, _encodedLen)
+				let tablePtr := add(_table, 1)
+				let dataPtr := _data
+				let endPtr := add(dataPtr, mload(_data))
+				let resultPtr := add(result, 32)
+
+				for {} lt(dataPtr, endPtr) {}
+				{
+					dataPtr := add(dataPtr, 3)
+					let input := mload(dataPtr)
+					mstore(resultPtr, shl(248, mload(add(tablePtr, and(shr(18, input), 0x3F)))))
+					resultPtr := add(resultPtr, 1)
+					mstore(resultPtr, shl(248, mload(add(tablePtr, and(shr(12, input), 0x3F)))))
+					resultPtr := add(resultPtr, 1)
+					mstore(resultPtr, shl(248, mload(add(tablePtr, and(shr( 6, input), 0x3F)))))
+					resultPtr := add(resultPtr, 1)
+					mstore(resultPtr, shl(248, mload(add(tablePtr, and(        input,  0x3F)))))
+					resultPtr := add(resultPtr, 1)
+				}
+				switch mod(mload(_data), 3)
+				case 1 { mstore(sub(resultPtr, 2), shl(240, 0x3d3d)) }
+				case 2 { mstore(sub(resultPtr, 1), shl(248, 0x3d)) }
+			}
+			return result;
+		}
+	}
+}
+
+// File: xNFT.sol
+//
+// ██   ██ ███    ██ ███████ ████████ 
+//  ██ ██  ████   ██ ██         ██    
+//   ███   ██ ██  ██ █████      ██    
+//  ██ ██  ██  ██ ██ ██         ██    
+// ██   ██ ██   ████ ██         ██    
+//
+// xNFT - Exchangeable Non-Fungible Tokens
+// An experimental hybrid of ERC-20 & ERC-721.
+//
+// - Easily inheritable
+// - Extremely gas efficient
+// - Logically coherent single contract hybrid
+//
+//
+// !!! Important Caveats !!!
+// - `ownerOf()` is unbounded in gas usage due to loops, as such, all contract
+//   calls are blocked to it to prevent high transaction fees.
+//   !! This will break external contracts that use `ownerOf()` !!
+//   For new implementations, use the `isOwnerOf()` method to check ownership.
+//   Queries outside of the blockchain should not be effected.
+// - `transferFrom()` can behave unexpectedly due to how the function needs to
+//   be overloaded to work for both ERC-20 & ERC-721 applications.
+//   !! Any contract that does not wrap `transferFrom()` with a before/after
+//   balance check has the potential to be exploited !!
+//
+// WARNING - Hybrid NFT standards are universally new, and inherently DANGEROUS,
+// no systems have been built with these use cases in mind, and there are a number of 
+// ways that experimental, complex contracts can lead to unforseen consequences.
+// INTERACT WITH EXPERIMENTAL SMART CONTRACTS AT YOUR OWN RISK
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface Receiver {
+	function onERC721Received(address _operator, address _from, uint256 _tokenId, bytes calldata _data) external returns (bytes4);
+}
+
+abstract contract xNFT {
+
+	uint256 constant internal MASK_SIZE = 256;
+	uint256 constant internal MAX_ALLOWED_SUPPLY = 57344;
+	uint256 constant internal UINT_MAX = type(uint256).max;
+	uint256 constant internal M1 = 0x5555555555555555555555555555555555555555555555555555555555555555;
+	uint256 constant internal M2 = 0x3333333333333333333333333333333333333333333333333333333333333333;
+	uint256 constant internal M4 = 0x0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f;
+	uint256 constant internal H01 = 0x0101010101010101010101010101010101010101010101010101010101010101;
+	bytes32 constant internal TRANSFER_TOPIC = keccak256(bytes("Transfer(address,address,uint256)"));
+	bytes32 constant internal APPROVAL_TOPIC = keccak256(bytes("Approval(address,address,uint256)"));
+
+	uint8 constant public decimals = 0;
+	uint256 immutable public totalSupply;
+	uint256 immutable internal maskDepth;
+	bool internal skipEventEmits = false;
+
+	struct User {
+		uint16 balance;
+		uint16 approvedCount;
+		bytes28 activeMasks;
+		mapping(uint256 => bytes32) masks;
+		mapping(address => uint256) allowance;
+		mapping(address => bool) approved;
+	}
+
+	struct Info {
+		address owner;
+		mapping(address => User) users;
+		mapping(uint256 => address) approved;
+		address[] holders;
+		mapping(address => uint256) indexOf;
+	}
+	Info internal info;
+
+	mapping(bytes4 => bool) public supportsInterface;
+
+
+	event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+	event ERC20Transfer(bytes32 indexed topic0, address indexed from, address indexed to, uint256 tokens) anonymous;
+	event Approval(address indexed owner, address indexed spender, uint256 indexed tokenId);
+	event ERC20Approval(bytes32 indexed topic0, address indexed owner, address indexed spender, uint256 tokens) anonymous;
+	event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+
+	modifier _onlyOwner() {
+		require(msg.sender == owner());
+		_;
+	}
+
+	modifier _withoutEventEmits() {
+		skipEventEmits = true;
+		_;
+		skipEventEmits = false;
+	}
+
+
+	constructor(address _owner, uint256 _totalSupply) {
+		require(_totalSupply > 0 && _totalSupply <= MAX_ALLOWED_SUPPLY);
+		info.owner = _owner;
+		totalSupply = _totalSupply;
+		maskDepth = ((totalSupply - 1) / MASK_SIZE) + 1;
+		supportsInterface[0x01ffc9a7] = true; // ERC-165
+		supportsInterface[0x80ac58cd] = true; // ERC-721
+		supportsInterface[0x5b5e139f] = true; // Metadata
+		supportsInterface[0x780e9d63] = true; // Enumerable
+		_initialize();
+	}
+
+	function setOwner(address _owner) external _onlyOwner {
+		info.owner = _owner;
+	}
+
+
+	function approve(address _spender, uint256 _tokens) external returns (bool) {
+		unchecked {
+			if (_tokens > totalSupply && _tokens <= 2 * totalSupply) {
+				_approveNFT(_spender, _tokens);
+			} else {
+				_approveERC20(msg.sender, _spender, _tokens);
+			}
+			return true;	
+		}
+	}
+
+	function setApprovalForAll(address _operator, bool _approved) external {
+		info.users[msg.sender].approved[_operator] = _approved;
+		emit ApprovalForAll(msg.sender, _operator, _approved);
+	}
+
+	function transfer(address _to, uint256 _tokens) external returns (bool) {
+		_transferERC20(msg.sender, _to, _tokens);
+		return true;
+	}
+
+	function transferFrom(address _from, address _to, uint256 _tokens) external returns (bool) {
+		unchecked {
+			if (_tokens > totalSupply && _tokens <= 2 * totalSupply) {
+				_transferNFT(_from, _to, _tokens);
+			} else {
+				uint256 _allowance = allowance(_from, msg.sender);
+				require(_allowance >= _tokens);
+				if (_allowance != UINT_MAX) {
+					info.users[_from].allowance[msg.sender] -= _tokens;
+				}
+				_transferERC20(_from, _to, _tokens);
+			}
+			return true;
+		}
+	}
+
+	function safeTransferFrom(address _from, address _to, uint256 _tokenId) external {
+		safeTransferFrom(_from, _to, _tokenId, "");
+	}
+
+	function safeTransferFrom(address _from, address _to, uint256 _tokenId, bytes memory _data) public {
+		_transferNFT(_from, _to, _tokenId);
+		uint32 _size;
+		assembly {
+			_size := extcodesize(_to)
+		}
+		if (_size > 0) {
+			require(Receiver(_to).onERC721Received(msg.sender, _from, _tokenId, _data) == Receiver.onERC721Received.selector);
+		}
+	}
+
+	function bulkTransfer(address _to, uint256[] memory _tokenIds) external {
+		_transferNFTs(_to, _tokenIds);
+	}
+	
+
+	function owner() public view returns (address) {
+		return info.owner;
+	}
+
+	function holders() external view returns (address[] memory) {
+		return info.holders;
+	}
+
+	function name() external virtual view returns (string memory);
+
+	function symbol() external virtual view returns (string memory);
+
+	function tokenURI(uint256 _tokenId) public virtual view returns (string memory);
+
+	function maskAtIndexOf(uint256 _index, address _user) public view returns (bytes32) {
+		unchecked {
+			require(_index < maskDepth);
+			return info.users[_user].masks[_index];
+		}
+	}
+
+	function masksOf(address _user) external view returns (bytes32[] memory masks) {
+		unchecked {
+			masks = new bytes32[](maskDepth);
+			for (uint256 i = 0; i < masks.length; i++) {
+				masks[i] = maskAtIndexOf(i, _user);
+			}
+		}
+	}
+
+	function balanceOf(address _user) public view returns (uint256 balance) {
+		return info.users[_user].balance;
+	}
+
+	function allowance(address _user, address _spender) public view returns (uint256) {
+		return info.users[_user].allowance[_spender];
+	}
+
+	// !!! Important !!!
+	// To save gas on bulk ERC-20 & ERC-721 transfers, this method has been written in a way
+	// that doesn't individually update a storage slot for each token owner but instead loops
+	// through an array of holders in order to find a match.
+	// As such it costs approximately 5k gas per loop (1 block = 30m gas = 6k loops) so having
+	// another contract call this method could result in very large transaction fees. To prevent
+	// this from happening, this method will block and revert if the caller is a contract.
+	// !! This will break external contracts that use `ownerOf()` but queries outside of the
+	// blockchain should not be effected !!
+	//
+	// If you need to externally check if a token is owned by a certain address, use the
+	// new `isOwnerOf(address _user, uint256 _tokenId)` method instead.
+	// Most current NFT based contracts don't use `ownerOf()` and assume that if a call
+	// to `transferFrom()` was successful then `_from` was in fact the owner.
+	function ownerOf(uint256 _tokenId) public view returns (address) {
+		unchecked {
+			uint32 _size;
+			assembly {
+				_size := caller()
+			}
+			require(_size == 0);
+			require(_tokenId > totalSupply && _tokenId <= 2 * totalSupply);
+			(uint256 _maskIndex, bytes32 _mask) = _tokenIdToMask(_tokenId);
+			uint256 _holdersLength = info.holders.length;
+			for (uint256 i = 0; i < _holdersLength; i++) {
+				address _holder = info.holders[i];
+				if (maskAtIndexOf(_maskIndex, _holder) & _mask == _mask) {
+					return _holder;
+				}
+			}
+			return address(0x0);
+		}
+	}
+
+	function getApproved(uint256 _tokenId) public view returns (address) {
+		unchecked {
+			require(_tokenId > totalSupply && _tokenId <= 2 * totalSupply);
+			return info.approved[_tokenId];
+		}
+	}
+
+	function isApprovedForAll(address _owner, address _operator) public view returns (bool) {
+		return info.users[_owner].approved[_operator];
+	}
+
+	function isOwnerOf(address _user, uint256 _tokenId) external view returns (bool) {
+		unchecked {
+			require(_tokenId > totalSupply && _tokenId <= 2 * totalSupply);
+			(uint256 _maskIndex, bytes32 _mask) = _tokenIdToMask(_tokenId);
+			return maskAtIndexOf(_maskIndex, _user) & _mask == _mask;
+		}
+	}
+
+	function tokenByIndex(uint256 _index) external view returns (uint256) {
+		unchecked {
+			require(_index < totalSupply);
+			return totalSupply + _index + 1;
+		}
+	}
+
+	function tokenOfOwnerByIndex(address _owner, uint256 _index) external view returns (uint256 tokenId) {
+		unchecked {
+			require(_index < balanceOf(_owner));
+			uint256 _count = 0;
+			uint256 _activeMasks = uint224(info.users[_owner].activeMasks);
+			while (_activeMasks > 0 && _count <= _index) {
+				uint256 _activeIndex = _lsb(_activeMasks);
+				_activeMasks ^= 1 << _activeIndex;
+				bytes32 _mask = maskAtIndexOf(_activeIndex, _owner);
+				uint256 _maskCount = _popcount(_mask);
+				if (_count + _maskCount <= _index) {
+					_count += _maskCount;
+				} else {
+					uint256 _n = uint256(_mask);
+					while (_n > 0 && _count <= _index) {
+						uint256 _pos = _lsb(_n);
+						_n ^= 1 << _pos;
+						_count++;
+						if (_count == _index + 1) {
+							return (MASK_SIZE * _activeIndex) + totalSupply + _pos + 1;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	function getToken(uint256 _tokenId, bool _getOwner) public view returns (address tokenOwner, address approved, string memory uri) {
+		return (_getOwner ? ownerOf(_tokenId) : address(0x0), getApproved(_tokenId), tokenURI(_tokenId));
+	}
+
+	function getTokens(uint256[] memory _tokenIds, bool _getOwner) external view returns (address[] memory owners, address[] memory approveds, string[] memory uris) {
+		uint256 _length = _tokenIds.length;
+		owners = new address[](_length);
+		approveds = new address[](_length);
+		uris = new string[](_length);
+		for (uint256 i = 0; i < _length; i++) {
+			(owners[i], approveds[i], uris[i]) = getToken(_tokenIds[i], _getOwner);
+		}
+	}
+
+
+	// Can be overridden by a parent contract if needed. Most of the logic inside this function is
+	// essential for setting up the initial supply so be careful when altering it.
+	// If all you want to do is save gas on deployment by preventing all the NFT `Transfer()` events
+	// from emitting, use this in your parent contract:
+	// `function _initialize() internal override _withoutEventEmits { super._initialize(); }`
+	function _initialize() internal virtual {
+		unchecked {
+			for (uint256 i = 0; i < maskDepth; i++) {
+				if (i == maskDepth - 1 && totalSupply % MASK_SIZE != 0) {
+					info.users[owner()].masks[i] = bytes32(UINT_MAX) >> (MASK_SIZE - (totalSupply % MASK_SIZE));
+				} else {
+					info.users[owner()].masks[i] = bytes32(UINT_MAX);
+				}
+			}
+			info.users[owner()].balance = uint16(totalSupply);
+			info.users[owner()].activeMasks = bytes28(uint224(2**maskDepth - 1));
+			info.holders.push(owner());
+			emit ERC20Transfer(TRANSFER_TOPIC, address(0x0), owner(), totalSupply);
+			if (!skipEventEmits) {
+				for (uint256 i = 0; i < totalSupply; i++) {
+					emit Transfer(address(0x0), owner(), totalSupply + i + 1);
+				}
+			}
+		}
+	}
+	
+	function _approveERC20(address _owner, address _spender, uint256 _tokens) internal {
+		info.users[_owner].allowance[_spender] = _tokens;
+		emit ERC20Approval(APPROVAL_TOPIC, _owner, _spender, _tokens);
+	}
+
+	function _approveNFT(address _spender, uint256 _tokenId) internal {
+		unchecked {
+			(uint256 _maskIndex, bytes32 _mask) = _tokenIdToMask(_tokenId);
+			require(maskAtIndexOf(_maskIndex, msg.sender) & _mask == _mask);
+			info.approved[_tokenId] = _spender;
+			info.users[msg.sender].approvedCount++;
+			emit Approval(msg.sender, _spender, _tokenId);
+		}
+	}
+	
+	// Can be overridden by a parent contract to change how token ids are selected when performing
+	// an ERC-20 transfer. It is not recommended to do this unless you're sure you know what
+	// the outcome will be and test it to make sure your implementation works as expected.
+	function _transferERC20(address _from, address _to, uint256 _tokens) internal virtual {
+		unchecked {
+			uint256 _count = 0;
+			uint256[] memory _tokenIds = new uint256[](_tokens);
+			bytes32[] memory _masks = new bytes32[](maskDepth);
+			uint256 _activeMasks = uint224(info.users[_from].activeMasks);
+			while (_activeMasks > 0 && _count < _tokens) {
+				uint256 _activeIndex = _lsb(_activeMasks);
+				_activeMasks ^= 1 << _activeIndex;
+				bytes32 _mask = maskAtIndexOf(_activeIndex, _from);
+				uint256 _n = uint256(_mask);
+				while (_n > 0 && _count < _tokens) {
+					uint256 _pos = _lsb(_n);
+					bytes32 _tokenMask = bytes32(1 << _pos);
+					_masks[_activeIndex] |= _tokenMask;
+					_tokenIds[_count++] = (MASK_SIZE * _activeIndex) + totalSupply + _pos + 1;
+					_n ^= uint256(_tokenMask);
+				}
+				require(_mask & _masks[_activeIndex] == _masks[_activeIndex]);
+			}
+			require(_count == _tokens);
+			_transfer(_from, _to, _masks, _tokenIds);
+		}
+	}
+	
+	function _transferNFT(address _from, address _to, uint256 _tokenId) internal {
+		unchecked {
+			require(_tokenId > totalSupply && _tokenId <= 2 * totalSupply);
+			(uint256 _maskIndex, bytes32 _mask) = _tokenIdToMask(_tokenId);
+			require(maskAtIndexOf(_maskIndex, _from) & _mask == _mask);
+			require(msg.sender == _from || msg.sender == getApproved(_tokenId) || isApprovedForAll(_from, msg.sender));
+			bytes32[] memory _masks = new bytes32[](maskDepth);
+			_masks[_maskIndex] = _mask;
+			uint256[] memory _tokenIds = new uint256[](1);
+			_tokenIds[0] = _tokenId;
+			_transfer(_from, _to, _masks, _tokenIds);
+		}
+	}
+	
+	function _transferNFTs(address _to, uint256[] memory _tokenIds) internal {
+		unchecked {
+			bytes32[] memory _masks = new bytes32[](maskDepth);
+			for (uint256 i = 0; i < _tokenIds.length; i++) {
+				(uint256 _maskIndex, bytes32 _mask) = _tokenIdToMask(_tokenIds[i]);
+				_masks[_maskIndex] |= _mask;
+			}
+			uint256 _count = 0;
+			for (uint256 i = 0; i < _masks.length; i++) {
+				if (_masks[i] != 0x0) {
+					require(maskAtIndexOf(i, msg.sender) & _masks[i] == _masks[i]);
+					_count += _popcount(_masks[i]);
+				}
+			}
+			require(_count == _tokenIds.length);
+			_transfer(msg.sender, _to, _masks, _tokenIds);
+		}
+	}
+
+	// Can be overridden by a parent contract in order to add some logic before the transfer completes. The
+	// code here is important for the ERC-721 side of things so unless you explicitly want to change how this
+	// works, you should always use `super._beforeTransfer(...);` in your overridden function.
+	function _beforeTransfer(address _from, address _to, bytes32[] memory, uint256[] memory _tokenIds) internal virtual {
+		unchecked {
+			bool _skip = skipEventEmits;
+			bool _skipApproveds = info.users[_from].approvedCount == 0;
+			if (!(_skipApproveds && _skip)) {
+				for (uint256 i = 0; i < _tokenIds.length; i++) {
+					if (!_skipApproveds && getApproved(_tokenIds[i]) != address(0x0)) {
+						info.users[_from].approvedCount--;
+						info.approved[_tokenIds[i]] = address(0x0);
+						emit Approval(address(0x0), address(0x0), _tokenIds[i]);
+					}
+					if (!_skip) {
+						emit Transfer(_from, _to, _tokenIds[i]);
+					}
+				}
+			}
+		}
+	}
+
+	function _transfer(address _from, address _to, bytes32[] memory _masks, uint256[] memory _tokenIds) internal {
+		unchecked {
+			require(_to != address(0x0));
+			require(_tokenIds.length > 0);
+			_beforeTransfer(_from, _to, _masks, _tokenIds);
+			uint256 _fromActive = uint224(info.users[_from].activeMasks);
+			uint256 _toActive = uint224(info.users[_to].activeMasks);
+			for (uint256 i = 0; i < _masks.length; i++) {
+				if (_masks[i] != bytes32(0x0)) {
+					bytes32 _fromMask = maskAtIndexOf(i, _from);
+					_fromMask ^= _masks[i];
+					info.users[_from].masks[i] = _fromMask;
+					bytes32 _toMask = maskAtIndexOf(i, _to);
+					_toMask |= _masks[i];
+					info.users[_to].masks[i] = _toMask;
+					if (_fromMask == 0x0) {
+						_fromActive ^= 1 << i;
+					}
+					_toActive |= 1 << i;
+					require(_fromMask & _toMask == 0x0);
+				}
+			}
+			uint256 _fromBalance = balanceOf(_from);
+			_fromBalance -= _tokenIds.length;
+			info.users[_from].balance = uint16(_fromBalance);
+			info.users[_from].activeMasks = bytes28(uint224(_fromActive));
+			uint256 _toBalance = balanceOf(_to);
+			info.users[_to].balance = uint16(_toBalance + _tokenIds.length);
+			info.users[_to].activeMasks = bytes28(uint224(_toActive));
+			if (_fromBalance == 0) {
+				uint256 _index = info.indexOf[_from];
+				if (_toBalance == 0) {
+					info.holders[_index] = _to;
+					info.indexOf[_to] = _index;
+				} else {
+					address _moved = info.holders[info.holders.length - 1];
+					info.holders[_index] = _moved;
+					info.indexOf[_moved] = _index;
+					info.holders.pop();
+				}
+				delete info.indexOf[_from];
+			} else if (_toBalance == 0) {
+				info.holders.push(_to);
+				info.indexOf[_to] = info.holders.length - 1;
+			}
+			emit ERC20Transfer(TRANSFER_TOPIC, _from, _to, _tokenIds.length);
+			_afterTransfer(_from, _to, _masks, _tokenIds);
+		}
+	}
+
+	// Can be overridden by a parent contract and used as a way to execute extra code after a transfer has completed.
+	function _afterTransfer(address _from, address _to, bytes32[] memory _masks, uint256[] memory _tokenIds) internal virtual {}
+
+
+	function _tokenIdToMask(uint256 _tokenId) internal view returns (uint256 maskIndex, bytes32 mask) {
+		unchecked {
+			maskIndex = (_tokenId - totalSupply - 1) / MASK_SIZE;
+			mask = bytes32(1 << (_tokenId - (MASK_SIZE * maskIndex) - totalSupply - 1));
+		}
+	}
+	
+	function _popcount(bytes32 _b) internal pure returns (uint256) {
+		unchecked {
+			uint256 _n = uint256(_b);
+			if (_n == 0) {
+				return 0;
+			} else if (_n == UINT_MAX) {
+				return MASK_SIZE;
+			}
+			_n -= (_n >> 1) & M1;
+			_n = (_n & M2) + ((_n >> 2) & M2);
+			_n = (_n + (_n >> 4)) & M4;
+			_n = (_n * H01) >> 248;
+			return _n;
+		}
+	}
+
+
+	// An extremely gas efficient implementation of the least significant bit algorithm. Due to all of
+	// the constants in the if/else binary search tree, this function does add approximately 1.1m gas
+	// to the deployment cost (~0.022 ETH @ 20 Gwei) but the end users will save on transaction fees.
+	// The 'break even' point is around 3,000 total transfer volume where by you spending the extra to
+	// make it more efficient, you have saved your end users more than you initially paid.
+	// If you would rather have cheaper deployment costs and slightly less efficient transfers, replace
+	// the entire `_lsb()` function with the one commented below:
+	// ```function _lsb(uint256 _n) internal pure returns (uint256 i) {
+	// 	unchecked { uint256 _b = _n & ~(_n - 1); i = 0;
+	// 	for (uint256 _s = 0x80; _s > 0; _s >>= 1) { if (_b >= (1 << _s)) { _b >>= _s; i |= _s; } } }
+	// }```
+	function _lsb(uint256 _n) internal pure returns (uint256 i) {
+		unchecked {
+			uint256 _b = _n & ~(_n - 1);
+			if (_b < 0x0100000000000000000000000000000000)
+				if (_b < 0x010000000000000000)
+					if (_b < 0x0100000000)
+						if (_b < 0x010000)
+							if (_b < 0x0100)
+								if (_b < 0x10)
+									if (_b < 0x04)
+										if (_b < 0x02) return 0; else return 1;
+									else
+										if (_b < 0x08) return 2; else return 3;
+								else
+									if (_b < 0x40)
+										if (_b < 0x20) return 4; else return 5;
+									else
+										if (_b < 0x80) return 6; else return 7;
+							else
+								if (_b < 0x1000)
+									if (_b < 0x0400)
+										if (_b < 0x0200) return 8; else return 9;
+									else
+										if (_b < 0x0800) return 10; else return 11;
+								else
+									if (_b < 0x4000)
+										if (_b < 0x2000) return 12; else return 13;
+									else
+										if (_b < 0x8000) return 14; else return 15;
+						else
+							if (_b < 0x01000000)
+								if (_b < 0x100000)
+									if (_b < 0x040000)
+										if (_b < 0x020000) return 16; else return 17;
+									else
+										if (_b < 0x080000) return 18; else return 19;
+								else
+									if (_b < 0x400000)
+										if (_b < 0x200000) return 20; else return 21;
+									else
+										if (_b < 0x800000) return 22; else return 23;
+							else
+								if (_b < 0x10000000)
+									if (_b < 0x04000000)
+										if (_b < 0x02000000) return 24; else return 25;
+									else
+										if (_b < 0x08000000) return 26; else return 27;
+								else
+									if (_b < 0x40000000)
+										if (_b < 0x20000000) return 28; else return 29;
+									else
+										if (_b < 0x80000000) return 30; else return 31;
+					else
+						if (_b < 0x01000000000000)
+							if (_b < 0x010000000000)
+								if (_b < 0x1000000000)
+									if (_b < 0x0400000000)
+										if (_b < 0x0200000000) return 32; else return 33;
+									else
+										if (_b < 0x0800000000) return 34; else return 35;
+								else
+									if (_b < 0x4000000000)
+										if (_b < 0x2000000000) return 36; else return 37;
+									else
+										if (_b < 0x8000000000) return 38; else return 39;
+							else
+								if (_b < 0x100000000000)
+									if (_b < 0x040000000000)
+										if (_b < 0x020000000000) return 40; else return 41;
+									else
+										if (_b < 0x080000000000) return 42; else return 43;
+								else
+									if (_b < 0x400000000000)
+										if (_b < 0x200000000000) return 44; else return 45;
+									else
+										if (_b < 0x800000000000) return 46; else return 47;
+						else
+							if (_b < 0x0100000000000000)
+								if (_b < 0x10000000000000)
+									if (_b < 0x04000000000000)
+										if (_b < 0x02000000000000) return 48; else return 49;
+									else
+										if (_b < 0x08000000000000) return 50; else return 51;
+								else
+									if (_b < 0x40000000000000)
+										if (_b < 0x20000000000000) return 52; else return 53;
+									else
+										if (_b < 0x80000000000000) return 54; else return 55;
+							else
+								if (_b < 0x1000000000000000)
+									if (_b < 0x0400000000000000)
+										if (_b < 0x0200000000000000) return 56; else return 57;
+									else
+										if (_b < 0x0800000000000000) return 58; else return 59;
+								else
+									if (_b < 0x4000000000000000)
+										if (_b < 0x2000000000000000) return 60; else return 61;
+									else
+										if (_b < 0x8000000000000000) return 62; else return 63;
+				else
+					if (_b < 0x01000000000000000000000000)
+						if (_b < 0x0100000000000000000000)
+							if (_b < 0x01000000000000000000)
+								if (_b < 0x100000000000000000)
+									if (_b < 0x040000000000000000)
+										if (_b < 0x020000000000000000) return 64; else return 65;
+									else
+										if (_b < 0x080000000000000000) return 66; else return 67;
+								else
+									if (_b < 0x400000000000000000)
+										if (_b < 0x200000000000000000) return 68; else return 69;
+									else
+										if (_b < 0x800000000000000000) return 70; else return 71;
+							else
+								if (_b < 0x10000000000000000000)
+									if (_b < 0x04000000000000000000)
+										if (_b < 0x02000000000000000000) return 72; else return 73;
+									else
+										if (_b < 0x08000000000000000000) return 74; else return 75;
+								else
+									if (_b < 0x40000000000000000000)
+										if (_b < 0x20000000000000000000) return 76; else return 77;
+									else
+										if (_b < 0x80000000000000000000) return 78; else return 79;
+						else
+							if (_b < 0x010000000000000000000000)
+								if (_b < 0x1000000000000000000000)
+									if (_b < 0x0400000000000000000000)
+										if (_b < 0x0200000000000000000000) return 80; else return 81;
+									else
+										if (_b < 0x0800000000000000000000) return 82; else return 83;
+								else
+									if (_b < 0x4000000000000000000000)
+										if (_b < 0x2000000000000000000000) return 84; else return 85;
+									else
+										if (_b < 0x8000000000000000000000) return 86; else return 87;
+							else
+								if (_b < 0x100000000000000000000000)
+									if (_b < 0x040000000000000000000000)
+										if (_b < 0x020000000000000000000000) return 88; else return 89;
+									else
+										if (_b < 0x080000000000000000000000) return 90; else return 91;
+								else
+									if (_b < 0x400000000000000000000000)
+										if (_b < 0x200000000000000000000000) return 92; else return 93;
+									else
+										if (_b < 0x800000000000000000000000) return 94; else return 95;
+					else
+						if (_b < 0x010000000000000000000000000000)
+							if (_b < 0x0100000000000000000000000000)
+								if (_b < 0x10000000000000000000000000)
+									if (_b < 0x04000000000000000000000000)
+										if (_b < 0x02000000000000000000000000) return 96; else return 97;
+									else
+										if (_b < 0x08000000000000000000000000) return 98; else return 99;
+								else
+									if (_b < 0x40000000000000000000000000)
+										if (_b < 0x20000000000000000000000000) return 100; else return 101;
+									else
+										if (_b < 0x80000000000000000000000000) return 102; else return 103;
+							else
+								if (_b < 0x1000000000000000000000000000)
+									if (_b < 0x0400000000000000000000000000)
+										if (_b < 0x0200000000000000000000000000) return 104; else return 105;
+									else
+										if (_b < 0x0800000000000000000000000000) return 106; else return 107;
+								else
+									if (_b < 0x4000000000000000000000000000)
+										if (_b < 0x2000000000000000000000000000) return 108; else return 109;
+									else
+										if (_b < 0x8000000000000000000000000000) return 110; else return 111;
+						else
+							if (_b < 0x01000000000000000000000000000000)
+								if (_b < 0x100000000000000000000000000000)
+									if (_b < 0x040000000000000000000000000000)
+										if (_b < 0x020000000000000000000000000000) return 112; else return 113;
+									else
+										if (_b < 0x080000000000000000000000000000) return 114; else return 115;
+								else
+									if (_b < 0x400000000000000000000000000000)
+										if (_b < 0x200000000000000000000000000000) return 116; else return 117;
+									else
+										if (_b < 0x800000000000000000000000000000) return 118; else return 119;
+							else
+								if (_b < 0x10000000000000000000000000000000)
+									if (_b < 0x04000000000000000000000000000000)
+										if (_b < 0x02000000000000000000000000000000) return 120; else return 121;
+									else
+										if (_b < 0x08000000000000000000000000000000) return 122; else return 123;
+								else
+									if (_b < 0x40000000000000000000000000000000)
+										if (_b < 0x20000000000000000000000000000000) return 124; else return 125;
+									else
+										if (_b < 0x80000000000000000000000000000000) return 126; else return 127;
+			else
+				if (_b < 0x01000000000000000000000000000000000000000000000000)
+					if (_b < 0x010000000000000000000000000000000000000000)
+						if (_b < 0x01000000000000000000000000000000000000)
+							if (_b < 0x010000000000000000000000000000000000)
+								if (_b < 0x1000000000000000000000000000000000)
+									if (_b < 0x0400000000000000000000000000000000)
+										if (_b < 0x0200000000000000000000000000000000) return 128; else return 129;
+									else
+										if (_b < 0x0800000000000000000000000000000000) return 130; else return 131;
+								else
+									if (_b < 0x4000000000000000000000000000000000)
+										if (_b < 0x2000000000000000000000000000000000) return 132; else return 133;
+									else
+										if (_b < 0x8000000000000000000000000000000000) return 134; else return 135;
+							else
+								if (_b < 0x100000000000000000000000000000000000)
+									if (_b < 0x040000000000000000000000000000000000)
+										if (_b < 0x020000000000000000000000000000000000) return 136; else return 137;
+									else
+										if (_b < 0x080000000000000000000000000000000000) return 138; else return 139;
+								else
+									if (_b < 0x400000000000000000000000000000000000)
+										if (_b < 0x200000000000000000000000000000000000) return 140; else return 141;
+									else
+										if (_b < 0x800000000000000000000000000000000000) return 142; else return 143;
+						else
+							if (_b < uint160(0x0100000000000000000000000000000000000000))
+								if (_b < 0x10000000000000000000000000000000000000)
+									if (_b < 0x04000000000000000000000000000000000000)
+										if (_b < 0x02000000000000000000000000000000000000) return 144; else return 145;
+									else
+										if (_b < 0x08000000000000000000000000000000000000) return 146; else return 147;
+								else
+									if (_b < 0x40000000000000000000000000000000000000)
+										if (_b < 0x20000000000000000000000000000000000000) return 148; else return 149;
+									else
+										if (_b < 0x80000000000000000000000000000000000000) return 150; else return 151;
+							else
+								if (_b < uint160(0x1000000000000000000000000000000000000000))
+									if (_b < uint160(0x0400000000000000000000000000000000000000))
+										if (_b < uint160(0x0200000000000000000000000000000000000000)) return 152; else return 153;
+									else
+										if (_b < uint160(0x0800000000000000000000000000000000000000)) return 154; else return 155;
+								else
+									if (_b < uint160(0x4000000000000000000000000000000000000000))
+										if (_b < uint160(0x2000000000000000000000000000000000000000)) return 156; else return 157;
+									else
+										if (_b < uint160(0x8000000000000000000000000000000000000000)) return 158; else return 159;
+					else
+						if (_b < 0x0100000000000000000000000000000000000000000000)
+							if (_b < 0x01000000000000000000000000000000000000000000)
+								if (_b < 0x100000000000000000000000000000000000000000)
+									if (_b < 0x040000000000000000000000000000000000000000)
+										if (_b < 0x020000000000000000000000000000000000000000) return 160; else return 161;
+									else
+										if (_b < 0x080000000000000000000000000000000000000000) return 162; else return 163;
+								else
+									if (_b < 0x400000000000000000000000000000000000000000)
+										if (_b < 0x200000000000000000000000000000000000000000) return 164; else return 165;
+									else
+										if (_b < 0x800000000000000000000000000000000000000000) return 166; else return 167;
+							else
+								if (_b < 0x10000000000000000000000000000000000000000000)
+									if (_b < 0x04000000000000000000000000000000000000000000)
+										if (_b < 0x02000000000000000000000000000000000000000000) return 168; else return 169;
+									else
+										if (_b < 0x08000000000000000000000000000000000000000000) return 170; else return 171;
+								else
+									if (_b < 0x40000000000000000000000000000000000000000000)
+										if (_b < 0x20000000000000000000000000000000000000000000) return 172; else return 173;
+									else
+										if (_b < 0x80000000000000000000000000000000000000000000) return 174; else return 175;
+						else
+							if (_b < 0x010000000000000000000000000000000000000000000000)
+								if (_b < 0x1000000000000000000000000000000000000000000000)
+									if (_b < 0x0400000000000000000000000000000000000000000000)
+										if (_b < 0x0200000000000000000000000000000000000000000000) return 176; else return 177;
+									else
+										if (_b < 0x0800000000000000000000000000000000000000000000) return 178; else return 179;
+								else
+									if (_b < 0x4000000000000000000000000000000000000000000000)
+										if (_b < 0x2000000000000000000000000000000000000000000000) return 180; else return 181;
+									else
+										if (_b < 0x8000000000000000000000000000000000000000000000) return 182; else return 183;
+							else
+								if (_b < 0x100000000000000000000000000000000000000000000000)
+									if (_b < 0x040000000000000000000000000000000000000000000000)
+										if (_b < 0x020000000000000000000000000000000000000000000000) return 184; else return 185;
+									else
+										if (_b < 0x080000000000000000000000000000000000000000000000) return 186; else return 187;
+								else
+									if (_b < 0x400000000000000000000000000000000000000000000000)
+										if (_b < 0x200000000000000000000000000000000000000000000000) return 188; else return 189;
+									else
+										if (_b < 0x800000000000000000000000000000000000000000000000) return 190; else return 191;
+				else
+					if (_b < 0x0100000000000000000000000000000000000000000000000000000000)
+						if (_b < 0x010000000000000000000000000000000000000000000000000000)
+							if (_b < 0x0100000000000000000000000000000000000000000000000000)
+								if (_b < 0x10000000000000000000000000000000000000000000000000)
+									if (_b < 0x04000000000000000000000000000000000000000000000000)
+										if (_b < 0x02000000000000000000000000000000000000000000000000) return 192; else return 193;
+									else
+										if (_b < 0x08000000000000000000000000000000000000000000000000) return 194; else return 195;
+								else
+									if (_b < 0x40000000000000000000000000000000000000000000000000)
+										if (_b < 0x20000000000000000000000000000000000000000000000000) return 196; else return 197;
+									else
+										if (_b < 0x80000000000000000000000000000000000000000000000000) return 198; else return 199;
+							else
+								if (_b < 0x1000000000000000000000000000000000000000000000000000)
+									if (_b < 0x0400000000000000000000000000000000000000000000000000)
+										if (_b < 0x0200000000000000000000000000000000000000000000000000) return 200; else return 201;
+									else
+										if (_b < 0x0800000000000000000000000000000000000000000000000000) return 202; else return 203;
+								else
+									if (_b < 0x4000000000000000000000000000000000000000000000000000)
+										if (_b < 0x2000000000000000000000000000000000000000000000000000) return 204; else return 205;
+									else
+										if (_b < 0x8000000000000000000000000000000000000000000000000000) return 206; else return 207;
+						else
+							if (_b < 0x01000000000000000000000000000000000000000000000000000000)
+								if (_b < 0x100000000000000000000000000000000000000000000000000000)
+									if (_b < 0x040000000000000000000000000000000000000000000000000000)
+										if (_b < 0x020000000000000000000000000000000000000000000000000000) return 208; else return 209;
+									else
+										if (_b < 0x080000000000000000000000000000000000000000000000000000) return 210; else return 211;
+								else
+									if (_b < 0x400000000000000000000000000000000000000000000000000000)
+										if (_b < 0x200000000000000000000000000000000000000000000000000000) return 212; else return 213;
+									else
+										if (_b < 0x800000000000000000000000000000000000000000000000000000) return 214; else return 215;
+							else
+								if (_b < 0x10000000000000000000000000000000000000000000000000000000)
+									if (_b < 0x04000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x02000000000000000000000000000000000000000000000000000000) return 216; else return 217;
+									else
+										if (_b < 0x08000000000000000000000000000000000000000000000000000000) return 218; else return 219;
+								else
+									if (_b < 0x40000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x20000000000000000000000000000000000000000000000000000000) return 220; else return 221;
+									else
+										if (_b < 0x80000000000000000000000000000000000000000000000000000000) return 222; else return 223;
+					else
+						if (_b < 0x01000000000000000000000000000000000000000000000000000000000000)
+							if (_b < 0x010000000000000000000000000000000000000000000000000000000000)
+								if (_b < 0x1000000000000000000000000000000000000000000000000000000000)
+									if (_b < 0x0400000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x0200000000000000000000000000000000000000000000000000000000) return 224; else return 225;
+									else
+										if (_b < 0x0800000000000000000000000000000000000000000000000000000000) return 226; else return 227;
+								else
+									if (_b < 0x4000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x2000000000000000000000000000000000000000000000000000000000) return 228; else return 229;
+									else
+										if (_b < 0x8000000000000000000000000000000000000000000000000000000000) return 230; else return 231;
+							else
+								if (_b < 0x100000000000000000000000000000000000000000000000000000000000)
+									if (_b < 0x040000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x020000000000000000000000000000000000000000000000000000000000) return 232; else return 233;
+									else
+										if (_b < 0x080000000000000000000000000000000000000000000000000000000000) return 234; else return 235;
+								else
+									if (_b < 0x400000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x200000000000000000000000000000000000000000000000000000000000) return 236; else return 237;
+									else
+										if (_b < 0x800000000000000000000000000000000000000000000000000000000000) return 238; else return 239;
+						else
+							if (_b < 0x0100000000000000000000000000000000000000000000000000000000000000)
+								if (_b < 0x10000000000000000000000000000000000000000000000000000000000000)
+									if (_b < 0x04000000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x02000000000000000000000000000000000000000000000000000000000000) return 240; else return 241;
+									else
+										if (_b < 0x08000000000000000000000000000000000000000000000000000000000000) return 242; else return 243;
+								else
+									if (_b < 0x40000000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x20000000000000000000000000000000000000000000000000000000000000) return 244; else return 245;
+									else
+										if (_b < 0x80000000000000000000000000000000000000000000000000000000000000) return 246; else return 247;
+							else
+								if (_b < 0x1000000000000000000000000000000000000000000000000000000000000000)
+									if (_b < 0x0400000000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x0200000000000000000000000000000000000000000000000000000000000000) return 248; else return 249;
+									else
+										if (_b < 0x0800000000000000000000000000000000000000000000000000000000000000) return 250; else return 251;
+								else
+									if (_b < 0x4000000000000000000000000000000000000000000000000000000000000000)
+										if (_b < 0x2000000000000000000000000000000000000000000000000000000000000000) return 252; else return 253;
+									else
+										if (_b < 0x8000000000000000000000000000000000000000000000000000000000000000) return 254; else return 255;
+		}
+	}
+}

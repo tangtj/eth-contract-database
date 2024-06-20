@@ -1,0 +1,1384 @@
+
+// File: contracts/RiceFields.sol
+// contracts/RiceFields.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.12;
+
+import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "./interfaces/IRewardFarmers.sol";
+import "./libraries/ERC20Helpers.sol";
+import "./interfaces/IFARM.sol";
+
+
+
+/**
+ *  
+ *   .d8888b.  d8b                        888           .d8888b.                  d8b                                       
+ *  d88P  Y88b Y8P                        888          d88P  Y88b                 Y8P                                       
+ *  Y88b.                                 888          888    888                                                           
+ *   "Y888b.   888 88888b.d88b.  88888b.  888  .d88b.  888        888d888 8888b.  888 88888b.       .d88b.  888d888 .d88b.  
+ *      "Y88b. 888 888 "888 "88b 888 "88b 888 d8P  Y8b 888  88888 888P"      "88b 888 888 "88b     d88""88b 888P"  d88P"88b 
+ *        "888 888 888  888  888 888  888 888 88888888 888    888 888    .d888888 888 888  888     888  888 888    888  888 
+ *  Y88b  d88P 888 888  888  888 888 d88P 888 Y8b.     Y88b  d88P 888    888  888 888 888  888 d8b Y88..88P 888    Y88b 888 
+ *   "Y8888P"  888 888  888  888 88888P"  888  "Y8888   "Y8888P88 888    "Y888888 888 888  888 Y8P  "Y88P"  888     "Y88888 
+ *                               888                                                                                    888 
+ *                               888                                                                               Y8b d88P 
+ *                               888                                                                                "Y88P"  
+ */
+
+
+
+/**
+ * @title RiceFields contract
+ * @dev
+ */
+contract RiceFields is ReentrancyGuard, Ownable {
+  uint256 public PRECISION = 10**18;
+
+  IRewardFarmers rewardFarmers;
+
+  struct TokenInfo {
+    address contractAddress;
+    uint256 decimals;
+    string symbol;
+    string name;
+  }
+
+  struct DistributionInfo {
+    Distribution distribution;
+    uint256 uncommonRewardId;
+    uint256 currentTimestamp;
+    bool hasUncommonReward;
+    uint256 userAllocated;
+    uint256 tokenOutPrice;
+    uint256 tokenInPrice;
+    uint256 userDeposits;
+    bool userHasClaimed;
+    TokenInfo tokenOUT;
+    TokenInfo tokenIN;
+    uint256 rewardId;
+  }
+
+  mapping(uint256 => mapping(address => Deposit)) public deposits;
+  struct Distribution {
+    uint256 totalTokensPerDeposit;
+    uint256 uncommonRewardId;
+    uint256 percentReturned; // divided by 10_000
+    uint256 tokensPerSecond;
+    bool hasUncommonReward;
+    uint256 totalDeposited;
+    bool rewardDistributed;
+    uint256 lastDepositAt;
+    bool ownerWithdrawn;
+    uint256 platformFee;
+    uint256 startTime;
+    uint256 amountOUT;
+    uint256 duration;
+    uint256 endTime;
+    string ipfsHash;
+    address creator;
+    uint256 id;
+
+    string description;
+    string name;
+
+    uint256 nextActiveId;
+    uint256 prevActiveId;
+
+    IERC20Metadata tokenIN;
+    IERC20Metadata tokenOUT;
+  }
+
+  uint256 public newestActiveDistributionId;
+
+  struct Deposit {
+    uint256 previouslyAllocated;
+    uint256 amount;
+    bool claimed;
+  }
+
+  Distribution[] public distributions;
+
+  mapping(address => uint256[]) public userDistributions; // To track distributions a user has deposited into or created
+
+  event DistributionCreated(
+    uint256 id, address creator, string name, string description,
+    uint256 duration, string ipfsHash, uint256 amountOUT,
+    uint256 percentReturned, address tokenOUT, address tokenIN
+  );
+  event Deposited(uint256 distributionId, address indexed user, uint256 amount);
+  event Claim(uint256 distributionId, address indexed user, uint256 amount, uint256 ethAmount);
+
+  uint256 public platformFee = 100; // divided by 10_000
+
+  /**
+  * @dev Constructor to initialize the contract with the RewardFarmers contract.
+  * @param _farm Address of the RewardFarmers contract.
+  */
+  constructor(IRewardFarmers _farm) {
+    rewardFarmers = _farm;
+  }
+
+  /**
+  * @dev Returns the number of distributions created.
+  * @return The total count of distributions.
+  */
+  function distributionCount() public view returns (uint256) {
+    return distributions.length;
+  }
+
+  /**
+  * @dev Sets the farmer fee percentage. Can only be called by the contract owner.
+  * @notice This function allows the contract owner to update the farmer fee percentage.
+  * The fee is a percentage of the total deposited amount, with a maximum limit of 5% to protect users.
+  * @param newFee The new fee percentage to be set, expressed in basis points (hundredths of a percent).
+  * For example, to set a fee of 5%, `newFee` should be 500.
+  */
+  function setPlatformFee(uint256 newFee) external onlyOwner {
+    require(newFee <= 500, 'Platform fee can not be greater than 5%');
+
+    platformFee = newFee;
+  }
+
+  /**
+  * @dev Creates a new distribution with the provided parameters.
+  * @param tokenIN The address of the input token.
+  * @param tokenOUT The address of the output token.
+  * @param duration The duration of the distribution in seconds.
+  * @param amountOUT The amount of output tokens to distribute.
+  * @param name The name of the distribution.
+  * @param description The description of the distribution.
+  * @param ipfsHash The IPFS hash containing distribution details.
+  * @param percentReturned The percentage of input tokens to be returned to the user.
+  */
+  function createDistribution(
+    IERC20Metadata tokenIN,
+    IERC20Metadata tokenOUT,
+    uint256 duration,
+    uint256 amountOUT,
+    string calldata name,
+    string calldata description,
+    string calldata ipfsHash,
+    uint256 percentReturned
+  ) public payable {
+    // Transfer tokensOUT from creator to contract for yield
+    if (address(tokenOUT) != address(0)) {
+      uint256 balanceBefore = tokenOUT.balanceOf(address(this));
+      ERC20Helpers.safeTransferFrom(address(tokenOUT), msg.sender, address(this), amountOUT);
+      require(tokenOUT.balanceOf(address(this)) - balanceBefore == amountOUT, "Incorrect number of tokens received");
+      require(msg.value == 0, 'msg.value must be zero for distributions that do not use ETH for tokenOUT');
+    } else require(amountOUT == msg.value, 'amountOUT and msg.value must be exactly the same');
+
+    require(amountOUT / duration > 0, "Tokens per second must be greater than 0");
+    require(percentReturned <= 10_000 - platformFee, "Percent returned must be less than or equal to 100% minus platformFee");
+
+    distributions.push();
+    //
+    uint256 id = distributions.length;
+    Distribution storage distribution = distributions[id - 1];
+    userDistributions[msg.sender].push(id);
+
+    if (newestActiveDistributionId != 0)
+      distributions[newestActiveDistributionId - 1].prevActiveId = id;
+
+    distribution.nextActiveId = newestActiveDistributionId;
+    newestActiveDistributionId = id;
+
+
+    distribution.tokensPerSecond = PRECISION * amountOUT / duration;
+    distribution.percentReturned = percentReturned;
+    distribution.platformFee = platformFee;
+    distribution.amountOUT = amountOUT;
+    distribution.creator = msg.sender;
+    distribution.ipfsHash = ipfsHash;
+    distribution.duration = duration;
+    distribution.tokenOUT = tokenOUT;
+    distribution.tokenIN = tokenIN;
+    distribution.id = id;
+
+    distribution.name = name;
+    distribution.description = description;
+    emit DistributionCreated(
+      id,
+      distribution.creator,
+      name,
+      description,
+      duration,
+      ipfsHash,
+      amountOUT,
+      percentReturned,
+      address(tokenOUT),
+      address(tokenIN)
+    );
+  }
+
+  /**
+  * @dev Retrieves token information such as contract address, symbol, name, and decimals.
+  * @param token The token contract to retrieve information from.
+  * @return TokenInfo Struct containing the token information.
+  */
+  function tokenInfo(IERC20Metadata token) public view returns (TokenInfo memory) {
+    if (address(token) == address(0))
+      return TokenInfo({
+        contractAddress: address(0),
+        name: 'Ethereum',
+        symbol: 'ETH',
+        decimals: 18
+      });
+
+    return TokenInfo({
+      contractAddress: address(token),
+      decimals: ERC20Helpers.tryDecimals(token),
+      symbol: ERC20Helpers.trySymbol(token),
+      name: ERC20Helpers.tryName(token)
+    });
+  }
+
+  /**
+  * @notice Gets distribution and user-specific information for a given distribution ID.
+  * @param distributionId The ID of the distribution.
+  * @param user The address of the user.
+  * @return DistributionInfo Struct containing information about the distribution and the user's interaction with it.
+  */
+  function getInfo(uint256 distributionId, address user) public view returns (DistributionInfo memory) {
+    require(distributionId > 0 && distributionId <= distributions.length, "Distribution ID is out of range");
+
+    Distribution storage distribution = distributions[distributionId - 1];
+    DistributionInfo memory info;
+
+    info.distribution = distribution;
+    info.currentTimestamp = block.timestamp;
+
+    info.tokenOUT = tokenInfo(distribution.tokenOUT);
+    info.tokenIN = tokenInfo(distribution.tokenIN);
+
+    info.tokenOutPrice = ethPerToken(address(distribution.tokenOUT));
+    info.tokenInPrice = ethPerToken(address(distribution.tokenIN));
+    info.uncommonRewardId = distribution.uncommonRewardId;
+    info.hasUncommonReward = distribution.hasUncommonReward;
+
+    if (user != address(0)) {
+      Deposit storage deposited = deposits[distributionId][user];
+      info.userAllocated = allocatedAmount(distributionId, user);
+      info.userHasClaimed = deposited.claimed;
+      info.userDeposits = deposited.amount;
+    }
+
+    return info;
+	}
+
+  /**
+  * @notice Retrieves distributions created or participated in by a specified user.
+  * @dev Supports pagination and fetches distributions by user creation or deposits. It returns a subset of distributions based on the page
+  *      and pageSize provided.
+  * @param user User's address whose distributions are queried.
+  * @param page Page number for result pagination.
+  * @param pageSize Number of distribution entries per page.
+  * @return results Array of `DistributionInfo` with details on each relevant distribution.
+  */
+  function getUserDistributions(address user, uint256 page, uint256 pageSize) public view returns (DistributionInfo[] memory) {
+    uint256 total = userDistributions[user].length;
+    uint256 startIndex = (page - 1) * pageSize;
+    if (startIndex > total) startIndex = total;
+
+    uint256 endIndex = startIndex + pageSize;
+    if (endIndex > total) endIndex = total;
+
+    uint256 resultCount = endIndex - startIndex;
+    DistributionInfo[] memory results = new DistributionInfo[](resultCount);
+
+    for (uint256 i = 0; i < resultCount; i++)
+      results[i] = getInfo(userDistributions[user][startIndex + i], user);
+
+    return results;
+  }
+
+  /**
+  * @notice Retrieves a list of active distributions that haven't distributed rewards yet.
+  * @dev Paginates active distributions based on page and pageSize parameters. This method dynamically calculates the number of
+  *      active distributions available starting from the requested page and returns only those entries.
+  * @param user Address of the user for context in the getInfo call.
+  * @param page Page number, starting from 1.
+  * @param pageSize Maximum number of entries per page.
+  * @return results Array of `DistributionInfo` with details about each active distribution.
+  */
+  function getActiveDistributions(address user, uint256 page, uint256 pageSize) public view returns (DistributionInfo[] memory) {
+    uint256 currentIndex = newestActiveDistributionId;
+    uint256 skipped = 0;
+
+    // Skip to the page's starting distribution
+    while (currentIndex != 0 && skipped < (page - 1) * pageSize) {
+      currentIndex = distributions[currentIndex - 1].nextActiveId;
+      skipped++;
+    }
+
+    // Determine the size of the results array based on remaining active distributions
+    uint256 remainingDistributions = 0;
+    uint256 countIndex = currentIndex;
+    while (countIndex != 0 && remainingDistributions < pageSize) {
+      remainingDistributions++;
+      countIndex = distributions[countIndex - 1].nextActiveId;
+    }
+
+    // Allocate the array with the correct number of elements
+    DistributionInfo[] memory results = new DistributionInfo[](remainingDistributions);
+
+    // Populate the results array
+    uint256 count = 0;
+    while (currentIndex != 0 && count < remainingDistributions) {
+      results[count] = getInfo(currentIndex, user);
+      currentIndex = distributions[currentIndex - 1].nextActiveId;
+      count++;
+    }
+
+    return results;
+  }
+
+
+  /**
+  * @dev Returns a list of recent distributions with pagination.
+  * @param user The user address to include in the distribution info.
+  * @param page The page number to fetch.
+  * @param pageSize The number of items per page.
+  * @return An array of DistributionInfo structs.
+  */
+  function getRecentDistributions(address user, uint256 page, uint256 pageSize) external view returns (DistributionInfo[] memory) {
+    uint256 totalDistributions = distributions.length;
+
+    // Calculate the starting index
+    uint256 startIndex = ((page - 1) * pageSize);
+    if (startIndex > totalDistributions)
+      startIndex = totalDistributions;
+
+    // Calculate the number of items to return
+    uint256 endIndex = startIndex + pageSize;
+    if (endIndex > totalDistributions)
+      endIndex = totalDistributions;
+
+    uint256 resultCount = endIndex - startIndex;
+    DistributionInfo[] memory recentDistributions = new DistributionInfo[](resultCount);
+
+    // Iterate over the distributions array in reverse order and fill the result array
+    for (uint256 i = 0; i < resultCount; i++)
+      recentDistributions[i] = getInfo(totalDistributions - startIndex - i, user);
+
+    return recentDistributions;
+  }
+
+  /**
+  * @dev Starts the distribution process by setting the start and end times.
+  * @param distribution The distribution to start.
+  */
+  function startDistribution(Distribution storage distribution) private {
+    distribution.startTime = block.timestamp;
+    distribution.endTime = distribution.startTime + distribution.duration;
+  }
+
+  /**
+  * @dev Allows a user to deposit into a distribution, starting the distribution if necessary.
+  * @param distributionId The ID of the distribution to deposit into.
+  * @param amount The amount to deposit.
+  */
+  function deposit(uint256 distributionId, uint256 amount) external payable nonReentrant {
+    Distribution storage distribution = distributions[distributionId - 1];
+    if (distribution.startTime == 0) startDistribution(distribution);
+    require(block.timestamp <= distribution.endTime, "Distribution period has ended");
+    require(deposits[distributionId][msg.sender].amount == 0, "Can only deposit once");
+
+    if (address(distribution.tokenIN) != address(0)) {
+      require(msg.value == 0, "Cannot send ETH to token-based distribution");
+      ERC20Helpers.safeTransferFrom(address(distribution.tokenIN), msg.sender, address(this), amount);
+    } else require(amount == msg.value, "deposit amount and msg.value must be exactly the same");
+
+    require(amount > 0, "Cannot deposit zero tokens");
+
+    uint256 elapsedTime = block.timestamp - distribution.lastDepositAt;
+
+    if (distribution.lastDepositAt > 0)
+      distribution.totalTokensPerDeposit += elapsedTime * distribution.tokensPerSecond / distribution.totalDeposited;
+
+    deposits[distributionId][msg.sender] = Deposit({
+      previouslyAllocated: distribution.totalTokensPerDeposit,
+      amount: amount,
+      claimed: false
+    });
+
+    distribution.totalDeposited += amount;
+    distribution.lastDepositAt = block.timestamp;
+
+    if (distribution.creator != msg.sender)
+      userDistributions[msg.sender].push(distributionId);
+
+    emit Deposited(distributionId, msg.sender, amount);
+  }
+
+  /**
+  * @dev Distributes the reward for a distribution after the distribution period has ended.
+  * @param distributionId The ID of the distribution whose rewards are to be distributed.
+  */
+  function distributeReward(uint256 distributionId) external nonReentrant {
+    Distribution storage distribution = distributions[distributionId - 1];
+    require(block.timestamp > distribution.endTime, "Distribution period has not yet ended");
+    _distributeReward(distribution);
+  }
+
+  /**
+  * @dev Internal function to distribute rewards for a distribution.
+  * @param distribution The distribution whose rewards are to be distributed.
+  */
+  function _distributeReward(Distribution storage distribution) internal {
+    if (distribution.rewardDistributed) return;
+    distribution.rewardDistributed = true;
+
+    // Remove from active list
+    if (distribution.prevActiveId != 0)
+      distributions[distribution.prevActiveId - 1].nextActiveId = distribution.nextActiveId;
+
+    if (distribution.nextActiveId != 0)
+      distributions[distribution.nextActiveId - 1].prevActiveId = distribution.prevActiveId;
+
+    if (newestActiveDistributionId == distribution.id)
+      newestActiveDistributionId = distribution.nextActiveId;
+
+    uint256 rewardAmount = distribution.platformFee * distribution.totalDeposited / 10_000;
+    uint256 uncommonRewardLength = rewardFarmers.uncommonRewardCount();
+
+    if (address(distribution.tokenIN) == address(0))
+      rewardFarmers.addRewards{value: rewardAmount}(distribution.id, address(0), rewardAmount);
+    else {
+      ERC20Helpers.safeApprove(address(distribution.tokenIN), address(rewardFarmers), rewardAmount);
+      rewardFarmers.addRewards(distribution.id, address(distribution.tokenIN), rewardAmount);
+      if (uncommonRewardLength != rewardFarmers.uncommonRewardCount()) {
+        distribution.uncommonRewardId = uncommonRewardLength;
+        distribution.hasUncommonReward = true;
+      }
+    }
+  }
+
+  /**
+  * @dev Allows the creator of a distribution to withdraw the input tokens after the distribution has ended.
+  * @param distributionId The ID of the distribution to withdraw from.
+  */
+  function withdraw(uint256 distributionId) external nonReentrant {
+    Distribution storage distribution = distributions[distributionId - 1];
+    require(msg.sender == distribution.creator, "Only the creator can withdraw the received tokens");
+    require(block.timestamp > distribution.endTime, "Distribution period has not yet ended");
+    require(!distribution.ownerWithdrawn, "Creator has already withdrawn");
+    distribution.ownerWithdrawn = true;
+    _distributeReward(distribution);
+
+    uint256 rewardAmount = distribution.platformFee * distribution.totalDeposited / 10_000;
+    uint256 amountIn = (10_000 - distribution.percentReturned) * distribution.totalDeposited / 10_000;
+    amountIn -= rewardAmount;
+
+    if (address(distribution.tokenIN) == address(0))
+      payable(msg.sender).transfer(amountIn);
+    else ERC20Helpers.safeTransfer(address(distribution.tokenIN), msg.sender, amountIn);
+
+  }
+
+  /**
+  * @dev Allows a user to claim their rewards after the distribution period has ended.
+  * @param distributionId The ID of the distribution from which to claim rewards.
+  */
+  function claim(uint256 distributionId) external nonReentrant {
+    Distribution storage distribution = distributions[distributionId - 1];
+    require(block.timestamp > distribution.endTime, "Distribution period has not yet ended");
+
+    _distributeReward(distribution);
+
+    Deposit storage userDeposit = deposits[distributionId][msg.sender];
+    require(!userDeposit.claimed, "Already claimed");
+    userDeposit.claimed = true;
+
+    uint256 yieldAmount = allocatedAmount(distributionId, msg.sender);
+    uint256 amountReturned = userDeposit.amount * distribution.percentReturned / 10_000;
+
+    if (address(distribution.tokenOUT) == address(0))
+      payable(msg.sender).transfer(yieldAmount);
+    else ERC20Helpers.safeTransfer(address(distribution.tokenOUT), msg.sender, yieldAmount);
+
+    if (address(distribution.tokenIN) == address(0))
+      payable(msg.sender).transfer(amountReturned);
+    else ERC20Helpers.safeTransfer(address(distribution.tokenIN), msg.sender, amountReturned);
+
+    emit Claim(distributionId, msg.sender, yieldAmount, amountReturned);
+  }
+
+  /**
+  * @dev Calculates the current allocation period for a distribution.
+  * @param distributionId The ID of the distribution.
+  * @return The current allocation period in seconds.
+  */
+  function currentAllocationPeriod(uint256 distributionId) public view returns (uint256) {
+    Distribution storage distribution = distributions[distributionId - 1];
+    if (distribution.endTime < block.timestamp)
+      return distribution.endTime - distribution.lastDepositAt;
+    else return block.timestamp - distribution.lastDepositAt;
+  }
+
+  /**
+  * @dev Calculates the total allocated amount for a user in a distribution.
+  * @param distributionId The ID of the distribution.
+  * @param user The address of the user.
+  * @return The total allocated amount for the user.
+  */
+  function allocatedAmount(uint256 distributionId, address user) public view returns (uint256) {
+    Distribution storage distribution = distributions[distributionId - 1];
+    if (distribution.totalDeposited == 0) return 0;
+    Deposit storage deposited = deposits[distributionId][user];
+    uint256 currentAllocationAmount = currentAllocationPeriod(distributionId) * distribution.tokensPerSecond * deposited.amount / distribution.totalDeposited;
+    uint256 previousAllocationAmount = deposited.amount * (distribution.totalTokensPerDeposit - deposited.previouslyAllocated);
+
+    return (previousAllocationAmount + currentAllocationAmount) / PRECISION;
+  }
+
+  /**
+  * @dev Calculates the current allocation for a user in a distribution.
+  * @param distributionId The ID of the distribution.
+  * @param user The user's address.
+  * @return The current allocation for the user.
+  */
+  function currentAllocation(uint256 distributionId, address user) public view returns (uint256) {
+    Distribution storage distribution = distributions[distributionId - 1];
+    if (distribution.totalDeposited == 0) return 0;
+    Deposit storage deposited = deposits[distributionId][user];
+    return currentAllocationPeriod(distributionId) * distribution.tokensPerSecond * deposited.amount / distribution.totalDeposited;
+  }
+
+  /**
+  * @dev Calculates the previous allocation for a user in a distribution.
+  * @param distributionId The ID of the distribution.
+  * @param user The user's address.
+  * @return The previous allocation for the user.
+  */
+  function previousAllocation(uint256 distributionId, address user) public view returns (uint256) {
+    Distribution storage distribution = distributions[distributionId - 1];
+    if (distribution.totalDeposited == 0) return 0;
+    Deposit storage deposited = deposits[distributionId][user];
+    return deposited.amount * (distribution.totalTokensPerDeposit - deposited.previouslyAllocated);
+  }
+
+  /**
+  * @dev Retrieves the current exchange rate of a token to ETH.
+  * @param token The address of the token.
+  * @return The exchange rate of the token to ETH.
+  */
+  function ethPerToken(address token) public view returns (uint) {
+    return rewardFarmers.ethPerToken(token);
+  }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/ERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/ERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC20.sol";
+import "./extensions/IERC20Metadata.sol";
+import "../../utils/Context.sol";
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20PresetMinterPauser}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.openzeppelin.com/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * The default value of {decimals} is 18. To change this, you should override
+ * this function so it returns a different value.
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the default value returned by this function, unless
+     * it's overridden.
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(address from, address to, uint256 amount) public virtual override returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, allowance(owner, spender) + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        uint256 currentAllowance = allowance(owner, spender);
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(owner, spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` of tokens from `from` to `to`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     */
+    function _transfer(address from, address to, uint256 amount) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, amount);
+
+        uint256 fromBalance = _balances[from];
+        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        unchecked {
+            _balances[from] = fromBalance - amount;
+            // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
+            // decrementing then incrementing.
+            _balances[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        unchecked {
+            // Overflow not possible: balance + amount is at most totalSupply + amount, which is checked above.
+            _balances[account] += amount;
+        }
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _balances[account] = accountBalance - amount;
+            // Overflow not possible: amount <= accountBalance <= totalSupply.
+            _totalSupply -= amount;
+        }
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _spendAllowance(address owner, address spender, uint256 amount) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+}
+
+
+// File: node_modules/@openzeppelin/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: contracts/interfaces/IRewardFarmers.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.12;
+
+interface IRewardFarmers {
+  // Define method signatures that are used in the RiceFields contract
+
+  // Assuming addRewards is a function called on rewardFarmers
+  function addRewards(uint256 distributionId, address token, uint256 amount) external payable;
+
+  // Assuming uncommonRewardCount is a function called on rewardFarmers
+  function uncommonRewardCount() external view returns (uint256);
+
+  // Assuming ethPerToken is a function called on rewardFarmers
+  function ethPerToken(address token) external view returns (uint256);
+}
+
+
+
+// File: contracts/libraries/ERC20Helpers.sol
+// SPDX-License-Identifier: GPL-3.0-or-later
+import "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
+
+pragma solidity >=0.6.0;
+
+// helper methods for interacting with ERC20 tokens and sending ETH that do not consistently return true/false
+library ERC20Helpers {
+  function safeApprove(
+    address token,
+    address to,
+    uint256 value
+  ) internal {
+    // bytes4(keccak256(bytes('approve(address,uint256)')));
+    (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, to, value));
+    require(
+      success && (data.length == 0 || abi.decode(data, (bool))),
+      'ERC20Helpers::safeApprove: approve failed'
+    );
+  }
+
+  function safeTransfer(
+    address token,
+    address to,
+    uint256 value
+  ) internal {
+    // bytes4(keccak256(bytes('transfer(address,uint256)')));
+    (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, to, value));
+    require(
+      success && (data.length == 0 || abi.decode(data, (bool))),
+      'ERC20Helpers::safeTransfer: transfer failed'
+    );
+  }
+
+  function safeTransferFrom(
+    address token,
+    address from,
+    address to,
+    uint256 value
+  ) internal {
+    // bytes4(keccak256(bytes('transferFrom(address,address,uint256)')));
+    (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, value));
+    require(
+      success && (data.length == 0 || abi.decode(data, (bool))),
+      'ERC20Helpers::transferFrom: transferFrom failed'
+    );
+  }
+
+  function safeTransferETH(address to, uint256 value) internal {
+    (bool success, ) = to.call{value: value}(new bytes(0));
+    require(success, 'ERC20Helpers::safeTransferETH: ETH transfer failed');
+  }
+
+  /**
+  * @dev Tries to fetch the decimals of the given token, defaults to 0 if undefined.
+  * @param token The token contract to retrieve decimals from.
+  * @return The number of decimals of the token.
+  */
+  function tryDecimals(IERC20Metadata token) internal view returns (uint8) {
+    try token.decimals{gas: 20000}() returns (uint8 value) {
+      return value;
+    } catch {
+      return 18; // Default value
+    }
+  }
+
+  /**
+  * @dev Tries to fetch the symbol of the given token, defaults to "UNKNOWN" if undefined.
+  * @param token The token contract to retrieve the symbol from.
+  * @return The symbol of the token.
+  */
+  function trySymbol(IERC20Metadata token) internal view returns (string memory) {
+    try token.symbol{gas: 20000}() returns (string memory value) {
+      return value;
+    } catch {
+      return "UNKNOWN"; // Default value
+    }
+  }
+
+  /**
+  * @dev Tries to fetch the name of the given token, defaults to "Unknown Token" if undefined.
+  * @param token The token contract to retrieve the name from.
+  * @return The name of the token.
+  */
+  function tryName(IERC20Metadata token) internal view returns (string memory) {
+    try token.name{gas: 20000}() returns (string memory value) {
+      return value;
+    } catch {
+      return "Unknown Token"; // Default value
+    }
+  }
+
+}
+
+
+
+
+// File: contracts/interfaces/IFARM.sol
+pragma solidity ^0.8.12;
+
+interface IFARM {
+  function activateRewards(address _uniswapPair, address _weth, address _router) external;
+}
+
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.4) (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/interfaces/IERC20Metadata.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (interfaces/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../token/ERC20/extensions/IERC20Metadata.sol";
+

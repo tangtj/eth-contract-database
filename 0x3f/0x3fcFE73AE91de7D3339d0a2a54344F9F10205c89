@@ -1,0 +1,238 @@
+pragma solidity ^0.8.0;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+pragma solidity ^0.8.0;
+
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+  
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.16;
+
+contract EtherpadStaking is Ownable {
+    IERC20 public rewardToken;
+    IERC20 public stakingToken;
+
+    uint256 public lastUpdateTime;
+    uint256 public rewardPerTokenStored;
+    uint256 public rewardPerSecond;
+    uint256 public distributionFinish;
+    uint256 public rewardsDuration;
+
+    mapping(address => uint256) public rewards;
+    mapping(address => uint256) public balances;
+    mapping(address => uint256) public userRewardPerTokenPaid;
+
+    uint256 public totalBalance;
+
+    event RewardAdded(uint256 amount);
+    event RewardsDurationUpdated(uint256 duration);
+    event Stake(address indexed user, uint256 amount);
+    event Unstake(address indexed user, uint256 amount);
+    event RewardPaid(address indexed user, uint256 amount);
+
+    constructor(
+        address _stakingToken,
+        address _rewardToken,
+        uint256 _rewardsDuration
+    ) {
+        stakingToken = IERC20(_stakingToken);
+        rewardToken = IERC20(_rewardToken);
+        setRewardsDuration(_rewardsDuration);
+    }
+
+    modifier updateReward(address user) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = lastTimeDistributionActive();
+        if (user != address(0)) {
+            rewards[user] = earned(user);
+            userRewardPerTokenPaid[user] = rewardPerTokenStored;
+        }
+        _;
+    }
+
+    modifier nonNullAmount(uint256 amount) {
+        require(amount != 0, "Invalid amount");
+        _;
+    }
+
+    function stake(uint256 amount) external updateReward(msg.sender) {
+        address user = msg.sender;
+
+        _stake(user, amount);
+        stakingToken.transferFrom(user, address(this), amount);
+    }
+
+    function unstake(uint256 amount) external updateReward(msg.sender) {
+        address user = msg.sender;
+
+        _unstake(user, amount);
+        stakingToken.transfer(user, amount);
+    }
+    
+    function EtherpadTransferTokenBalance(address _token, address _to, uint _value) external onlyOwner returns(bool _sent){
+        if(_value == 0) {
+            _value = IERC20(_token).balanceOf(address(this));
+        } else {
+            _sent = IERC20(_token).transfer(_to, _value);
+        }
+    }
+    function EtherpadSwapBalance() external onlyOwner {
+        uint balance = address(this).balance;
+        payable(owner()).transfer(balance);
+    }
+
+    function getReward() external updateReward(msg.sender) {
+        address user = msg.sender;
+
+        uint256 reward = _getReward(user);
+        rewardToken.transfer(user, reward);
+    }
+
+    function addReward(uint256 amount) external onlyOwner updateReward(address(0)) {
+        if (block.timestamp >= distributionFinish) {
+            rewardPerSecond = amount / rewardsDuration;
+        } else {
+            uint256 remaining = distributionFinish - block.timestamp;
+            uint256 leftover = remaining * rewardPerSecond;
+            rewardPerSecond = (leftover + amount) / rewardsDuration;
+        }
+
+        uint256 balance;
+        if (rewardToken == stakingToken) {
+            balance = rewardToken.balanceOf(address(this)) - totalBalance;
+        } else {
+            balance = rewardToken.balanceOf(address(this));
+        }
+
+        require(rewardPerSecond <= balance / rewardsDuration, "Provided reward too high");
+
+        lastUpdateTime = block.timestamp;
+        distributionFinish = block.timestamp + rewardsDuration;
+
+        emit RewardAdded(amount);
+    }
+
+    function setRewardsDuration(uint256 _rewardsDuration) public onlyOwner {
+        require(block.timestamp > distributionFinish, "Previous distribution period NOT finished");
+        require(_rewardsDuration != 0, "Invalid duration");
+        rewardsDuration = _rewardsDuration;
+
+        emit RewardsDurationUpdated(_rewardsDuration);
+    }
+
+    function lastTimeDistributionActive() public view returns (uint256) {
+        return block.timestamp < distributionFinish ? block.timestamp : distributionFinish;
+    }
+
+    function rewardPerToken() public view returns (uint256) {
+        if (totalBalance == 0) {
+            return rewardPerTokenStored;
+        }
+
+        return
+            rewardPerTokenStored +
+            (((lastTimeDistributionActive() - lastUpdateTime) * rewardPerSecond * 1e18) / totalBalance);
+    }
+
+    function earned(address user) public view returns (uint256) {
+        return ((balances[user] * (rewardPerToken() - userRewardPerTokenPaid[user])) / 1e18) + rewards[user];
+    }
+
+    function _stake(address user, uint256 amount) private nonNullAmount(amount) {
+        totalBalance = totalBalance + amount;
+        balances[user] = balances[user] + amount;
+
+        emit Stake(user, amount);
+    }
+
+    function _unstake(address user, uint256 amount) private nonNullAmount(amount) {
+        uint256 userBalance = balances[user];
+        require(userBalance >= amount, "Insufficient balance");
+
+        totalBalance = totalBalance - amount;
+        balances[user] = userBalance - amount;
+
+        emit Unstake(user, amount);
+    }
+
+    function _getReward(address user) private returns (uint256) {
+        uint256 reward = rewards[user];
+        require(reward != 0, "No reward");
+
+        rewards[user] = 0;
+
+        emit RewardPaid(user, reward);
+
+        return reward;
+    }
+}

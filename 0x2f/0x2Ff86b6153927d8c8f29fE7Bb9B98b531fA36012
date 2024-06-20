@@ -1,0 +1,673 @@
+// File: @openzeppelin/contracts/utils/ReentrancyGuard.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+// File: @openzeppelin/contracts/utils/Context.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+// File: @openzeppelin/contracts/access/Ownable.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+// File: contracts/VestingLanify.sol
+
+
+pragma solidity ^0.8.19;
+
+// OpenZeppelin dependencies
+
+
+
+
+/**
+ * @title Vesting
+ */
+contract Vesting is Ownable, ReentrancyGuard {
+    struct VestingSchedule {
+        // beneficiary of tokens after they are released
+        address beneficiary;
+        // cliff time of the vesting start in seconds since the UNIX epoch
+        uint256 cliff;
+        // start time of the vesting period in seconds since the UNIX epoch
+        uint256 start;
+        // start time of TGE
+        uint256 launch;
+        // duration of the vesting period in seconds
+        uint256 duration;
+        // duration of a slice period for the vesting in seconds
+        uint256 slicePeriodSeconds;
+        // whether or not the vesting is revocable
+        bool revocable;
+        // total amount of tokens to be released at the end of the vesting
+        uint256 amountTotal;
+        // percentage to be released at TGE
+        uint256 launchPercent;
+        // amount of tokens released
+        uint256 released;
+        // whether or not the vesting has been revoked
+        bool revoked;
+    }
+
+    IERC20 public immutable token;
+
+    bytes32[] private vestingSchedulesIds;
+    mapping(bytes32 => VestingSchedule) private vestingSchedules;
+    uint256 private vestingSchedulesTotalAmount;
+    mapping(address => uint256) private holdersVestingCount;
+
+    /**
+     * @dev Reverts if the vesting schedule does not exist or has been revoked.
+     */
+    modifier onlyIfVestingScheduleNotRevoked(bytes32 vestingScheduleId) {
+        require(!vestingSchedules[vestingScheduleId].revoked);
+        _;
+    }
+
+    /**
+     * @dev Creates a vesting contract.
+     * @param token_ address of the ERC20 token contract
+     */
+    constructor(address token_) Ownable(msg.sender) {
+        // Check that the token address is not 0x0.
+        require(token_ != address(0x0), "Vesting: invalid token address");
+        // Set the token address.
+        token = IERC20(token_);
+    }
+
+    /**
+     * @dev This function is called for plain Ether transfers, i.e. for every call with empty calldata.
+     */
+    receive() external payable {}
+
+    /**
+     * @dev Fallback function is executed if none of the other functions match the function
+     * identifier or no data was provided with the function call.
+     */
+    fallback() external payable {}
+
+    /**
+     * @notice Creates a new vesting schedule for a beneficiary.
+     * @param _beneficiary address of the beneficiary to whom vested tokens are transferred
+     * @param _start start time of the vesting period
+     * @param _cliff duration in seconds of the cliff in which tokens will begin to vest
+     * @param _duration duration in seconds of the period in which the tokens will vest
+     * @param _slicePeriodSeconds duration of a slice period for the vesting in seconds
+     * @param _revocable whether the vesting is revocable or not
+     * @param _amount total amount of tokens to be released at the end of the vesting
+     */
+    function createVestingSchedule(
+        address _beneficiary,
+        uint256 _start,
+        uint256 _cliff,
+        uint256 _launch,
+        uint256 _duration,
+        uint256 _slicePeriodSeconds,
+        uint256 _launchPercent,
+        bool _revocable,
+        uint256 _amount
+    ) external onlyOwner {
+        require(
+            getWithdrawableAmount() >= _amount,
+            "Vesting: cannot create vesting schedule because not sufficient tokens"
+        );
+        require(_duration > 0, "Vesting: duration must be > 0");
+        require(_launch > 0, "Vesting: launch must be > 0");
+        require(_amount > 0, "Vesting: amount must be > 0");
+        require(
+            _slicePeriodSeconds >= 1,
+            "Vesting: slicePeriodSeconds must be >= 1"
+        );
+        require(_duration >= _cliff, "Vesting: duration must be >= cliff");
+        bytes32 vestingScheduleId = computeNextVestingScheduleIdForHolder(
+            _beneficiary
+        );
+        uint256 cliff = _start + _cliff;
+        uint256 launch = _start + _launch;
+        vestingSchedules[vestingScheduleId] = VestingSchedule(
+            _beneficiary,
+            cliff,
+            _start,
+            launch,
+            _duration,
+            _slicePeriodSeconds,
+            _revocable,
+            _amount,
+            _launchPercent,
+            0,
+            false
+        );
+        vestingSchedulesTotalAmount = vestingSchedulesTotalAmount + _amount;
+        vestingSchedulesIds.push(vestingScheduleId);
+        uint256 currentVestingCount = holdersVestingCount[_beneficiary];
+        holdersVestingCount[_beneficiary] = currentVestingCount + 1;
+    }
+
+    /**
+     * @notice Revokes the vesting schedule for given identifier.
+     * @param vestingScheduleId the vesting schedule identifier
+     */
+    function revoke(
+        bytes32 vestingScheduleId
+    ) external onlyOwner onlyIfVestingScheduleNotRevoked(vestingScheduleId) {
+        VestingSchedule storage vestingSchedule = vestingSchedules[
+            vestingScheduleId
+        ];
+        require(vestingSchedule.revocable, "Vesting: vesting is not revocable");
+        uint256 vestedAmount = _computeReleasableAmount(vestingSchedule);
+        if (vestedAmount > 0) {
+            release(vestingScheduleId, vestedAmount);
+        }
+        uint256 unreleased = vestingSchedule.amountTotal -
+            vestingSchedule.released;
+        vestingSchedulesTotalAmount = vestingSchedulesTotalAmount - unreleased;
+        vestingSchedule.revoked = true;
+    }
+
+    /**
+     * @notice Withdraw the specified amount if possible.
+     * @param amount the amount to withdraw
+     */
+    function withdraw(uint256 amount) external nonReentrant onlyOwner {
+        require(
+            getWithdrawableAmount() >= amount,
+            "Vesting: not enough withdrawable funds"
+        );
+        /*
+         * @dev Replaced owner() with msg.sender => address of WITHDRAWER_ROLE
+         */
+        token.transfer(msg.sender, amount);
+    }
+
+    /**
+     * @notice Release vested amount of tokens.
+     * @param vestingScheduleId the vesting schedule identifier
+     * @param amount the amount to release
+     */
+    function release(
+        bytes32 vestingScheduleId,
+        uint256 amount
+    ) public nonReentrant onlyIfVestingScheduleNotRevoked(vestingScheduleId) {
+        VestingSchedule storage vestingSchedule = vestingSchedules[
+            vestingScheduleId
+        ];
+        bool isBeneficiary = msg.sender == vestingSchedule.beneficiary;
+
+        bool isReleasor = (msg.sender == owner());
+        require(
+            isBeneficiary || isReleasor,
+            "Vesting: only beneficiary and owner can release vested tokens"
+        );
+        uint256 vestedAmount = _computeReleasableAmount(vestingSchedule);
+        require(
+            vestedAmount >= amount,
+            "Vesting: cannot release tokens, not enough vested tokens"
+        );
+        vestingSchedule.released = vestingSchedule.released + amount;
+        address payable beneficiaryPayable = payable(
+            vestingSchedule.beneficiary
+        );
+        vestingSchedulesTotalAmount = vestingSchedulesTotalAmount - amount;
+        token.transfer(beneficiaryPayable, amount);
+    }
+
+    /**
+     * @dev Returns the number of vesting schedules associated to a beneficiary.
+     * @return the number of vesting schedules
+     */
+    function getVestingSchedulesCountByBeneficiary(
+        address _beneficiary
+    ) external view returns (uint256) {
+        return holdersVestingCount[_beneficiary];
+    }
+
+    /**
+     * @dev Returns the vesting schedule id at the given index.
+     * @return the vesting id
+     */
+    function getVestingIdAtIndex(
+        uint256 index
+    ) external view returns (bytes32) {
+        require(
+            index < getVestingSchedulesCount(),
+            "Vesting: index out of bounds"
+        );
+        return vestingSchedulesIds[index];
+    }
+
+    /**
+     * @notice Returns the vesting schedule information for a given holder and index.
+     * @return the vesting schedule structure information
+     */
+    function getVestingScheduleByAddressAndIndex(
+        address holder,
+        uint256 index
+    ) external view returns (VestingSchedule memory) {
+        return
+            getVestingSchedule(
+                computeVestingScheduleIdForAddressAndIndex(holder, index)
+            );
+    }
+
+    /**
+     * @notice Returns the total amount of vesting schedules.
+     * @return the total amount of vesting schedules
+     */
+    function getVestingSchedulesTotalAmount() external view returns (uint256) {
+        return vestingSchedulesTotalAmount;
+    }
+
+    /**
+     * @dev Returns the number of vesting schedules managed by this contract.
+     * @return the number of vesting schedules
+     */
+    function getVestingSchedulesCount() public view returns (uint256) {
+        return vestingSchedulesIds.length;
+    }
+
+    /**
+     * @notice Computes the vested amount of tokens for the given vesting schedule identifier.
+     * @return the vested amount
+     */
+    function computeReleasableAmount(
+        bytes32 vestingScheduleId
+    )
+        external
+        view
+        onlyIfVestingScheduleNotRevoked(vestingScheduleId)
+        returns (uint256)
+    {
+        VestingSchedule storage vestingSchedule = vestingSchedules[
+            vestingScheduleId
+        ];
+        return _computeReleasableAmount(vestingSchedule);
+    }
+
+    /**
+     * @notice Returns the vesting schedule information for a given identifier.
+     * @return the vesting schedule structure information
+     */
+    function getVestingSchedule(
+        bytes32 vestingScheduleId
+    ) public view returns (VestingSchedule memory) {
+        return vestingSchedules[vestingScheduleId];
+    }
+
+    /**
+     * @dev Returns the amount of tokens that can be withdrawn by the owner.
+     * @return the amount of tokens
+     */
+    function getWithdrawableAmount() public view returns (uint256) {
+        return token.balanceOf(address(this)) - vestingSchedulesTotalAmount;
+    }
+
+    /**
+     * @dev Computes the next vesting schedule identifier for a given holder address.
+     */
+    function computeNextVestingScheduleIdForHolder(
+        address holder
+    ) public view returns (bytes32) {
+        return
+            computeVestingScheduleIdForAddressAndIndex(
+                holder,
+                holdersVestingCount[holder]
+            );
+    }
+
+    /**
+     * @dev Returns the last vesting schedule for a given holder address.
+     */
+    function getLastVestingScheduleForHolder(
+        address holder
+    ) external view returns (VestingSchedule memory) {
+        return
+            vestingSchedules[
+                computeVestingScheduleIdForAddressAndIndex(
+                    holder,
+                    holdersVestingCount[holder] - 1
+                )
+            ];
+    }
+
+    /**
+     * @dev Computes the vesting schedule identifier for an address and an index.
+     */
+    function computeVestingScheduleIdForAddressAndIndex(
+        address holder,
+        uint256 index
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(holder, index));
+    }
+
+    /**
+     * @dev Computes the releasable amount of tokens for a vesting schedule.
+     * @return the amount of releasable tokens
+     */
+    function _computeReleasableAmount(
+        VestingSchedule memory vestingSchedule
+    ) internal view returns (uint256) {
+        // Retrieve the current time.
+        uint256 currentTime = block.timestamp;
+        // If the current time is before the cliff, no tokens are releasable.
+        if (
+            (currentTime < vestingSchedule.cliff) ||
+            (currentTime < vestingSchedule.launch) ||
+            vestingSchedule.revoked
+        ) {
+            return 0;
+        }
+        // If the current time is after the vesting period, all tokens are releasable,
+        // minus the amount already released.
+        else if (
+            currentTime >= vestingSchedule.start + vestingSchedule.duration
+        ) {
+            return vestingSchedule.amountTotal - vestingSchedule.released;
+        }
+        // Otherwise, some tokens are releasable.
+        else {
+            // Compute the number of full vesting periods that have elapsed.
+            uint256 launchAmount = (vestingSchedule.amountTotal *
+                vestingSchedule.launchPercent) / 100;
+            uint256 leftAmount = vestingSchedule.amountTotal - launchAmount;
+            uint256 timeFromStart = currentTime - vestingSchedule.start;
+            uint256 secondsPerSlice = vestingSchedule.slicePeriodSeconds;
+            uint256 vestedSlicePeriods = timeFromStart / secondsPerSlice;
+            uint256 vestedSeconds = vestedSlicePeriods * secondsPerSlice;
+            // Compute the amount of tokens that are vested.
+            uint256 vestedAmount = (leftAmount * vestedSeconds) /
+                vestingSchedule.duration;
+            // Subtract the amount already released and return.
+            return vestedAmount + launchAmount - vestingSchedule.released;
+        }
+    }
+}

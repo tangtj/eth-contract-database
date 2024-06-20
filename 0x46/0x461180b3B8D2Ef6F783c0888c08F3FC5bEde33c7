@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+interface IGaussToken {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+}
+
+contract RevenueShare {
+    IGaussToken public gaussToken;
+    mapping(address => uint256) public lockedTokens;
+    mapping(address => uint256) public userETHBalances;
+    mapping(address => uint256) public lockTimes; // Track when tokens were locked
+    mapping(address => bool) private isLocked;
+    address[] private lockers;
+    uint256 public totalLocked;
+    uint256 public remainETH;
+    uint256 public totalDepositedETH;
+    bool public distributionEnabled = false;
+    address private owner;
+    uint256 public minimumLockAmount = 10000 * 10**9; 
+
+    event TokensLocked(address indexed user, uint256 amount, uint256 lockTime);
+    event TokensUnlocked(address indexed user, uint256 amount, uint256 ethRedistributed);
+    event ETHDeposited(uint256 amount, uint256 totalDeposited);
+    event Redistributed(uint256 amount, uint256 users);
+    event DistributionEnabled();
+    event RewardClaimed(address indexed user, uint256 reward);
+
+    constructor(address _gaussTokenAddress) {
+        owner = msg.sender;
+        gaussToken = IGaussToken(_gaussTokenAddress);
+    }
+
+    receive() external payable {
+        require(msg.value > 0, "RevenueShare: Deposit must be greater than 0");
+        remainETH += msg.value;
+        totalDepositedETH += msg.value;
+        if (distributionEnabled) redistributeETH();
+        emit ETHDeposited(msg.value, totalDepositedETH);
+    }
+
+    function lockTokens(uint256 amount) public {
+        require(amount >= minimumLockAmount, "Amount is below the minimum lock requirement");
+        require(gaussToken.transferFrom(msg.sender, address(this), amount), "RevenueShare:Transfer failed");
+        lockedTokens[msg.sender] += amount;
+        lockTimes[msg.sender] = block.timestamp; // Set lock time
+        totalLocked += amount;
+        if(isLocked[msg.sender] == false) {
+            lockers.push(msg.sender);
+            isLocked[msg.sender] = true;
+        }
+        emit TokensLocked(msg.sender, amount, block.timestamp);
+    }
+
+    function unlockTokens(uint256 amount) public {
+        require(block.timestamp >= lockTimes[msg.sender] + 1 weeks, "RevenueShare: Tokens must be locked for at least one week");
+        require(lockedTokens[msg.sender] >= amount, "RevenueShare: Insufficient locked tokens");
+        require(gaussToken.transfer(msg.sender, amount), "RevenueShare: Transfer failed");
+
+        lockedTokens[msg.sender] -= amount;
+        totalLocked -= amount;
+
+        emit TokensUnlocked(msg.sender, amount, userETHBalances[msg.sender]);
+    }
+
+    function enableDistribution() public {
+        require(owner == msg.sender, "RevenueShare: Only owner can enable distribution");
+        require(!distributionEnabled, "RevenueShare: Distribution already enabled");
+        distributionEnabled = true;
+        if(remainETH > 0) redistributeETH();
+        emit DistributionEnabled();
+    }
+
+    function redistributeETH() internal {
+        require(distributionEnabled, "RevenueShare: Distribution not enabled");
+        
+        uint256 distributionETH = remainETH;
+        uint256 distributedAmount = 0; // Track the distributed amount to verify after distribution
+
+        for (uint i = 0; i < lockers.length; i++) {
+            address locker = lockers[i];
+            if (lockedTokens[locker] > 0) {
+                uint256 userShare = (lockedTokens[locker] * distributionETH) / totalLocked;
+                userETHBalances[locker] += userShare;
+                distributedAmount += userShare;
+            }
+        }
+        
+        require(distributedAmount <= remainETH, "Insufficient ETH for distribution");
+        remainETH -= distributedAmount;
+        emit Redistributed(distributedAmount, lockers.length);
+    }
+
+    function claimETHReward() public {
+        require(distributionEnabled, "RevenueShare: Distribution not enabled");
+        uint256 reward = userETHBalances[msg.sender];
+        require(reward > 0, "RevenueShare: No reward available");
+        userETHBalances[msg.sender] = 0; // Reset the balance after claiming
+        payable(msg.sender).transfer(reward);
+        emit RewardClaimed(msg.sender, reward);
+    }
+}

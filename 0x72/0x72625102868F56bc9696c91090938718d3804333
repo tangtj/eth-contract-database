@@ -1,0 +1,1452 @@
+
+// File: FeeConverter.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+import "SafeERC20.sol";
+import "PrismaOwnable.sol";
+import "SystemStart.sol";
+import "IPriceFeed.sol";
+import "ITroveManager.sol";
+import "IFactory.sol";
+
+interface IFeeDistributor {
+    function depositFeeToken(address token, uint256 amount) external returns (bool);
+}
+
+interface ICryptoSwap {
+    function add_liquidity(
+        uint256[2] memory amounts,
+        uint256 min_mint_amount,
+        bool use_eth,
+        address receiver
+    ) external returns (uint256);
+
+    function price_oracle() external view returns (uint256);
+
+    function price_scale() external view returns (uint256);
+
+    function token() external view returns (address);
+}
+
+contract AddLiquidityChecker is PrismaOwnable {
+    ICryptoSwap public immutable curvePool;
+
+    uint256 public constant MAX_PCT = 10000;
+
+    // maximum deviation percent between `price_oracle` and `price_scale` when
+    // adding liquidity on `curvePool`. protects against sandwich attacks.
+    uint256 public maxDeviation;
+
+    constructor(address _core, ICryptoSwap _curve, uint256 _maxDeviation) PrismaOwnable(_core) {
+        curvePool = _curve;
+        maxDeviation = _maxDeviation;
+    }
+
+    function setMaxDeviation(uint256 _maxDeviation) public onlyOwner {
+        require(_maxDeviation <= MAX_PCT, "Invalid maxDeviation");
+
+        maxDeviation = uint16(_maxDeviation);
+    }
+
+    function canAddLiquidity(address caller, uint256 amountToAdd) external view returns (bool) {
+        uint256 priceOracle = curvePool.price_oracle();
+        uint256 priceScale = curvePool.price_scale();
+
+        if (priceOracle > priceScale) {
+            uint256 delta = priceOracle - priceScale;
+            return (delta * MAX_PCT) / priceOracle < maxDeviation;
+        } else {
+            uint256 delta = priceScale - priceOracle;
+            return (delta * MAX_PCT) / priceScale < maxDeviation;
+        }
+    }
+}
+
+contract FeeConverter is PrismaOwnable, SystemStart {
+    using SafeERC20 for IERC20;
+
+    IFeeDistributor public immutable feeDistributor;
+    IERC20 public immutable debtToken;
+    IERC20 public immutable prismaToken;
+    IFactory public immutable factory;
+
+    ICryptoSwap public immutable curvePool;
+    IERC20 public immutable curvePoolLp;
+
+    uint256 public constant MAX_PCT = 10000;
+
+    ITroveManager[] public troveManagers;
+
+    AddLiquidityChecker public addLiquidityChecker;
+
+    uint16 public updatedWeek;
+
+    // target percent of liquidity within `curvePool` that the protocol should
+    // own. if the actual owned percent is less than this, a portion of the
+    // week's fees are used to add liquidity.
+    uint16 public targetPOLPct;
+    // percentage of weekly debt amount used to add liquidity, if protocol owned
+    // liquidity is below the target percent.
+    uint16 public weeklyDebtPOLPct;
+
+    // maximum percentage of `debtToken` distrubted in a week, relative to the
+    // amount within the fee receiver.
+    uint16 public maxWeeklyDebtPct;
+    // maximum amount of `debtToken` distributed in a week, as an absolute value.
+    uint88 public maxWeeklyDebtAmount;
+
+    // debt amount allocated to POL that was not added due to unfavorable conditions
+    uint88 public pendingPOLDebtAmount;
+
+    // amount of `debtToken` send to caller each week for processing fees
+    // if no POL is added, only half of this amount is given
+    uint80 public callerIncentive;
+
+    // collateral -> is for sale via `swapCollateralForDebt`?
+    mapping(address collateral => bool isForSale) public isSellingCollateral;
+
+    event WeeklyDebtParamsSet(uint256 maxWeeklyDebtAmount, uint256 maxWeeklyDebtPct);
+    event POLParamsSet(uint256 targetPOLPct, uint256 weeklyDebtPOLPct);
+    event CallerIncentiveSet(uint256 callerIncentive);
+    event AddLiquidityCheckerSet(address addLiquidityChecker);
+    event IsSellingCollateralSet(address[] collaterals, bool isSelling);
+
+    event CollateralSold(
+        address indexed buyer,
+        address indexed collateral,
+        uint256 price,
+        uint256 amountSold,
+        uint256 amountReceived
+    );
+
+    event LiquidityAdded(uint256 priceScale, uint256 debtAmount, uint256 prismaAmount, uint256 lpAmountReceived);
+
+    event TroveManagersSynced();
+    event InterestCollected();
+    event FeeTokenDeposited(uint256 amount);
+    event CallerIncentivePaid(address indexed caller, uint256 amount);
+    event PendingPOLDebtUpdated(uint256 amount);
+
+    struct InitialParams {
+        uint88 maxWeeklyDebtAmount;
+        uint16 maxWeeklyDebtPct;
+        uint16 targetPOLPct;
+        uint16 weeklyDebtPOLPct;
+        uint80 callerIncentive;
+        AddLiquidityChecker addLiquidityChecker;
+        address[] sellCollaterals;
+    }
+
+    constructor(
+        address _prismaCore,
+        address _feeDistributor,
+        IERC20 _debtToken,
+        IERC20 _prismaToken,
+        IFactory _factory,
+        ICryptoSwap _curvePool,
+        InitialParams memory initialParams
+    ) PrismaOwnable(_prismaCore) SystemStart(_prismaCore) {
+        feeDistributor = IFeeDistributor(_feeDistributor);
+        debtToken = _debtToken;
+        prismaToken = _prismaToken;
+        factory = _factory;
+        curvePool = _curvePool;
+        curvePoolLp = IERC20(_curvePool.token());
+
+        _debtToken.approve(_feeDistributor, type(uint256).max);
+        _debtToken.approve(address(_curvePool), type(uint256).max);
+        _prismaToken.approve(address(_curvePool), type(uint256).max);
+
+        _setWeeklyDebtParams(initialParams.maxWeeklyDebtAmount, initialParams.maxWeeklyDebtPct);
+        _setPOLParams(initialParams.targetPOLPct, initialParams.weeklyDebtPOLPct);
+        _setAddLiquidityChecker(initialParams.addLiquidityChecker);
+        _setCallerIncentive(initialParams.callerIncentive);
+        _setIsSellingCollateral(initialParams.sellCollaterals, true);
+
+        syncTroveManagers();
+    }
+
+    function setWeeklyDebtParams(uint256 _maxWeeklyDebtAmount, uint256 _maxWeeklyDebtPct) external onlyOwner {
+        _setWeeklyDebtParams(_maxWeeklyDebtAmount, _maxWeeklyDebtPct);
+    }
+
+    function _setWeeklyDebtParams(uint256 _maxWeeklyDebtAmount, uint256 _maxWeeklyDebtPct) internal {
+        require(_maxWeeklyDebtPct <= MAX_PCT, "Invalid maxWeeklyDebtPct");
+        maxWeeklyDebtAmount = uint88(_maxWeeklyDebtAmount);
+        maxWeeklyDebtPct = uint16(_maxWeeklyDebtPct);
+
+        emit WeeklyDebtParamsSet(_maxWeeklyDebtAmount, _maxWeeklyDebtPct);
+    }
+
+    function setPOLParams(uint256 _targetPOLPct, uint256 _weeklyDebtPOLPct) external onlyOwner {
+        _setPOLParams(_targetPOLPct, _weeklyDebtPOLPct);
+    }
+
+    function _setPOLParams(uint256 _targetPOLPct, uint256 _weeklyDebtPOLPct) internal {
+        require(_targetPOLPct <= MAX_PCT, "Invalid targetPOLPct");
+        require(_weeklyDebtPOLPct <= MAX_PCT, "Invalid weeklyDebtPOLPct");
+        targetPOLPct = uint16(_targetPOLPct);
+        weeklyDebtPOLPct = uint16(_weeklyDebtPOLPct);
+
+        emit POLParamsSet(_targetPOLPct, _weeklyDebtPOLPct);
+    }
+
+    function setAddLiquidityChecker(AddLiquidityChecker _checker) external onlyOwner {
+        _setAddLiquidityChecker(_checker);
+    }
+
+    function _setAddLiquidityChecker(AddLiquidityChecker _checker) internal {
+        addLiquidityChecker = _checker;
+
+        emit AddLiquidityCheckerSet(address(_checker));
+    }
+
+    function setCallerIncentive(uint256 _callerIncentive) external onlyOwner {
+        _setCallerIncentive(_callerIncentive);
+    }
+
+    function _setCallerIncentive(uint256 _callerIncentive) internal {
+        callerIncentive = uint80(_callerIncentive);
+
+        emit CallerIncentiveSet(_callerIncentive);
+    }
+
+    function setIsSellingCollateral(address[] memory collaterals, bool isSelling) external onlyOwner {
+        _setIsSellingCollateral(collaterals, isSelling);
+    }
+
+    function _setIsSellingCollateral(address[] memory collaterals, bool isSelling) internal {
+        uint256 length = collaterals.length;
+        if (isSelling) {
+            IPriceFeed feed = IPriceFeed(PRISMA_CORE.priceFeed());
+            for (uint i = 0; i < length; i++) {
+                address collateral = collaterals[i];
+                // fetch price as validation that collateral can be sold
+                feed.fetchPrice(collateral);
+                isSellingCollateral[collateral] = true;
+            }
+        } else {
+            for (uint i = 0; i < length; i++) {
+                isSellingCollateral[collaterals[i]] = false;
+            }
+        }
+
+        emit IsSellingCollateralSet(collaterals, isSelling);
+    }
+
+    /**
+        @notice Swap collateral token for debt
+        @dev Collateral is sold at the oracle price without discount, assuming a
+             debt token value of $1. Swaps become profitable for the caller when
+             the debt token price is under peg. As fees from redemptions are
+             also generated only when the debt price is under peg, it is expected
+             that redeemers will also call this function in the same action.
+     */
+    function swapDebtForColl(address collateral, uint256 debtAmount) external returns (uint256) {
+        require(isSellingCollateral[collateral], "Collateral sale disabled");
+        address receiver = PRISMA_CORE.feeReceiver();
+
+        (uint256 collAmount, uint256 price) = getSwapAmountReceived(collateral, debtAmount);
+        debtToken.transferFrom(msg.sender, receiver, debtAmount);
+        IERC20(collateral).safeTransferFrom(receiver, msg.sender, collAmount);
+
+        emit CollateralSold(msg.sender, collateral, price, debtAmount, collAmount);
+        return collAmount;
+    }
+
+    /**
+        @notice Get the amount received when swapping collateral for debt
+        @dev Intended to be called as a view method
+     */
+    function getSwapAmountReceived(
+        address collateral,
+        uint256 debtAmount
+    ) public returns (uint256 collAmount, uint256 price) {
+        IPriceFeed feed = IPriceFeed(PRISMA_CORE.priceFeed());
+        price = feed.fetchPrice(collateral);
+        collAmount = (debtAmount * 1e18) / price;
+        return (collAmount, price);
+    }
+
+    /**
+        @notice Update the local storage array of trove managers
+        @dev Should be called whenever a trove manager is added
+     */
+    function syncTroveManagers() public returns (bool) {
+        uint256 newLength = factory.troveManagerCount();
+
+        for (uint i = troveManagers.length; i < newLength; i++) {
+            ITroveManager troveManager = ITroveManager(factory.troveManagers(i));
+            troveManagers.push(troveManager);
+        }
+
+        emit TroveManagersSynced();
+        return true;
+    }
+
+    /**
+        @notice Collect accrued interest from all trove managers
+        @dev Callable by anyone at any time. Also called within `processWeeklyFees`.
+     */
+    function collectInterests() public returns (bool) {
+        uint256 length = troveManagers.length;
+        for (uint i = 0; i < length; i++) {
+            ITroveManager tm = troveManagers[i];
+            if (tm.interestPayable() > 0) tm.collectInterests();
+        }
+
+        emit InterestCollected();
+        return true;
+    }
+
+    /**
+        @notice Process weekly fees
+        @dev Callable once per week. The caller is incentivized with a fixed
+             amount of debt tokens.
+     */
+    function processWeeklyFees() external returns (bool) {
+        require(getWeek() > updatedWeek, "Already called this week");
+        updatedWeek = uint16(getWeek());
+
+        // collect accrued interest this week
+        collectInterests();
+
+        // calculate amount of debtToken to distribute
+        address receiver = PRISMA_CORE.feeReceiver();
+        uint256 amount = debtToken.balanceOf(receiver);
+        amount = (amount * maxWeeklyDebtPct) / MAX_PCT;
+        uint256 maxDebt = maxWeeklyDebtAmount;
+        if (amount > maxDebt) amount = maxDebt;
+        debtToken.transferFrom(receiver, address(this), amount);
+
+        // deduct `callerIncentive` from amount
+        uint256 incentive = callerIncentive;
+        amount -= incentive;
+
+        // add liquidity to `curveLpPool`
+        bool addedLiquidity;
+        uint256 polPct = weeklyDebtPOLPct;
+        if (polPct > 0) {
+            if ((curvePoolLp.balanceOf(receiver) * MAX_PCT) / curvePoolLp.totalSupply() < targetPOLPct) {
+                uint256 polAmount = (amount * polPct) / MAX_PCT;
+                amount -= polAmount;
+                polAmount += pendingPOLDebtAmount;
+
+                if (addLiquidityChecker.canAddLiquidity(msg.sender, polAmount)) {
+                    uint256 added = _addLiquidity(polAmount, receiver);
+                    addedLiquidity = true;
+                    pendingPOLDebtAmount = uint88(polAmount - added);
+                    emit PendingPOLDebtUpdated(polAmount - added);
+                } else {
+                    pendingPOLDebtAmount = uint88(polAmount);
+                    emit PendingPOLDebtUpdated(polAmount);
+                }
+            }
+        }
+
+        // transfer `callerIncentive` to caller - thank you for your service!
+        if (incentive != 0) {
+            if (!addedLiquidity) {
+                incentive /= 2;
+                amount += incentive;
+            }
+            debtToken.transfer(msg.sender, incentive);
+            emit CallerIncentivePaid(msg.sender, incentive);
+        }
+
+        // deposit to `feeDistributor`
+        if (amount > 0) {
+            feeDistributor.depositFeeToken(address(debtToken), amount);
+            emit FeeTokenDeposited(amount);
+        }
+
+        return true;
+    }
+
+    /**
+        @notice Add any pending liquidity
+        @dev Reverts if the liquidity checker disallows
+     */
+    function addPendingLiquidity() external returns (bool) {
+        uint256 amount = pendingPOLDebtAmount;
+        if (amount > 0) {
+            require(addLiquidityChecker.canAddLiquidity(msg.sender, amount), "Blocked by liquidityChecker");
+            uint added = _addLiquidity(amount, PRISMA_CORE.feeReceiver());
+            pendingPOLDebtAmount = uint88(amount - added);
+            emit PendingPOLDebtUpdated(amount - added);
+        }
+        return true;
+    }
+
+    function recoverToken(IERC20 token) external onlyOwner returns (bool) {
+        uint256 amount = token.balanceOf(address(this));
+        if (amount > 0) {
+            if (token == debtToken) {
+                // if recovering `debtToken`, need to zero pending POL amount or things break
+                pendingPOLDebtAmount = 0;
+                emit PendingPOLDebtUpdated(0);
+            }
+            token.safeTransfer(PRISMA_CORE.feeReceiver(), amount);
+        }
+        return true;
+    }
+
+    function _addLiquidity(uint256 debtAmount, address receiver) internal returns (uint256) {
+        uint256 priceScale = curvePool.price_scale();
+
+        uint256 prismaAmount = (debtAmount * 1e18) / priceScale;
+        uint256 prismaAvailable = prismaToken.balanceOf(receiver);
+
+        // if insufficient PRISMA is available, adjust the amounts
+        if (prismaAvailable < prismaAmount) {
+            if (prismaAvailable < 1e18) return 0;
+            prismaAmount = prismaAvailable;
+            debtAmount = (prismaAmount * priceScale) / 1e18;
+        }
+
+        prismaToken.transferFrom(receiver, address(this), prismaAmount);
+        uint256 lpAmount = curvePool.add_liquidity([debtAmount, prismaAmount], 0, false, receiver);
+
+        emit LiquidityAdded(priceScale, debtAmount, prismaAmount, lpAmount);
+        return debtAmount;
+    }
+}
+
+
+// File: SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.3) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC20.sol";
+import "IERC20Permit.sol";
+import "Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20 token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && Address.isContract(address(token));
+    }
+}
+
+
+// File: IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: PrismaOwnable.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+import "IPrismaCore.sol";
+
+/**
+    @title Prisma Ownable
+    @notice Contracts inheriting `PrismaOwnable` have the same owner as `PrismaCore`.
+            The ownership cannot be independently modified or renounced.
+ */
+contract PrismaOwnable {
+    IPrismaCore public immutable PRISMA_CORE;
+
+    constructor(address _prismaCore) {
+        PRISMA_CORE = IPrismaCore(_prismaCore);
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == PRISMA_CORE.owner(), "Only owner");
+        _;
+    }
+
+    function owner() public view returns (address) {
+        return PRISMA_CORE.owner();
+    }
+
+    function guardian() public view returns (address) {
+        return PRISMA_CORE.guardian();
+    }
+}
+
+
+// File: IPrismaCore.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IPrismaCore {
+    event FeeReceiverSet(address feeReceiver);
+    event GuardianSet(address guardian);
+    event NewOwnerAccepted(address oldOwner, address owner);
+    event NewOwnerCommitted(address owner, address pendingOwner, uint256 deadline);
+    event NewOwnerRevoked(address owner, address revokedOwner);
+    event Paused();
+    event PriceFeedSet(address priceFeed);
+    event Unpaused();
+
+    function acceptTransferOwnership() external;
+
+    function commitTransferOwnership(address newOwner) external;
+
+    function revokeTransferOwnership() external;
+
+    function setFeeReceiver(address _feeReceiver) external;
+
+    function setGuardian(address _guardian) external;
+
+    function setPaused(bool _paused) external;
+
+    function setPriceFeed(address _priceFeed) external;
+
+    function OWNERSHIP_TRANSFER_DELAY() external view returns (uint256);
+
+    function feeReceiver() external view returns (address);
+
+    function guardian() external view returns (address);
+
+    function owner() external view returns (address);
+
+    function ownershipTransferDeadline() external view returns (uint256);
+
+    function paused() external view returns (bool);
+
+    function pendingOwner() external view returns (address);
+
+    function priceFeed() external view returns (address);
+
+    function startTime() external view returns (uint256);
+}
+
+
+// File: SystemStart.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+import "IPrismaCore.sol";
+
+/**
+    @title Prisma System Start Time
+    @dev Provides a unified `startTime` and `getWeek`, used for emissions.
+ */
+contract SystemStart {
+    uint256 immutable startTime;
+
+    constructor(address prismaCore) {
+        startTime = IPrismaCore(prismaCore).startTime();
+    }
+
+    function getWeek() public view returns (uint256 week) {
+        return (block.timestamp - startTime) / 1 weeks;
+    }
+}
+
+
+// File: IPriceFeed.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IPriceFeed {
+    event NewOracleRegistered(address token, address chainlinkAggregator, bool isEthIndexed);
+    event PriceFeedStatusUpdated(address token, address oracle, bool isWorking);
+    event PriceRecordUpdated(address indexed token, uint256 _price);
+
+    function fetchPrice(address _token) external returns (uint256);
+
+    function setOracle(
+        address _token,
+        address _chainlinkOracle,
+        bytes4 sharePriceSignature,
+        uint8 sharePriceDecimals,
+        bool _isEthIndexed
+    ) external;
+
+    function MAX_PRICE_DEVIATION_FROM_PREVIOUS_ROUND() external view returns (uint256);
+
+    function PRISMA_CORE() external view returns (address);
+
+    function RESPONSE_TIMEOUT() external view returns (uint256);
+
+    function TARGET_DIGITS() external view returns (uint256);
+
+    function guardian() external view returns (address);
+
+    function oracleRecords(
+        address
+    )
+        external
+        view
+        returns (
+            address chainLinkOracle,
+            uint8 decimals,
+            bytes4 sharePriceSignature,
+            uint8 sharePriceDecimals,
+            bool isFeedWorking,
+            bool isEthIndexed
+        );
+
+    function owner() external view returns (address);
+
+    function priceRecords(
+        address
+    ) external view returns (uint96 scaledPrice, uint32 timestamp, uint32 lastUpdated, uint80 roundId);
+}
+
+
+// File: ITroveManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface ITroveManager {
+    event BaseRateUpdated(uint256 _baseRate);
+    event CollateralSent(address _to, uint256 _amount);
+    event LTermsUpdated(uint256 _L_collateral, uint256 _L_debt);
+    event LastFeeOpTimeUpdated(uint256 _lastFeeOpTime);
+    event Redemption(
+        uint256 _attemptedDebtAmount,
+        uint256 _actualDebtAmount,
+        uint256 _collateralSent,
+        uint256 _collateralFee
+    );
+    event RewardClaimed(address indexed account, address indexed recipient, uint256 claimed);
+    event SystemSnapshotsUpdated(uint256 _totalStakesSnapshot, uint256 _totalCollateralSnapshot);
+    event TotalStakesUpdated(uint256 _newTotalStakes);
+    event TroveIndexUpdated(address _borrower, uint256 _newIndex);
+    event TroveSnapshotsUpdated(uint256 _L_collateral, uint256 _L_debt);
+    event TroveUpdated(address indexed _borrower, uint256 _debt, uint256 _coll, uint256 _stake, uint8 _operation);
+
+    function addCollateralSurplus(address borrower, uint256 collSurplus) external;
+
+    function applyPendingRewards(address _borrower) external returns (uint256 coll, uint256 debt);
+
+    function claimCollateral(address _receiver) external;
+
+    function claimReward(address receiver) external returns (uint256);
+
+    function closeTrove(address _borrower, address _receiver, uint256 collAmount, uint256 debtAmount) external;
+
+    function closeTroveByLiquidation(address _borrower) external;
+
+    function collectInterests() external;
+
+    function decayBaseRateAndGetBorrowingFee(uint256 _debt) external returns (uint256);
+
+    function decreaseDebtAndSendCollateral(address account, uint256 debt, uint256 coll) external;
+
+    function fetchPrice() external returns (uint256);
+
+    function finalizeLiquidation(
+        address _liquidator,
+        uint256 _debt,
+        uint256 _coll,
+        uint256 _collSurplus,
+        uint256 _debtGasComp,
+        uint256 _collGasComp
+    ) external;
+
+    function getEntireSystemBalances() external returns (uint256, uint256, uint256);
+
+    function movePendingTroveRewardsToActiveBalances(uint256 _debt, uint256 _collateral) external;
+
+    function notifyRegisteredId(uint256[] calldata _assignedIds) external returns (bool);
+
+    function openTrove(
+        address _borrower,
+        uint256 _collateralAmount,
+        uint256 _compositeDebt,
+        uint256 NICR,
+        address _upperHint,
+        address _lowerHint,
+        bool _isRecoveryMode
+    ) external returns (uint256 stake, uint256 arrayIndex);
+
+    function redeemCollateral(
+        uint256 _debtAmount,
+        address _firstRedemptionHint,
+        address _upperPartialRedemptionHint,
+        address _lowerPartialRedemptionHint,
+        uint256 _partialRedemptionHintNICR,
+        uint256 _maxIterations,
+        uint256 _maxFeePercentage
+    ) external;
+
+    function setAddresses(address _priceFeedAddress, address _sortedTrovesAddress, address _collateralToken) external;
+
+    function setParameters(
+        uint256 _minuteDecayFactor,
+        uint256 _redemptionFeeFloor,
+        uint256 _maxRedemptionFee,
+        uint256 _borrowingFeeFloor,
+        uint256 _maxBorrowingFee,
+        uint256 _interestRateInBPS,
+        uint256 _maxSystemDebt,
+        uint256 _MCR
+    ) external;
+
+    function setPaused(bool _paused) external;
+
+    function setPriceFeed(address _priceFeedAddress) external;
+
+    function startSunset() external;
+
+    function updateBalances() external;
+
+    function updateTroveFromAdjustment(
+        bool _isRecoveryMode,
+        bool _isDebtIncrease,
+        uint256 _debtChange,
+        uint256 _netDebtChange,
+        bool _isCollIncrease,
+        uint256 _collChange,
+        address _upperHint,
+        address _lowerHint,
+        address _borrower,
+        address _receiver
+    ) external returns (uint256, uint256, uint256);
+
+    function vaultClaimReward(address claimant, address) external returns (uint256);
+
+    function BOOTSTRAP_PERIOD() external view returns (uint256);
+
+    function CCR() external view returns (uint256);
+
+    function DEBT_GAS_COMPENSATION() external view returns (uint256);
+
+    function DECIMAL_PRECISION() external view returns (uint256);
+
+    function L_collateral() external view returns (uint256);
+
+    function L_debt() external view returns (uint256);
+
+    function MAX_INTEREST_RATE_IN_BPS() external view returns (uint256);
+
+    function MCR() external view returns (uint256);
+
+    function PERCENT_DIVISOR() external view returns (uint256);
+
+    function PRISMA_CORE() external view returns (address);
+
+    function SUNSETTING_INTEREST_RATE() external view returns (uint256);
+
+    function Troves(
+        address
+    )
+        external
+        view
+        returns (
+            uint256 debt,
+            uint256 coll,
+            uint256 stake,
+            uint8 status,
+            uint128 arrayIndex,
+            uint256 activeInterestIndex
+        );
+
+    function accountLatestMint(address) external view returns (uint32 amount, uint32 week, uint32 day);
+
+    function activeInterestIndex() external view returns (uint256);
+
+    function baseRate() external view returns (uint256);
+
+    function borrowerOperationsAddress() external view returns (address);
+
+    function borrowingFeeFloor() external view returns (uint256);
+
+    function claimableReward(address account) external view returns (uint256);
+
+    function collateralToken() external view returns (address);
+
+    function dailyMintReward(uint256) external view returns (uint256);
+
+    function debtToken() external view returns (address);
+
+    function defaultedCollateral() external view returns (uint256);
+
+    function defaultedDebt() external view returns (uint256);
+
+    function emissionId() external view returns (uint16 debt, uint16 minting);
+
+    function getBorrowingFee(uint256 _debt) external view returns (uint256);
+
+    function getBorrowingFeeWithDecay(uint256 _debt) external view returns (uint256);
+
+    function getBorrowingRate() external view returns (uint256);
+
+    function getBorrowingRateWithDecay() external view returns (uint256);
+
+    function getCurrentICR(address _borrower, uint256 _price) external view returns (uint256);
+
+    function getEntireDebtAndColl(
+        address _borrower
+    ) external view returns (uint256 debt, uint256 coll, uint256 pendingDebtReward, uint256 pendingCollateralReward);
+
+    function getEntireSystemColl() external view returns (uint256);
+
+    function getEntireSystemDebt() external view returns (uint256);
+
+    function getNominalICR(address _borrower) external view returns (uint256);
+
+    function getPendingCollAndDebtRewards(address _borrower) external view returns (uint256, uint256);
+
+    function getRedemptionFeeWithDecay(uint256 _collateralDrawn) external view returns (uint256);
+
+    function getRedemptionRate() external view returns (uint256);
+
+    function getRedemptionRateWithDecay() external view returns (uint256);
+
+    function getTotalActiveCollateral() external view returns (uint256);
+
+    function getTotalActiveDebt() external view returns (uint256);
+
+    function getTotalMints(uint256 week) external view returns (uint32[7] memory);
+
+    function getTroveCollAndDebt(address _borrower) external view returns (uint256 coll, uint256 debt);
+
+    function getTroveFromTroveOwnersArray(uint256 _index) external view returns (address);
+
+    function getTroveOwnersCount() external view returns (uint256);
+
+    function getTroveStake(address _borrower) external view returns (uint256);
+
+    function getTroveStatus(address _borrower) external view returns (uint256);
+
+    function getWeek() external view returns (uint256 week);
+
+    function getWeekAndDay() external view returns (uint256, uint256);
+
+    function guardian() external view returns (address);
+
+    function hasPendingRewards(address _borrower) external view returns (bool);
+
+    function interestPayable() external view returns (uint256);
+
+    function interestRate() external view returns (uint256);
+
+    function lastActiveIndexUpdate() external view returns (uint256);
+
+    function lastCollateralError_Redistribution() external view returns (uint256);
+
+    function lastDebtError_Redistribution() external view returns (uint256);
+
+    function lastFeeOperationTime() external view returns (uint256);
+
+    function lastUpdate() external view returns (uint32);
+
+    function liquidationManager() external view returns (address);
+
+    function maxBorrowingFee() external view returns (uint256);
+
+    function maxRedemptionFee() external view returns (uint256);
+
+    function maxSystemDebt() external view returns (uint256);
+
+    function minuteDecayFactor() external view returns (uint256);
+
+    function owner() external view returns (address);
+
+    function paused() external view returns (bool);
+
+    function periodFinish() external view returns (uint32);
+
+    function priceFeed() external view returns (address);
+
+    function redemptionFeeFloor() external view returns (uint256);
+
+    function rewardIntegral() external view returns (uint256);
+
+    function rewardIntegralFor(address) external view returns (uint256);
+
+    function rewardRate() external view returns (uint128);
+
+    function rewardSnapshots(address) external view returns (uint256 collateral, uint256 debt);
+
+    function sortedTroves() external view returns (address);
+
+    function sunsetting() external view returns (bool);
+
+    function surplusBalances(address) external view returns (uint256);
+
+    function systemDeploymentTime() external view returns (uint256);
+
+    function totalCollateralSnapshot() external view returns (uint256);
+
+    function totalStakes() external view returns (uint256);
+
+    function totalStakesSnapshot() external view returns (uint256);
+
+    function vault() external view returns (address);
+}
+
+
+// File: IFactory.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+interface IFactory {
+    // commented values are suggested default parameters
+    struct DeploymentParams {
+        uint256 minuteDecayFactor; // 999037758833783000  (half life of 12 hours)
+        uint256 redemptionFeeFloor; // 1e18 / 1000 * 5  (0.5%)
+        uint256 maxRedemptionFee; // 1e18  (100%)
+        uint256 borrowingFeeFloor; // 1e18 / 1000 * 5  (0.5%)
+        uint256 maxBorrowingFee; // 1e18 / 100 * 5  (5%)
+        uint256 interestRateInBps; // 100 (1%)
+        uint256 maxDebt;
+        uint256 MCR; // 12 * 1e17  (120%)
+    }
+
+    event NewDeployment(address collateral, address priceFeed, address troveManager, address sortedTroves);
+
+    function deployNewInstance(
+        address collateral,
+        address priceFeed,
+        address customTroveManagerImpl,
+        address customSortedTrovesImpl,
+        DeploymentParams calldata params
+    ) external;
+
+    function setImplementations(address _troveManagerImpl, address _sortedTrovesImpl) external;
+
+    function PRISMA_CORE() external view returns (address);
+
+    function borrowerOperations() external view returns (address);
+
+    function debtToken() external view returns (address);
+
+    function guardian() external view returns (address);
+
+    function liquidationManager() external view returns (address);
+
+    function owner() external view returns (address);
+
+    function sortedTrovesImpl() external view returns (address);
+
+    function stabilityPool() external view returns (address);
+
+    function troveManagerCount() external view returns (uint256);
+
+    function troveManagerImpl() external view returns (address);
+
+    function troveManagers(uint256) external view returns (address);
+}
+

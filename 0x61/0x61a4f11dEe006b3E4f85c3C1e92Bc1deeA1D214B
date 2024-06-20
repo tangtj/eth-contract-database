@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.0;
+
+contract HowMuchYouLikeBtc {
+
+    event Vote_HowMuchYouLikeBtc(uint8 from0to255);
+
+    function howMuchYouLikeBtc(uint8 _from0to255) public {
+        emit Vote_HowMuchYouLikeBtc(_from0to255);
+    }
+
+}

@@ -1,0 +1,351 @@
+
+// File: @openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: @uniswap/v3-core/contracts/libraries/FixedPoint96.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.4.0;
+
+/// @title FixedPoint96
+/// @notice A library for handling binary fixed point numbers, see https://en.wikipedia.org/wiki/Q_(number_format)
+/// @dev Used in SqrtPriceMath.sol
+library FixedPoint96 {
+    uint8 internal constant RESOLUTION = 96;
+    uint256 internal constant Q96 = 0x1000000000000000000000000;
+}
+
+
+// File: contracts/GameTheoryRewards.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import '@openzeppelin/contracts/utils/Context.sol';
+import '@uniswap/v3-core/contracts/libraries/FixedPoint96.sol';
+import './interfaces/ILPAdapter.sol';
+
+contract GameTheoryRewards is Context {
+  uint256 constant P = FixedPoint96.Q96;
+
+  uint256 public immutable CREATED;
+  address public immutable TOKEN;
+  uint256 public immutable FIRST_CLAIM_DELAY;
+  uint256 public immutable MIN_LOCKUP_TIME;
+
+  uint256 public totalUsers;
+  uint256 public totalShares;
+  struct Reward {
+    uint256 cached;
+    uint256 excluded;
+    uint256 realized;
+  }
+  mapping(address => uint256) public shares;
+  mapping(address => uint256) public lastClaimAmt;
+  mapping(address => uint256) public lastClaimTime;
+  mapping(address => Reward) public rewards;
+
+  uint256 _totalPerShare;
+  uint256 public totalDistributed;
+  uint256 public totalDepositedGross;
+  uint256 public totalDepositedNet;
+
+  event AddShares(
+    address indexed user,
+    uint256 amount,
+    uint256 userCached,
+    uint256 userExcluded
+  );
+  event RemoveShares(
+    address indexed user,
+    uint256 amount,
+    uint256 userCached,
+    uint256 userExcluded
+  );
+  event CacheReward(
+    address indexed user,
+    uint256 newlyAdded,
+    uint256 userCached
+  );
+  event DistributeReward(
+    address indexed user,
+    uint256 amount,
+    uint256 userCached,
+    uint256 userExcluded
+  );
+  event CompoundReward(
+    address indexed user,
+    uint256 amountETH,
+    uint256 amountTokenOut,
+    uint256 userCached,
+    uint256 userExcluded
+  );
+  event DepositRewards(
+    address indexed user,
+    uint256 amount,
+    uint256 latestTotalPerShare,
+    bool areNew
+  );
+  event PayBackLastClaim(
+    address indexed user,
+    uint256 amountPaidBack,
+    uint256 userCached,
+    uint256 userExcluded
+  );
+
+  constructor(uint256 _firstClaim, uint256 _minLockup) {
+    CREATED = block.timestamp;
+    TOKEN = _msgSender();
+    FIRST_CLAIM_DELAY = _firstClaim;
+    MIN_LOCKUP_TIME = _minLockup;
+  }
+
+  function update(
+    address _wallet,
+    uint256 _updateAmount,
+    bool _removing
+  ) external {
+    require(_msgSender() == TOKEN, 'T');
+    if (_removing) {
+      _removeShares(_wallet, _updateAmount);
+      emit RemoveShares(
+        _wallet,
+        _updateAmount,
+        rewards[_wallet].cached,
+        rewards[_wallet].excluded
+      );
+    } else {
+      _addShares(_wallet, _updateAmount);
+      emit AddShares(
+        _wallet,
+        _updateAmount,
+        rewards[_wallet].cached,
+        rewards[_wallet].excluded
+      );
+    }
+  }
+
+  function depositRewards() external payable {
+    _depositRewards(_msgSender(), msg.value, true);
+  }
+
+  function claim(bool _compound, uint256 _cmpndMinOut) external {
+    require(block.timestamp >= CREATED + FIRST_CLAIM_DELAY, 'I');
+    _distributeReward(_msgSender(), false, _compound, _cmpndMinOut);
+  }
+
+  function paybackLastClaim() external payable {
+    address _wallet = _msgSender();
+    require(!_isUnlocked(_wallet), 'ULK');
+    require(msg.value == lastClaimAmt[_wallet], 'E');
+    uint256 _userShares = shares[_wallet];
+    if (totalShares > _userShares) {
+      // distribute to other reward-eligible users
+      _removeShares(_wallet, _userShares);
+      _depositRewards(_wallet, msg.value, true);
+      _addShares(_wallet, _userShares);
+    } else {
+      _depositRewards(_wallet, msg.value, true);
+      lastClaimAmt[_wallet] = 0;
+      lastClaimTime[_wallet] = 0;
+    }
+    emit PayBackLastClaim(
+      _wallet,
+      msg.value,
+      rewards[_wallet].cached,
+      rewards[_wallet].excluded
+    );
+  }
+
+  function _addShares(address _wallet, uint256 _amount) internal {
+    if (shares[_wallet] > 0) {
+      _distributeReward(_wallet, true, false, 0);
+    }
+    uint256 sharesBefore = shares[_wallet];
+    totalShares += _amount;
+    shares[_wallet] += _amount;
+    if (sharesBefore == 0 && shares[_wallet] > 0) {
+      totalUsers++;
+    }
+    rewards[_wallet].excluded = _cumulative(shares[_wallet]);
+  }
+
+  function _removeShares(address _wallet, uint256 _amount) internal {
+    require(_amount <= shares[_wallet], 'R');
+    if (shares[_wallet] == 0) {
+      return;
+    }
+    uint256 _unclaimed = _unclaimedRewards(_wallet);
+    if (_unclaimed > 0) {
+      uint256 _userShares = shares[_wallet];
+      if (totalShares > _userShares) {
+        // distribute to other reward-eligible users
+        totalShares -= _userShares;
+        _depositRewards(_wallet, _unclaimed, false);
+        totalShares += _userShares;
+        rewards[_wallet].cached = 0;
+      } else {
+        _distributeReward(_wallet, false, false, 0);
+      }
+    }
+    totalShares -= _amount;
+    shares[_wallet] -= _amount;
+    if (shares[_wallet] == 0) {
+      totalUsers--;
+    }
+    lastClaimAmt[_wallet] = 0;
+    lastClaimTime[_wallet] = 0;
+    rewards[_wallet].excluded = _cumulative(shares[_wallet]);
+  }
+
+  function _depositRewards(
+    address _wallet,
+    uint256 _amount,
+    bool _additive
+  ) internal {
+    require(_amount > 0 && totalShares > 0, 'D0');
+    totalDepositedGross += _amount;
+    if (_additive) {
+      totalDepositedNet += _amount;
+    }
+    _totalPerShare += (P * _amount) / totalShares;
+    emit DepositRewards(_wallet, _amount, _totalPerShare, _additive);
+  }
+
+  function _distributeReward(
+    address _wallet,
+    bool _cache,
+    bool _compound,
+    uint256 _cmpndMinOut
+  ) internal {
+    if (shares[_wallet] == 0) {
+      return;
+    }
+    bool _unlocked = _isUnlocked(_wallet);
+    uint256 _amount = _unclaimedRewards(_wallet);
+    rewards[_wallet].excluded = _cumulative(shares[_wallet]);
+    if (_cache) {
+      uint256 _newRewards = _amount - rewards[_wallet].cached;
+      if (_newRewards == 0) {
+        return;
+      }
+      rewards[_wallet].cached += _newRewards;
+      emit CacheReward(_wallet, _newRewards, rewards[_wallet].cached);
+    } else if (_compound) {
+      require(_amount > 0, 'CA');
+      rewards[_wallet].cached = 0;
+      lastClaimAmt[_wallet] = _unlocked
+        ? _amount
+        : lastClaimAmt[_wallet] + _amount;
+      lastClaimTime[_wallet] = block.timestamp;
+      rewards[_wallet].realized += _amount;
+      totalDistributed += _amount;
+      uint256 _amountOut = ILPAdapter(TOKEN).swapETHForToken{ value: _amount }(
+        TOKEN,
+        _cmpndMinOut,
+        _wallet
+      );
+      emit CompoundReward(
+        _wallet,
+        _amount,
+        _amountOut,
+        rewards[_wallet].cached,
+        rewards[_wallet].excluded
+      );
+    } else {
+      require(_unlocked, 'LK');
+      rewards[_wallet].cached = 0;
+      if (_amount > 0) {
+        lastClaimAmt[_wallet] = _amount;
+        lastClaimTime[_wallet] = block.timestamp;
+        rewards[_wallet].realized += _amount;
+        totalDistributed += _amount;
+        uint256 _bef = address(this).balance;
+        (bool _s, ) = payable(_wallet).call{ value: _amount }('');
+        require(_s, 'D1');
+        require(address(this).balance >= _bef - _amount, 'D2');
+        emit DistributeReward(
+          _wallet,
+          _amount,
+          rewards[_wallet].cached,
+          rewards[_wallet].excluded
+        );
+      }
+    }
+  }
+
+  function _isUnlocked(address _wallet) internal view returns (bool) {
+    bool _enoughUnclaimed = _unclaimedRewards(_wallet) >= lastClaimAmt[_wallet];
+    bool _minTimePassed = block.timestamp >
+      lastClaimTime[_wallet] + MIN_LOCKUP_TIME;
+    return _enoughUnclaimed && _minTimePassed;
+  }
+
+  function isUnlocked(address _wallet) external view returns (bool) {
+    return _isUnlocked(_wallet);
+  }
+
+  function _unclaimedRewards(address _wallet) internal view returns (uint256) {
+    if (shares[_wallet] == 0) {
+      return 0;
+    }
+    uint256 _earned = _cumulative(shares[_wallet]) + rewards[_wallet].cached;
+    uint256 _excluded = rewards[_wallet].excluded;
+    if (_earned <= _excluded) {
+      return 0;
+    }
+    return _earned - _excluded;
+  }
+
+  function unclaimedRewards(address _wallet) external view returns (uint256) {
+    return _unclaimedRewards(_wallet);
+  }
+
+  function _cumulative(uint256 _share) internal view returns (uint256) {
+    return (_share * _totalPerShare) / P;
+  }
+
+  receive() external payable {
+    _depositRewards(_msgSender(), msg.value, true);
+  }
+}
+
+
+// File: contracts/interfaces/ILPAdapter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface ILPAdapter {
+  function swapETHForToken(
+    address token,
+    uint256 amountOutMin,
+    address recipient
+  ) external payable returns (uint256 amountOut);
+}
+

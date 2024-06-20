@@ -1,0 +1,2282 @@
+
+// File: contracts/StakedBPT.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.18;
+
+// Import necessary contracts and libraries
+import "contracts/StakedPT.sol";
+import "./interfaces/IVault.sol";
+import "./interfaces/IBPT.sol";
+
+/**
+ * @title StakedBPT
+ * @dev StakedBPT is a contract that represents staked Balancer LP (Liquidity Provider) tokens,
+ * allowing users to stake their LP tokens to earn rewards in another token (cvxtoken).
+ * This contract extends ERC4626, implements ReentrancyGuard, and is Owned.
+ */
+contract StakedBPT is StakedPT {
+    using SafeTransferLib for ERC20;
+
+    /// @notice Balancer Vault contract
+    IVault immutable bal;
+    /// @dev BAL gov token for reward swapping
+    address internal constant BAL = 0xba100000625a3754423978a60c9317c58a424e3D;
+    /// @notice Pool ID for Balancer pool
+    bytes32 public immutable poolId;
+    /// @dev PoolID for BAL/WETH to exchange rewards
+    bytes32 internal constant balPoolId = 0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014;
+    /// @dev PoolID for AUR/WETH to exchange rewards
+    bytes32 internal constant aurPoolId = 0xcfca23ca9ca720b6e98e3eb9b6aa0ffc4a5c08b9000200000000000000000274;
+
+    /**
+     * @dev Constructor to initialize the StakedBPT contract.
+     * @param _lptoken Address of the LP token
+     * @param _cvxtoken convex deposit token(a 1:1 token representing an lp deposit)
+     * @param _booster Address of the booster contract
+     * @param _treasury Address of the treasury
+     * @param _owner Address of the contract owner
+     * @param _minLockDuration Minimum lock duration for staked LP tokens
+     * @param _weth Address of the Wrapped Ether (WETH) contract
+     * @param _vault Address of the Balancer Vault contract
+     * @param _pid Pool ID in the rewards pool contract
+     * @param _poolId Pool ID for Balancer pool
+     */
+    constructor(
+        address _lptoken,
+        address _cvxtoken,
+        address _booster,
+        address _treasury,
+        address _owner,
+        uint256 _minLockDuration,
+        address _weth,
+        address _vault,
+        uint256 _pid,
+        bytes32 _poolId
+    ) StakedPT(_lptoken, _cvxtoken, _booster, _treasury, _owner, _minLockDuration, _weth, _pid) {
+        bal = IVault(_vault);
+        poolId = _poolId;
+
+        // approve max for balancer vault
+        weth.approve(_vault, type(uint256).max);
+        mevEth.approve(_vault, type(uint256).max);
+    }
+
+    /**
+     * @notice Calculates alternative token amountIn required for zap
+     * @dev Assumes: 2 token pool, 18 decimals
+     * @param token Token address of known amount in
+     * @param amountIn Known amount In of token
+     * @return amountInAlt Amount In of alternative token required for zap
+     * @return bptOut Expected BPT out amount
+     */
+    function getAltTokenAmountInRequired(
+        address token,
+        uint256 amountIn
+    ) external view returns (uint256 amountInAlt, uint256 bptOut) {
+        (address[] memory tokens, uint256[] memory balances, ) = bal.getPoolTokens(poolId);
+        uint256 totalSupply = ERC20(lptoken).totalSupply();
+        uint256 len = tokens.length;
+        for (uint256 i; i < len; i = _inc(i)) {
+            if (tokens[i] == token) {
+                bptOut = (amountIn * totalSupply) / balances[i];
+                break;
+            }
+        }
+        for (uint256 i; i < len; i = _inc(i)) {
+            if (tokens[i] != token) {
+                amountInAlt = (balances[i] * bptOut) / totalSupply;
+
+                break;
+            }
+        }
+    }
+
+    /**
+     * @notice Calculates expected amounts out of tokens given bpt amount to redeem
+     * @dev Assumes: 2 token pool, 18 decimals
+     * @param bptOut BPT amount to redeem
+     * @return amountsIn Amounts Out expected for tokens in LP
+     */
+    function calcAllTokensInGivenExactBptOut(uint256 bptOut) external view returns (uint256[] memory amountsIn) {
+        /************************************************************************************
+        // tokensInForExactBptOut                                                          //
+        //                              /   bptOut   \                                     //
+        // amountsIn[i] = balances[i] * | ------------ |                                   //
+        //                              \  totalBPT  /                                     //
+        ************************************************************************************/
+        // We adjust the order of operations to minimize error amplification, assuming that
+        // balances[i], totalBPT > 1 (which is usually the case).
+        // Tokens in, so we round up overall.
+        (, uint256[] memory balances, ) = bal.getPoolTokens(poolId);
+        uint256 totalBPT = ERC20(lptoken).totalSupply();
+        amountsIn = new uint256[](balances.length);
+        for (uint256 i = 0; i < balances.length; i++) {
+            amountsIn[i] = (balances[i] * bptOut) / totalBPT;
+        }
+
+        return amountsIn;
+    }
+
+    /**
+     * @notice Zap into the Balancer pool by providing tokens and receiving staked LP tokens in return.
+     * @dev Assumes: 2 token pool, 18 decimals, one sided liquidity provision (with a trace amount of other token, eg eth)
+     * @param amounts Array of amounts of tokens to be provided.
+     * @param receiver Address to receive the staked LP tokens.
+     * @param lptokenAmount Amount of lp to expect.
+     * @return shares Number of shares representing the staked LP tokens.
+     */
+    function zapBPT(
+        uint256[] calldata amounts,
+        address receiver,
+        uint256 lptokenAmount
+    ) external payable nonReentrant returns (uint256 shares) {
+        (address[] memory tokens, , ) = bal.getPoolTokens(poolId);
+        uint256 value = msg.value;
+        for (uint256 i; i < tokens.length; i = _inc(i)) {
+            if (tokens[i] == address(weth) && value > 0) {
+                if (amounts[i] != value) revert AmountMismatch();
+                weth.deposit{value: value}();
+            } else {
+                ERC20(tokens[i]).safeTransferFrom(msg.sender, address(this), amounts[i]);
+            }
+        }
+
+        bytes memory userData = abi.encode(3, lptokenAmount);
+
+        IVault.JoinPoolRequest memory request = IVault.JoinPoolRequest({
+            assets: tokens,
+            maxAmountsIn: amounts,
+            userData: userData,
+            fromInternalBalance: false
+        });
+
+        bal.joinPool(poolId, address(this), address(this), request);
+
+        // Stake BPT to receive cvxtoken
+        uint256 amount = IERC20(lptoken).balanceOf(address(this));
+        IERC20(lptoken).approve(address(booster), amount);
+        booster.deposit(pid, amount, false);
+
+        // stake cvxtoken
+        shares = _deposit(receiver);
+
+        // refund dust
+        for (uint256 i; i < tokens.length; i = _inc(i)) {
+            address token = tokens[i];
+            amount = IERC20(token).balanceOf(address(this));
+            // if token is weth, check refund is more than value transfer fee
+            if (token == address(weth) && 50000 * block.basefee > amount) {
+                continue;
+            }
+            ERC20(token).safeTransfer(msg.sender, amount);
+        }
+    }
+
+    /**
+     * @dev Zap out of the Balancer pool by redeeming staked LP tokens and receiving underlying tokens in return.
+     * @param shares Number of shares representing the staked LP tokens to be redeemed.
+     * @param receiver Address to receive the redeemed underlying tokens.
+     * @param owner Address of the owner initiating the withdrawal.
+     * @param minAmountsOut Minimum amounts of underlying tokens to be received in the redemption.
+     * @return amountsOut Array of amounts representing the redeemed underlying tokens.
+     */
+    function zipBPT(
+        uint256 shares,
+        address receiver,
+        address owner,
+        uint256[] calldata minAmountsOut
+    ) public virtual returns (uint256[] memory amountsOut) {
+        if (shares > maxRedeem(owner)) revert WithdrawMoreThanMax();
+
+        uint256 assets = previewRedeem(shares);
+
+        if (msg.sender != owner) {
+            uint256 allowed = allowance[owner][msg.sender]; // Saves gas for limited approvals.
+            if (allowed != type(uint256).max) allowance[owner][msg.sender] = allowed - shares;
+        }
+
+        if (lastDepositTimestamp[owner] + minLockDuration > block.timestamp) revert TimeLocked();
+
+        // Receive BPT
+        crvRewards.withdraw(assets, false);
+        IERC20(cvxtoken).approve(address(booster), assets);
+        booster.withdraw(pid, assets);
+
+        _burn(owner, shares);
+
+        // Exit BPT
+        (address[] memory tokens, , ) = bal.getPoolTokens(poolId);
+        {
+            bytes memory userData = abi.encode(1, IERC20(lptoken).balanceOf(address(this)));
+            IVault.ExitPoolRequest memory request = IVault.ExitPoolRequest({
+                assets: tokens,
+                minAmountsOut: minAmountsOut,
+                userData: userData,
+                toInternalBalance: false
+            });
+
+            bal.exitPool(poolId, address(this), payable(address(this)), request);
+        }
+        amountsOut = new uint256[](tokens.length);
+        for (uint256 i; i < tokens.length; i = _inc(i)) {
+            amountsOut[i] = IERC20(tokens[i]).balanceOf(address(this));
+            ERC20(tokens[i]).safeTransfer(receiver, amountsOut[i]);
+        }
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+    }
+
+    /// @dev swap reward token for weth for compound staking
+    function swapReward(address tokenIn, uint256 amountIn) internal virtual override returns (uint256 amountOut) {
+        bytes32 id;
+        if (tokenIn == BAL) {
+            id = balPoolId;
+        } else {
+            id = aurPoolId;
+        }
+        IVault.SingleSwap memory singleSwap = IVault.SingleSwap(
+            id,
+            IVault.SwapKind.GIVEN_IN,
+            tokenIn,
+            address(weth),
+            amountIn,
+            new bytes(0)
+        );
+        IVault.FundManagement memory fund = IVault.FundManagement(address(this), false, payable(address(this)), false);
+        ERC20(tokenIn).approve(address(bal), amountIn);
+        amountOut = bal.swap(singleSwap, fund, 1, block.timestamp + 120);
+    }
+
+    /// @dev zap weth rewards into LP, then stake
+    /// note: assumes weth is one of the tokens
+    function _zapSwappedRewards(uint256 amount) internal virtual override {
+        {
+            uint256 wethBal = weth.balanceOf(address(this));
+            if (amount > wethBal) return;
+            if (wethBal < MIN_ZAP) return;
+            if (amount < wethBal) amount = wethBal;
+        }
+
+        // step 1: get optimal amounts of token0 and token1 for LP
+        uint256 bptOut;
+        address[] memory tokens;
+        uint256[] memory amountsIn;
+        {
+            uint256[] memory balances;
+            (tokens, balances, ) = bal.getPoolTokens(poolId);
+            uint256 totalSupply = ERC20(lptoken).totalSupply();
+            uint256 len = tokens.length;
+            // NB assuming one of the tokens is mevEth or weth (works foe MevEth/Weth and Weth/Fold and mevEth/Fold)
+            for (uint256 i; i < len; i = _inc(i)) {
+                if (tokens[i] == address(mevEth)) {
+                    // MevEth/Weth and mevEth/Fold are mevEth heavy (>80%)
+                    // todo: find way to remove hard coded 80%
+                    // Note: likely to be some dust in weth, which can be used up on the next harvest
+                    bptOut = (mevEth.previewDeposit((amount * 80) / 100) * totalSupply) / balances[i];
+                    break;
+                } else if (tokens[i] == address(weth)) {
+                    // weth/fold 50 : 50
+                    bptOut = (amount * totalSupply) / (2 * balances[i]);
+                    break;
+                }
+            }
+            // use optimal amounts to swap weth for tokens
+            amountsIn = new uint256[](len);
+            for (uint256 i = 0; i < len; i++) {
+                amountsIn[i] = (balances[i] * bptOut) / totalSupply;
+                if (tokens[i] == address(mevEth) && amountsIn[i] > 10 ether) {
+                    // default to swap if low amount otherwise use mevEth directly
+                    weth.approve(address(mevEth), mevEth.previewMint(amountsIn[i]));
+                    mevEth.mint(amountsIn[i], address(this));
+                } else if (tokens[i] != address(weth)) {
+                    // swap weth -> token
+                    IVault.SingleSwap memory singleSwap = IVault.SingleSwap(
+                        poolId,
+                        IVault.SwapKind.GIVEN_IN,
+                        address(weth),
+                        tokens[i],
+                        mevEth.previewMint(amountsIn[i]),
+                        new bytes(0)
+                    );
+                    IVault.FundManagement memory fund = IVault.FundManagement(
+                        address(this),
+                        false,
+                        payable(address(this)),
+                        false
+                    );
+                    bal.swap(singleSwap, fund, 1, block.timestamp + 120);
+                }
+            }
+            // adjust amounts by balances for max stake
+            for (uint256 i = 0; i < len; i++) {
+                amountsIn[i] = ERC20(tokens[i]).balanceOf(address(this));
+            }
+        }
+
+        // step 2: zap tokens for LP
+        {
+            bytes memory userData = abi.encode(3, bptOut);
+            IVault.JoinPoolRequest memory request = IVault.JoinPoolRequest({
+                assets: tokens,
+                maxAmountsIn: amountsIn,
+                userData: userData,
+                fromInternalBalance: false
+            });
+            bal.joinPool(poolId, address(this), address(this), request);
+        }
+
+        // step 3: Stake BPT to receive cvxtoken
+        {
+            amount = IERC20(lptoken).balanceOf(address(this));
+            IERC20(lptoken).approve(address(booster), amount);
+            booster.deposit(pid, amount, false);
+        }
+
+        // step 4: stake cvxtoken
+        {
+            uint256 assets = IERC20(cvxtoken).balanceOf(address(this));
+            emit CompoundRewards(assets);
+            afterDeposit(assets, 0);
+        }
+    }
+}
+
+
+// File: contracts/StakedPT.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.18;
+
+// Import necessary contracts and libraries
+import "./Owned.sol";
+import "solmate/mixins/ERC4626.sol";
+import "solmate/utils/ReentrancyGuard.sol";
+import "solmate/utils/SafeTransferLib.sol";
+import "./interfaces/IBooster.sol";
+import "./interfaces/IRewards.sol";
+import "./interfaces/IERC20.sol";
+import "./interfaces/IVirtualRewards.sol";
+import "./interfaces/IStash.sol";
+import "./interfaces/IMevEth.sol";
+import "./interfaces/IWETH.sol";
+
+/**
+ * @title StakedPT
+ * @dev StakedPT is a contract that represents staked PT / LP (Pool Token / Liquidity Provider) tokens,
+ * allowing users to stake their LP tokens to earn rewards in another token (cvxtoken).
+ * This contract extends ERC4626, implements ReentrancyGuard, and is Owned.
+ * Ref: https://docs.convexfinance.com/convexfinanceintegration/booster
+ */
+abstract contract StakedPT is ERC4626, ReentrancyGuard, Owned {
+    using SafeTransferLib for ERC20;
+
+    // Immutables
+    /// @notice underlying token(ex. the curve lp token)
+    address public immutable lptoken;
+    /// @notice convex deposit token(a 1:1 token representing an lp deposit)
+    address public immutable cvxtoken;
+    /// @notice main deposit contract for LP tokens
+    IBooster public immutable booster;
+    /// @notice main reward contract for the pool
+    IRewards public immutable crvRewards;
+    /// @notice Wrapped Ether (WETH) contract
+    IWETH public immutable weth;
+    /// @notice Pool ID in the rewards pool contract
+    uint256 public immutable pid;
+
+    IMevEth internal constant mevEth = IMevEth(0x24Ae2dA0f361AA4BE46b48EB19C91e02c5e4f27E);
+    uint256 internal constant MIN_ZAP = 0.01 ether;
+
+    // Globals
+    address public treasury;
+    uint256 public minLockDuration;
+    mapping(address => uint256) public lastDepositTimestamp;
+
+    // Events
+    event UpdateTreasury(address indexed treasury);
+    event UpdateMinLockDuration(uint256 duration);
+    event CompoundRewards(uint256 assets);
+
+    // Custom errors
+    error ZeroShares();
+    error TimeLocked();
+    error AmountMismatch();
+    error WithdrawMoreThanMax();
+
+    /**
+     * @dev Constructor to initialize the StakedBPT contract.
+     * @param _lptoken Address of the LP token
+     * @param _cvxtoken convex deposit token(a 1:1 token representing an lp deposit)
+     * @param _booster Address of the booster contract
+     * @param _treasury Address of the treasury
+     * @param _owner Address of the contract owner
+     * @param _minLockDuration Minimum lock duration for staked LP tokens
+     * @param _weth Address of the Wrapped Ether (WETH) contract
+     * @param _pid Pool ID in the rewards pool contract
+     */
+    constructor(
+        address _lptoken,
+        address _cvxtoken,
+        address _booster,
+        address _treasury,
+        address _owner,
+        uint256 _minLockDuration,
+        address _weth,
+        uint256 _pid
+    )
+        ERC4626(
+            ERC20(_cvxtoken),
+            string(abi.encodePacked("Staked ", IERC20(_lptoken).name())),
+            string(abi.encodePacked("stk", IERC20(_lptoken).symbol()))
+        )
+        Owned(_owner)
+    {
+        booster = IBooster(_booster);
+
+        treasury = _treasury;
+        minLockDuration = _minLockDuration;
+        pid = _pid;
+        weth = IWETH(_weth);
+
+        IBooster.PoolInfo memory info = booster.poolInfo(_pid);
+        lptoken = _lptoken;
+        cvxtoken = _cvxtoken;
+        crvRewards = IRewards(info.crvRewards);
+
+        // Emit initialization events
+        emit UpdateTreasury(_treasury);
+        emit UpdateMinLockDuration(_minLockDuration);
+    }
+
+    /**
+     * @dev View function to get the total assets held by the contract.
+     * @return uint256 representing the total assets held by the contract.
+     */
+    function totalAssets() public view virtual override returns (uint256) {
+        return crvRewards.balanceOf(address(this));
+    }
+
+    /**
+     * @dev Update the treasury address. Only callable by the owner.
+     * @param _treasury New treasury address.
+     */
+    function updateTreasury(address _treasury) external onlyOwner {
+        treasury = _treasury;
+
+        emit UpdateTreasury(_treasury);
+    }
+
+    /**
+     * @dev Update the minimum lock duration for staked LP tokens. Only callable by the owner.
+     * @param _minLockDuration New minimum lock duration.
+     */
+    function updateMinLockDuration(uint256 _minLockDuration) external onlyOwner {
+        minLockDuration = _minLockDuration;
+
+        emit UpdateMinLockDuration(_minLockDuration);
+    }
+
+    function _deposit(address receiver) internal returns (uint256 shares) {
+        uint256 assets = IERC20(cvxtoken).balanceOf(address(this));
+
+        // Check for rounding error since we round down in previewDeposit.
+        shares = previewDeposit(assets);
+        if (shares == 0) revert ZeroShares();
+
+        _updateDepositTimestamp(receiver, shares);
+
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+
+        afterDeposit(assets, shares);
+    }
+
+    /**
+     * @dev Deposit LP tokens to stake and receive AUR / CVX rewards.
+     * @param lptokenAmount Amount of LP tokens to deposit.
+     * @param receiver Address to receive the staked LP tokens.
+     * @return shares Number of shares representing the staked LP tokens.
+     */
+    function depositLP(uint256 lptokenAmount, address receiver) public virtual returns (uint256 shares) {
+        ERC20(lptoken).safeTransferFrom(msg.sender, address(this), lptokenAmount);
+
+        // Stake BPT to receive cvxtoken
+        IERC20(lptoken).approve(address(booster), lptokenAmount);
+        booster.deposit(pid, lptokenAmount, false);
+
+        // stake cvxtoken
+        shares = _deposit(receiver);
+    }
+
+    function withdrawLP(
+        uint256 shares,
+        address receiver,
+        address owner
+    ) public virtual returns (uint256 lptokenAmount) {
+        if (shares > maxRedeem(owner)) revert WithdrawMoreThanMax();
+
+        uint256 assets = previewRedeem(shares);
+
+        if (msg.sender != owner) {
+            uint256 allowed = allowance[owner][msg.sender]; // Saves gas for limited approvals.
+            if (allowed != type(uint256).max) allowance[owner][msg.sender] = allowed - shares;
+        }
+
+        if (lastDepositTimestamp[owner] + minLockDuration > block.timestamp) revert TimeLocked();
+
+        // Receive LP
+        crvRewards.withdraw(assets, false);
+        IERC20(cvxtoken).approve(address(booster), assets);
+        booster.withdraw(pid, assets);
+
+        _burn(owner, shares);
+
+        // Transfer LP
+        lptokenAmount = IERC20(lptoken).balanceOf(address(this));
+        ERC20(lptoken).safeTransfer(receiver, lptokenAmount);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+    }
+
+    /**
+     * @dev Internal function executed after a successful deposit.
+     * @param assets Amount of cvxtoken received after staking BPT.
+     */
+    function afterDeposit(uint256 assets, uint256) internal override {
+        IERC20(cvxtoken).approve(address(crvRewards), assets);
+        crvRewards.stake(assets);
+    }
+
+    /**
+     * @dev Internal function executed before a withdrawal to check withdrawal conditions.
+     * @param assets Amount of cvxtoken to be withdrawn.
+     */
+    function beforeWithdraw(uint256 assets, uint256) internal override {
+        // Receive cvxtoken
+        crvRewards.withdraw(assets, false);
+    }
+
+    function harvest() external {
+        booster.earmarkRewards(pid);
+        crvRewards.getReward();
+        address token = crvRewards.rewardToken();
+        uint256 amount = IERC20(token).balanceOf(address(this));
+        uint256 amountOut;
+        if (amount > 0) {
+            // swap for weth
+            amountOut = swapReward(token, amount);
+        }
+        amountOut += _claimExtras();
+        amountOut = _sendProtocolFee(amountOut);
+        _zapSwappedRewards(amountOut);
+    }
+
+    function _claimExtras() internal virtual returns (uint256 amountOut) {
+        uint256 len = crvRewards.extraRewardsLength();
+        if (len > 0) {
+            for (uint256 i; i < len; i = _inc(i)) {
+                address virtualRewards = crvRewards.extraRewards(i);
+                address token = _getStashToken(virtualRewards);
+                uint256 amount = IERC20(token).balanceOf(address(this));
+                if (amount > 0) {
+                    amountOut += swapReward(token, amount);
+                }
+            }
+        }
+    }
+
+    function swapReward(address token, uint256 amountIn) internal virtual returns (uint256 amountOut) {}
+
+    function _zapSwappedRewards(uint256 amount) internal virtual {}
+
+    function _sendProtocolFee(uint256 wethBal) internal returns (uint256 amountRemaining) {
+        // send 10% to treasury
+        ERC20(address(weth)).safeTransfer(treasury, wethBal / 10);
+        amountRemaining = (wethBal * 90) / 100;
+    }
+
+    function _getStashToken(address virtualRewards) internal virtual returns (address stashToken) {
+        address stash = IVirtualRewards(virtualRewards).rewardToken();
+        stashToken = IStash(stash).baseToken();
+    }
+
+    function _inc(uint256 i) internal pure returns (uint256 j) {
+        unchecked {
+            j = i + 1;
+        }
+    }
+
+    // override ERC4626 functions to update deposit timestamp
+
+    function deposit(uint256 assets, address receiver) public virtual override returns (uint256 shares) {
+        // Set the deposit timestamp for the user
+        _updateDepositTimestamp(receiver, previewDeposit(assets));
+        shares = super.deposit(assets, receiver);
+    }
+
+    function mint(uint256 shares, address receiver) public virtual override returns (uint256 assets) {
+        // Set the deposit timestamp for the user
+        _updateDepositTimestamp(receiver, shares);
+        assets = super.mint(shares, receiver);
+    }
+
+    function withdraw(
+        uint256 assets,
+        address receiver,
+        address owner
+    ) public virtual override returns (uint256 shares) {
+        if (lastDepositTimestamp[owner] + minLockDuration > block.timestamp) revert TimeLocked();
+        shares = super.withdraw(assets, receiver, owner);
+    }
+
+    function redeem(uint256 shares, address receiver, address owner) public virtual override returns (uint256 assets) {
+        if (lastDepositTimestamp[owner] + minLockDuration > block.timestamp) revert TimeLocked();
+        assets = super.redeem(shares, receiver, owner);
+    }
+
+    function _updateDepositTimestamp(address account, uint256 shares) internal {
+        // Set the deposit timestamp for the user
+        uint256 prevBalance = balanceOf[account];
+        uint256 lastDeposit = lastDepositTimestamp[account];
+        if (prevBalance == 0 || lastDeposit == 0) {
+            lastDepositTimestamp[account] = block.timestamp;
+        } else {
+            // multiple deposits, so weight timestamp by amounts
+            unchecked {
+                lastDepositTimestamp[account] =
+                    lastDeposit +
+                    ((block.timestamp - lastDeposit) * shares) /
+                    (prevBalance + shares);
+            }
+        }
+    }
+
+    function _updateTransferTimestamp(address account, uint256 shares) internal {
+        // Set the transfer timestamp for the user
+        uint256 newBalance = balanceOf[account];
+        uint256 lastDeposit = lastDepositTimestamp[account];
+        if (newBalance == 0 || lastDeposit < (block.timestamp - lastDeposit)) {
+            lastDepositTimestamp[account] = 0;
+        } else {
+            // multiple deposits, so weight timestamp by amounts
+            unchecked {
+                lastDepositTimestamp[account] =
+                    lastDeposit -
+                    ((block.timestamp - lastDeposit) * shares) /
+                    (newBalance + shares);
+            }
+        }
+    }
+
+    function transfer(address to, uint256 amount) public virtual override returns (bool success) {
+        _updateDepositTimestamp(to, amount);
+        success = super.transfer(to, amount);
+        _updateTransferTimestamp(msg.sender, amount);
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public virtual override returns (bool success) {
+        _updateDepositTimestamp(to, amount);
+        success = super.transferFrom(from, to, amount);
+        _updateTransferTimestamp(from, amount);
+    }
+}
+
+
+// File: contracts/interfaces/IVault.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IVault {
+    // Generalities about the Vault:
+    //
+    // - Whenever documentation refers to 'tokens', it strictly refers to ERC20-compliant token contracts. Tokens are
+    // transferred out of the Vault by calling the `IERC20.transfer` function, and transferred in by calling
+    // `IERC20.transferFrom`. In these cases, the sender must have previously allowed the Vault to use their tokens by
+    // calling `IERC20.approve`. The only deviation from the ERC20 standard that is supported is functions not returning
+    // a boolean value: in these scenarios, a non-reverting call is assumed to be successful.
+    //
+    // - All non-view functions in the Vault are non-reentrant: calling them while another one is mid-execution (e.g.
+    // while execution control is transferred to a token contract during a swap) will result in a revert. View
+    // functions can be called in a re-reentrant way, but doing so might cause them to return inconsistent results.
+    // Contracts calling view functions in the Vault must make sure the Vault has not already been entered.
+    //
+    // - View functions revert if referring to either unregistered Pools, or unregistered tokens for registered Pools.
+
+    // Authorizer
+    //
+    // Some system actions are permissioned, like setting and collecting protocol fees. This permissioning system exists
+    // outside of the Vault in the Authorizer contract: the Vault simply calls the Authorizer to check if the caller
+    // can perform a given action.
+
+    /**
+     * @dev Returns detailed information for a Pool's registered token.
+     *
+     * `cash` is the number of tokens the Vault currently holds for the Pool. `managed` is the number of tokens
+     * withdrawn and held outside the Vault by the Pool's token Asset Manager. The Pool's total balance for `token`
+     * equals the sum of `cash` and `managed`.
+     *
+     * Internally, `cash` and `managed` are stored using 112 bits. No action can ever cause a Pool's token `cash`,
+     * `managed` or `total` balance to be greater than 2^112 - 1.
+     *
+     * `lastChangeBlock` is the number of the block in which `token`'s total balance was last modified (via either a
+     * join, exit, swap, or Asset Manager update). This value is useful to avoid so-called 'sandwich attacks', for
+     * example when developing price oracles. A change of zero (e.g. caused by a swap with amount zero) is considered a
+     * change for this purpose, and will update `lastChangeBlock`.
+     *
+     * `assetManager` is the Pool's token Asset Manager.
+     */
+    function getPoolTokenInfo(
+        bytes32 poolId,
+        address token
+    ) external view returns (uint256 cash, uint256 managed, uint256 lastChangeBlock, address assetManager);
+
+    /**
+     * @dev Returns a Pool's registered tokens, the total balance for each, and the latest block when *any* of
+     * the tokens' `balances` changed.
+     *
+     * The order of the `tokens` array is the same order that will be used in `joinPool`, `exitPool`, as well as in all
+     * Pool hooks (where applicable). Calls to `registerTokens` and `deregisterTokens` may change this order.
+     *
+     * If a Pool only registers tokens once, and these are sorted in ascending order, they will be stored in the same
+     * order as passed to `registerTokens`.
+     *
+     * Total balances include both tokens held by the Vault and those withdrawn by the Pool's Asset Managers. These are
+     * the amounts used by joins, exits and swaps. For a detailed breakdown of token balances, use `getPoolTokenInfo`
+     * instead.
+     */
+    function getPoolTokens(
+        bytes32 poolId
+    ) external view returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock);
+
+    /**
+     * @dev Called by users to join a Pool, which transfers tokens from `sender` into the Pool's balance. This will
+     * trigger custom Pool behavior, which will typically grant something in return to `recipient` - often tokenized
+     * Pool shares.
+     *
+     * If the caller is not `sender`, it must be an authorized relayer for them.
+     *
+     * The `assets` and `maxAmountsIn` arrays must have the same length, and each entry indicates the maximum amount
+     * to send for each asset. The amounts to send are decided by the Pool and not the Vault: it just enforces
+     * these maximums.
+     *
+     * If joining a Pool that holds WETH, it is possible to send ETH directly: the Vault will do the wrapping. To enable
+     * this mechanism, the address sentinel value (the zero address) must be passed in the `assets` array instead of the
+     * WETH address. Note that it is not possible to combine ETH and WETH in the same join. Any excess ETH will be sent
+     * back to the caller (not the sender, which is important for relayers).
+     *
+     * `assets` must have the same length and order as the array returned by `getPoolTokens`. This prevents issues when
+     * interacting with Pools that register and deregister tokens frequently. If sending ETH however, the array must be
+     * sorted *before* replacing the WETH address with the ETH sentinel value (the zero address), which means the final
+     * `assets` array might not be sorted. Pools with no registered tokens cannot be joined.
+     *
+     * If `fromInternalBalance` is true, the caller's Internal Balance will be preferred: ERC20 transfers will only
+     * be made for the difference between the requested amount and Internal Balance (if any). Note that ETH cannot be
+     * withdrawn from Internal Balance: attempting to do so will trigger a revert.
+     *
+     * This causes the Vault to call the `IBasePool.onJoinPool` hook on the Pool's contract, where Pools implement
+     * their own custom logic. This typically requires additional information from the user (such as the expected number
+     * of Pool shares). This can be encoded in the `userData` argument, which is ignored by the Vault and passed
+     * directly to the Pool's contract, as is `recipient`.
+     *
+     * Emits a `PoolBalanceChanged` event.
+     */
+    function joinPool(
+        bytes32 poolId,
+        address sender,
+        address recipient,
+        JoinPoolRequest memory request
+    ) external payable;
+
+    struct JoinPoolRequest {
+        address[] assets;
+        uint256[] maxAmountsIn;
+        bytes userData;
+        bool fromInternalBalance;
+    }
+
+    /**
+     * @dev Called by users to exit a Pool, which transfers tokens from the Pool's balance to `recipient`. This will
+     * trigger custom Pool behavior, which will typically ask for something in return from `sender` - often tokenized
+     * Pool shares. The amount of tokens that can be withdrawn is limited by the Pool's `cash` balance (see
+     * `getPoolTokenInfo`).
+     *
+     * If the caller is not `sender`, it must be an authorized relayer for them.
+     *
+     * The `tokens` and `minAmountsOut` arrays must have the same length, and each entry in these indicates the minimum
+     * token amount to receive for each token contract. The amounts to send are decided by the Pool and not the Vault:
+     * it just enforces these minimums.
+     *
+     * If exiting a Pool that holds WETH, it is possible to receive ETH directly: the Vault will do the unwrapping. To
+     * enable this mechanism, the address sentinel value (the zero address) must be passed in the `assets` array instead
+     * of the WETH address. Note that it is not possible to combine ETH and WETH in the same exit.
+     *
+     * `assets` must have the same length and order as the array returned by `getPoolTokens`. This prevents issues when
+     * interacting with Pools that register and deregister tokens frequently. If receiving ETH however, the array must
+     * be sorted *before* replacing the WETH address with the ETH sentinel value (the zero address), which means the
+     * final `assets` array might not be sorted. Pools with no registered tokens cannot be exited.
+     *
+     * If `toInternalBalance` is true, the tokens will be deposited to `recipient`'s Internal Balance. Otherwise,
+     * an ERC20 transfer will be performed. Note that ETH cannot be deposited to Internal Balance: attempting to
+     * do so will trigger a revert.
+     *
+     * `minAmountsOut` is the minimum amount of tokens the user expects to get out of the Pool, for each token in the
+     * `tokens` array. This array must match the Pool's registered tokens.
+     *
+     * This causes the Vault to call the `IBasePool.onExitPool` hook on the Pool's contract, where Pools implement
+     * their own custom logic. This typically requires additional information from the user (such as the expected number
+     * of Pool shares to return). This can be encoded in the `userData` argument, which is ignored by the Vault and
+     * passed directly to the Pool's contract.
+     *
+     * Emits a `PoolBalanceChanged` event.
+     */
+    function exitPool(
+        bytes32 poolId,
+        address sender,
+        address payable recipient,
+        ExitPoolRequest memory request
+    ) external;
+
+    struct ExitPoolRequest {
+        address[] assets;
+        uint256[] minAmountsOut;
+        bytes userData;
+        bool toInternalBalance;
+    }
+
+    // Swaps
+    //
+    // Users can swap tokens with Pools by calling the `swap` and `batchSwap` functions. To do this,
+    // they need not trust Pool contracts in any way: all security checks are made by the Vault. They must however be
+    // aware of the Pools' pricing algorithms in order to estimate the prices Pools will quote.
+    //
+    // The `swap` function executes a single swap, while `batchSwap` can perform multiple swaps in sequence.
+    // In each individual swap, tokens of one kind are sent from the sender to the Pool (this is the 'token in'),
+    // and tokens of another kind are sent from the Pool to the recipient in exchange (this is the 'token out').
+    // More complex swaps, such as one token in to multiple tokens out can be achieved by batching together
+    // individual swaps.
+    //
+    // There are two swap kinds:
+    //  - 'given in' swaps, where the amount of tokens in (sent to the Pool) is known, and the Pool determines (via the
+    // `onSwap` hook) the amount of tokens out (to send to the recipient).
+    //  - 'given out' swaps, where the amount of tokens out (received from the Pool) is known, and the Pool determines
+    // (via the `onSwap` hook) the amount of tokens in (to receive from the sender).
+    //
+    // Additionally, it is possible to chain swaps using a placeholder input amount, which the Vault replaces with
+    // the calculated output of the previous swap. If the previous swap was 'given in', this will be the calculated
+    // tokenOut amount. If the previous swap was 'given out', it will use the calculated tokenIn amount. These extended
+    // swaps are known as 'multihop' swaps, since they 'hop' through a number of intermediate tokens before arriving at
+    // the final intended token.
+    //
+    // In all cases, tokens are only transferred in and out of the Vault (or withdrawn from and deposited into Internal
+    // Balance) after all individual swaps have been completed, and the net token balance change computed. This makes
+    // certain swap patterns, such as multihops, or swaps that interact with the same token pair in multiple Pools, cost
+    // much less gas than they would otherwise.
+    //
+    // It also means that under certain conditions it is possible to perform arbitrage by swapping with multiple
+    // Pools in a way that results in net token movement out of the Vault (profit), with no tokens being sent in (only
+    // updating the Pool's internal accounting).
+    //
+    // To protect users from front-running or the market changing rapidly, they supply a list of 'limits' for each token
+    // involved in the swap, where either the maximum number of tokens to send (by passing a positive value) or the
+    // minimum amount of tokens to receive (by passing a negative value) is specified.
+    //
+    // Additionally, a 'deadline' timestamp can also be provided, forcing the swap to fail if it occurs after
+    // this point in time (e.g. if the transaction failed to be included in a block promptly).
+    //
+    // If interacting with Pools that hold WETH, it is possible to both send and receive ETH directly: the Vault will do
+    // the wrapping and unwrapping. To enable this mechanism, the address sentinel value (the zero address) must be
+    // passed in the `assets` array instead of the WETH address. Note that it is possible to combine ETH and WETH in the
+    // same swap. Any excess ETH will be sent back to the caller (not the sender, which is relevant for relayers).
+    //
+    // Finally, Internal Balance can be used when either sending or receiving tokens.
+
+    enum SwapKind {
+        GIVEN_IN,
+        GIVEN_OUT
+    }
+
+    /**
+     * @dev Performs a swap with a single Pool.
+     *
+     * If the swap is 'given in' (the number of tokens to send to the Pool is known), it returns the amount of tokens
+     * taken from the Pool, which must be greater than or equal to `limit`.
+     *
+     * If the swap is 'given out' (the number of tokens to take from the Pool is known), it returns the amount of tokens
+     * sent to the Pool, which must be less than or equal to `limit`.
+     *
+     * Internal Balance usage and the recipient are determined by the `funds` struct.
+     *
+     * Emits a `Swap` event.
+     */
+    function swap(
+        SingleSwap memory singleSwap,
+        FundManagement memory funds,
+        uint256 limit,
+        uint256 deadline
+    ) external payable returns (uint256);
+
+    /**
+     * @dev Data for a single swap executed by `swap`. `amount` is either `amountIn` or `amountOut` depending on
+     * the `kind` value.
+     *
+     * `assetIn` and `assetOut` are either token addresses, or the address sentinel value for ETH (the zero address).
+     * Note that Pools never interact with ETH directly: it will be wrapped to or unwrapped from WETH by the Vault.
+     *
+     * The `userData` field is ignored by the Vault, but forwarded to the Pool in the `onSwap` hook, and may be
+     * used to extend swap behavior.
+     */
+    struct SingleSwap {
+        bytes32 poolId;
+        SwapKind kind;
+        address assetIn;
+        address assetOut;
+        uint256 amount;
+        bytes userData;
+    }
+
+    /**
+     * @dev Performs a series of swaps with one or multiple Pools. In each individual swap, the caller determines either
+     * the amount of tokens sent to or received from the Pool, depending on the `kind` value.
+     *
+     * Returns an array with the net Vault asset balance deltas. Positive amounts represent tokens (or ETH) sent to the
+     * Vault, and negative amounts represent tokens (or ETH) sent by the Vault. Each delta corresponds to the asset at
+     * the same index in the `assets` array.
+     *
+     * Swaps are executed sequentially, in the order specified by the `swaps` array. Each array element describes a
+     * Pool, the token to be sent to this Pool, the token to receive from it, and an amount that is either `amountIn` or
+     * `amountOut` depending on the swap kind.
+     *
+     * Multihop swaps can be executed by passing an `amount` value of zero for a swap. This will cause the amount in/out
+     * of the previous swap to be used as the amount in for the current one. In a 'given in' swap, 'tokenIn' must equal
+     * the previous swap's `tokenOut`. For a 'given out' swap, `tokenOut` must equal the previous swap's `tokenIn`.
+     *
+     * The `assets` array contains the addresses of all assets involved in the swaps. These are either token addresses,
+     * or the address sentinel value for ETH (the zero address). Each entry in the `swaps` array specifies tokens in and
+     * out by referencing an index in `assets`. Note that Pools never interact with ETH directly: it will be wrapped to
+     * or unwrapped from WETH by the Vault.
+     *
+     * Internal Balance usage, sender, and recipient are determined by the `funds` struct. The `limits` array specifies
+     * the minimum or maximum amount of each token the vault is allowed to transfer.
+     *
+     * `batchSwap` can be used to make a single swap, like `swap` does, but doing so requires more gas than the
+     * equivalent `swap` call.
+     *
+     * Emits `Swap` events.
+     */
+    function batchSwap(
+        SwapKind kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds,
+        int256[] memory limits,
+        uint256 deadline
+    ) external payable returns (int256[] memory);
+
+    /**
+     * @dev Data for each individual swap executed by `batchSwap`. The asset in and out fields are indexes into the
+     * `assets` array passed to that function, and ETH assets are converted to WETH.
+     *
+     * If `amount` is zero, the multihop mechanism is used to determine the actual amount based on the amount in/out
+     * from the previous swap, depending on the swap kind.
+     *
+     * The `userData` field is ignored by the Vault, but forwarded to the Pool in the `onSwap` hook, and may be
+     * used to extend swap behavior.
+     */
+    struct BatchSwapStep {
+        bytes32 poolId;
+        uint256 assetInIndex;
+        uint256 assetOutIndex;
+        uint256 amount;
+        bytes userData;
+    }
+
+    /**
+     * @dev Emitted for each individual swap performed by `swap` or `batchSwap`.
+     */
+    event Swap(
+        bytes32 indexed poolId,
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+
+    /**
+     * @dev All tokens in a swap are either sent from the `sender` account to the Vault, or from the Vault to the
+     * `recipient` account.
+     *
+     * If the caller is not `sender`, it must be an authorized relayer for them.
+     *
+     * If `fromInternalBalance` is true, the `sender`'s Internal Balance will be preferred, performing an ERC20
+     * transfer for the difference between the requested amount and the User's Internal Balance (if any). The `sender`
+     * must have allowed the Vault to use their tokens via `IERC20.approve()`. This matches the behavior of
+     * `joinPool`.
+     *
+     * If `toInternalBalance` is true, tokens will be deposited to `recipient`'s internal balance instead of
+     * transferred. This matches the behavior of `exitPool`.
+     *
+     * Note that ETH cannot be deposited to or withdrawn from Internal Balance: attempting to do so will trigger a
+     * revert.
+     */
+    struct FundManagement {
+        address sender;
+        bool fromInternalBalance;
+        address payable recipient;
+        bool toInternalBalance;
+    }
+
+    /**
+     * @dev Simulates a call to `batchSwap`, returning an array of Vault asset deltas. Calls to `swap` cannot be
+     * simulated directly, but an equivalent `batchSwap` call can and will yield the exact same result.
+     *
+     * Each element in the array corresponds to the asset at the same index, and indicates the number of tokens (or ETH)
+     * the Vault would take from the sender (if positive) or send to the recipient (if negative). The arguments it
+     * receives are the same that an equivalent `batchSwap` call would receive.
+     *
+     * Unlike `batchSwap`, this function performs no checks on the sender or recipient field in the `funds` struct.
+     * This makes it suitable to be called by off-chain applications via eth_call without needing to hold tokens,
+     * approve them for the Vault, or even know a user's address.
+     *
+     * Note that this function is not 'view' (due to implementation details): the client code must explicitly execute
+     * eth_call instead of eth_sendTransaction.
+     */
+    function queryBatchSwap(
+        SwapKind kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds
+    ) external returns (int256[] memory assetDeltas);
+}
+
+
+// File: contracts/interfaces/IBPT.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IBPT {
+    function getSwapFeePercentage() external returns (uint256);
+
+    function getActualSupply() external returns (uint256);
+
+    function getLastInvariant() external returns (uint256);
+
+    function getNormalizedWeights() external returns (uint256[] memory);
+
+    function totalSupply() external returns (uint256);
+
+    function getPrice() external returns (uint256);
+}
+
+
+// File: contracts/Owned.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/auth/Owned.sol)
+abstract contract Owned {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event OwnerUpdated(address indexed user, address indexed newOwner);
+
+    /*//////////////////////////////////////////////////////////////
+                            OWNERSHIP STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    address public OWNER;
+
+    modifier onlyOwner() virtual {
+        require(msg.sender == OWNER, "UNAUTHORIZED");
+
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(address _owner) {
+        OWNER = _owner;
+
+        emit OwnerUpdated(address(0), _owner);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             OWNERSHIP LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function setOwner(address newOwner) public virtual onlyOwner {
+        OWNER = newOwner;
+
+        emit OwnerUpdated(msg.sender, newOwner);
+    }
+}
+
+
+// File: lib/solmate/src/mixins/ERC4626.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+import {SafeTransferLib} from "../utils/SafeTransferLib.sol";
+import {FixedPointMathLib} from "../utils/FixedPointMathLib.sol";
+
+/// @notice Minimal ERC4626 tokenized Vault implementation.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/mixins/ERC4626.sol)
+abstract contract ERC4626 is ERC20 {
+    using SafeTransferLib for ERC20;
+    using FixedPointMathLib for uint256;
+
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Deposit(address indexed caller, address indexed owner, uint256 assets, uint256 shares);
+
+    event Withdraw(
+        address indexed caller,
+        address indexed receiver,
+        address indexed owner,
+        uint256 assets,
+        uint256 shares
+    );
+
+    /*//////////////////////////////////////////////////////////////
+                               IMMUTABLES
+    //////////////////////////////////////////////////////////////*/
+
+    ERC20 public immutable asset;
+
+    constructor(
+        ERC20 _asset,
+        string memory _name,
+        string memory _symbol
+    ) ERC20(_name, _symbol, _asset.decimals()) {
+        asset = _asset;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        DEPOSIT/WITHDRAWAL LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function deposit(uint256 assets, address receiver) public virtual returns (uint256 shares) {
+        // Check for rounding error since we round down in previewDeposit.
+        require((shares = previewDeposit(assets)) != 0, "ZERO_SHARES");
+
+        // Need to transfer before minting or ERC777s could reenter.
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+
+        afterDeposit(assets, shares);
+    }
+
+    function mint(uint256 shares, address receiver) public virtual returns (uint256 assets) {
+        assets = previewMint(shares); // No need to check for rounding error, previewMint rounds up.
+
+        // Need to transfer before minting or ERC777s could reenter.
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+
+        afterDeposit(assets, shares);
+    }
+
+    function withdraw(
+        uint256 assets,
+        address receiver,
+        address owner
+    ) public virtual returns (uint256 shares) {
+        shares = previewWithdraw(assets); // No need to check for rounding error, previewWithdraw rounds up.
+
+        if (msg.sender != owner) {
+            uint256 allowed = allowance[owner][msg.sender]; // Saves gas for limited approvals.
+
+            if (allowed != type(uint256).max) allowance[owner][msg.sender] = allowed - shares;
+        }
+
+        beforeWithdraw(assets, shares);
+
+        _burn(owner, shares);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+
+        asset.safeTransfer(receiver, assets);
+    }
+
+    function redeem(
+        uint256 shares,
+        address receiver,
+        address owner
+    ) public virtual returns (uint256 assets) {
+        if (msg.sender != owner) {
+            uint256 allowed = allowance[owner][msg.sender]; // Saves gas for limited approvals.
+
+            if (allowed != type(uint256).max) allowance[owner][msg.sender] = allowed - shares;
+        }
+
+        // Check for rounding error since we round down in previewRedeem.
+        require((assets = previewRedeem(shares)) != 0, "ZERO_ASSETS");
+
+        beforeWithdraw(assets, shares);
+
+        _burn(owner, shares);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+
+        asset.safeTransfer(receiver, assets);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ACCOUNTING LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function totalAssets() public view virtual returns (uint256);
+
+    function convertToShares(uint256 assets) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? assets : assets.mulDivDown(supply, totalAssets());
+    }
+
+    function convertToAssets(uint256 shares) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? shares : shares.mulDivDown(totalAssets(), supply);
+    }
+
+    function previewDeposit(uint256 assets) public view virtual returns (uint256) {
+        return convertToShares(assets);
+    }
+
+    function previewMint(uint256 shares) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? shares : shares.mulDivUp(totalAssets(), supply);
+    }
+
+    function previewWithdraw(uint256 assets) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? assets : assets.mulDivUp(supply, totalAssets());
+    }
+
+    function previewRedeem(uint256 shares) public view virtual returns (uint256) {
+        return convertToAssets(shares);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                     DEPOSIT/WITHDRAWAL LIMIT LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function maxDeposit(address) public view virtual returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function maxMint(address) public view virtual returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function maxWithdraw(address owner) public view virtual returns (uint256) {
+        return convertToAssets(balanceOf[owner]);
+    }
+
+    function maxRedeem(address owner) public view virtual returns (uint256) {
+        return balanceOf[owner];
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          INTERNAL HOOKS LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function beforeWithdraw(uint256 assets, uint256 shares) internal virtual {}
+
+    function afterDeposit(uint256 assets, uint256 shares) internal virtual {}
+}
+
+
+// File: lib/solmate/src/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+/// @notice Gas optimized reentrancy protection for smart contracts.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/utils/ReentrancyGuard.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/security/ReentrancyGuard.sol)
+abstract contract ReentrancyGuard {
+    uint256 private locked = 1;
+
+    modifier nonReentrant() virtual {
+        require(locked == 1, "REENTRANCY");
+
+        locked = 2;
+
+        _;
+
+        locked = 1;
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Caution! This library won't check that a token has code, responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        assembly {
+            // We'll write our calldata to this slot below, but restore it later.
+            let memPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(0, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(4, from) // Append the "from" argument.
+            mstore(36, to) // Append the "to" argument.
+            mstore(68, amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because that's the total length of our calldata (4 + 32 * 3)
+                // Counterintuitively, this call() must be positioned after the or() in the
+                // surrounding and() because and() evaluates its arguments from right to left.
+                call(gas(), token, 0, 0, 100, 0, 32)
+            )
+
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, memPointer) // Restore the memPointer.
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        assembly {
+            // We'll write our calldata to this slot below, but restore it later.
+            let memPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(0, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(4, to) // Append the "to" argument.
+            mstore(36, amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because that's the total length of our calldata (4 + 32 * 2)
+                // Counterintuitively, this call() must be positioned after the or() in the
+                // surrounding and() because and() evaluates its arguments from right to left.
+                call(gas(), token, 0, 0, 68, 0, 32)
+            )
+
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, memPointer) // Restore the memPointer.
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        assembly {
+            // We'll write our calldata to this slot below, but restore it later.
+            let memPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(0, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(4, to) // Append the "to" argument.
+            mstore(36, amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because that's the total length of our calldata (4 + 32 * 2)
+                // Counterintuitively, this call() must be positioned after the or() in the
+                // surrounding and() because and() evaluates its arguments from right to left.
+                call(gas(), token, 0, 0, 68, 0, 32)
+            )
+
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, memPointer) // Restore the memPointer.
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: contracts/interfaces/IBooster.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IBooster {
+    /// @notice Pool Info for deposits and staking
+    /// @custom: lptoken:  the underlying token(ex. the curve lp token)
+    /// @custom: cvxtoken: the convex deposit token(a 1:1 token representing an lp deposit).  The supply of this token can be used to calculate the TVL of the pool
+    /// @custom: gauge: the curve "gauge" or staking contract used by the pool
+    /// @custom: crvRewards: the main reward contract for the pool
+    /// @custom: stash: a helper contract used to hold extra rewards (like snx) on behalf of the pool until distribution is called
+    /// @custom: shutdown: a shutdown flag of the pool
+    struct PoolInfo {
+        address lptoken;
+        address cvxtoken;
+        address gauge;
+        address crvRewards;
+        address stash;
+        bool shutdown;
+    }
+
+    function poolInfo(uint256 _pid) external returns (PoolInfo memory);
+
+    //deposit into convex, receive a tokenized deposit.  parameter to stake immediately
+    function deposit(uint256 _pid, uint256 _amount, bool _stake) external returns (bool);
+
+    //burn a tokenized deposit to receive curve lp tokens back
+    function withdraw(uint256 _pid, uint256 _amount) external returns (bool);
+
+    function earmarkRewards(uint256 pid) external;
+}
+
+
+// File: contracts/interfaces/IRewards.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IRewards {
+    //get balance of an address
+    function balanceOf(address _account) external view returns (uint256);
+
+    //withdraw to a convex tokenized deposit
+    function withdraw(uint256 _amount, bool _claim) external returns (bool);
+
+    //withdraw directly to curve LP token
+    function withdrawAndUnwrap(uint256 _amount, bool _claim) external returns (bool);
+
+    //claim rewards
+    function getReward() external returns (bool);
+
+    //stake a convex tokenized deposit
+    function stake(uint256 _amount) external returns (bool);
+
+    //stake a convex tokenized deposit for another address(transfering ownership)
+    function stakeFor(address _account, uint256 _amount) external returns (bool);
+
+    function exit() external returns (bool);
+
+    function rewardToken() external view returns (address);
+
+    function extraRewards(uint256) external view returns (address);
+
+    function extraRewardsLength() external view returns (uint256);
+}
+
+
+// File: contracts/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+
+// File: contracts/interfaces/IVirtualRewards.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IVirtualRewards {
+    function rewardToken() external returns (address);
+}
+
+
+// File: contracts/interfaces/IStash.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface IStash {
+    function baseToken() external returns (address);
+}
+
+
+// File: contracts/interfaces/IMevEth.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+import "./IERC20.sol";
+
+interface IMevEth is IERC20 {
+    function fraction() external view returns (uint128 elastic, uint128 base);
+
+    function convertToAssets(uint256 shares) external view returns (uint256 assets);
+
+    function convertToShares(uint256 assets) external view returns (uint256 shares);
+
+    function previewRedeem(uint256 shares) external view returns (uint256 assets);
+
+    function previewWithdraw(uint256 assets) external view returns (uint256 shares);
+
+    function previewDeposit(uint256 assets) external view returns (uint256 shares);
+
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+
+    function deposit(uint256 assets, address receiver) external payable returns (uint256 shares);
+
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+
+    function withdrawQueue(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+}
+
+
+// File: contracts/interfaces/IWETH.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+import "./IERC20.sol";
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+
+    function withdraw(uint) external;
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/solmate/src/utils/FixedPointMathLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+/// @notice Arithmetic library with operations for fixed-point numbers.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/utils/FixedPointMathLib.sol)
+library FixedPointMathLib {
+    /*//////////////////////////////////////////////////////////////
+                    SIMPLIFIED FIXED POINT OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal constant WAD = 1e18; // The scalar of ETH and most ERC20s.
+
+    function mulWadDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, y, WAD); // Equivalent to (x * y) / WAD rounded down.
+    }
+
+    function mulWadUp(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivUp(x, y, WAD); // Equivalent to (x * y) / WAD rounded up.
+    }
+
+    function divWadDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, WAD, y); // Equivalent to (x * WAD) / y rounded down.
+    }
+
+    function divWadUp(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivUp(x, WAD, y); // Equivalent to (x * WAD) / y rounded up.
+    }
+
+    function powWad(int256 x, int256 y) internal pure returns (int256) {
+        // Equivalent to x to the power of y because x ** y = (e ** ln(x)) ** y = e ** (ln(x) * y)
+        return expWad((lnWad(x) * y) / int256(WAD)); // Using ln(x) means x must be greater than 0.
+    }
+
+    function expWad(int256 x) internal pure returns (int256 r) {
+        unchecked {
+            // When the result is < 0.5 we return zero. This happens when
+            // x <= floor(log(0.5e18) * 1e18) ~ -42e18
+            if (x <= -42139678854452767551) return 0;
+
+            // When the result is > (2**255 - 1) / 1e18 we can not represent it as an
+            // int. This happens when x >= floor(log((2**255 - 1) / 1e18) * 1e18) ~ 135.
+            if (x >= 135305999368893231589) revert("EXP_OVERFLOW");
+
+            // x is now in the range (-42, 136) * 1e18. Convert to (-42, 136) * 2**96
+            // for more intermediate precision and a binary basis. This base conversion
+            // is a multiplication by 1e18 / 2**96 = 5**18 / 2**78.
+            x = (x << 78) / 5**18;
+
+            // Reduce range of x to (-½ ln 2, ½ ln 2) * 2**96 by factoring out powers
+            // of two such that exp(x) = exp(x') * 2**k, where k is an integer.
+            // Solving this gives k = round(x / log(2)) and x' = x - k * log(2).
+            int256 k = ((x << 96) / 54916777467707473351141471128 + 2**95) >> 96;
+            x = x - k * 54916777467707473351141471128;
+
+            // k is in the range [-61, 195].
+
+            // Evaluate using a (6, 7)-term rational approximation.
+            // p is made monic, we'll multiply by a scale factor later.
+            int256 y = x + 1346386616545796478920950773328;
+            y = ((y * x) >> 96) + 57155421227552351082224309758442;
+            int256 p = y + x - 94201549194550492254356042504812;
+            p = ((p * y) >> 96) + 28719021644029726153956944680412240;
+            p = p * x + (4385272521454847904659076985693276 << 96);
+
+            // We leave p in 2**192 basis so we don't need to scale it back up for the division.
+            int256 q = x - 2855989394907223263936484059900;
+            q = ((q * x) >> 96) + 50020603652535783019961831881945;
+            q = ((q * x) >> 96) - 533845033583426703283633433725380;
+            q = ((q * x) >> 96) + 3604857256930695427073651918091429;
+            q = ((q * x) >> 96) - 14423608567350463180887372962807573;
+            q = ((q * x) >> 96) + 26449188498355588339934803723976023;
+
+            assembly {
+                // Div in assembly because solidity adds a zero check despite the unchecked.
+                // The q polynomial won't have zeros in the domain as all its roots are complex.
+                // No scaling is necessary because p is already 2**96 too large.
+                r := sdiv(p, q)
+            }
+
+            // r should be in the range (0.09, 0.25) * 2**96.
+
+            // We now need to multiply r by:
+            // * the scale factor s = ~6.031367120.
+            // * the 2**k factor from the range reduction.
+            // * the 1e18 / 2**96 factor for base conversion.
+            // We do this all at once, with an intermediate result in 2**213
+            // basis, so the final right shift is always by a positive amount.
+            r = int256((uint256(r) * 3822833074963236453042738258902158003155416615667) >> uint256(195 - k));
+        }
+    }
+
+    function lnWad(int256 x) internal pure returns (int256 r) {
+        unchecked {
+            require(x > 0, "UNDEFINED");
+
+            // We want to convert x from 10**18 fixed point to 2**96 fixed point.
+            // We do this by multiplying by 2**96 / 10**18. But since
+            // ln(x * C) = ln(x) + ln(C), we can simply do nothing here
+            // and add ln(2**96 / 10**18) at the end.
+
+            // Reduce range of x to (1, 2) * 2**96
+            // ln(2^k * x) = k * ln(2) + ln(x)
+            int256 k = int256(log2(uint256(x))) - 96;
+            x <<= uint256(159 - k);
+            x = int256(uint256(x) >> 159);
+
+            // Evaluate using a (8, 8)-term rational approximation.
+            // p is made monic, we will multiply by a scale factor later.
+            int256 p = x + 3273285459638523848632254066296;
+            p = ((p * x) >> 96) + 24828157081833163892658089445524;
+            p = ((p * x) >> 96) + 43456485725739037958740375743393;
+            p = ((p * x) >> 96) - 11111509109440967052023855526967;
+            p = ((p * x) >> 96) - 45023709667254063763336534515857;
+            p = ((p * x) >> 96) - 14706773417378608786704636184526;
+            p = p * x - (795164235651350426258249787498 << 96);
+
+            // We leave p in 2**192 basis so we don't need to scale it back up for the division.
+            // q is monic by convention.
+            int256 q = x + 5573035233440673466300451813936;
+            q = ((q * x) >> 96) + 71694874799317883764090561454958;
+            q = ((q * x) >> 96) + 283447036172924575727196451306956;
+            q = ((q * x) >> 96) + 401686690394027663651624208769553;
+            q = ((q * x) >> 96) + 204048457590392012362485061816622;
+            q = ((q * x) >> 96) + 31853899698501571402653359427138;
+            q = ((q * x) >> 96) + 909429971244387300277376558375;
+            assembly {
+                // Div in assembly because solidity adds a zero check despite the unchecked.
+                // The q polynomial is known not to have zeros in the domain.
+                // No scaling required because p is already 2**96 too large.
+                r := sdiv(p, q)
+            }
+
+            // r is in the range (0, 0.125) * 2**96
+
+            // Finalization, we need to:
+            // * multiply by the scale factor s = 5.549…
+            // * add ln(2**96 / 10**18)
+            // * add k * ln(2)
+            // * multiply by 10**18 / 2**96 = 5**18 >> 78
+
+            // mul s * 5e18 * 2**96, base is now 5**18 * 2**192
+            r *= 1677202110996718588342820967067443963516166;
+            // add ln(2) * k * 5e18 * 2**192
+            r += 16597577552685614221487285958193947469193820559219878177908093499208371 * k;
+            // add ln(2**96 / 10**18) * 5e18 * 2**192
+            r += 600920179829731861736702779321621459595472258049074101567377883020018308;
+            // base conversion: mul 2**18 / 2**192
+            r >>= 174;
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    LOW LEVEL FIXED POINT OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function mulDivDown(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 z) {
+        assembly {
+            // Store x * y in z for now.
+            z := mul(x, y)
+
+            // Equivalent to require(denominator != 0 && (x == 0 || (x * y) / x == y))
+            if iszero(and(iszero(iszero(denominator)), or(iszero(x), eq(div(z, x), y)))) {
+                revert(0, 0)
+            }
+
+            // Divide z by the denominator.
+            z := div(z, denominator)
+        }
+    }
+
+    function mulDivUp(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 z) {
+        assembly {
+            // Store x * y in z for now.
+            z := mul(x, y)
+
+            // Equivalent to require(denominator != 0 && (x == 0 || (x * y) / x == y))
+            if iszero(and(iszero(iszero(denominator)), or(iszero(x), eq(div(z, x), y)))) {
+                revert(0, 0)
+            }
+
+            // First, divide z - 1 by the denominator and add 1.
+            // We allow z - 1 to underflow if z is 0, because we multiply the
+            // end result by 0 if z is zero, ensuring we return 0 if z is zero.
+            z := mul(iszero(iszero(z)), add(div(sub(z, 1), denominator), 1))
+        }
+    }
+
+    function rpow(
+        uint256 x,
+        uint256 n,
+        uint256 scalar
+    ) internal pure returns (uint256 z) {
+        assembly {
+            switch x
+            case 0 {
+                switch n
+                case 0 {
+                    // 0 ** 0 = 1
+                    z := scalar
+                }
+                default {
+                    // 0 ** n = 0
+                    z := 0
+                }
+            }
+            default {
+                switch mod(n, 2)
+                case 0 {
+                    // If n is even, store scalar in z for now.
+                    z := scalar
+                }
+                default {
+                    // If n is odd, store x in z for now.
+                    z := x
+                }
+
+                // Shifting right by 1 is like dividing by 2.
+                let half := shr(1, scalar)
+
+                for {
+                    // Shift n right by 1 before looping to halve it.
+                    n := shr(1, n)
+                } n {
+                    // Shift n right by 1 each iteration to halve it.
+                    n := shr(1, n)
+                } {
+                    // Revert immediately if x ** 2 would overflow.
+                    // Equivalent to iszero(eq(div(xx, x), x)) here.
+                    if shr(128, x) {
+                        revert(0, 0)
+                    }
+
+                    // Store x squared.
+                    let xx := mul(x, x)
+
+                    // Round to the nearest number.
+                    let xxRound := add(xx, half)
+
+                    // Revert if xx + half overflowed.
+                    if lt(xxRound, xx) {
+                        revert(0, 0)
+                    }
+
+                    // Set x to scaled xxRound.
+                    x := div(xxRound, scalar)
+
+                    // If n is even:
+                    if mod(n, 2) {
+                        // Compute z * x.
+                        let zx := mul(z, x)
+
+                        // If z * x overflowed:
+                        if iszero(eq(div(zx, x), z)) {
+                            // Revert if x is non-zero.
+                            if iszero(iszero(x)) {
+                                revert(0, 0)
+                            }
+                        }
+
+                        // Round to the nearest number.
+                        let zxRound := add(zx, half)
+
+                        // Revert if zx + half overflowed.
+                        if lt(zxRound, zx) {
+                            revert(0, 0)
+                        }
+
+                        // Return properly scaled zxRound.
+                        z := div(zxRound, scalar)
+                    }
+                }
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        GENERAL NUMBER UTILITIES
+    //////////////////////////////////////////////////////////////*/
+
+    function sqrt(uint256 x) internal pure returns (uint256 z) {
+        assembly {
+            let y := x // We start y at x, which will help us make our initial estimate.
+
+            z := 181 // The "correct" value is 1, but this saves a multiplication later.
+
+            // This segment is to get a reasonable initial estimate for the Babylonian method. With a bad
+            // start, the correct # of bits increases ~linearly each iteration instead of ~quadratically.
+
+            // We check y >= 2^(k + 8) but shift right by k bits
+            // each branch to ensure that if x >= 256, then y >= 256.
+            if iszero(lt(y, 0x10000000000000000000000000000000000)) {
+                y := shr(128, y)
+                z := shl(64, z)
+            }
+            if iszero(lt(y, 0x1000000000000000000)) {
+                y := shr(64, y)
+                z := shl(32, z)
+            }
+            if iszero(lt(y, 0x10000000000)) {
+                y := shr(32, y)
+                z := shl(16, z)
+            }
+            if iszero(lt(y, 0x1000000)) {
+                y := shr(16, y)
+                z := shl(8, z)
+            }
+
+            // Goal was to get z*z*y within a small factor of x. More iterations could
+            // get y in a tighter range. Currently, we will have y in [256, 256*2^16).
+            // We ensured y >= 256 so that the relative difference between y and y+1 is small.
+            // That's not possible if x < 256 but we can just verify those cases exhaustively.
+
+            // Now, z*z*y <= x < z*z*(y+1), and y <= 2^(16+8), and either y >= 256, or x < 256.
+            // Correctness can be checked exhaustively for x < 256, so we assume y >= 256.
+            // Then z*sqrt(y) is within sqrt(257)/sqrt(256) of sqrt(x), or about 20bps.
+
+            // For s in the range [1/256, 256], the estimate f(s) = (181/1024) * (s+1) is in the range
+            // (1/2.84 * sqrt(s), 2.84 * sqrt(s)), with largest error when s = 1 and when s = 256 or 1/256.
+
+            // Since y is in [256, 256*2^16), let a = y/65536, so that a is in [1/256, 256). Then we can estimate
+            // sqrt(y) using sqrt(65536) * 181/1024 * (a + 1) = 181/4 * (y + 65536)/65536 = 181 * (y + 65536)/2^18.
+
+            // There is no overflow risk here since y < 2^136 after the first branch above.
+            z := shr(18, mul(z, add(y, 65536))) // A mul() is saved from starting z at 181.
+
+            // Given the worst case multiplicative error of 2.84 above, 7 iterations should be enough.
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+
+            // If x+1 is a perfect square, the Babylonian method cycles between
+            // floor(sqrt(x)) and ceil(sqrt(x)). This statement ensures we return floor.
+            // See: https://en.wikipedia.org/wiki/Integer_square_root#Using_only_integer_division
+            // Since the ceil is rare, we save gas on the assignment and repeat division in the rare case.
+            // If you don't care whether the floor or ceil square root is returned, you can remove this statement.
+            z := sub(z, lt(div(x, z), z))
+        }
+    }
+
+    function log2(uint256 x) internal pure returns (uint256 r) {
+        require(x > 0, "UNDEFINED");
+
+        assembly {
+            r := shl(7, lt(0xffffffffffffffffffffffffffffffff, x))
+            r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, x))))
+            r := or(r, shl(5, lt(0xffffffff, shr(r, x))))
+            r := or(r, shl(4, lt(0xffff, shr(r, x))))
+            r := or(r, shl(3, lt(0xff, shr(r, x))))
+            r := or(r, shl(2, lt(0xf, shr(r, x))))
+            r := or(r, shl(1, lt(0x3, shr(r, x))))
+            r := or(r, lt(0x1, shr(r, x)))
+        }
+    }
+
+    function unsafeMod(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        assembly {
+            // z will equal 0 if y is 0, unlike in Solidity where it will revert.
+            z := mod(x, y)
+        }
+    }
+
+    function unsafeDiv(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        assembly {
+            // z will equal 0 if y is 0, unlike in Solidity where it will revert.
+            z := div(x, y)
+        }
+    }
+
+    /// @dev Will return 0 instead of reverting if y is zero.
+    function unsafeDivUp(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        assembly {
+            // Add 1 to x * y if x % y > 0.
+            z := add(gt(mod(x, y), 0), div(x, y))
+        }
+    }
+}
+

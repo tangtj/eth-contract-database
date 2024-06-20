@@ -1,0 +1,3711 @@
+
+// File: src/policies/Clearinghouse.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.15;
+
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {ERC4626} from "solmate/mixins/ERC4626.sol";
+import {IStaking} from "interfaces/IStaking.sol";
+
+import {CoolerFactory, Cooler} from "cooler/CoolerFactory.sol";
+import {CoolerCallback} from "cooler/CoolerCallback.sol";
+
+import {ROLESv1, RolesConsumer} from "modules/ROLES/OlympusRoles.sol";
+import {TRSRYv1} from "modules/TRSRY/TRSRY.v1.sol";
+import {MINTRv1} from "modules/MINTR/MINTR.v1.sol";
+import "src/Kernel.sol";
+
+/// @title  Olympus Clearinghouse.
+/// @notice Olympus Clearinghouse (Policy) Contract.
+/// @dev    The Olympus Clearinghouse is a lending facility built on top of Cooler Loans. The Clearinghouse
+///         ensures that OHM holders can take loans against their gOHM holdings according to the parameters
+///         approved by the community in OIP-144 and its subsequent RFCs. The Clearinghouse parameters are
+///         immutable, because of that, if backing was to increase substantially, a new governance process
+///         to fork this implementation with upgraded parameters should take place.
+///         Although the Cooler contracts allow lenders to transfer ownership of their repayment rights, the
+///         Clearinghouse doesn't implement any functions to use that feature.
+contract Clearinghouse is Policy, RolesConsumer, CoolerCallback {
+    // --- ERRORS ----------------------------------------------------
+
+    error BadEscrow();
+    error DurationMaximum();
+    error OnlyBurnable();
+    error TooEarlyToFund();
+    error LengthDiscrepancy();
+    error OnlyBorrower();
+    error NotLender();
+
+    // --- EVENTS ----------------------------------------------------
+
+    /// @notice Logs whenever the Clearinghouse is deactivated.
+    event Deactivate();
+    /// @notice Logs whenever the Clearinghouse is reactivated.
+    event Reactivate();
+    /// @notice Logs whenever the treasury is defunded.
+    event Defund(address token, uint256 amount);
+    /// @notice Logs the balance change (in DAI terms) whenever a rebalance occurs.
+    event Rebalance(bool defund, uint256 daiAmount);
+
+    // --- RELEVANT CONTRACTS ----------------------------------------
+
+    ERC20 public immutable dai; // Debt token
+    ERC4626 public immutable sdai; // Idle DAI will be wrapped into sDAI
+    ERC20 public immutable gohm; // Collateral token
+    ERC20 public immutable ohm; // Unwrapped gOHM
+    IStaking public immutable staking; // Necessary to unstake (and burn) OHM from defaults
+
+    // --- MODULES ---------------------------------------------------
+
+    TRSRYv1 public TRSRY; // Olympus V3 Treasury Module
+    MINTRv1 public MINTR; // Olympus V3 Minter Module
+
+    // --- PARAMETER BOUNDS ------------------------------------------
+
+    uint256 public constant INTEREST_RATE = 5e15; // 0.5% anually
+    uint256 public constant LOAN_TO_COLLATERAL = 289292e16; // 2,892.92 DAI/gOHM
+    uint256 public constant DURATION = 121 days; // Four months
+    uint256 public constant FUND_CADENCE = 7 days; // One week
+    uint256 public constant FUND_AMOUNT = 18_000_000e18; // 18 million
+    uint256 public constant MAX_REWARD = 1e17; // 0.1 gOHM
+
+    // --- STATE VARIABLES -------------------------------------------
+
+    /// @notice determines whether the contract can be funded or not.
+    bool public active;
+
+    /// @notice timestamp at which the next rebalance can occur.
+    uint256 public fundTime;
+
+    /// @notice Outstanding receivables.
+    /// Incremented when a loan is taken or rolled.
+    /// Decremented when a loan is repaid or collateral is burned.
+    uint256 public interestReceivables;
+    uint256 public principalReceivables;
+
+    // --- INITIALIZATION --------------------------------------------
+
+    constructor(
+        address ohm_,
+        address gohm_,
+        address staking_,
+        address sdai_,
+        address coolerFactory_,
+        address kernel_
+    ) Policy(Kernel(kernel_)) CoolerCallback(coolerFactory_) {
+        // Store the relevant contracts.
+        ohm = ERC20(ohm_);
+        gohm = ERC20(gohm_);
+        staking = IStaking(staking_);
+        sdai = ERC4626(sdai_);
+        dai = ERC20(sdai.asset());
+
+        // Initialize the contract status and its funding schedule.
+        active = true;
+        fundTime = block.timestamp;
+    }
+
+    /// @notice Default framework setup. Configure dependencies for olympus-v3 modules.
+    /// @dev    This function will be called when the `executor` installs the Clearinghouse
+    ///         policy in the olympus-v3 `Kernel`.
+    function configureDependencies() external override returns (Keycode[] memory dependencies) {
+        dependencies = new Keycode[](3);
+        dependencies[0] = toKeycode("TRSRY");
+        dependencies[1] = toKeycode("MINTR");
+        dependencies[2] = toKeycode("ROLES");
+
+        TRSRY = TRSRYv1(getModuleAddress(toKeycode("TRSRY")));
+        MINTR = MINTRv1(getModuleAddress(toKeycode("MINTR")));
+        ROLES = ROLESv1(getModuleAddress(toKeycode("ROLES")));
+
+        // Approve MINTR for burning OHM (called here so that it is re-approved on updates)
+        ohm.approve(address(MINTR), type(uint256).max);
+    }
+
+    /// @notice Default framework setup. Request permissions for interacting with olympus-v3 modules.
+    /// @dev    This function will be called when the `executor` installs the Clearinghouse
+    ///         policy in the olympus-v3 `Kernel`.
+    function requestPermissions() external view override returns (Permissions[] memory requests) {
+        Keycode TRSRY_KEYCODE = toKeycode("TRSRY");
+
+        requests = new Permissions[](4);
+        requests[0] = Permissions(TRSRY_KEYCODE, TRSRY.setDebt.selector);
+        requests[1] = Permissions(TRSRY_KEYCODE, TRSRY.increaseWithdrawApproval.selector);
+        requests[2] = Permissions(TRSRY_KEYCODE, TRSRY.withdrawReserves.selector);
+        requests[3] = Permissions(toKeycode("MINTR"), MINTR.burnOhm.selector);
+    }
+
+    // --- OPERATION -------------------------------------------------
+
+    /// @notice Lend to a cooler.
+    /// @dev    To simplify the UX and easily ensure that all holders get the same terms,
+    ///         this function requests a new loan and clears it in the same transaction.
+    /// @param  cooler_ to lend to.
+    /// @param  amount_ of DAI to lend.
+    /// @return the id of the granted loan.
+    function lendToCooler(Cooler cooler_, uint256 amount_) external returns (uint256) {
+        // Attempt a Clearinghouse <> Treasury rebalance.
+        rebalance();
+
+        // Validate that cooler was deployed by the trusted factory.
+        if (!factory.created(address(cooler_))) revert OnlyFromFactory();
+
+        // Validate cooler collateral and debt tokens.
+        if (cooler_.collateral() != gohm || cooler_.debt() != dai) revert BadEscrow();
+
+        // Transfer in collateral owed
+        uint256 collateral = cooler_.collateralFor(amount_, LOAN_TO_COLLATERAL);
+        gohm.transferFrom(msg.sender, address(this), collateral);
+
+        // Increment interest to be expected
+        (, uint256 interest) = getLoanForCollateral(collateral);
+        interestReceivables += interest;
+        principalReceivables += amount_;
+
+        // Create a new loan request.
+        gohm.approve(address(cooler_), collateral);
+        uint256 reqID = cooler_.requestLoan(amount_, INTEREST_RATE, LOAN_TO_COLLATERAL, DURATION);
+
+        // Clear the created loan request by providing enough DAI.
+        sdai.withdraw(amount_, address(this), address(this));
+        dai.approve(address(cooler_), amount_);
+        uint256 loanID = cooler_.clearRequest(reqID, address(this), true);
+
+        return loanID;
+    }
+
+    /// @notice Extend the loan expiry by repaying the extension interest in advance.
+    ///         The extension cost is paid by the caller. If a third-party executes the
+    ///         extension, the loan period is extended, but the borrower debt does not increase.
+    /// @param  cooler_ holding the loan to be extended.
+    /// @param  loanID_ index of loan in loans[].
+    /// @param  times_ Amount of times that the fixed-term loan duration is extended.
+    function extendLoan(Cooler cooler_, uint256 loanID_, uint8 times_) external {
+        Cooler.Loan memory loan = cooler_.getLoan(loanID_);
+
+        // Validate that cooler was deployed by the trusted factory.
+        if (!factory.created(address(cooler_))) revert OnlyFromFactory();
+
+        // Calculate extension interest based on the remaining principal.
+        uint256 interestBase = interestForLoan(loan.principal, loan.request.duration);
+
+        // Transfer in extension interest from the caller.
+        dai.transferFrom(msg.sender, address(this), interestBase * times_);
+        if (active) {
+            _sweepIntoDSR(interestBase * times_);
+        } else {
+            _defund(dai, interestBase * times_);
+        }
+
+        // Signal to cooler that loan should be extended.
+        cooler_.extendLoanTerms(loanID_, times_);
+    }
+
+    /// @notice Batch several default claims to save gas.
+    ///         The elements on both arrays must be paired based on their index.
+    /// @dev    Implements an auction style reward system that linearly increases up to a max reward.
+    /// @param  coolers_ Array of contracts where the default must be claimed.
+    /// @param  loans_ Array of defaulted loan ids.
+    function claimDefaulted(address[] calldata coolers_, uint256[] calldata loans_) external {
+        uint256 loans = loans_.length;
+        if (loans != coolers_.length) revert LengthDiscrepancy();
+
+        uint256 totalPrincipal;
+        uint256 totalInterest;
+        uint256 totalCollateral;
+        uint256 keeperRewards;
+        for (uint256 i = 0; i < loans; ) {
+            // Validate that cooler was deployed by the trusted factory.
+            if (!factory.created(coolers_[i])) revert OnlyFromFactory();
+
+            // Validate that loan was written by clearinghouse.
+            if (Cooler(coolers_[i]).getLoan(loans_[i]).lender != address(this)) revert NotLender();
+
+            // Claim defaults and update cached metrics.
+            (uint256 principal, uint256 interest, uint256 collateral, uint256 elapsed) = Cooler(
+                coolers_[i]
+            ).claimDefaulted(loans_[i]);
+
+            unchecked {
+                // Cannot overflow due to max supply limits for both tokens
+                totalPrincipal += principal;
+                totalInterest += interest;
+                totalCollateral += collateral;
+                // There will not exist more than 2**256 loans
+                ++i;
+            }
+
+            // Cap rewards to 5% of the collateral to avoid OHM holder's dillution.
+            uint256 maxAuctionReward = (collateral * 5e16) / 1e18;
+
+            // Cap rewards to avoid exorbitant amounts.
+            uint256 maxReward = (maxAuctionReward < MAX_REWARD) ? maxAuctionReward : MAX_REWARD;
+
+            // Calculate rewards based on the elapsed time since default.
+            keeperRewards = (elapsed < 7 days)
+                ? keeperRewards + (maxReward * elapsed) / 7 days
+                : keeperRewards + maxReward;
+        }
+
+        // Decrement loan receivables.
+        interestReceivables = (interestReceivables > totalInterest)
+            ? interestReceivables - totalInterest
+            : 0;
+        principalReceivables = (principalReceivables > totalPrincipal)
+            ? principalReceivables - totalPrincipal
+            : 0;
+
+        // Update outstanding debt owed to the Treasury upon default.
+        uint256 outstandingDebt = TRSRY.reserveDebt(dai, address(this));
+
+        // debt owed to TRSRY = user debt - user interest
+        TRSRY.setDebt({
+            debtor_: address(this),
+            token_: dai,
+            amount_: (outstandingDebt > totalPrincipal) ? outstandingDebt - totalPrincipal : 0
+        });
+
+        // Reward keeper.
+        gohm.transfer(msg.sender, keeperRewards);
+        // Burn the outstanding collateral of defaulted loans.
+        burn();
+    }
+
+    // --- CALLBACKS -----------------------------------------------------
+
+    /// @notice Overridden callback to decrement loan receivables.
+    /// @param *unused loadID_ of the load.
+    /// @param  principalPaid_ in DAI.
+    /// @param  interestPaid_ in DAI.
+    function _onRepay(uint256, uint256 principalPaid_, uint256 interestPaid_) internal override {
+        if (active) {
+            _sweepIntoDSR(principalPaid_ + interestPaid_);
+        } else {
+            _defund(dai, principalPaid_ + interestPaid_);
+        }
+
+        // Decrement loan receivables.
+        interestReceivables = (interestReceivables > interestPaid_)
+            ? interestReceivables - interestPaid_
+            : 0;
+        principalReceivables = (principalReceivables > principalPaid_)
+            ? principalReceivables - principalPaid_
+            : 0;
+    }
+
+    /// @notice Unused callback since defaults are handled by the clearinghouse.
+    /// @dev    Overriden and left empty to save gas.
+    function _onDefault(uint256, uint256, uint256, uint256) internal override {}
+
+    // --- FUNDING ---------------------------------------------------
+
+    /// @notice Fund loan liquidity from treasury.
+    /// @dev    Exposure is always capped at FUND_AMOUNT and rebalanced at up to FUND_CADANCE.
+    ///         If several rebalances are available (because some were missed), calling this
+    ///         function several times won't impact the funds controlled by the contract.
+    ///         If the emergency shutdown is triggered, a rebalance will send funds back to
+    ///         the treasury.
+    /// @return False if too early to rebalance. Otherwise, true.
+    function rebalance() public returns (bool) {
+        // If the contract is deactivated, defund.
+        uint256 maxFundAmount = active ? FUND_AMOUNT : 0;
+        // Update funding schedule if necessary.
+        if (fundTime > block.timestamp) return false;
+        fundTime += FUND_CADENCE;
+
+        // Sweep DAI into DSR if necessary.
+        uint256 idle = dai.balanceOf(address(this));
+        if (idle != 0) _sweepIntoDSR(idle);
+
+        uint256 daiBalance = sdai.maxWithdraw(address(this));
+        uint256 outstandingDebt = TRSRY.reserveDebt(dai, address(this));
+        // Rebalance funds on hand with treasury's reserves.
+        if (daiBalance < maxFundAmount) {
+            // Since users loans are denominated in DAI, the clearinghouse
+            // debt is set in DAI terms. It must be adjusted when funding.
+            uint256 fundAmount = maxFundAmount - daiBalance;
+            TRSRY.setDebt({
+                debtor_: address(this),
+                token_: dai,
+                amount_: outstandingDebt + fundAmount
+            });
+
+            // Since TRSRY holds sDAI, a conversion must be done before
+            // funding the clearinghouse.
+            uint256 sdaiAmount = sdai.previewWithdraw(fundAmount);
+            TRSRY.increaseWithdrawApproval(address(this), sdai, sdaiAmount);
+            TRSRY.withdrawReserves(address(this), sdai, sdaiAmount);
+
+            // Log the event.
+            emit Rebalance(false, fundAmount);
+        } else if (daiBalance > maxFundAmount) {
+            // Since users loans are denominated in DAI, the clearinghouse
+            // debt is set in DAI terms. It must be adjusted when defunding.
+            uint256 defundAmount = daiBalance - maxFundAmount;
+            TRSRY.setDebt({
+                debtor_: address(this),
+                token_: dai,
+                amount_: (outstandingDebt > defundAmount) ? outstandingDebt - defundAmount : 0
+            });
+
+            // Since TRSRY holds sDAI, a conversion must be done before
+            // sending sDAI back.
+            uint256 sdaiAmount = sdai.previewWithdraw(defundAmount);
+            sdai.transfer(address(TRSRY), sdaiAmount);
+
+            // Log the event.
+            emit Rebalance(true, defundAmount);
+        }
+
+        return true;
+    }
+
+    /// @notice Sweep excess DAI into vault.
+    function sweepIntoDSR() public {
+        uint256 daiBalance = dai.balanceOf(address(this));
+        _sweepIntoDSR(daiBalance);
+    }
+
+    /// @notice Sweep excess DAI into vault.
+    function _sweepIntoDSR(uint256 amount_) internal {
+        dai.approve(address(sdai), amount_);
+        sdai.deposit(amount_, address(this));
+    }
+
+    /// @notice Return funds to treasury.
+    /// @param  token_ to transfer.
+    /// @param  amount_ to transfer.
+    function defund(ERC20 token_, uint256 amount_) external onlyRole("cooler_overseer") {
+        if (token_ == gohm) revert OnlyBurnable();
+        _defund(token_, amount_);
+    }
+
+    /// @notice Internal function to return funds to treasury.
+    /// @param  token_ to transfer.
+    /// @param  amount_ to transfer.
+    function _defund(ERC20 token_, uint256 amount_) internal {
+        if (token_ == sdai || token_ == dai) {
+            // Since users loans are denominated in DAI, the clearinghouse
+            // debt is set in DAI terms. It must be adjusted when defunding.
+            uint256 outstandingDebt = TRSRY.reserveDebt(dai, address(this));
+            uint256 daiAmount = (token_ == sdai) ? sdai.previewRedeem(amount_) : amount_;
+
+            TRSRY.setDebt({
+                debtor_: address(this),
+                token_: dai,
+                amount_: (outstandingDebt > daiAmount) ? outstandingDebt - daiAmount : 0
+            });
+        }
+
+        // Defund and log the event
+        token_.transfer(address(TRSRY), amount_);
+        emit Defund(address(token_), amount_);
+    }
+
+    /// @notice Public function to burn gOHM.
+    /// @dev    Can be used to burn any gOHM defaulted using the Cooler instead of the Clearinghouse.
+    function burn() public {
+        uint256 gohmBalance = gohm.balanceOf(address(this));
+        // Unstake and burn gOHM holdings.
+        gohm.approve(address(staking), gohmBalance);
+        MINTR.burnOhm(address(this), staking.unstake(address(this), gohmBalance, false, false));
+    }
+
+    /// @notice Deactivate the contract and return funds to treasury.
+    function emergencyShutdown() external onlyRole("emergency_shutdown") {
+        active = false;
+
+        // If necessary, defund sDAI.
+        uint256 sdaiBalance = sdai.balanceOf(address(this));
+        if (sdaiBalance != 0) _defund(sdai, sdaiBalance);
+
+        // If necessary, defund DAI.
+        uint256 daiBalance = dai.balanceOf(address(this));
+        if (daiBalance != 0) _defund(dai, daiBalance);
+
+        emit Deactivate();
+    }
+
+    /// @notice Reactivate the contract.
+    function reactivate() external onlyRole("cooler_overseer") {
+        active = true;
+        fundTime = block.timestamp;
+
+        emit Reactivate();
+    }
+
+    // --- AUX FUNCTIONS ---------------------------------------------
+
+    /// @notice view function computing collateral for a loan amount.
+    function getCollateralForLoan(uint256 principal_) external pure returns (uint256) {
+        return (principal_ * 1e18) / LOAN_TO_COLLATERAL;
+    }
+
+    /// @notice view function computing loan for a collateral amount.
+    /// @param  collateral_ amount of gOHM.
+    /// @return debt (amount to be lent + interest) for a given collateral amount.
+    function getLoanForCollateral(uint256 collateral_) public pure returns (uint256, uint256) {
+        uint256 principal = (collateral_ * LOAN_TO_COLLATERAL) / 1e18;
+        uint256 interest = interestForLoan(principal, DURATION);
+        return (principal, interest);
+    }
+
+    /// @notice view function to compute the interest for given principal amount.
+    /// @param principal_ amount of DAI being lent.
+    /// @param duration_ elapsed time in seconds.
+    function interestForLoan(uint256 principal_, uint256 duration_) public pure returns (uint256) {
+        uint256 interestPercent = (INTEREST_RATE * duration_) / 365 days;
+        return (principal_ * interestPercent) / 1e18;
+    }
+
+    /// @notice Get total receivable DAI for the treasury.
+    ///         Includes both principal and interest.
+    function getTotalReceivables() external view returns (uint256) {
+        return principalReceivables + interestReceivables;
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/solmate/src/mixins/ERC4626.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+import {SafeTransferLib} from "../utils/SafeTransferLib.sol";
+import {FixedPointMathLib} from "../utils/FixedPointMathLib.sol";
+
+/// @notice Minimal ERC4626 tokenized Vault implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/mixins/ERC4626.sol)
+abstract contract ERC4626 is ERC20 {
+    using SafeTransferLib for ERC20;
+    using FixedPointMathLib for uint256;
+
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Deposit(address indexed caller, address indexed owner, uint256 assets, uint256 shares);
+
+    event Withdraw(
+        address indexed caller,
+        address indexed receiver,
+        address indexed owner,
+        uint256 assets,
+        uint256 shares
+    );
+
+    /*//////////////////////////////////////////////////////////////
+                               IMMUTABLES
+    //////////////////////////////////////////////////////////////*/
+
+    ERC20 public immutable asset;
+
+    constructor(
+        ERC20 _asset,
+        string memory _name,
+        string memory _symbol
+    ) ERC20(_name, _symbol, _asset.decimals()) {
+        asset = _asset;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        DEPOSIT/WITHDRAWAL LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function deposit(uint256 assets, address receiver) public virtual returns (uint256 shares) {
+        // Check for rounding error since we round down in previewDeposit.
+        require((shares = previewDeposit(assets)) != 0, "ZERO_SHARES");
+
+        // Need to transfer before minting or ERC777s could reenter.
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+
+        afterDeposit(assets, shares);
+    }
+
+    function mint(uint256 shares, address receiver) public virtual returns (uint256 assets) {
+        assets = previewMint(shares); // No need to check for rounding error, previewMint rounds up.
+
+        // Need to transfer before minting or ERC777s could reenter.
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+
+        afterDeposit(assets, shares);
+    }
+
+    function withdraw(
+        uint256 assets,
+        address receiver,
+        address owner
+    ) public virtual returns (uint256 shares) {
+        shares = previewWithdraw(assets); // No need to check for rounding error, previewWithdraw rounds up.
+
+        if (msg.sender != owner) {
+            uint256 allowed = allowance[owner][msg.sender]; // Saves gas for limited approvals.
+
+            if (allowed != type(uint256).max) allowance[owner][msg.sender] = allowed - shares;
+        }
+
+        beforeWithdraw(assets, shares);
+
+        _burn(owner, shares);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+
+        asset.safeTransfer(receiver, assets);
+    }
+
+    function redeem(
+        uint256 shares,
+        address receiver,
+        address owner
+    ) public virtual returns (uint256 assets) {
+        if (msg.sender != owner) {
+            uint256 allowed = allowance[owner][msg.sender]; // Saves gas for limited approvals.
+
+            if (allowed != type(uint256).max) allowance[owner][msg.sender] = allowed - shares;
+        }
+
+        // Check for rounding error since we round down in previewRedeem.
+        require((assets = previewRedeem(shares)) != 0, "ZERO_ASSETS");
+
+        beforeWithdraw(assets, shares);
+
+        _burn(owner, shares);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+
+        asset.safeTransfer(receiver, assets);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ACCOUNTING LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function totalAssets() public view virtual returns (uint256);
+
+    function convertToShares(uint256 assets) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? assets : assets.mulDivDown(supply, totalAssets());
+    }
+
+    function convertToAssets(uint256 shares) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? shares : shares.mulDivDown(totalAssets(), supply);
+    }
+
+    function previewDeposit(uint256 assets) public view virtual returns (uint256) {
+        return convertToShares(assets);
+    }
+
+    function previewMint(uint256 shares) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? shares : shares.mulDivUp(totalAssets(), supply);
+    }
+
+    function previewWithdraw(uint256 assets) public view virtual returns (uint256) {
+        uint256 supply = totalSupply; // Saves an extra SLOAD if totalSupply is non-zero.
+
+        return supply == 0 ? assets : assets.mulDivUp(supply, totalAssets());
+    }
+
+    function previewRedeem(uint256 shares) public view virtual returns (uint256) {
+        return convertToAssets(shares);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                     DEPOSIT/WITHDRAWAL LIMIT LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function maxDeposit(address) public view virtual returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function maxMint(address) public view virtual returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function maxWithdraw(address owner) public view virtual returns (uint256) {
+        return convertToAssets(balanceOf[owner]);
+    }
+
+    function maxRedeem(address owner) public view virtual returns (uint256) {
+        return balanceOf[owner];
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          INTERNAL HOOKS LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function beforeWithdraw(uint256 assets, uint256 shares) internal virtual {}
+
+    function afterDeposit(uint256 assets, uint256 shares) internal virtual {}
+}
+
+
+// File: src/interfaces/IStaking.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IStaking {
+    function unstake(
+        address to,
+        uint256 amount,
+        bool trigger,
+        bool rebasing
+    ) external returns (uint256);
+}
+
+
+// File: lib/Cooler/src/CoolerFactory.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.15;
+
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {ClonesWithImmutableArgs} from "clones/ClonesWithImmutableArgs.sol";
+
+import {Cooler} from "./Cooler.sol";
+
+/// @title  Cooler Loans Factory.
+/// @notice The Cooler Factory creates new Cooler escrow contracts.
+/// @dev    This contract uses Clones (https://github.com/wighawag/clones-with-immutable-args)
+///         to save gas on deployment.
+contract CoolerFactory {
+    using ClonesWithImmutableArgs for address;
+
+    // --- ERRORS ----------------------------------------------------
+
+    error NotFromFactory();
+    error DecimalsNot18();
+
+    // --- EVENTS ----------------------------------------------------
+
+    /// @notice A global event when a new loan request is created.
+    event RequestLoan(address indexed cooler, address collateral, address debt, uint256 reqID);
+    /// @notice A global event when a loan request is rescinded.
+    event RescindRequest(address indexed cooler, uint256 reqID);
+    /// @notice A global event when a loan request is fulfilled.
+    event ClearRequest(address indexed cooler, uint256 reqID, uint256 loanID);
+    /// @notice A global event when a loan is repaid.
+    event RepayLoan(address indexed cooler, uint256 loanID, uint256 amount);
+    /// @notice A global event when a loan is extended.
+    event ExtendLoan(address indexed cooler, uint256 loanID, uint8 times);
+    /// @notice A global event when the collateral of defaulted loan is claimed.
+    event DefaultLoan(address indexed cooler, uint256 loanID, uint256 amount);
+
+    // -- STATE VARIABLES --------------------------------------------
+
+    /// @notice Cooler reference implementation (deployed on creation to clone from).
+    Cooler public immutable coolerImplementation;
+
+    /// @notice Mapping to validate deployed coolers.
+    mapping(address => bool) public created;
+
+    /// @notice Mapping to prevent duplicate coolers.
+    mapping(address => mapping(ERC20 => mapping(ERC20 => address))) private coolerFor;
+
+    /// @notice Mapping to query Coolers for Collateral-Debt pair.
+    mapping(ERC20 => mapping(ERC20 => address[])) public coolersFor;
+
+    // --- INITIALIZATION --------------------------------------------
+
+    constructor() {
+        coolerImplementation = new Cooler();
+    }
+
+    // --- DEPLOY NEW COOLERS ----------------------------------------
+
+    /// @notice creates a new Escrow contract for collateral and debt tokens.
+    /// @param  collateral_ the token given as collateral.
+    /// @param  debt_ the token to be lent. Interest is denominated in debt tokens.
+    /// @return cooler address of the contract.
+function generateCooler(ERC20 collateral_, ERC20 debt_) external returns (address cooler) {
+    // Return address if cooler exists.
+    cooler = coolerFor[msg.sender][collateral_][debt_];
+
+    // Otherwise generate new cooler.
+    if (cooler == address(0)) {
+        if (collateral_.decimals() != 18 || debt_.decimals() != 18) revert DecimalsNot18();
+        // Clone the cooler implementation.
+        bytes memory coolerData = abi.encodePacked(
+            msg.sender,              // owner
+            address(collateral_),    // collateral
+            address(debt_),          // debt
+            address(this)            // factory
+        );
+        cooler = address(coolerImplementation).clone(coolerData);
+
+        // Update storage accordingly.
+        coolerFor[msg.sender][collateral_][debt_] = cooler;
+        coolersFor[collateral_][debt_].push(cooler);
+        created[cooler] = true;
+    }
+}
+
+    // --- EMIT EVENTS -----------------------------------------------
+
+    /// @notice Ensure that the called is a Cooler.
+    modifier onlyFromFactory {        
+        if (!created[msg.sender]) revert NotFromFactory();
+        _;
+    }
+
+    /// @notice Emit a global event when a new loan request is created.
+    function logRequestLoan(uint256 reqID_) external onlyFromFactory {
+        emit RequestLoan(msg.sender, address(Cooler(msg.sender).collateral()), address(Cooler(msg.sender).debt()), reqID_);
+    }
+
+    /// @notice Emit a global event when a loan request is rescinded.
+    function logRescindRequest(uint256 reqID_) external onlyFromFactory {
+        emit RescindRequest(msg.sender, reqID_);
+    }
+
+    /// @notice Emit a global event when a loan request is fulfilled.
+    function logClearRequest(uint256 reqID_, uint256 loanID_) external onlyFromFactory {
+        emit ClearRequest(msg.sender, reqID_, loanID_);
+    }
+
+    /// @notice Emit a global event when a loan is repaid.
+    function logRepayLoan(uint256 loanID_, uint256 repayment_) external onlyFromFactory {
+        emit RepayLoan(msg.sender, loanID_, repayment_);
+    }
+
+    /// @notice Emit a global event when a loan is extended.
+    function logExtendLoan(uint256 loanID_, uint8 times_) external onlyFromFactory {
+        emit ExtendLoan(msg.sender, loanID_, times_);
+    }
+
+    /// @notice Emit a global event when the collateral of defaulted loan is claimed.
+    function logDefaultLoan(uint256 loanID_, uint256 collateral_) external onlyFromFactory {
+        emit DefaultLoan(msg.sender, loanID_, collateral_);
+    }
+
+    // --- AUX FUNCTIONS ---------------------------------------------
+
+    /// @notice Getter function to get an existing cooler for a given user <> collateral <> debt combination.
+    function getCoolerFor(address user_, address collateral_, address debt_) public view returns (address) {
+        return coolerFor[user_][ERC20(collateral_)][ERC20(debt_)];
+    }
+}
+
+// File: lib/Cooler/src/CoolerCallback.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+import {CoolerFactory} from "./CoolerFactory.sol";
+
+/// @notice Allows for debt issuers to execute logic when a loan is repaid, rolled, or defaulted.
+/// @dev    The three callback functions must be implemented if `isCoolerCallback()` is set to true.
+abstract contract CoolerCallback {
+    // --- ERRORS ----------------------------------------------------
+
+    error OnlyFromFactory();
+
+    // --- INITIALIZATION --------------------------------------------
+
+    CoolerFactory public immutable factory;
+
+    constructor(address coolerFactory_) {
+        factory = CoolerFactory(coolerFactory_);
+    }
+
+    // --- EXTERNAL FUNCTIONS ------------------------------------------------
+
+    /// @notice Informs to Cooler that this contract can handle its callbacks.
+    function isCoolerCallback() external pure returns (bool) {
+        return true;
+    }
+
+    /// @notice Callback function that handles repayments.
+    function onRepay(uint256 loanID_, uint256 principlePaid_, uint256 interestPaid_) external {
+        if (!factory.created(msg.sender)) revert OnlyFromFactory();
+        _onRepay(loanID_, principlePaid_, interestPaid_);
+    }
+
+    /// @notice Callback function that handles defaults.
+    function onDefault(
+        uint256 loanID_,
+        uint256 principle,
+        uint256 interest,
+        uint256 collateral
+    ) external {
+        if (!factory.created(msg.sender)) revert OnlyFromFactory();
+        _onDefault(loanID_, principle, interest, collateral);
+    }
+
+    // --- INTERNAL FUNCTIONS ------------------------------------------------
+
+    /// @notice Callback function that handles repayments. Override for custom logic.
+    function _onRepay(
+        uint256 loanID_,
+        uint256 principlePaid_,
+        uint256 interestPaid_
+    ) internal virtual;
+
+    /// @notice Callback function that handles defaults.
+    function _onDefault(
+        uint256 loanID_,
+        uint256 principle_,
+        uint256 interestDue_,
+        uint256 collateral
+    ) internal virtual;
+}
+
+
+// File: src/modules/ROLES/OlympusRoles.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.15;
+
+import {ROLESv1} from "src/modules/ROLES/ROLES.v1.sol";
+import "src/Kernel.sol";
+
+/// @notice Abstract contract to have the `onlyRole` modifier
+/// @dev    Inheriting this automatically makes ROLES module a dependency
+abstract contract RolesConsumer {
+    ROLESv1 public ROLES;
+
+    modifier onlyRole(bytes32 role_) {
+        ROLES.requireRole(role_, msg.sender);
+        _;
+    }
+}
+
+/// @notice Module that holds multisig roles needed by various policies.
+contract OlympusRoles is ROLESv1 {
+    //============================================================================================//
+    //                                        MODULE SETUP                                        //
+    //============================================================================================//
+
+    constructor(Kernel kernel_) Module(kernel_) {}
+
+    /// @inheritdoc Module
+    function KEYCODE() public pure override returns (Keycode) {
+        return toKeycode("ROLES");
+    }
+
+    /// @inheritdoc Module
+    function VERSION() external pure override returns (uint8 major, uint8 minor) {
+        major = 1;
+        minor = 0;
+    }
+
+    //============================================================================================//
+    //                                       CORE FUNCTIONS                                       //
+    //============================================================================================//
+
+    /// @inheritdoc ROLESv1
+    function saveRole(bytes32 role_, address addr_) external override permissioned {
+        if (hasRole[addr_][role_]) revert ROLES_AddressAlreadyHasRole(addr_, role_);
+
+        ensureValidRole(role_);
+
+        // Grant role to the address
+        hasRole[addr_][role_] = true;
+
+        emit RoleGranted(role_, addr_);
+    }
+
+    /// @inheritdoc ROLESv1
+    function removeRole(bytes32 role_, address addr_) external override permissioned {
+        if (!hasRole[addr_][role_]) revert ROLES_AddressDoesNotHaveRole(addr_, role_);
+
+        hasRole[addr_][role_] = false;
+
+        emit RoleRevoked(role_, addr_);
+    }
+
+    //============================================================================================//
+    //                                       VIEW FUNCTIONS                                       //
+    //============================================================================================//
+
+    /// @inheritdoc ROLESv1
+    function requireRole(bytes32 role_, address caller_) external view override {
+        if (!hasRole[caller_][role_]) revert ROLES_RequireRole(role_);
+    }
+
+    /// @inheritdoc ROLESv1
+    function ensureValidRole(bytes32 role_) public pure override {
+        for (uint256 i = 0; i < 32; ) {
+            bytes1 char = role_[i];
+            if ((char < 0x61 || char > 0x7A) && char != 0x5f && char != 0x00) {
+                revert ROLES_InvalidRole(role_); // a-z only
+            }
+            unchecked {
+                i++;
+            }
+        }
+    }
+}
+
+
+// File: src/modules/TRSRY/TRSRY.v1.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.15;
+
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import "src/Kernel.sol";
+
+/// @notice Treasury holds all other assets under the control of the protocol.
+abstract contract TRSRYv1 is Module {
+    // =========  EVENTS ========= //
+
+    event IncreaseWithdrawApproval(
+        address indexed withdrawer_,
+        ERC20 indexed token_,
+        uint256 newAmount_
+    );
+    event DecreaseWithdrawApproval(
+        address indexed withdrawer_,
+        ERC20 indexed token_,
+        uint256 newAmount_
+    );
+    event Withdrawal(
+        address indexed policy_,
+        address indexed withdrawer_,
+        ERC20 indexed token_,
+        uint256 amount_
+    );
+    event IncreaseDebtorApproval(address indexed debtor_, ERC20 indexed token_, uint256 newAmount_);
+    event DecreaseDebtorApproval(address indexed debtor_, ERC20 indexed token_, uint256 newAmount_);
+    event DebtIncurred(ERC20 indexed token_, address indexed policy_, uint256 amount_);
+    event DebtRepaid(ERC20 indexed token_, address indexed policy_, uint256 amount_);
+    event DebtSet(ERC20 indexed token_, address indexed policy_, uint256 amount_);
+
+    // =========  ERRORS ========= //
+
+    error TRSRY_NoDebtOutstanding();
+    error TRSRY_NotActive();
+
+    // =========  STATE ========= //
+
+    /// @notice Status of the treasury. If false, no withdrawals or debt can be incurred.
+    bool public active;
+
+    /// @notice Mapping of who is approved for withdrawal.
+    /// @dev    withdrawer -> token -> amount. Infinite approval is max(uint256).
+    mapping(address => mapping(ERC20 => uint256)) public withdrawApproval;
+
+    /// @notice Mapping of who is approved to incur debt.
+    /// @dev    debtor -> token -> amount. Infinite approval is max(uint256).
+    mapping(address => mapping(ERC20 => uint256)) public debtApproval;
+
+    /// @notice Total debt for token across all withdrawals.
+    mapping(ERC20 => uint256) public totalDebt;
+
+    /// @notice Debt for particular token and debtor address
+    mapping(ERC20 => mapping(address => uint256)) public reserveDebt;
+
+    // =========  FUNCTIONS ========= //
+
+    modifier onlyWhileActive() {
+        if (!active) revert TRSRY_NotActive();
+        _;
+    }
+
+    /// @notice Increase approval for specific withdrawer addresses
+    function increaseWithdrawApproval(
+        address withdrawer_,
+        ERC20 token_,
+        uint256 amount_
+    ) external virtual;
+
+    /// @notice Decrease approval for specific withdrawer addresses
+    function decreaseWithdrawApproval(
+        address withdrawer_,
+        ERC20 token_,
+        uint256 amount_
+    ) external virtual;
+
+    /// @notice Allow withdrawal of reserve funds from pre-approved addresses.
+    function withdrawReserves(address to_, ERC20 token_, uint256 amount_) external virtual;
+
+    /// @notice Increase approval for someone to accrue debt in order to withdraw reserves.
+    /// @dev    Debt will generally be taken by contracts to allocate treasury funds in yield sources.
+    function increaseDebtorApproval(
+        address debtor_,
+        ERC20 token_,
+        uint256 amount_
+    ) external virtual;
+
+    /// @notice Decrease approval for someone to withdraw reserves as debt.
+    function decreaseDebtorApproval(
+        address debtor_,
+        ERC20 token_,
+        uint256 amount_
+    ) external virtual;
+
+    /// @notice Pre-approved policies can get a loan to perform operations with treasury assets.
+    function incurDebt(ERC20 token_, uint256 amount_) external virtual;
+
+    /// @notice Repay a debtor debt.
+    /// @dev    Only confirmed to safely handle standard and non-standard ERC20s.
+    /// @dev    Can have unforeseen consequences with ERC777. Be careful with ERC777 as reserve.
+    function repayDebt(address debtor_, ERC20 token_, uint256 amount_) external virtual;
+
+    /// @notice An escape hatch for setting debt in special cases, like swapping reserves to another token.
+    function setDebt(address debtor_, ERC20 token_, uint256 amount_) external virtual;
+
+    /// @notice Get total balance of assets inside the treasury + any debt taken out against those assets.
+    function getReserveBalance(ERC20 token_) external view virtual returns (uint256);
+
+    /// @notice Emergency shutdown of withdrawals.
+    function deactivate() external virtual;
+
+    /// @notice Re-activate withdrawals after shutdown.
+    function activate() external virtual;
+}
+
+
+// File: src/modules/MINTR/MINTR.v1.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.15;
+
+import {OlympusERC20Token as OHM} from "src/external/OlympusERC20.sol";
+import "src/Kernel.sol";
+
+/// @notice Wrapper for minting and burning functions of OHM token.
+abstract contract MINTRv1 is Module {
+    // =========  EVENTS ========= //
+
+    event IncreaseMintApproval(address indexed policy_, uint256 newAmount_);
+    event DecreaseMintApproval(address indexed policy_, uint256 newAmount_);
+    event Mint(address indexed policy_, address indexed to_, uint256 amount_);
+    event Burn(address indexed policy_, address indexed from_, uint256 amount_);
+
+    // ========= ERRORS ========= //
+
+    error MINTR_NotApproved();
+    error MINTR_ZeroAmount();
+    error MINTR_NotActive();
+
+    // =========  STATE ========= //
+
+    OHM public ohm;
+
+    /// @notice Status of the minter. If false, minting and burning OHM is disabled.
+    bool public active;
+
+    /// @notice Mapping of who is approved for minting.
+    /// @dev    minter -> amount. Infinite approval is max(uint256).
+    mapping(address => uint256) public mintApproval;
+
+    // =========  FUNCTIONS ========= //
+
+    modifier onlyWhileActive() {
+        if (!active) revert MINTR_NotActive();
+        _;
+    }
+
+    /// @notice Mint OHM to an address.
+    function mintOhm(address to_, uint256 amount_) external virtual;
+
+    /// @notice Burn OHM from an address. Must have approval.
+    function burnOhm(address from_, uint256 amount_) external virtual;
+
+    /// @notice Increase approval for specific withdrawer addresses
+    /// @dev    Policies must explicity request how much they want approved before withdrawing.
+    function increaseMintApproval(address policy_, uint256 amount_) external virtual;
+
+    /// @notice Decrease approval for specific withdrawer addresses
+    function decreaseMintApproval(address policy_, uint256 amount_) external virtual;
+
+    /// @notice Emergency shutdown of minting and burning.
+    function deactivate() external virtual;
+
+    /// @notice Re-activate minting and burning after shutdown.
+    function activate() external virtual;
+}
+
+
+// File: src/Kernel.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.15;
+
+//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████
+//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███
+//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░
+// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████
+// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███
+// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███
+//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████
+//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░
+
+//============================================================================================//
+//                                        GLOBAL TYPES                                        //
+//============================================================================================//
+
+/// @notice Actions to trigger state changes in the kernel. Passed by the executor
+enum Actions {
+    InstallModule,
+    UpgradeModule,
+    ActivatePolicy,
+    DeactivatePolicy,
+    ChangeExecutor,
+    MigrateKernel
+}
+
+/// @notice Used by executor to select an action and a target contract for a kernel action
+struct Instruction {
+    Actions action;
+    address target;
+}
+
+/// @notice Used to define which module functions a policy needs access to
+struct Permissions {
+    Keycode keycode;
+    bytes4 funcSelector;
+}
+
+type Keycode is bytes5;
+
+//============================================================================================//
+//                                       UTIL FUNCTIONS                                       //
+//============================================================================================//
+
+error TargetNotAContract(address target_);
+error InvalidKeycode(Keycode keycode_);
+
+// solhint-disable-next-line func-visibility
+function toKeycode(bytes5 keycode_) pure returns (Keycode) {
+    return Keycode.wrap(keycode_);
+}
+
+// solhint-disable-next-line func-visibility
+function fromKeycode(Keycode keycode_) pure returns (bytes5) {
+    return Keycode.unwrap(keycode_);
+}
+
+// solhint-disable-next-line func-visibility
+function ensureContract(address target_) view {
+    if (target_.code.length == 0) revert TargetNotAContract(target_);
+}
+
+// solhint-disable-next-line func-visibility
+function ensureValidKeycode(Keycode keycode_) pure {
+    bytes5 unwrapped = Keycode.unwrap(keycode_);
+    for (uint256 i = 0; i < 5; ) {
+        bytes1 char = unwrapped[i];
+        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only
+        unchecked {
+            i++;
+        }
+    }
+}
+
+//============================================================================================//
+//                                        COMPONENTS                                          //
+//============================================================================================//
+
+/// @notice Generic adapter interface for kernel access in modules and policies.
+abstract contract KernelAdapter {
+    error KernelAdapter_OnlyKernel(address caller_);
+
+    Kernel public kernel;
+
+    constructor(Kernel kernel_) {
+        kernel = kernel_;
+    }
+
+    /// @notice Modifier to restrict functions to be called only by kernel.
+    modifier onlyKernel() {
+        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);
+        _;
+    }
+
+    /// @notice Function used by kernel when migrating to a new kernel.
+    function changeKernel(Kernel newKernel_) external onlyKernel {
+        kernel = newKernel_;
+    }
+}
+
+/// @notice Base level extension of the kernel. Modules act as independent state components to be
+///         interacted with and mutated through policies.
+/// @dev    Modules are installed and uninstalled via the executor.
+abstract contract Module is KernelAdapter {
+    error Module_PolicyNotPermitted(address policy_);
+
+    constructor(Kernel kernel_) KernelAdapter(kernel_) {}
+
+    /// @notice Modifier to restrict which policies have access to module functions.
+    modifier permissioned() {
+        if (
+            msg.sender == address(kernel) ||
+            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)
+        ) revert Module_PolicyNotPermitted(msg.sender);
+        _;
+    }
+
+    /// @notice 5 byte identifier for a module.
+    function KEYCODE() public pure virtual returns (Keycode) {}
+
+    /// @notice Returns which semantic version of a module is being implemented.
+    /// @return major - Major version upgrade indicates breaking change to the interface.
+    /// @return minor - Minor version change retains backward-compatible interface.
+    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}
+
+    /// @notice Initialization function for the module
+    /// @dev    This function is called when the module is installed or upgraded by the kernel.
+    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.
+    function INIT() external virtual onlyKernel {}
+}
+
+/// @notice Policies are application logic and external interface for the kernel and installed modules.
+/// @dev    Policies are activated and deactivated in the kernel by the executor.
+/// @dev    Module dependencies and function permissions must be defined in appropriate functions.
+abstract contract Policy is KernelAdapter {
+    error Policy_ModuleDoesNotExist(Keycode keycode_);
+
+    constructor(Kernel kernel_) KernelAdapter(kernel_) {}
+
+    /// @notice Easily accessible indicator for if a policy is activated or not.
+    function isActive() external view returns (bool) {
+        return kernel.isPolicyActive(this);
+    }
+
+    /// @notice Function to grab module address from a given keycode.
+    function getModuleAddress(Keycode keycode_) internal view returns (address) {
+        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));
+        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);
+        return moduleForKeycode;
+    }
+
+    /// @notice Define module dependencies for this policy.
+    /// @return dependencies - Keycode array of module dependencies.
+    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}
+
+    /// @notice Function called by kernel to set module function permissions.
+    /// @return requests - Array of keycodes and function selectors for requested permissions.
+    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}
+}
+
+/// @notice Main contract that acts as a central component registry for the protocol.
+/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,
+/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.
+contract Kernel {
+    // =========  EVENTS ========= //
+
+    event PermissionsUpdated(
+        Keycode indexed keycode_,
+        Policy indexed policy_,
+        bytes4 funcSelector_,
+        bool granted_
+    );
+    event ActionExecuted(Actions indexed action_, address indexed target_);
+
+    // =========  ERRORS ========= //
+
+    error Kernel_OnlyExecutor(address caller_);
+    error Kernel_ModuleAlreadyInstalled(Keycode module_);
+    error Kernel_InvalidModuleUpgrade(Keycode module_);
+    error Kernel_PolicyAlreadyActivated(address policy_);
+    error Kernel_PolicyNotActivated(address policy_);
+
+    // =========  PRIVILEGED ADDRESSES ========= //
+
+    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.
+    address public executor;
+
+    // =========  MODULE MANAGEMENT ========= //
+
+    /// @notice Array of all modules currently installed.
+    Keycode[] public allKeycodes;
+
+    /// @notice Mapping of module address to keycode.
+    mapping(Keycode => Module) public getModuleForKeycode;
+
+    /// @notice Mapping of keycode to module address.
+    mapping(Module => Keycode) public getKeycodeForModule;
+
+    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.
+    mapping(Keycode => Policy[]) public moduleDependents;
+
+    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.
+    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;
+
+    /// @notice Module <> Policy Permissions.
+    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission
+    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;
+
+    // =========  POLICY MANAGEMENT ========= //
+
+    /// @notice List of all active policies
+    Policy[] public activePolicies;
+
+    /// @notice Helper to get active policy quickly. Prevents need to loop through array.
+    mapping(Policy => uint256) public getPolicyIndex;
+
+    //============================================================================================//
+    //                                       CORE FUNCTIONS                                       //
+    //============================================================================================//
+
+    constructor() {
+        executor = msg.sender;
+    }
+
+    /// @notice Modifier to check if caller is the executor.
+    modifier onlyExecutor() {
+        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);
+        _;
+    }
+
+    function isPolicyActive(Policy policy_) public view returns (bool) {
+        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;
+    }
+
+    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.
+    function executeAction(Actions action_, address target_) external onlyExecutor {
+        if (action_ == Actions.InstallModule) {
+            ensureContract(target_);
+            ensureValidKeycode(Module(target_).KEYCODE());
+            _installModule(Module(target_));
+        } else if (action_ == Actions.UpgradeModule) {
+            ensureContract(target_);
+            ensureValidKeycode(Module(target_).KEYCODE());
+            _upgradeModule(Module(target_));
+        } else if (action_ == Actions.ActivatePolicy) {
+            ensureContract(target_);
+            _activatePolicy(Policy(target_));
+        } else if (action_ == Actions.DeactivatePolicy) {
+            ensureContract(target_);
+            _deactivatePolicy(Policy(target_));
+        } else if (action_ == Actions.ChangeExecutor) {
+            executor = target_;
+        } else if (action_ == Actions.MigrateKernel) {
+            ensureContract(target_);
+            _migrateKernel(Kernel(target_));
+        }
+
+        emit ActionExecuted(action_, target_);
+    }
+
+    function _installModule(Module newModule_) internal {
+        Keycode keycode = newModule_.KEYCODE();
+
+        if (address(getModuleForKeycode[keycode]) != address(0))
+            revert Kernel_ModuleAlreadyInstalled(keycode);
+
+        getModuleForKeycode[keycode] = newModule_;
+        getKeycodeForModule[newModule_] = keycode;
+        allKeycodes.push(keycode);
+
+        newModule_.INIT();
+    }
+
+    function _upgradeModule(Module newModule_) internal {
+        Keycode keycode = newModule_.KEYCODE();
+        Module oldModule = getModuleForKeycode[keycode];
+
+        if (address(oldModule) == address(0) || oldModule == newModule_)
+            revert Kernel_InvalidModuleUpgrade(keycode);
+
+        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));
+        getKeycodeForModule[newModule_] = keycode;
+        getModuleForKeycode[keycode] = newModule_;
+
+        newModule_.INIT();
+
+        _reconfigurePolicies(keycode);
+    }
+
+    function _activatePolicy(Policy policy_) internal {
+        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));
+
+        // Add policy to list of active policies
+        activePolicies.push(policy_);
+        getPolicyIndex[policy_] = activePolicies.length - 1;
+
+        // Record module dependencies
+        Keycode[] memory dependencies = policy_.configureDependencies();
+        uint256 depLength = dependencies.length;
+
+        for (uint256 i; i < depLength; ) {
+            Keycode keycode = dependencies[i];
+
+            moduleDependents[keycode].push(policy_);
+            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        // Grant permissions for policy to access restricted module functions
+        Permissions[] memory requests = policy_.requestPermissions();
+        _setPolicyPermissions(policy_, requests, true);
+    }
+
+    function _deactivatePolicy(Policy policy_) internal {
+        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));
+
+        // Revoke permissions
+        Permissions[] memory requests = policy_.requestPermissions();
+        _setPolicyPermissions(policy_, requests, false);
+
+        // Remove policy from all policy data structures
+        uint256 idx = getPolicyIndex[policy_];
+        Policy lastPolicy = activePolicies[activePolicies.length - 1];
+
+        activePolicies[idx] = lastPolicy;
+        activePolicies.pop();
+        getPolicyIndex[lastPolicy] = idx;
+        delete getPolicyIndex[policy_];
+
+        // Remove policy from module dependents
+        _pruneFromDependents(policy_);
+    }
+
+    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.
+    /// @dev    New kernel must add in all of the modules and policies via executeAction.
+    /// @dev    NOTE: Data does not get cleared from this kernel.
+    function _migrateKernel(Kernel newKernel_) internal {
+        uint256 keycodeLen = allKeycodes.length;
+        for (uint256 i; i < keycodeLen; ) {
+            Module module = Module(getModuleForKeycode[allKeycodes[i]]);
+            module.changeKernel(newKernel_);
+            unchecked {
+                ++i;
+            }
+        }
+
+        uint256 policiesLen = activePolicies.length;
+        for (uint256 j; j < policiesLen; ) {
+            Policy policy = activePolicies[j];
+
+            // Deactivate before changing kernel
+            policy.changeKernel(newKernel_);
+            unchecked {
+                ++j;
+            }
+        }
+    }
+
+    function _reconfigurePolicies(Keycode keycode_) internal {
+        Policy[] memory dependents = moduleDependents[keycode_];
+        uint256 depLength = dependents.length;
+
+        for (uint256 i; i < depLength; ) {
+            dependents[i].configureDependencies();
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _setPolicyPermissions(
+        Policy policy_,
+        Permissions[] memory requests_,
+        bool grant_
+    ) internal {
+        uint256 reqLength = requests_.length;
+        for (uint256 i = 0; i < reqLength; ) {
+            Permissions memory request = requests_[i];
+            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;
+
+            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _pruneFromDependents(Policy policy_) internal {
+        Keycode[] memory dependencies = policy_.configureDependencies();
+        uint256 depcLength = dependencies.length;
+
+        for (uint256 i; i < depcLength; ) {
+            Keycode keycode = dependencies[i];
+            Policy[] storage dependents = moduleDependents[keycode];
+
+            uint256 origIndex = getDependentIndex[keycode][policy_];
+            Policy lastPolicy = dependents[dependents.length - 1];
+
+            // Swap with last and pop
+            dependents[origIndex] = lastPolicy;
+            dependents.pop();
+
+            // Record new index and delete deactivated policy index
+            getDependentIndex[keycode][lastPolicy] = origIndex;
+            delete getDependentIndex[keycode][policy_];
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "from" argument.
+            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: lib/solmate/src/utils/FixedPointMathLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Arithmetic library with operations for fixed-point numbers.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/FixedPointMathLib.sol)
+/// @author Inspired by USM (https://github.com/usmfum/USM/blob/master/contracts/WadMath.sol)
+library FixedPointMathLib {
+    /*//////////////////////////////////////////////////////////////
+                    SIMPLIFIED FIXED POINT OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal constant MAX_UINT256 = 2**256 - 1;
+
+    uint256 internal constant WAD = 1e18; // The scalar of ETH and most ERC20s.
+
+    function mulWadDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, y, WAD); // Equivalent to (x * y) / WAD rounded down.
+    }
+
+    function mulWadUp(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivUp(x, y, WAD); // Equivalent to (x * y) / WAD rounded up.
+    }
+
+    function divWadDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, WAD, y); // Equivalent to (x * WAD) / y rounded down.
+    }
+
+    function divWadUp(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivUp(x, WAD, y); // Equivalent to (x * WAD) / y rounded up.
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    LOW LEVEL FIXED POINT OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function mulDivDown(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Equivalent to require(denominator != 0 && (y == 0 || x <= type(uint256).max / y))
+            if iszero(mul(denominator, iszero(mul(y, gt(x, div(MAX_UINT256, y)))))) {
+                revert(0, 0)
+            }
+
+            // Divide x * y by the denominator.
+            z := div(mul(x, y), denominator)
+        }
+    }
+
+    function mulDivUp(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Equivalent to require(denominator != 0 && (y == 0 || x <= type(uint256).max / y))
+            if iszero(mul(denominator, iszero(mul(y, gt(x, div(MAX_UINT256, y)))))) {
+                revert(0, 0)
+            }
+
+            // If x * y modulo the denominator is strictly greater than 0,
+            // 1 is added to round up the division of x * y by the denominator.
+            z := add(gt(mod(mul(x, y), denominator), 0), div(mul(x, y), denominator))
+        }
+    }
+
+    function rpow(
+        uint256 x,
+        uint256 n,
+        uint256 scalar
+    ) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            switch x
+            case 0 {
+                switch n
+                case 0 {
+                    // 0 ** 0 = 1
+                    z := scalar
+                }
+                default {
+                    // 0 ** n = 0
+                    z := 0
+                }
+            }
+            default {
+                switch mod(n, 2)
+                case 0 {
+                    // If n is even, store scalar in z for now.
+                    z := scalar
+                }
+                default {
+                    // If n is odd, store x in z for now.
+                    z := x
+                }
+
+                // Shifting right by 1 is like dividing by 2.
+                let half := shr(1, scalar)
+
+                for {
+                    // Shift n right by 1 before looping to halve it.
+                    n := shr(1, n)
+                } n {
+                    // Shift n right by 1 each iteration to halve it.
+                    n := shr(1, n)
+                } {
+                    // Revert immediately if x ** 2 would overflow.
+                    // Equivalent to iszero(eq(div(xx, x), x)) here.
+                    if shr(128, x) {
+                        revert(0, 0)
+                    }
+
+                    // Store x squared.
+                    let xx := mul(x, x)
+
+                    // Round to the nearest number.
+                    let xxRound := add(xx, half)
+
+                    // Revert if xx + half overflowed.
+                    if lt(xxRound, xx) {
+                        revert(0, 0)
+                    }
+
+                    // Set x to scaled xxRound.
+                    x := div(xxRound, scalar)
+
+                    // If n is even:
+                    if mod(n, 2) {
+                        // Compute z * x.
+                        let zx := mul(z, x)
+
+                        // If z * x overflowed:
+                        if iszero(eq(div(zx, x), z)) {
+                            // Revert if x is non-zero.
+                            if iszero(iszero(x)) {
+                                revert(0, 0)
+                            }
+                        }
+
+                        // Round to the nearest number.
+                        let zxRound := add(zx, half)
+
+                        // Revert if zx + half overflowed.
+                        if lt(zxRound, zx) {
+                            revert(0, 0)
+                        }
+
+                        // Return properly scaled zxRound.
+                        z := div(zxRound, scalar)
+                    }
+                }
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        GENERAL NUMBER UTILITIES
+    //////////////////////////////////////////////////////////////*/
+
+    function sqrt(uint256 x) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let y := x // We start y at x, which will help us make our initial estimate.
+
+            z := 181 // The "correct" value is 1, but this saves a multiplication later.
+
+            // This segment is to get a reasonable initial estimate for the Babylonian method. With a bad
+            // start, the correct # of bits increases ~linearly each iteration instead of ~quadratically.
+
+            // We check y >= 2^(k + 8) but shift right by k bits
+            // each branch to ensure that if x >= 256, then y >= 256.
+            if iszero(lt(y, 0x10000000000000000000000000000000000)) {
+                y := shr(128, y)
+                z := shl(64, z)
+            }
+            if iszero(lt(y, 0x1000000000000000000)) {
+                y := shr(64, y)
+                z := shl(32, z)
+            }
+            if iszero(lt(y, 0x10000000000)) {
+                y := shr(32, y)
+                z := shl(16, z)
+            }
+            if iszero(lt(y, 0x1000000)) {
+                y := shr(16, y)
+                z := shl(8, z)
+            }
+
+            // Goal was to get z*z*y within a small factor of x. More iterations could
+            // get y in a tighter range. Currently, we will have y in [256, 256*2^16).
+            // We ensured y >= 256 so that the relative difference between y and y+1 is small.
+            // That's not possible if x < 256 but we can just verify those cases exhaustively.
+
+            // Now, z*z*y <= x < z*z*(y+1), and y <= 2^(16+8), and either y >= 256, or x < 256.
+            // Correctness can be checked exhaustively for x < 256, so we assume y >= 256.
+            // Then z*sqrt(y) is within sqrt(257)/sqrt(256) of sqrt(x), or about 20bps.
+
+            // For s in the range [1/256, 256], the estimate f(s) = (181/1024) * (s+1) is in the range
+            // (1/2.84 * sqrt(s), 2.84 * sqrt(s)), with largest error when s = 1 and when s = 256 or 1/256.
+
+            // Since y is in [256, 256*2^16), let a = y/65536, so that a is in [1/256, 256). Then we can estimate
+            // sqrt(y) using sqrt(65536) * 181/1024 * (a + 1) = 181/4 * (y + 65536)/65536 = 181 * (y + 65536)/2^18.
+
+            // There is no overflow risk here since y < 2^136 after the first branch above.
+            z := shr(18, mul(z, add(y, 65536))) // A mul() is saved from starting z at 181.
+
+            // Given the worst case multiplicative error of 2.84 above, 7 iterations should be enough.
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+
+            // If x+1 is a perfect square, the Babylonian method cycles between
+            // floor(sqrt(x)) and ceil(sqrt(x)). This statement ensures we return floor.
+            // See: https://en.wikipedia.org/wiki/Integer_square_root#Using_only_integer_division
+            // Since the ceil is rare, we save gas on the assignment and repeat division in the rare case.
+            // If you don't care whether the floor or ceil square root is returned, you can remove this statement.
+            z := sub(z, lt(div(x, z), z))
+        }
+    }
+
+    function unsafeMod(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Mod x by y. Note this will return
+            // 0 instead of reverting if y is zero.
+            z := mod(x, y)
+        }
+    }
+
+    function unsafeDiv(uint256 x, uint256 y) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Divide x by y. Note this will return
+            // 0 instead of reverting if y is zero.
+            r := div(x, y)
+        }
+    }
+
+    function unsafeDivUp(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Add 1 to x * y if x % y > 0. Note this will
+            // return 0 instead of reverting if y is zero.
+            z := add(gt(mod(x, y), 0), div(x, y))
+        }
+    }
+}
+
+
+// File: lib/clones-with-immutable-args/src/ClonesWithImmutableArgs.sol
+// SPDX-License-Identifier: BSD
+
+pragma solidity ^0.8.4;
+
+/// @title ClonesWithImmutableArgs
+/// @author wighawag, zefram.eth
+/// @notice Enables creating clone contracts with immutable args
+library ClonesWithImmutableArgs {
+    error CreateFail();
+
+    /// @notice Creates a clone proxy of the implementation contract, with immutable args
+    /// @dev data cannot exceed 65535 bytes, since 2 bytes are used to store the data length
+    /// @param implementation The implementation contract to clone
+    /// @param data Encoded immutable args
+    /// @return instance The address of the created clone
+    function clone(address implementation, bytes memory data)
+        internal
+        returns (address instance)
+    {
+        // unrealistic for memory ptr or data length to exceed 256 bits
+        unchecked {
+            uint256 extraLength = data.length + 2; // +2 bytes for telling how much data there is appended to the call
+            uint256 creationSize = 0x43 + extraLength;
+            uint256 runSize = creationSize - 11;
+            uint256 dataPtr;
+            uint256 ptr;
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                ptr := mload(0x40)
+
+                // -------------------------------------------------------------------------------------------------------------
+                // CREATION (11 bytes)
+                // -------------------------------------------------------------------------------------------------------------
+
+                // 3d          | RETURNDATASIZE        | 0                       | –
+                // 61 runtime  | PUSH2 runtime (r)     | r 0                     | –
+                mstore(
+                    ptr,
+                    0x3d61000000000000000000000000000000000000000000000000000000000000
+                )
+                mstore(add(ptr, 0x02), shl(240, runSize)) // size of the contract running bytecode (16 bits)
+
+                // creation size = 0b
+                // 80          | DUP1                  | r r 0                   | –
+                // 60 creation | PUSH1 creation (c)    | c r r 0                 | –
+                // 3d          | RETURNDATASIZE        | 0 c r r 0               | –
+                // 39          | CODECOPY              | r 0                     | [0-2d]: runtime code
+                // 81          | DUP2                  | 0 c  0                  | [0-2d]: runtime code
+                // f3          | RETURN                | 0                       | [0-2d]: runtime code
+                mstore(
+                    add(ptr, 0x04),
+                    0x80600b3d3981f300000000000000000000000000000000000000000000000000
+                )
+
+                // -------------------------------------------------------------------------------------------------------------
+                // RUNTIME
+                // -------------------------------------------------------------------------------------------------------------
+
+                // 36          | CALLDATASIZE          | cds                     | –
+                // 3d          | RETURNDATASIZE        | 0 cds                   | –
+                // 3d          | RETURNDATASIZE        | 0 0 cds                 | –
+                // 37          | CALLDATACOPY          | –                       | [0, cds] = calldata
+                // 61          | PUSH2 extra           | extra                   | [0, cds] = calldata
+                mstore(
+                    add(ptr, 0x0b),
+                    0x363d3d3761000000000000000000000000000000000000000000000000000000
+                )
+                mstore(add(ptr, 0x10), shl(240, extraLength))
+
+                // 60 0x38     | PUSH1 0x38            | 0x38 extra              | [0, cds] = calldata // 0x38 (56) is runtime size - data
+                // 36          | CALLDATASIZE          | cds 0x38 extra          | [0, cds] = calldata
+                // 39          | CODECOPY              | _                       | [0, cds] = calldata
+                // 3d          | RETURNDATASIZE        | 0                       | [0, cds] = calldata
+                // 3d          | RETURNDATASIZE        | 0 0                     | [0, cds] = calldata
+                // 3d          | RETURNDATASIZE        | 0 0 0                   | [0, cds] = calldata
+                // 36          | CALLDATASIZE          | cds 0 0 0               | [0, cds] = calldata
+                // 61 extra    | PUSH2 extra           | extra cds 0 0 0         | [0, cds] = calldata
+                mstore(
+                    add(ptr, 0x12),
+                    0x603836393d3d3d36610000000000000000000000000000000000000000000000
+                )
+                mstore(add(ptr, 0x1b), shl(240, extraLength))
+
+                // 01          | ADD                   | cds+extra 0 0 0         | [0, cds] = calldata
+                // 3d          | RETURNDATASIZE        | 0 cds 0 0 0             | [0, cds] = calldata
+                // 73 addr     | PUSH20 0x123…         | addr 0 cds 0 0 0        | [0, cds] = calldata
+                mstore(
+                    add(ptr, 0x1d),
+                    0x013d730000000000000000000000000000000000000000000000000000000000
+                )
+                mstore(add(ptr, 0x20), shl(0x60, implementation))
+
+                // 5a          | GAS                   | gas addr 0 cds 0 0 0    | [0, cds] = calldata
+                // f4          | DELEGATECALL          | success 0               | [0, cds] = calldata
+                // 3d          | RETURNDATASIZE        | rds success 0           | [0, cds] = calldata
+                // 82          | DUP3                  | 0 rds success 0         | [0, cds] = calldata
+                // 80          | DUP1                  | 0 0 rds success 0       | [0, cds] = calldata
+                // 3e          | RETURNDATACOPY        | success 0               | [0, rds] = return data (there might be some irrelevant leftovers in memory [rds, cds] when rds < cds)
+                // 90          | SWAP1                 | 0 success               | [0, rds] = return data
+                // 3d          | RETURNDATASIZE        | rds 0 success           | [0, rds] = return data
+                // 91          | SWAP2                 | success 0 rds           | [0, rds] = return data
+                // 60 0x36     | PUSH1 0x36            | 0x36 sucess 0 rds       | [0, rds] = return data
+                // 57          | JUMPI                 | 0 rds                   | [0, rds] = return data
+                // fd          | REVERT                | –                       | [0, rds] = return data
+                // 5b          | JUMPDEST              | 0 rds                   | [0, rds] = return data
+                // f3          | RETURN                | –                       | [0, rds] = return data
+
+                mstore(
+                    add(ptr, 0x34),
+                    0x5af43d82803e903d91603657fd5bf30000000000000000000000000000000000
+                )
+            }
+
+            // -------------------------------------------------------------------------------------------------------------
+            // APPENDED DATA (Accessible from extcodecopy)
+            // (but also send as appended data to the delegatecall)
+            // -------------------------------------------------------------------------------------------------------------
+
+            extraLength -= 2;
+            uint256 counter = extraLength;
+            uint256 copyPtr = ptr + 0x43;
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                dataPtr := add(data, 32)
+            }
+            for (; counter >= 32; counter -= 32) {
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    mstore(copyPtr, mload(dataPtr))
+                }
+
+                copyPtr += 32;
+                dataPtr += 32;
+            }
+            uint256 mask = ~(256**(32 - counter) - 1);
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                mstore(copyPtr, and(mload(dataPtr), mask))
+            }
+            copyPtr += counter;
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                mstore(copyPtr, shl(240, extraLength))
+            }
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                instance := create(0, ptr, creationSize)
+            }
+            if (instance == address(0)) {
+                revert CreateFail();
+            }
+        }
+    }
+}
+
+
+// File: lib/Cooler/src/Cooler.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.15;
+
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {Clone} from "clones/Clone.sol";
+
+import {CoolerFactory} from "./CoolerFactory.sol";
+import {CoolerCallback} from "./CoolerCallback.sol";
+
+// Function sig taken from gOHM contract
+interface IDelegate { function delegate(address to_) external; }
+
+
+/// @title  Cooler Loans.
+/// @notice A Cooler is a smart contract escrow that facilitates fixed-duration, peer-to-peer
+///         loans for a user-defined debt-collateral pair.
+/// @dev    This contract uses Clones (https://github.com/wighawag/clones-with-immutable-args)
+///         to save gas on deployment.
+contract Cooler is Clone {
+    using SafeTransferLib for ERC20;
+
+    // --- ERRORS ----------------------------------------------------
+
+    error OnlyApproved();
+    error Deactivated();
+    error Default();
+    error NotExpired();
+    error NotCoolerCallback();
+
+    // --- DATA STRUCTURES -------------------------------------------
+
+    /// @notice A loan begins with a borrow request.
+    struct Request {
+        uint256 amount;             // Amount to be borrowed.
+        uint256 interest;           // Annualized percentage to be paid as interest.
+        uint256 loanToCollateral;   // Requested loan-to-collateral ratio.
+        uint256 duration;           // Time to repay the loan before it defaults.
+        bool active;                // Any lender can clear an active loan request.
+        address requester;          // The address that created the request.
+    }
+
+    /// @notice A request is converted to a loan when a lender clears it.
+    struct Loan {
+        Request request;        // Loan terms specified in the request.
+        uint256 principal;      // Amount of principal debt owed to the lender.
+        uint256 interestDue;    // Interest owed to the lender.
+        uint256 collateral;     // Amount of collateral pledged.
+        uint256 expiry;         // Time when the loan defaults.
+        address lender;         // Lender's address.
+        address recipient;      // Recipient of repayments.
+        bool callback;          // If this is true, the lender must inherit CoolerCallback.
+    }
+
+    // --- IMMUTABLES ------------------------------------------------
+
+    // This makes the code look prettier.
+    uint256 private constant DECIMALS_INTEREST = 1e18;
+
+    /// @notice This address owns the collateral in escrow.
+    function owner() public pure returns (address _owner) {
+        return _getArgAddress(0x0);
+    }
+
+    /// @notice This token is borrowed against.
+    function collateral() public pure returns (ERC20 _collateral) {
+        return ERC20(_getArgAddress(0x14));
+    }
+
+    /// @notice This token is lent.
+    function debt() public pure returns (ERC20 _debt) {
+        return ERC20(_getArgAddress(0x28));
+    }
+    
+    /// @notice This contract created the Cooler
+    function factory() public pure returns (CoolerFactory _factory) {
+        return CoolerFactory(_getArgAddress(0x3c));
+    }
+
+    // --- STATE VARIABLES -------------------------------------------
+
+    /// @notice Arrays stores all the loan requests.
+    Request[] public requests;
+
+    /// @notice Arrays stores all the granted loans.
+    Loan[] public loans;
+
+    /// @notice Facilitates transfer of lender ownership to new addresses
+    mapping(uint256 => address) public approvals;
+
+    // --- BORROWER --------------------------------------------------
+
+    /// @notice Request a loan with given parameters.
+    ///         Collateral is taken at time of request.
+    /// @param  amount_ of debt tokens to borrow.
+    /// @param  interest_ to pay (annualized % of 'amount_'). Expressed in DECIMALS_INTEREST.
+    /// @param  loanToCollateral_ debt tokens per collateral token pledged. Expressed in 10**collateral().decimals().
+    /// @param  duration_ of loan tenure in seconds.
+    /// @return reqID of the created request. Equivalent to the index of request in requests[].
+    function requestLoan(
+        uint256 amount_,
+        uint256 interest_,
+        uint256 loanToCollateral_,
+        uint256 duration_
+    ) external returns (uint256 reqID) {
+        reqID = requests.length;
+        requests.push(
+            Request({
+                amount: amount_,
+                interest: interest_,
+                loanToCollateral: loanToCollateral_,
+                duration: duration_,
+                active: true,
+                requester: msg.sender
+            })
+        );
+
+        // The collateral is taken upfront. Will be escrowed
+        // until the loan is repaid or defaulted.
+        collateral().safeTransferFrom(
+            msg.sender,
+            address(this),
+            collateralFor(amount_, loanToCollateral_)
+        );
+
+        // Log the event.
+        factory().logRequestLoan(reqID);
+    }
+
+    /// @notice Cancel a loan request and get the collateral back.
+    /// @param  reqID_ index of request in requests[].
+    function rescindRequest(uint256 reqID_) external {
+        if (msg.sender != owner()) revert OnlyApproved();
+
+        Request storage req = requests[reqID_];
+
+        if (!req.active) revert Deactivated();
+
+        // Update storage and send collateral back to the owner.
+        req.active = false;
+        collateral().safeTransfer(owner(), collateralFor(req.amount, req.loanToCollateral));
+
+        // Log the event.
+        factory().logRescindRequest(reqID_);
+    }
+
+    /// @notice Repay a loan to get the collateral back.
+    /// @dev    Despite a malicious lender could reenter with the callback, the
+    ///         usage of `msg.sender` prevents any economical benefit to the
+    ///         attacker, since they would be repaying the loan themselves.
+    /// @param  loanID_ index of loan in loans[].
+    /// @param  repayment_ debt tokens to be repaid.
+    /// @return collateral given back to the borrower.
+    function repayLoan(uint256 loanID_, uint256 repayment_) external returns (uint256) {
+        Loan memory loan = loans[loanID_];
+
+        if (block.timestamp > loan.expiry) revert Default();
+
+        // Cap the repayment to the total debt of the loan
+        uint256 totalDebt = loan.principal + loan.interestDue;
+        if (repayment_ > totalDebt) repayment_ = totalDebt;
+
+        // Need to repay interest first, then any extra goes to paying down principal.
+        uint256 interestPaid;
+        uint256 remainder;
+        if (repayment_ >= loan.interestDue) {
+            remainder = repayment_ - loan.interestDue;
+            interestPaid = loan.interestDue;
+            loan.interestDue = 0;
+        } else {
+            loan.interestDue -= repayment_;
+            interestPaid = repayment_;
+        }
+
+        // We pay back only if user has paid back principal. This can be 0.
+        uint256 decollateralized;
+        if (remainder > 0) {
+            decollateralized = (loan.collateral * remainder) / loan.principal;
+            
+            loan.principal -= remainder;
+            loan.collateral -= decollateralized;
+        }
+
+        // Save updated loan info in storage.
+        loans[loanID_] = loan;
+
+        // Transfer repaid debt back to the lender and collateral back to the owner if applicable
+        debt().safeTransferFrom(msg.sender, loan.recipient, repayment_);
+        if (decollateralized > 0) collateral().safeTransfer(owner(), decollateralized);
+
+        // Log the event.
+        factory().logRepayLoan(loanID_, repayment_);
+
+        // If necessary, trigger lender callback.
+        if (loan.callback) {
+            CoolerCallback(loan.lender).onRepay(loanID_, remainder, interestPaid);
+        }
+
+        return decollateralized;
+    }
+
+    /// @notice Delegate voting power on collateral.
+    /// @param  to_ address to delegate.
+    function delegateVoting(address to_) external {
+        if (msg.sender != owner()) revert OnlyApproved();
+        IDelegate(address(collateral())).delegate(to_);
+    }
+
+    // --- LENDER ----------------------------------------------------
+
+    /// @notice Fill a requested loan as a lender.
+    /// @param  reqID_ index of request in requests[].
+    /// @param  recipient_ address to repay the loan to.
+    /// @param  isCallback_ true if the lender implements the CoolerCallback abstract. False otherwise.
+    /// @return loanID of the granted loan. Equivalent to the index of loan in loans[].
+    function clearRequest(
+        uint256 reqID_,
+        address recipient_,
+        bool isCallback_
+    ) external returns (uint256 loanID) {
+        Request memory req = requests[reqID_];
+
+        // Loan callbacks are only allowed if:
+        //  1. The loan request has been created via a trusted lender.
+        //  2. The lender signals that it implements the CoolerCallback Abstract.
+        bool callback = (isCallback_ && msg.sender == req.requester);
+
+        // If necessary, ensure lender implements the CoolerCallback abstract.
+        if (callback && !CoolerCallback(msg.sender).isCoolerCallback()) revert NotCoolerCallback();
+        // Ensure loan request is active. 
+        if (!req.active) revert Deactivated();
+
+        // Clear the loan request in memory.
+        req.active = false;
+
+        // Calculate and store loan terms.
+        uint256 interest = interestFor(req.amount, req.interest, req.duration);
+        uint256 collat = collateralFor(req.amount, req.loanToCollateral);
+        loanID = loans.length;
+
+        loans.push(
+            Loan({
+                request: req,
+                principal: req.amount,
+                interestDue: interest,
+                collateral: collat,
+                expiry: block.timestamp + req.duration,
+                lender: msg.sender,
+                recipient: recipient_,
+                callback: callback
+            })
+        );
+
+        // Clear the loan request storage.
+        requests[reqID_].active = false;
+
+        // Transfer debt tokens to the owner of the request.
+        debt().safeTransferFrom(msg.sender, owner(), req.amount);
+
+        // Log the event.
+        factory().logClearRequest(reqID_, loanID);
+    }
+
+    /// @notice Allow lender to extend a loan for the borrower. Doesn't require
+    ///         borrower permission because it doesn't have a negative impact for them.
+    /// @dev    Since this function solely impacts the expiration day, the lender
+    ///         should ensure that extension interest payments are done beforehand.
+    /// @param  loanID_ index of loan in loans[].
+    /// @param  times_ that the fixed-term loan duration is extended.
+    function extendLoanTerms(uint256 loanID_, uint8 times_) external {
+        Loan memory loan = loans[loanID_];
+
+        if (msg.sender != loan.lender) revert OnlyApproved();
+        if (block.timestamp > loan.expiry) revert Default();
+
+        // Update loan terms to reflect the extension.
+        loan.expiry += loan.request.duration * times_;
+
+        // Save updated loan info in storage.
+        loans[loanID_] = loan;
+
+        // Log the event.
+        factory().logExtendLoan(loanID_, times_);
+    }
+
+    /// @notice Claim collateral upon loan default.
+    /// @param  loanID_ index of loan in loans[].
+    /// @return defaulted debt by the borrower, collateral kept by the lender, elapsed time since expiry.
+    function claimDefaulted(uint256 loanID_) external returns (uint256, uint256, uint256, uint256) {
+        Loan memory loan = loans[loanID_];
+
+        if (block.timestamp <= loan.expiry) revert NotExpired();
+
+        loans[loanID_].principal = 0;
+        loans[loanID_].interestDue = 0;
+        loans[loanID_].collateral = 0;
+
+        // Transfer defaulted collateral to the lender.
+        collateral().safeTransfer(loan.lender, loan.collateral);
+
+        // Log the event.
+        factory().logDefaultLoan(loanID_, loan.collateral);
+
+        // If necessary, trigger lender callback.
+        if (loan.callback) {
+            CoolerCallback(loan.lender).onDefault(loanID_, loan.principal, loan.interestDue, loan.collateral);
+        }
+
+        return (loan.principal, loan.interestDue, loan.collateral, block.timestamp - loan.expiry);
+    }
+
+    /// @notice Approve transfer of loan ownership rights to a new address.
+    /// @param  to_ address to be approved.
+    /// @param  loanID_ index of loan in loans[].
+    function approveTransfer(address to_, uint256 loanID_) external {
+        if (msg.sender != loans[loanID_].lender) revert OnlyApproved();
+
+        // Update transfer approvals.
+        approvals[loanID_] = to_;
+    }
+
+    /// @notice Execute loan ownership transfer. Must be previously approved by the lender.
+    /// @param  loanID_ index of loan in loans[].
+    function transferOwnership(uint256 loanID_) external {
+        if (msg.sender != approvals[loanID_]) revert OnlyApproved();
+
+        // Update the load lender and the recipient.
+        loans[loanID_].lender = msg.sender;
+        loans[loanID_].recipient = msg.sender;
+        // Callbacks are disabled when transferring ownership.
+        loans[loanID_].callback = false;
+        // Clear transfer approvals.
+        approvals[loanID_] = address(0);
+    }
+
+    /// @notice Allow lender to set repayment recipient of a given loan.
+    /// @param  loanID_ of lender's loan.
+    /// @param  recipient_ reciever of repayments
+    function setRepaymentAddress(uint256 loanID_, address recipient_) external {
+        if (msg.sender != loans[loanID_].lender) revert OnlyApproved();
+
+        // Update the repayment method.
+        loans[loanID_].recipient = recipient_;
+    }
+
+    // --- AUX FUNCTIONS ---------------------------------------------
+
+    /// @notice Compute collateral needed for a desired loan amount at given loan to collateral ratio.
+    /// @param  principal_ amount of debt tokens.
+    /// @param  loanToCollateral_ ratio for loan. Expressed in 10**collateral().decimals().
+    function collateralFor(uint256 principal_, uint256 loanToCollateral_) public view returns (uint256) {
+        return (principal_ * (10 ** collateral().decimals())) / loanToCollateral_;
+    }
+
+    /// @notice Compute interest cost on amount for duration at given annualized rate.
+    /// @param  principal_ amount of debt tokens.
+    /// @param  rate_ of interest (annualized).
+    /// @param  duration_ of the loan in seconds.
+    /// @return Interest in debt token terms.
+    function interestFor(uint256 principal_, uint256 rate_, uint256 duration_) public pure returns (uint256) {
+        uint256 interest = (rate_ * duration_) / 365 days;
+        return (principal_ * interest) / DECIMALS_INTEREST;
+    }
+
+    /// @notice Check if given loan has expired.
+    /// @param  loanID_ index of loan in loans[].
+    /// @return Expiration status.
+    function hasExpired(uint256 loanID_) external view returns (bool) {
+        return block.timestamp > loans[loanID_].expiry;
+    }
+
+    /// @notice Check if a given request is active.
+    /// @param  reqID_ index of request in requests[].
+    /// @return Active status.
+    function isActive(uint256 reqID_) external view returns (bool) {
+        return requests[reqID_].active;
+    }
+
+    /// @notice Getter for Request data as a struct.
+    /// @param  reqID_ index of request in requests[].
+    /// @return Request struct.
+    function getRequest(uint256 reqID_) external view returns (Request memory) {
+        return requests[reqID_];
+    }
+
+    /// @notice Getter for Loan data as a struct.
+    /// @param loanID_ index of loan in loans[].
+    /// @return Loan struct.
+    function getLoan(uint256 loanID_) external view returns (Loan memory) {
+        return loans[loanID_];
+    }
+}
+
+
+// File: src/modules/ROLES/ROLES.v1.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.15;
+
+import "src/Kernel.sol";
+
+abstract contract ROLESv1 is Module {
+    // =========  EVENTS ========= //
+
+    event RoleGranted(bytes32 indexed role_, address indexed addr_);
+    event RoleRevoked(bytes32 indexed role_, address indexed addr_);
+
+    // =========  ERRORS ========= //
+
+    error ROLES_InvalidRole(bytes32 role_);
+    error ROLES_RequireRole(bytes32 role_);
+    error ROLES_AddressAlreadyHasRole(address addr_, bytes32 role_);
+    error ROLES_AddressDoesNotHaveRole(address addr_, bytes32 role_);
+    error ROLES_RoleDoesNotExist(bytes32 role_);
+
+    // =========  STATE ========= //
+
+    /// @notice Mapping for if an address has a policy-defined role.
+    mapping(address => mapping(bytes32 => bool)) public hasRole;
+
+    // =========  FUNCTIONS ========= //
+
+    /// @notice Function to grant policy-defined roles to some address. Can only be called by admin.
+    function saveRole(bytes32 role_, address addr_) external virtual;
+
+    /// @notice Function to revoke policy-defined roles from some address. Can only be called by admin.
+    function removeRole(bytes32 role_, address addr_) external virtual;
+
+    /// @notice "Modifier" to restrict policy function access to certain addresses with a role.
+    /// @dev    Roles are defined in the policy and granted by the ROLES admin.
+    function requireRole(bytes32 role_, address caller_) external virtual;
+
+    /// @notice Function that checks if role is valid (all lower case)
+    function ensureValidRole(bytes32 role_) external pure virtual;
+}
+
+
+// File: src/external/OlympusERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-or-later
+pragma solidity >=0.7.5;
+
+/// @notice Olympus OHM token
+/// @dev This contract is the legacy v2 OHM token. Included in the repo for completeness,
+///      since it is not being changed and is imported in some contracts.
+
+interface IOlympusAuthority {
+    // =========  EVENTS ========= //
+
+    event GovernorPushed(address indexed from, address indexed to, bool _effectiveImmediately);
+    event GuardianPushed(address indexed from, address indexed to, bool _effectiveImmediately);
+    event PolicyPushed(address indexed from, address indexed to, bool _effectiveImmediately);
+    event VaultPushed(address indexed from, address indexed to, bool _effectiveImmediately);
+
+    event GovernorPulled(address indexed from, address indexed to);
+    event GuardianPulled(address indexed from, address indexed to);
+    event PolicyPulled(address indexed from, address indexed to);
+    event VaultPulled(address indexed from, address indexed to);
+
+    // =========  VIEW ========= //
+
+    function governor() external view returns (address);
+
+    function guardian() external view returns (address);
+
+    function policy() external view returns (address);
+
+    function vault() external view returns (address);
+}
+
+// File: types/OlympusAccessControlled.sol
+
+abstract contract OlympusAccessControlled {
+    // =========  EVENTS ========= //
+
+    event AuthorityUpdated(IOlympusAuthority indexed authority);
+
+    string internal UNAUTHORIZED = "UNAUTHORIZED"; // save gas
+
+    // =========  STATE VARIABLES ========= //
+
+    IOlympusAuthority public authority;
+
+    // =========  Constructor ========= //
+
+    constructor(IOlympusAuthority _authority) {
+        authority = _authority;
+        emit AuthorityUpdated(_authority);
+    }
+
+    // =========  MODIFIERS ========= //
+
+    modifier onlyGovernor() {
+        require(msg.sender == authority.governor(), UNAUTHORIZED);
+        _;
+    }
+
+    modifier onlyGuardian() {
+        require(msg.sender == authority.guardian(), UNAUTHORIZED);
+        _;
+    }
+
+    modifier onlyPermitted() {
+        require(msg.sender == authority.policy(), UNAUTHORIZED);
+        _;
+    }
+
+    modifier onlyVault() {
+        require(msg.sender == authority.vault(), UNAUTHORIZED);
+        _;
+    }
+
+    // =========  GOV ONLY ========= //
+
+    function setAuthority(IOlympusAuthority _newAuthority) external onlyGovernor {
+        authority = _newAuthority;
+        emit AuthorityUpdated(_newAuthority);
+    }
+}
+
+// File: cryptography/ECDSA.sol
+
+/**
+ * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.
+ *
+ * These functions can be used to verify that a message was signed by the holder
+ * of the private keys of a given address.
+ */
+library ECDSA {
+    enum RecoverError {
+        NoError,
+        InvalidSignature,
+        InvalidSignatureLength,
+        InvalidSignatureS,
+        InvalidSignatureV
+    }
+
+    function _throwError(RecoverError error) private pure {
+        if (error == RecoverError.NoError) {
+            return; // no error: do nothing
+        } else if (error == RecoverError.InvalidSignature) {
+            revert("ECDSA: invalid signature");
+        } else if (error == RecoverError.InvalidSignatureLength) {
+            revert("ECDSA: invalid signature length");
+        } else if (error == RecoverError.InvalidSignatureS) {
+            revert("ECDSA: invalid signature 's' value");
+        } else if (error == RecoverError.InvalidSignatureV) {
+            revert("ECDSA: invalid signature 'v' value");
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature` or error string. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {toEthSignedMessageHash} on it.
+     *
+     * Documentation for signature generation:
+     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]
+     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(
+        bytes32 hash,
+        bytes memory signature
+    ) internal pure returns (address, RecoverError) {
+        // Check the signature length
+        // - case 65: r,s,v signature (standard)
+        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._
+        if (signature.length == 65) {
+            bytes32 r;
+            bytes32 s;
+            uint8 v;
+            // ecrecover takes the signature parameters, and the only way to get them
+            // currently is to use assembly.
+            assembly {
+                r := mload(add(signature, 0x20))
+                s := mload(add(signature, 0x40))
+                v := byte(0, mload(add(signature, 0x60)))
+            }
+            return tryRecover(hash, v, r, s);
+        } else if (signature.length == 64) {
+            bytes32 r;
+            bytes32 vs;
+            // ecrecover takes the signature parameters, and the only way to get them
+            // currently is to use assembly.
+            assembly {
+                r := mload(add(signature, 0x20))
+                vs := mload(add(signature, 0x40))
+            }
+            return tryRecover(hash, r, vs);
+        } else {
+            return (address(0), RecoverError.InvalidSignatureLength);
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature`. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {toEthSignedMessageHash} on it.
+     */
+    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, signature);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.
+     *
+     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(
+        bytes32 hash,
+        bytes32 r,
+        bytes32 vs
+    ) internal pure returns (address, RecoverError) {
+        bytes32 s;
+        uint8 v;
+        assembly {
+            s := and(vs, 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+            v := add(shr(255, vs), 27)
+        }
+        return tryRecover(hash, v, r, s);
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.
+     *
+     * _Available since v4.2._
+     */
+    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, r, vs);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(
+        bytes32 hash,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal pure returns (address, RecoverError) {
+        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature
+        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines
+        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most
+        // signatures from current libraries generate a unique signature with an s-value in the lower half order.
+        //
+        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept
+        // these malleable signatures as well.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return (address(0), RecoverError.InvalidSignatureS);
+        }
+        if (v != 27 && v != 28) {
+            return (address(0), RecoverError.InvalidSignatureV);
+        }
+
+        // If the signature is valid (and not malleable), return the signer address
+        address signer = ecrecover(hash, v, r, s);
+        if (signer == address(0)) {
+            return (address(0), RecoverError.InvalidSignature);
+        }
+
+        return (signer, RecoverError.NoError);
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     */
+    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Message, created from a `hash`. This
+     * produces hash corresponding to the one signed with the
+     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]
+     * JSON-RPC method as part of EIP-191.
+     *
+     * See {recover}.
+     */
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {
+        // 32 is the length in bytes of hash,
+        // enforced by the type signature above
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Typed Data, created from a
+     * `domainSeparator` and a `structHash`. This produces hash corresponding
+     * to the one signed with the
+     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]
+     * JSON-RPC method as part of EIP-712.
+     *
+     * See {recover}.
+     */
+    function toTypedDataHash(
+        bytes32 domainSeparator,
+        bytes32 structHash
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    }
+}
+
+// File: cryptography/EIP712.sol
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.
+ *
+ * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,
+ * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding
+ * they need in their contracts using a combination of `abi.encode` and `keccak256`.
+ *
+ * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding
+ * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA
+ * ({_hashTypedDataV4}).
+ *
+ * The implementation of the domain separator was designed to be as efficient as possible while still properly updating
+ * the chain id to protect against replay attacks on an eventual fork of the chain.
+ *
+ * NOTE: This contract implements the version of the encoding known as "v4", as implemented by the JSON RPC method
+ * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].
+ *
+ * _Available since v3.4._
+ */
+abstract contract EIP712 {
+    /* solhint-disable var-name-mixedcase */
+    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to
+    // invalidate the cached domain separator if the chain id changes.
+    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;
+    uint256 private immutable _CACHED_CHAIN_ID;
+
+    bytes32 private immutable _HASHED_NAME;
+    bytes32 private immutable _HASHED_VERSION;
+    bytes32 private immutable _TYPE_HASH;
+
+    /* solhint-enable var-name-mixedcase */
+
+    /**
+     * @dev Initializes the domain separator and parameter caches.
+     *
+     * The meaning of `name` and `version` is specified in
+     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:
+     *
+     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.
+     * - `version`: the current major version of the signing domain.
+     *
+     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart
+     * contract upgrade].
+     */
+    constructor(string memory name, string memory version) {
+        uint256 chainID;
+        assembly {
+            chainID := chainid()
+        }
+
+        bytes32 hashedName = keccak256(bytes(name));
+        bytes32 hashedVersion = keccak256(bytes(version));
+        bytes32 typeHash = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        );
+        _HASHED_NAME = hashedName;
+        _HASHED_VERSION = hashedVersion;
+        _CACHED_CHAIN_ID = chainID;
+        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);
+        _TYPE_HASH = typeHash;
+    }
+
+    /**
+     * @dev Returns the domain separator for the current chain.
+     */
+    function _domainSeparatorV4() internal view returns (bytes32) {
+        uint256 chainID;
+        assembly {
+            chainID := chainid()
+        }
+
+        if (chainID == _CACHED_CHAIN_ID) {
+            return _CACHED_DOMAIN_SEPARATOR;
+        } else {
+            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);
+        }
+    }
+
+    function _buildDomainSeparator(
+        bytes32 typeHash,
+        bytes32 nameHash,
+        bytes32 versionHash
+    ) private view returns (bytes32) {
+        uint256 chainID;
+        assembly {
+            chainID := chainid()
+        }
+
+        return keccak256(abi.encode(typeHash, nameHash, versionHash, chainID, address(this)));
+    }
+
+    /**
+     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this
+     * function returns the hash of the fully encoded EIP712 message for this domain.
+     *
+     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:
+     *
+     * ```solidity
+     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(
+     *     keccak256("Mail(address to,string contents)"),
+     *     mailTo,
+     *     keccak256(bytes(mailContents))
+     * )));
+     * address signer = ECDSA.recover(digest, signature);
+     * ```
+     */
+    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {
+        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);
+    }
+}
+
+// File: interfaces/IERC20Permit.sol
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as th xe allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+// File: interfaces/IERC20.sol
+
+interface IERC20 {
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `sender` to `recipient` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+// File: interfaces/IOHM.sol
+
+interface IOHM is IERC20 {
+    function mint(address account_, uint256 amount_) external;
+
+    function burn(uint256 amount) external;
+
+    function burnFrom(address account_, uint256 amount_) external;
+}
+
+// File: libraries/SafeMath.sol
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        assert(a == b * c + (a % b)); // There is no case in which this doesn't hold
+
+        return c;
+    }
+
+    // Only used in the  BondingCalculator.sol
+    function sqrrt(uint256 a) internal pure returns (uint256 c) {
+        if (a > 3) {
+            c = a;
+            uint256 b = add(div(a, 2), 1);
+            while (b < c) {
+                c = b;
+                b = div(add(div(a, b), b), 2);
+            }
+        } else if (a != 0) {
+            c = 1;
+        }
+    }
+}
+
+// File: libraries/Counters.sol
+
+library Counters {
+    using SafeMath for uint256;
+
+    struct Counter {
+        // This variable should never be directly accessed by users of the library: interactions must be restricted to
+        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add
+        // this feature: see https://github.com/ethereum/solidity/issues/4637
+        uint256 _value; // default: 0
+    }
+
+    function current(Counter storage counter) internal view returns (uint256) {
+        return counter._value;
+    }
+
+    function increment(Counter storage counter) internal {
+        // The {SafeMath} overflow check can be skipped here, see the comment at the top
+        counter._value += 1;
+    }
+
+    function decrement(Counter storage counter) internal {
+        counter._value = counter._value.sub(1);
+    }
+}
+
+// File: types/ERC20.sol
+
+abstract contract ERC20 is IERC20 {
+    using SafeMath for uint256;
+
+    // TODO comment actual hash value.
+    bytes32 private constant ERC20TOKEN_ERC1820_INTERFACE_ID = keccak256("ERC20Token");
+
+    mapping(address => uint256) internal _balances;
+
+    mapping(address => mapping(address => uint256)) internal _allowances;
+
+    uint256 internal _totalSupply;
+
+    string internal _name;
+
+    string internal _symbol;
+
+    uint8 internal immutable _decimals;
+
+    constructor(string memory name_, string memory symbol_, uint8 decimals_) {
+        _name = name_;
+        _symbol = symbol_;
+        _decimals = decimals_;
+    }
+
+    function name() public view returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public view returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view virtual returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(
+        address owner,
+        address spender
+    ) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public virtual override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(
+            sender,
+            msg.sender,
+            _allowances[sender][msg.sender].sub(amount, "ERC20: transfer amount exceeds allowance")
+        );
+        return true;
+    }
+
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        _approve(msg.sender, spender, _allowances[msg.sender][spender].add(addedValue));
+        return true;
+    }
+
+    function decreaseAllowance(
+        address spender,
+        uint256 subtractedValue
+    ) public virtual returns (bool) {
+        _approve(
+            msg.sender,
+            spender,
+            _allowances[msg.sender][spender].sub(
+                subtractedValue,
+                "ERC20: decreased allowance below zero"
+            )
+        );
+        return true;
+    }
+
+    function _transfer(address sender, address recipient, uint256 amount) internal virtual {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(sender, recipient, amount);
+
+        _balances[sender] = _balances[sender].sub(amount, "ERC20: transfer amount exceeds balance");
+        _balances[recipient] = _balances[recipient].add(amount);
+        emit Transfer(sender, recipient, amount);
+    }
+
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+        _beforeTokenTransfer(address(0), account, amount);
+        _totalSupply = _totalSupply.add(amount);
+        _balances[account] = _balances[account].add(amount);
+        emit Transfer(address(0), account, amount);
+    }
+
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        _balances[account] = _balances[account].sub(amount, "ERC20: burn amount exceeds balance");
+        _totalSupply = _totalSupply.sub(amount);
+        emit Transfer(account, address(0), amount);
+    }
+
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _beforeTokenTransfer(address from_, address to_, uint256 amount_) internal virtual {}
+}
+
+// File: types/ERC20Permit.sol
+
+/**
+ * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * _Available since v3.4._
+ */
+abstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {
+    using Counters for Counters.Counter;
+
+    mapping(address => Counters.Counter) private _nonces;
+
+    // solhint-disable-next-line var-name-mixedcase
+    bytes32 private immutable _PERMIT_TYPEHASH =
+        keccak256(
+            "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+        );
+
+    /**
+     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `"1"`.
+     *
+     * It's a good idea to use the same `name` that is defined as the ERC20 token name.
+     */
+    constructor(string memory name) EIP712(name, "1") {}
+
+    /**
+     * @dev See {IERC20Permit-permit}.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual override {
+        require(block.timestamp <= deadline, "ERC20Permit: expired deadline");
+
+        bytes32 structHash = keccak256(
+            abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)
+        );
+
+        bytes32 hash = _hashTypedDataV4(structHash);
+
+        address signer = ECDSA.recover(hash, v, r, s);
+        require(signer == owner, "ERC20Permit: invalid signature");
+
+        _approve(owner, spender, value);
+    }
+
+    /**
+     * @dev See {IERC20Permit-nonces}.
+     */
+    function nonces(address owner) public view virtual override returns (uint256) {
+        return _nonces[owner].current();
+    }
+
+    /**
+     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view override returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    /**
+     * @dev "Consume a nonce": return the current value and increment.
+     *
+     * _Available since v4.1._
+     */
+    function _useNonce(address owner) internal virtual returns (uint256 current) {
+        Counters.Counter storage nonce = _nonces[owner];
+        current = nonce.current();
+        nonce.increment();
+    }
+}
+
+// File: OlympusERC20.sol
+
+contract OlympusERC20Token is ERC20Permit, IOHM, OlympusAccessControlled {
+    using SafeMath for uint256;
+
+    constructor(
+        address _authority
+    )
+        ERC20("Olympus", "OHM", 9)
+        ERC20Permit("Olympus")
+        OlympusAccessControlled(IOlympusAuthority(_authority))
+    {}
+
+    function mint(address account_, uint256 amount_) external override onlyVault {
+        _mint(account_, amount_);
+    }
+
+    function burn(uint256 amount) external override {
+        _burn(msg.sender, amount);
+    }
+
+    function burnFrom(address account_, uint256 amount_) external override {
+        _burnFrom(account_, amount_);
+    }
+
+    function _burnFrom(address account_, uint256 amount_) internal {
+        uint256 decreasedAllowance_ = allowance(account_, msg.sender).sub(
+            amount_,
+            "ERC20: burn amount exceeds allowance"
+        );
+
+        _approve(account_, msg.sender, decreasedAllowance_);
+        _burn(account_, amount_);
+    }
+}
+
+
+// File: lib/clones-with-immutable-args/src/Clone.sol
+// SPDX-License-Identifier: BSD
+pragma solidity ^0.8.4;
+
+/// @title Clone
+/// @author zefram.eth
+/// @notice Provides helper functions for reading immutable args from calldata
+contract Clone {
+    /// @notice Reads an immutable arg with type address
+    /// @param argOffset The offset of the arg in the packed data
+    /// @return arg The arg value
+    function _getArgAddress(uint256 argOffset)
+        internal
+        pure
+        returns (address arg)
+    {
+        uint256 offset = _getImmutableArgsOffset();
+        assembly {
+            arg := shr(0x60, calldataload(add(offset, argOffset)))
+        }
+    }
+
+    /// @notice Reads an immutable arg with type uint256
+    /// @param argOffset The offset of the arg in the packed data
+    /// @return arg The arg value
+    function _getArgUint256(uint256 argOffset)
+        internal
+        pure
+        returns (uint256 arg)
+    {
+        uint256 offset = _getImmutableArgsOffset();
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            arg := calldataload(add(offset, argOffset))
+        }
+    }
+
+    /// @notice Reads an immutable arg with type uint64
+    /// @param argOffset The offset of the arg in the packed data
+    /// @return arg The arg value
+    function _getArgUint64(uint256 argOffset)
+        internal
+        pure
+        returns (uint64 arg)
+    {
+        uint256 offset = _getImmutableArgsOffset();
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            arg := shr(0xc0, calldataload(add(offset, argOffset)))
+        }
+    }
+
+    /// @notice Reads an immutable arg with type uint8
+    /// @param argOffset The offset of the arg in the packed data
+    /// @return arg The arg value
+    function _getArgUint8(uint256 argOffset) internal pure returns (uint8 arg) {
+        uint256 offset = _getImmutableArgsOffset();
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            arg := shr(0xf8, calldataload(add(offset, argOffset)))
+        }
+    }
+
+    /// @return offset The offset of the packed immutable args in calldata
+    function _getImmutableArgsOffset() internal pure returns (uint256 offset) {
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            offset := sub(
+                calldatasize(),
+                add(shr(240, calldataload(sub(calldatasize(), 2))), 2)
+            )
+        }
+    }
+}
+

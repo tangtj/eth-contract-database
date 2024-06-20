@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.7.0 <0.9.0;
+
+contract IXTERC20 {
+    event Transfer(address indexed from, address indexed to, uint tokens);
+    event Approval(address indexed tokenOwner, address indexed spender, uint tokens);
+    string public constant name = "IXT Coin";
+    string public constant symbol = "IXT";
+    uint8 private constant decimals = 0;
+    address private tokenOwner;
+    mapping(address => uint256) private balances;
+    mapping(address => mapping (address => uint256)) private allowed;
+    uint256 private totalSupply_;
+    uint256 private transactionFee;
+
+    constructor() {
+      totalSupply_ = 100000000;
+      balances[msg.sender] = totalSupply_;
+      tokenOwner = msg.sender;
+      transactionFee = 5;
+    }
+    function totalSupply() public view returns (uint256) {
+      return totalSupply_;
+    }
+    function setTransactionFee(uint tFee) public returns (uint256) {
+      transactionFee = tFee; 
+      return transactionFee;
+    }
+    function balanceOf(address owner) public view returns (uint) {
+        return balances[owner];
+    }
+    function transfer(address receiver, uint numTokens) public returns (bool) {
+        require(numTokens <= balances[msg.sender]);
+        balances[msg.sender] -= numTokens;
+        balances[receiver] += numTokens;
+        emit Transfer(msg.sender, receiver, numTokens);
+        return true;
+    }
+    function approve(address delegate, uint numTokens) public returns (bool) {
+        allowed[msg.sender][delegate] = numTokens;
+        emit Approval(msg.sender, delegate, numTokens);
+        return true;
+    }
+    function allowance(address owner, address delegate) public view returns (uint) {
+        return allowed[owner][delegate];
+    }
+    function transferFrom(address owner, address buyer, uint numTokens) public returns (bool) {
+        require(numTokens <= balances[owner]);
+        require(numTokens <= allowed[owner][msg.sender]);
+        balances[owner] -= numTokens;
+        allowed[owner][msg.sender] -= numTokens;
+        balances[buyer] += numTokens;
+        emit Transfer(owner, buyer, numTokens);
+        return true;
+    }
+    function mint(address receiver, uint256 numTokens) public returns (bool) {
+        require (msg.sender==tokenOwner);
+        require (numTokens <= 1000);
+        uint256 tFee;
+        if (numTokens >=20){
+            tFee = uint((numTokens*transactionFee)/100);
+            balances[tokenOwner] += tFee;
+        }
+        else{
+            tFee = 1;
+            balances[tokenOwner] += tFee;
+        }
+        balances[receiver] += numTokens;         
+        totalSupply_ += numTokens;
+        totalSupply_ += tFee;
+        emit Transfer(address(0), receiver, numTokens);
+        return true;
+    }
+    function burn(uint256 numTokens) public returns (bool) {
+        require (msg.sender==tokenOwner);
+        require(numTokens <= balances[msg.sender]);
+        balances[tokenOwner] -= numTokens;
+        totalSupply_ -= numTokens;       
+        emit Transfer(tokenOwner, address(0), numTokens);
+        return true;
+    }
+}

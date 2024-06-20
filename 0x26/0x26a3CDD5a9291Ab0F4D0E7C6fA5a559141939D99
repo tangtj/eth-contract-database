@@ -1,0 +1,1448 @@
+
+// File: src/NSTokenizedStakingVault.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {AccessControl} from "./AccessControl.sol";
+import {IDepositContract} from "./IDepositContract.sol";
+import "./BeaconHelpers.sol" as BeaconHelpers;
+import {WithdrawalOracle, ExecutionWithdrawal} from "./WithdrawalOracle.sol";
+
+contract NSTokenizedStakingVault is AccessControl, WithdrawalOracle {
+  // Perhaps this can be optimised with a more compact uint64 set implementation.
+  using EnumerableSet for EnumerableSet.UintSet;
+
+  struct ExitProposal {
+    // Ultimate beneficiary of the final withdrawals
+    address beneficiary;
+    // Indices of the validators to exit
+    uint64[] validatorIndices;
+    // Deadline for the proposal in seconds since epoch
+    uint256 deadline;
+  }
+
+  struct DepositData {
+    bytes pubkey;
+    bytes withdrawalCredentials;
+    bytes signature;
+    bytes32 depositDataRoot;
+  }
+
+  bytes32 public constant DEPOSITOR_ROLE = keccak256("DEPOSITOR_ROLE");
+  bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+  bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+
+  error NoMev();
+  error AccessDenied();
+  error InvalidWithdrawalCredentials();
+  error InsufficientFunds();
+  error ProposalExpired();
+
+  /// @notice Emitted when a depositor sends funds to the vault. This should prompt the operator to queue validators for activation.
+  event Deposit(address indexed depositor, uint256 amount);
+
+  /// @notice Emitted when a validator is queued for activation after forwarding Eth to the deposit contract.
+  event ValidatorQueued(bytes pubkey);
+
+  /// @notice Emitted when a validator is accepted for exit by the depositor. This should prompt the operator to broadcast a voluntary exit.
+  event Exit(uint64 indexed validatorIndex);
+  /// @notice Whether the vault accepts MEV rewards. Can be read by the operator for node configuration.
+
+  bool public immutable isMevEnabled;
+
+  /// @notice The withdrawal credentials for the deposit contract. Can be read by the operator when generating deposit data.
+  bytes32 public immutable withdrawalCredential;
+
+  /// @notice The deposit contract for the beacon chain.
+  IDepositContract immutable depositContract;
+
+  /// @notice The address to send rewards to. Defaults to the vault itself. Can be updated by the depositor with `setRewardsRecipient`.
+  address payable public rewardsRecipient;
+
+  /// @notice The total amount of eth pending in the vault.
+  uint256 public pendingDeposits;
+
+  mapping(bytes32 id => ExitProposal) public exitProposals;
+
+  mapping(address beneficiary => EnumerableSet.UintSet) private _claims;
+
+  /// @param _depositContract The deposit contract for the beacon chain.
+  /// @param _isMevEnabled Whether the vault accepts MEV rewards.
+  constructor(IDepositContract _depositContract, bool _isMevEnabled) {
+    depositContract = _depositContract;
+    isMevEnabled = _isMevEnabled;
+    rewardsRecipient = payable(address(this));
+    withdrawalCredential = BeaconHelpers.eth1WithdrawalCredential(address(this));
+
+    _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+    _grantRole(OPERATOR_ROLE, msg.sender);
+    _grantRole(AccessControl.ROLE_PROPOSER_ROLE, msg.sender);
+  }
+
+  /// @notice Returns the total rewards available for harvesting.
+  /// @dev This is the total balance of the contract minus the pending deposits and pending withdrawals at the current block.
+  function rewards() public view returns (uint256) {
+    uint256 reserved = pendingDeposits + pendingWithdrawals();
+    // In case of underflow, return 0
+    if (address(this).balance < reserved) return 0;
+    return address(this).balance - reserved;
+  }
+
+  /// @notice Returns the total withdrawals available from the current block
+  function pendingWithdrawals() public view returns (uint256) {
+    return WithdrawalOracle._sum(uint64(block.number)) * 1 gwei;
+  }
+
+  /// @notice Deposit funds into the staking vault for validator creation.
+  function deposit() external payable onlyRole(DEPOSITOR_ROLE) {
+    pendingDeposits += msg.value;
+    emit Deposit(msg.sender, msg.value);
+  }
+
+  /// @notice Withdraw funds from the staking vault before they are used for validator creation.
+  function withdrawDeposit(uint256 wad) external onlyRole(DEPOSITOR_ROLE) {
+    if (wad > pendingDeposits) revert InsufficientFunds();
+
+    pendingDeposits -= wad;
+    payable(msg.sender).transfer(wad);
+  }
+
+  /// @notice Set the rewards recipient for the vault.
+  function setRewardsRecipient(address payable recipient) external onlyRole(DEPOSITOR_ROLE) {
+    rewardsRecipient = recipient;
+  }
+
+  /// @dev Harvest any accumulated rewards.
+  function collectRewards() external {
+    rewardsRecipient.transfer(rewards());
+  }
+
+  /// @notice Default function for receiving Ether (ie. MEV rewards)
+  receive() external payable {
+    if (isMevEnabled == false) revert NoMev();
+  }
+
+  /// @notice Helper function for deriving the deterministic id of an exit proposal.
+  function exitProposalId(ExitProposal calldata proposal) public pure returns (bytes32) {
+    return keccak256(abi.encode(proposal));
+  }
+
+  /// @notice Propose an exit for a list of validators. Note that the proposal must have the list of validators deterministically sorted, whether numerically or (preferably) by first available withdrawal. Making two proposals with the same validator indices will lead to undefined behaviour when claiming withdrawals.
+  function proposeExit(ExitProposal calldata proposal) external onlyRole(OPERATOR_ROLE) returns (bytes32) {
+    bytes32 id = exitProposalId(proposal);
+    exitProposals[id] = proposal;
+    return id;
+  }
+
+  /// @notice Accepts an exit proposal, assigning future withdrawals for the specific validators to the beneficiary.
+  function acceptExit(bytes32 proposalId) external onlyRole(DEPOSITOR_ROLE) {
+    ExitProposal memory proposal = exitProposals[proposalId];
+    delete exitProposals[proposalId];
+    if (proposal.deadline < block.timestamp) revert ProposalExpired();
+
+    for (uint256 i = 0; i < proposal.validatorIndices.length; i++) {
+      _claims[proposal.beneficiary].add(proposal.validatorIndices[i]);
+      emit Exit(proposal.validatorIndices[i]);
+    }
+  }
+
+  /// @notice Rejects an exit proposal, either by the depositor or if the deadline has passed.
+  /// @param proposalId The id of the proposal to reject.
+  function rejectExit(bytes32 proposalId) external {
+    if (hasRole(DEPOSITOR_ROLE, _msgSender())) delete exitProposals[proposalId];
+    if (exitProposals[proposalId].deadline >= block.timestamp) delete exitProposals[proposalId];
+  }
+
+  /// @notice Transfers pending claims for specific beneficiary.
+  /// @param beneficiary The beneficiary of the claims.
+  function claimWithdrawals(address beneficiary) external {
+    uint256 len = _claims[beneficiary].length();
+    uint256 gweiSum = 0;
+    for (uint256 i = 0; i < len; i++) {
+      uint64 index = uint64(_claims[beneficiary].at(i));
+      ExecutionWithdrawal memory withdrawal = validatorWithdrawals[index];
+
+      if (withdrawal.blockNumber >= block.number) {
+        WithdrawalOracle._delete(index, withdrawal);
+        _claims[beneficiary].remove(index);
+        gweiSum += withdrawal.amountGwei;
+      }
+    }
+
+    if (gweiSum > 0) payable(beneficiary).transfer(gweiSum * 1 gwei);
+  }
+
+  /// @notice Queue a batch of validators for activation. See the singular function for more details.
+  /// @param deposits The list of deposits to queue.
+  /// @dev This function is only callable by the operator role.
+  function queueValidator(DepositData[] calldata deposits) external onlyRole(OPERATOR_ROLE) {
+    for (uint256 i = 0; i < deposits.length; i++) {
+      this.queueValidator(deposits[i]);
+    }
+  }
+
+  /// @notice Queue a validator for activation by forwarding 32 eth and the deposit data to the deposit contract. Notice the withdrawal credentials must match the vault's credentials.
+  /// @param _deposit The deposit data for the validator.
+  /// @dev This function is only callable by the operator role.
+  function queueValidator(DepositData calldata _deposit) external onlyRole(OPERATOR_ROLE) {
+    bool isValidCredential = bytes32(_deposit.withdrawalCredentials) == withdrawalCredential;
+    if (isValidCredential == false) {
+      revert InvalidWithdrawalCredentials();
+    }
+    if (pendingDeposits < 32 ether) revert InsufficientFunds();
+
+    pendingDeposits -= 32 ether;
+    depositContract.deposit{value: 32 ether}(
+      _deposit.pubkey, _deposit.withdrawalCredentials, _deposit.signature, _deposit.depositDataRoot
+    );
+    emit ValidatorQueued(_deposit.pubkey);
+  }
+
+  struct Withdrawal {
+    uint64 validatorIndex;
+    uint64 blockNumber;
+    uint48 amountGwei;
+  }
+
+  /// @notice Update a batch of withdrawals for validators available at specific blocks. Note that the transaction costs are minimized by sorting the withdrawals from first to last. See the singular function for more details.
+  /// @param withdrawals The list of withdrawals to update.
+  /// @dev This function is only callable by the oracle role.
+  function updateWithdrawal(Withdrawal[] calldata withdrawals) external onlyRole(ORACLE_ROLE) {
+    for (uint256 i = 0; i < withdrawals.length; i++) {
+      WithdrawalOracle._upsert(withdrawals[i].validatorIndex, withdrawals[i].blockNumber, withdrawals[i].amountGwei);
+    }
+  }
+
+  /// @notice Update a withdrawal for a validator available at a specific block. Errorneous updates can be changed by posting another update with the correct block/amount. An update with amount and block 0 will remove the withdrawal.
+  /// @param validatorIndex The index of the validator
+  /// @param blockNumber The block number when the withdrawal will be executed.
+  /// @param amountGwei The amount of Gwei that will be withdrawn.
+  /// @dev This function is only callable by the oracle role.
+  function updateWithdrawal(uint64 validatorIndex, uint64 blockNumber, uint48 amountGwei)
+    external
+    onlyRole(ORACLE_ROLE)
+  {
+    WithdrawalOracle._upsert(validatorIndex, blockNumber, amountGwei);
+  }
+}
+
+
+// File: src/WithdrawalOracle.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {CumulativeSum} from "./CumulativeSum.sol";
+
+struct ExecutionWithdrawal {
+  // Using smaller types for compactness
+  uint64 blockNumber;
+  uint48 amountGwei;
+}
+
+abstract contract WithdrawalOracle {
+  using CumulativeSum for CumulativeSum.Storage;
+
+  mapping(uint64 validatorIndex => ExecutionWithdrawal) public validatorWithdrawals;
+  CumulativeSum.Storage private _cumulativeWithdrawals;
+
+  uint64 internal constant UNSET_BLOCK_NUMBER = 0;
+
+  function _sum(uint64 blockNumber) internal view returns (uint256) {
+    return _cumulativeWithdrawals.sum(blockNumber);
+  }
+
+  /// @notice Update the withdrawal amount for a validator
+  /// @dev This functions supports insertions, updates and deletions of withdrawals. Deletions happen by setting the blockNumber and amountGwei to 0.
+  /// @param validatorIndex The index of the validator
+  /// @param blockNumber The block number when the withdrawal will be executed.
+  /// @param amountGwei The amount of Gwei that will be withdrawn.
+  function _upsert(uint64 validatorIndex, uint64 blockNumber, uint48 amountGwei) internal {
+    if (blockNumber == UNSET_BLOCK_NUMBER) return _delete(validatorIndex);
+    // This function maintains two data structures:
+    // - validatorWithdrawals: simple KV mapping from validatorIndex to ExecutionWithdrawal that can be
+    //                       overwritten in place
+    // - _cumulativeWithdrawals: an aggregated sum per block of reserved withdrawal amounts.
+    //                           Values here must be carefully update, deducting any difference in case of
+    //                           an update rather than a new insert
+    ExecutionWithdrawal storage w = validatorWithdrawals[validatorIndex];
+    if (blockNumber == UNSET_BLOCK_NUMBER) return _delete(validatorIndex, w);
+
+    uint48 prevAmount = w.amountGwei;
+
+    // In place update
+    if (w.blockNumber == blockNumber) {
+      if (prevAmount == amountGwei) return; // you just did an expensive no-op
+
+      w.amountGwei = amountGwei;
+
+      if (prevAmount > amountGwei) {
+        _cumulativeWithdrawals.sub(blockNumber, prevAmount - amountGwei);
+      } else {
+        _cumulativeWithdrawals.add(blockNumber, amountGwei - prevAmount);
+      }
+      return;
+    }
+
+    // Clean up previous withdrawal
+    if (w.blockNumber != UNSET_BLOCK_NUMBER) {
+      _cumulativeWithdrawals.sub(w.blockNumber, prevAmount);
+    }
+
+    validatorWithdrawals[validatorIndex] = ExecutionWithdrawal({blockNumber: blockNumber, amountGwei: amountGwei});
+    if (blockNumber > 0) _cumulativeWithdrawals.add(blockNumber, amountGwei);
+  }
+
+  function _delete(uint64 validatorIndex, ExecutionWithdrawal memory w) internal {
+    delete validatorWithdrawals[validatorIndex];
+    _cumulativeWithdrawals.sub(w.blockNumber, w.amountGwei);
+  }
+
+  function _delete(uint64 validatorIndex) internal {
+    ExecutionWithdrawal memory w = validatorWithdrawals[validatorIndex];
+    return _delete(validatorIndex, w);
+  }
+}
+
+
+// File: src/BeaconHelpers.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+bytes1 constant ETH1_ADDRESS_WITHDRAWAL_PREFIX = 0x01;
+
+function eth1WithdrawalCredential(address executionAddress) pure returns (bytes32) {
+  return bytes32(abi.encodePacked(ETH1_ADDRESS_WITHDRAWAL_PREFIX, bytes11(0x00), executionAddress));
+}
+
+
+// File: src/IDepositContract.sol
+// ┏━━━┓━┏┓━┏┓━━┏━━━┓━━┏━━━┓━━━━┏━━━┓━━━━━━━━━━━━━━━━━━━┏┓━━━━━┏━━━┓━━━━━━━━━┏┓━━━━━━━━━━━━━━┏┓━
+// ┃┏━━┛┏┛┗┓┃┃━━┃┏━┓┃━━┃┏━┓┃━━━━┗┓┏┓┃━━━━━━━━━━━━━━━━━━┏┛┗┓━━━━┃┏━┓┃━━━━━━━━┏┛┗┓━━━━━━━━━━━━┏┛┗┓
+// ┃┗━━┓┗┓┏┛┃┗━┓┗┛┏┛┃━━┃┃━┃┃━━━━━┃┃┃┃┏━━┓┏━━┓┏━━┓┏━━┓┏┓┗┓┏┛━━━━┃┃━┗┛┏━━┓┏━┓━┗┓┏┛┏━┓┏━━┓━┏━━┓┗┓┏┛
+// ┃┏━━┛━┃┃━┃┏┓┃┏━┛┏┛━━┃┃━┃┃━━━━━┃┃┃┃┃┏┓┃┃┏┓┃┃┏┓┃┃━━┫┣┫━┃┃━━━━━┃┃━┏┓┃┏┓┃┃┏┓┓━┃┃━┃┏┛┗━┓┃━┃┏━┛━┃┃━
+// ┃┗━━┓━┃┗┓┃┃┃┃┃┃┗━┓┏┓┃┗━┛┃━━━━┏┛┗┛┃┃┃━┫┃┗┛┃┃┗┛┃┣━━┃┃┃━┃┗┓━━━━┃┗━┛┃┃┗┛┃┃┃┃┃━┃┗┓┃┃━┃┗┛┗┓┃┗━┓━┃┗┓
+// ┗━━━┛━┗━┛┗┛┗┛┗━━━┛┗┛┗━━━┛━━━━┗━━━┛┗━━┛┃┏━┛┗━━┛┗━━┛┗┛━┗━┛━━━━┗━━━┛┗━━┛┗┛┗┛━┗━┛┗┛━┗━━━┛┗━━┛━┗━┛
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┃┃━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┗┛━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// SPDX-License-Identifier: CC0-1.0
+
+pragma solidity *;
+
+// This interface is designed to be compatible with the Vyper version.
+/// @notice This is the Ethereum 2.0 deposit contract interface.
+/// For more information see the Phase 0 specification under https://github.com/ethereum/eth2.0-specs
+interface IDepositContract {
+  /// @notice A processed deposit event.
+  event DepositEvent(bytes pubkey, bytes withdrawal_credentials, bytes amount, bytes signature, bytes index);
+
+  /// @notice Submit a Phase 0 DepositData object.
+  /// @param pubkey A BLS12-381 public key.
+  /// @param withdrawal_credentials Commitment to a public key for withdrawals.
+  /// @param signature A BLS12-381 signature.
+  /// @param deposit_data_root The SHA-256 hash of the SSZ-encoded DepositData object.
+  /// Used as a protection against malformed input.
+  function deposit(
+    bytes calldata pubkey,
+    bytes calldata withdrawal_credentials,
+    bytes calldata signature,
+    bytes32 deposit_data_root
+  ) external payable;
+
+  /// @notice Query the current deposit root hash.
+  /// @return The deposit root hash.
+  function get_deposit_root() external view returns (bytes32);
+
+  /// @notice Query the current deposit count.
+  /// @return The deposit count encoded as a little endian 64-bit number.
+  function get_deposit_count() external view returns (bytes memory);
+}
+
+
+// File: src/AccessControl.sol
+// // SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {AccessControlEnumerable as Base} from "@openzeppelin/contracts/access/extensions/AccessControlEnumerable.sol";
+import {AccessControl as OZAccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
+contract AccessControl is Base {
+  bytes32 constant ROLE_PROPOSER_ROLE = keccak256("ROLE_PROPOSER_ROLE");
+
+  using EnumerableSet for EnumerableSet.AddressSet;
+
+  event AccessControlProposedRole(bytes32 role, address account);
+  event AccessControlAcceptedRole(bytes32 role, address account);
+  event AccessControlRejectedRole(bytes32 role, address account);
+
+  mapping(bytes32 role => EnumerableSet.AddressSet) private _roleProposals;
+
+  modifier anyOfRoles2(bytes32 role1, bytes32 role2) {
+    if (!hasRole(role1, _msgSender()) && !hasRole(role2, _msgSender())) {
+      revert AccessControlUnauthorizedAccount(_msgSender(), role1);
+    }
+
+    _;
+  }
+
+  /// @dev This functionality has been disabled.
+  function renounceRole(bytes32, address) public pure override(OZAccessControl, IAccessControl) {
+    revert AccessControlBadConfirmation();
+  }
+
+  function getRoleProposal(bytes32 role, uint256 index) public view returns (address) {
+    return _roleProposals[role].at(index);
+  }
+
+  function getRoleProposalsCount(bytes32 role) public view returns (uint256) {
+    return _roleProposals[role].length();
+  }
+
+  function proposeRole(bytes32 role, address account) public onlyRole(ROLE_PROPOSER_ROLE) {
+    _roleProposals[role].add(account);
+    emit AccessControlProposedRole(role, account);
+  }
+
+  function acceptRole(bytes32 role, address account) public onlyRole(getRoleAdmin(role)) {
+    _roleProposals[role].remove(account);
+    _grantRole(role, account);
+    emit AccessControlAcceptedRole(role, account);
+  }
+
+  function rejectRole(bytes32 role, address account) public anyOfRoles2(ROLE_PROPOSER_ROLE, getRoleAdmin(role)) {
+    _roleProposals[role].remove(account);
+    emit AccessControlRejectedRole(role, account);
+  }
+}
+
+
+// File: @openzeppelin/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position is the index of the value in the `values` array plus 1.
+        // Position 0 is used to mean a value is not in the set.
+        mapping(bytes32 value => uint256) _positions;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._positions[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We cache the value's position to prevent multiple reads from the same storage slot
+        uint256 position = set._positions[value];
+
+        if (position != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 valueIndex = position - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (valueIndex != lastIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the lastValue to the index where the value to delete is
+                set._values[valueIndex] = lastValue;
+                // Update the tracked position of the lastValue (that was just moved)
+                set._positions[lastValue] = position;
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the tracked position for the deleted slot
+            delete set._positions[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._positions[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: src/CumulativeSum.sol
+// // SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+/// @title CumulativeSum
+/// @notice This library implements a cumulative sum of uint64 amounts over sparse block numbers
+/// @dev The implementation uses a double linked list internally. Appending and removing from the front are assumed likely operations.
+library CumulativeSum {
+  // uint64 has capacity for 7 billion years of blocks at 12s per block
+  struct Storage {
+    uint64 head;
+    uint64 tail;
+    mapping(uint64 => Node) nodes;
+  }
+
+  // uint64 has capacity for 281k ETH per block
+  // uint64 has capacity for 1633 years of block gaps
+  struct Node {
+    uint64 sum;
+    uint64 nextOffset;
+    uint64 prevOffset;
+  }
+
+  function add(Storage storage self, uint64 blockNumber, uint64 amount) internal {
+    if (amount == 0) return;
+
+    assert(blockNumber > 0);
+    // Optimistically update the sum, as the default values are 0 in EVM
+    Node storage cur = self.nodes[blockNumber];
+    uint64 prevSum = cur.sum;
+    cur.sum = prevSum + amount;
+
+    // This was an update
+    if (prevSum > 0) return;
+
+    // Base case. head == 0 implies tail == 0
+    if (self.head == 0) {
+      self.head = blockNumber;
+      self.tail = blockNumber;
+      return;
+    }
+
+    // append
+    if (blockNumber > self.tail) {
+      uint64 delta = blockNumber - self.tail;
+      cur.prevOffset = delta;
+      self.nodes[self.tail].nextOffset = delta;
+      self.tail = blockNumber;
+      return;
+    }
+
+    // prepend
+    if (blockNumber < self.head) {
+      uint64 delta = self.head - blockNumber;
+      cur.nextOffset = delta;
+      self.nodes[self.head].prevOffset = delta;
+      self.head = blockNumber;
+      return;
+    }
+
+    // find insertion point, starting from the tail
+    uint64 lo = self.tail;
+    uint64 hi = blockNumber;
+    while (true) {
+      // Assumptions covered by branches above;
+      //   lo != blockNumber (that would imply the node already exists)
+      //   lo > 0 (that would imply we can reach the head)
+      if (lo < blockNumber) break;
+      hi = lo;
+      lo = lo - self.nodes[lo].prevOffset;
+    }
+
+    uint64 deltaBefore = blockNumber - lo;
+    uint64 deltaAfter = hi - blockNumber;
+    self.nodes[lo].nextOffset = deltaBefore;
+    cur.prevOffset = deltaBefore;
+    cur.nextOffset = deltaAfter;
+    self.nodes[hi].prevOffset = deltaAfter;
+  }
+
+  function sub(Storage storage self, uint64 blockNumber, uint64 amount) internal {
+    if (amount == 0) return;
+
+    Node storage cur = self.nodes[blockNumber];
+    assert(cur.sum >= amount);
+    cur.sum -= amount;
+
+    if (cur.sum == 0) {
+      (uint64 nextOffset, uint64 prevOffset) = (cur.nextOffset, cur.prevOffset);
+      delete self.nodes[blockNumber];
+
+      // Pointer fixup
+      if (nextOffset == 0 && prevOffset == 0) {
+        self.head = 0;
+        self.tail = 0;
+        return;
+      }
+
+      if (nextOffset == 0) {
+        self.tail = blockNumber - prevOffset;
+        self.nodes[self.tail].nextOffset = 0;
+        return;
+      }
+
+      if (prevOffset == 0) {
+        self.head = blockNumber + nextOffset;
+        self.nodes[self.head].prevOffset = 0;
+        return;
+      }
+
+      uint64 prev = blockNumber - prevOffset;
+      uint64 next = blockNumber + nextOffset;
+      uint64 delta = next - prev;
+      self.nodes[prev].nextOffset = delta;
+      self.nodes[next].prevOffset = delta;
+    }
+  }
+
+  function sum(Storage storage self, uint64 blockNumber) internal view returns (uint256) {
+    if (self.head == 0) return 0;
+    if (self.head > blockNumber) return 0;
+
+    uint256 _sum = 0;
+    uint64 next = self.head;
+    while (true) {
+      Node memory cur = self.nodes[next];
+      _sum += cur.sum;
+      if (cur.nextOffset == 0) break;
+
+      next += cur.nextOffset;
+      if (next > blockNumber) break;
+    }
+
+    return _sum;
+  }
+}
+
+
+// File: @openzeppelin/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/IAccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev The `account` is missing a role.
+     */
+    error AccessControlUnauthorizedAccount(address account, bytes32 neededRole);
+
+    /**
+     * @dev The caller of a function is not the expected one.
+     *
+     * NOTE: Don't confuse with {AccessControlUnauthorizedAccount}.
+     */
+    error AccessControlBadConfirmation();
+
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) external;
+}
+
+
+// File: @openzeppelin/contracts/access/AccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControl} from "./IAccessControl.sol";
+import {Context} from "../utils/Context.sol";
+import {ERC165} from "../utils/introspection/ERC165.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```solidity
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```solidity
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it. We recommend using {AccessControlDefaultAdminRules}
+ * to enforce additional security measures for this role.
+ */
+abstract contract AccessControl is Context, IAccessControl, ERC165 {
+    struct RoleData {
+        mapping(address account => bool) hasRole;
+        bytes32 adminRole;
+    }
+
+    mapping(bytes32 role => RoleData) private _roles;
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    /**
+     * @dev Modifier that checks that an account has a specific role. Reverts
+     * with an {AccessControlUnauthorizedAccount} error including the required role.
+     */
+    modifier onlyRole(bytes32 role) {
+        _checkRole(role);
+        _;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControl).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) public view virtual returns (bool) {
+        return _roles[role].hasRole[account];
+    }
+
+    /**
+     * @dev Reverts with an {AccessControlUnauthorizedAccount} error if `_msgSender()`
+     * is missing `role`. Overriding this function changes the behavior of the {onlyRole} modifier.
+     */
+    function _checkRole(bytes32 role) internal view virtual {
+        _checkRole(role, _msgSender());
+    }
+
+    /**
+     * @dev Reverts with an {AccessControlUnauthorizedAccount} error if `account`
+     * is missing `role`.
+     */
+    function _checkRole(bytes32 role, address account) internal view virtual {
+        if (!hasRole(role, account)) {
+            revert AccessControlUnauthorizedAccount(account, role);
+        }
+    }
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) public view virtual returns (bytes32) {
+        return _roles[role].adminRole;
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function grantRole(bytes32 role, address account) public virtual onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function revokeRole(bytes32 role, address account) public virtual onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been revoked `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) public virtual {
+        if (callerConfirmation != _msgSender()) {
+            revert AccessControlBadConfirmation();
+        }
+
+        _revokeRole(role, callerConfirmation);
+    }
+
+    /**
+     * @dev Sets `adminRole` as ``role``'s admin role.
+     *
+     * Emits a {RoleAdminChanged} event.
+     */
+    function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+        bytes32 previousAdminRole = getRoleAdmin(role);
+        _roles[role].adminRole = adminRole;
+        emit RoleAdminChanged(role, previousAdminRole, adminRole);
+    }
+
+    /**
+     * @dev Attempts to grant `role` to `account` and returns a boolean indicating if `role` was granted.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function _grantRole(bytes32 role, address account) internal virtual returns (bool) {
+        if (!hasRole(role, account)) {
+            _roles[role].hasRole[account] = true;
+            emit RoleGranted(role, account, _msgSender());
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Attempts to revoke `role` to `account` and returns a boolean indicating if `role` was revoked.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual returns (bool) {
+        if (hasRole(role, account)) {
+            _roles[role].hasRole[account] = false;
+            emit RoleRevoked(role, account, _msgSender());
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+
+// File: @openzeppelin/contracts/access/extensions/AccessControlEnumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/extensions/AccessControlEnumerable.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControlEnumerable} from "./IAccessControlEnumerable.sol";
+import {AccessControl} from "../AccessControl.sol";
+import {EnumerableSet} from "../../utils/structs/EnumerableSet.sol";
+
+/**
+ * @dev Extension of {AccessControl} that allows enumerating the members of each role.
+ */
+abstract contract AccessControlEnumerable is IAccessControlEnumerable, AccessControl {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    mapping(bytes32 role => EnumerableSet.AddressSet) private _roleMembers;
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControlEnumerable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns one of the accounts that have `role`. `index` must be a
+     * value between 0 and {getRoleMemberCount}, non-inclusive.
+     *
+     * Role bearers are not sorted in any particular way, and their ordering may
+     * change at any point.
+     *
+     * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+     * you perform all queries on the same block. See the following
+     * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+     * for more information.
+     */
+    function getRoleMember(bytes32 role, uint256 index) public view virtual returns (address) {
+        return _roleMembers[role].at(index);
+    }
+
+    /**
+     * @dev Returns the number of accounts that have `role`. Can be used
+     * together with {getRoleMember} to enumerate all bearers of a role.
+     */
+    function getRoleMemberCount(bytes32 role) public view virtual returns (uint256) {
+        return _roleMembers[role].length();
+    }
+
+    /**
+     * @dev Overload {AccessControl-_grantRole} to track enumerable memberships
+     */
+    function _grantRole(bytes32 role, address account) internal virtual override returns (bool) {
+        bool granted = super._grantRole(role, account);
+        if (granted) {
+            _roleMembers[role].add(account);
+        }
+        return granted;
+    }
+
+    /**
+     * @dev Overload {AccessControl-_revokeRole} to track enumerable memberships
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual override returns (bool) {
+        bool revoked = super._revokeRole(role, account);
+        if (revoked) {
+            _roleMembers[role].remove(account);
+        }
+        return revoked;
+    }
+}
+
+
+// File: @openzeppelin/contracts/access/extensions/IAccessControlEnumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/extensions/IAccessControlEnumerable.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControl} from "../IAccessControl.sol";
+
+/**
+ * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.
+ */
+interface IAccessControlEnumerable is IAccessControl {
+    /**
+     * @dev Returns one of the accounts that have `role`. `index` must be a
+     * value between 0 and {getRoleMemberCount}, non-inclusive.
+     *
+     * Role bearers are not sorted in any particular way, and their ordering may
+     * change at any point.
+     *
+     * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+     * you perform all queries on the same block. See the following
+     * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+     * for more information.
+     */
+    function getRoleMember(bytes32 role, uint256 index) external view returns (address);
+
+    /**
+     * @dev Returns the number of accounts that have `role`. Can be used
+     * together with {getRoleMember} to enumerate all bearers of a role.
+     */
+    function getRoleMemberCount(bytes32 role) external view returns (uint256);
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/ERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "./IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ */
+abstract contract ERC165 is IERC165 {
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
