@@ -1,0 +1,865 @@
+
+// File: src/contracts/EpochManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
+import {ReentrancyGuard} from '@openzeppelin/contracts/security/ReentrancyGuard.sol';
+
+import {CannotSetNullAddress} from '@floor/utils/Errors.sol';
+
+import {IVoteMarket} from '@floor-interfaces/bribes/VoteMarket.sol';
+import {IEpochEndTriggered} from '@floor-interfaces/utils/EpochEndTriggered.sol';
+import {INewCollectionWars} from '@floor-interfaces/voting/NewCollectionWars.sol';
+import {IEpochManager} from '@floor-interfaces/EpochManager.sol';
+
+/// If the epoch is currently timelocked and insufficient time has passed.
+/// @param timelockExpiry The timestamp at which the epoch can next be run
+error EpochTimelocked(uint timelockExpiry);
+
+/**
+ * Handles epoch management for all other contracts.
+ */
+contract EpochManager is IEpochManager, Ownable, ReentrancyGuard {
+    /// Stores the current epoch that is taking place.
+    uint public currentEpoch;
+
+    /// Store a timestamp of when last epoch was run so that we can timelock usage
+    uint public lastEpoch;
+
+    /// Store the length of an epoch
+    uint public constant EPOCH_LENGTH = 2 weeks;
+
+    /// Holds our internal contract references
+    INewCollectionWars public newCollectionWars;
+    address public voteMarket;
+
+    /// Stores a mapping of an epoch to a collection
+    mapping(uint => uint) public collectionEpochs;
+
+    /// Store our epoch triggers
+    address[] private _epochEndTriggers;
+
+    /**
+     * Will return if the current epoch is a collection addition vote.
+     *
+     * @return bool If the current epoch is a collection addition
+     */
+    function isCollectionAdditionEpoch() external view returns (bool) {
+        return collectionEpochs[currentEpoch] != 0;
+    }
+
+    /**
+     * Will return true if the specified epoch is a collection addition vote.
+     *
+     * @param epoch The epoch to check
+     *
+     * @return bool If the specified epoch is a collection addition
+     */
+    function isCollectionAdditionEpoch(uint epoch) external view returns (bool) {
+        return collectionEpochs[epoch] != 0;
+    }
+
+    /**
+     * Allows an epoch to be scheduled to be a collection addition vote. An index will
+     * be specified to show which collection addition will be used. The index will not
+     * be a zero value.
+     *
+     * @param epoch The epoch that the Collection Addition will take place in
+     * @param index The Collection Addition array index
+     */
+    function scheduleCollectionAdditionEpoch(uint epoch, uint index) external {
+        // Ensure that only our {NewCollectionWars} contract can make this call
+        require(msg.sender == address(newCollectionWars), 'Invalid caller');
+
+        // Set our new collection epoch
+        collectionEpochs[epoch] = index;
+
+        // If we have a {VoteMarket} contract set, then we need to increase the number
+        // of epochs of any bribes that overlap the new collection war epoch. This is
+        // done as only Sweep Wars utilise bribe logic and have a preset number of epochs
+        // covered at the point of creation, so by taking one of their epochs we append
+        // another to their bribe epoch window.
+        if (voteMarket != address(0)) {
+            IVoteMarket(voteMarket).extendBribes(epoch);
+        }
+
+        emit CollectionAdditionWarScheduled(epoch, index);
+    }
+
+    /**
+     * Triggers an epoch to end.
+     *
+     * If the epoch has successfully ended, then the `currentEpoch` value will be increased
+     * by one, and the epoch will be locked from updating again until `EPOCH_LENGTH` has
+     * passed. We will also check if a new Collection Addition is starting in the new epoch
+     * and initialise it if it is.
+     */
+    function endEpoch() external nonReentrant {
+        // Ensure enough time has past since the last epoch ended
+        if (lastEpoch != 0 && block.timestamp < lastEpoch + EPOCH_LENGTH) {
+            revert EpochTimelocked(lastEpoch + EPOCH_LENGTH);
+        }
+
+        unchecked {
+            // If our lastEpoch is zero, then this is the first epoch ended and we want
+            // to set it to the specific block timestamp. Otherwise, we just increase it
+            // by the length of the epoch to avoid epoch creep.
+            lastEpoch += (lastEpoch == 0) ? block.timestamp : EPOCH_LENGTH;
+        }
+
+        // If we have any logic that needs to be triggered when an epoch ends, then we include
+        // it here.
+        uint triggersLength = _epochEndTriggers.length;
+        for (uint i; i < triggersLength;) {
+            IEpochEndTriggered(_epochEndTriggers[i]).endEpoch(currentEpoch);
+            unchecked {
+                ++i;
+            }
+        }
+
+        emit EpochEnded(currentEpoch, lastEpoch);
+
+        unchecked {
+            ++currentEpoch;
+        }
+
+        // If we have a floor war ready to start, then action it
+        uint collectionWarIndex = collectionEpochs[currentEpoch];
+        if (collectionWarIndex != 0) {
+            newCollectionWars.startFloorWar(collectionWarIndex);
+        }
+    }
+
+    /**
+     * Allows a new epochEnd trigger to be attached
+     */
+    function setEpochEndTrigger(address contractAddr, bool enabled) external onlyOwner {
+        // If we are trying to add a zero address, exit early
+        if (enabled && contractAddr == address(0)) revert CannotSetNullAddress();
+
+        // Both enabling and disabling an `epochEndTrigger` will benefit from
+        // knowing the existing index of the `contractAddr`, if it already exists.
+        int existingIndex = -1;
+        uint triggersLength = _epochEndTriggers.length;
+        uint i;
+        for (i; i < triggersLength;) {
+            if (_epochEndTriggers[i] == contractAddr) {
+                existingIndex = int(i);
+                break;
+            }
+            unchecked { ++i; }
+        }
+
+        if (enabled) {
+            require(existingIndex == -1, 'Trigger already exists');
+            _epochEndTriggers.push(contractAddr);
+        } else {
+            require(existingIndex != -1, 'Trigger not found');
+
+            // Shift the elements after the deleted element by one position
+            for (i = uint(existingIndex); i < triggersLength - 1;) {
+                _epochEndTriggers[i] = _epochEndTriggers[i + 1];
+                unchecked { ++i; }
+            }
+
+            // Reduce the length of the array by 1
+            _epochEndTriggers.pop();
+        }
+    }
+
+    /**
+     * Provides an estimated timestamp of when an epoch started, and also the earliest
+     * that an epoch in the future could start.
+     *
+     * @param _epoch The epoch to find the estimated timestamp of
+     *
+     * @return uint The estimated timestamp of when the specified epoch started
+     */
+    function epochIterationTimestamp(uint _epoch) public view returns (uint) {
+        if (currentEpoch < _epoch) {
+            return lastEpoch + ((_epoch - currentEpoch) * EPOCH_LENGTH);
+        }
+
+        if (currentEpoch == _epoch) {
+            return lastEpoch;
+        }
+
+        return lastEpoch - ((currentEpoch - _epoch) * EPOCH_LENGTH);
+    }
+
+    /**
+     * Sets the contract addresses of internal contracts that are queried and used
+     * in other functions.
+     *
+     * @dev The vote market contract can be a zero-address as this won't be ready at
+     * launch.
+     */
+    function setContracts(address _newCollectionWars, address _voteMarket) external onlyOwner {
+        if (_newCollectionWars == address(0)) revert CannotSetNullAddress();
+
+        newCollectionWars = INewCollectionWars(_newCollectionWars);
+        voteMarket = _voteMarket;
+
+        emit EpochManagerContractsUpdated(_newCollectionWars, _voteMarket);
+    }
+
+    /**
+     * Provides a complete list of all epoch end triggers, in the order that they
+     * are executed.
+     */
+    function epochEndTriggers() public view returns (address[] memory) {
+        return _epochEndTriggers;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: src/contracts/utils/Errors.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+/**
+ * A collection of generic errors that can be referenced across multiple
+ * contracts. Contract-specific errors should still be stored in their
+ * individual Solidity files.
+ */
+
+/// If a NULL address tries to be stored which should not be accepted
+error CannotSetNullAddress();
+
+/// If the caller has entered an insufficient amount to process the action. This
+/// will likely be a zero amount.
+error InsufficientAmount();
+
+/// If the caller enters a percentage value that is too high for the requirements
+error PercentageTooHigh(uint amount);
+
+/// If a required ETH or token `transfer` call fails
+error TransferFailed();
+
+/// If a user calls a deposit related function with a zero amount
+error CannotDepositZeroAmount();
+
+/// If a user calls a withdrawal related function with a zero amount
+error CannotWithdrawZeroAmount();
+
+/// If there are no rewards available to be claimed
+error NoRewardsAvailableToClaim();
+
+/// If the requested collection is not approved
+/// @param collection Address of the collection requested
+error CollectionNotApproved(address collection);
+
+/// If the requested strategy implementation is not approved
+/// @param strategyImplementation Address of the strategy implementation requested
+error StrategyNotApproved(address strategyImplementation);
+
+
+// File: src/interfaces/bribes/VoteMarket.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IVoteMarket {
+    /**
+     * Bribe struct requirements.
+     *
+     * @param bribeId ID of the bribe
+     * @param startEpoch The first epoch at which the bribe reward is claimable.
+     * @param maxRewardPerVote Max Price per vote.
+     * @param totalRewardAmount The total amount of `rewardToken` funding the bribe.
+     * @param remainingRewards Tracking of the number of rewards remaining.
+     * @param collection Address of the target gauge.
+     * @param rewardToken Address of the ERC20 used for rewards.
+     * @param creator The creator of the bribe.
+     * @param numberOfEpochs The number of epochs the bribe will run for.
+     */
+    struct Bribe {
+        uint startEpoch; // 256 / 256
+        uint maxRewardPerVote; // 512 / 512
+        uint remainingRewards; // 768 / 768
+        uint totalRewardAmount; // 1024 / 1024
+        address collection; // 1184 / 1280
+        address rewardToken; // 1344 / 1536
+        address creator; // 1504 / 1536
+        uint8 numberOfEpochs; // 1512 / 1536
+    }
+
+    /// Fired when a new bribe is created
+    event BribeCreated(uint bribeId);
+
+    /// Fired when a user claims their bribe allocation
+    event Claimed(address account, address rewardToken, uint bribeId, uint amount, uint epoch);
+
+    /// Fired when a new claim allocation is assigned for an epoch
+    event ClaimRegistered(uint epoch, bytes32 merkleRoot);
+
+    /// Minimum number of epochs for a Bribe
+    function MINIMUM_EPOCHS() external returns (uint8);
+
+    /// The percentage of bribes that will be sent to the DAO
+    function DAO_FEE() external returns (uint8);
+
+    /// The recipient of any fees collected. This should be set to the {Treasury}, or
+    /// to a specialist fee collection contract.
+    function feeCollector() external returns (address);
+
+    /// Store our claim merkles that define the available rewards for each user across
+    /// all collections and bribes.
+    function epochMerkles(uint epoch) external returns (bytes32);
+
+    /// Stores a list of all bribes created, across past, live and future
+    function bribes(uint index) external returns (Bribe memory);
+
+    /// A mapping of collection addresses to an array of bribe array indexes
+    function collectionBribes(address) external returns (uint[] memory);
+
+    /// Blacklisted addresses per bribe that aren't counted for rewards arithmetics.
+    function isBlacklisted(uint bribeId, address account) external returns (bool);
+
+    /// Oracle wallet that has permission to write merkles
+    function oracleWallet() external returns (address);
+
+    /**
+     * Create a new bribe.
+     *
+     * @param collection Address of the target collection.
+     * @param rewardToken Address of the ERC20 used or rewards.
+     * @param startEpoch The epoch to start offering the bribe.
+     * @param numberOfEpochs Number of periods.
+     * @param maxRewardPerVote Target Bias for the Gauge.
+     * @param totalRewardAmount Total Reward Added.
+     * @param blacklist Array of addresses to blacklist.
+     *
+     * @return newBribeID of the bribe created.
+     */
+    function createBribe(
+        address collection,
+        address rewardToken,
+        uint startEpoch,
+        uint8 numberOfEpochs,
+        uint maxRewardPerVote,
+        uint totalRewardAmount,
+        address[] calldata blacklist
+    ) external returns (uint newBribeID);
+
+    /**
+     * Claims against any bribes for a user.
+     */
+    function claim(
+        address account,
+        uint[] calldata epoch,
+        uint[] calldata bribeIds,
+        address[] calldata collection,
+        uint[] calldata votes,
+        bytes32[][] calldata merkleProof
+    ) external;
+
+    /**
+     * Claims against all bribes in a collection for a user.
+     */
+    function claimAll(
+        address account,
+        uint[] calldata epoch,
+        address[] calldata collection,
+        uint[] calldata votes,
+        bytes32[][] calldata merkleProof
+    ) external;
+
+    /**
+     * Allows the bribe creator to withdraw unclaimed funds when the claim window has expired.
+     *
+     * @param bribeId The bribe ID to be reclaimed
+     */
+    function reclaimExpiredFunds(uint bribeId) external;
+
+    /**
+     * Checks if the user has already claimed against a bribe at an epoch.
+     */
+    function hasUserClaimed(uint bribeId, uint epoch) external view returns (bool);
+
+    /**
+     * Allows our oracle wallet to upload a merkle root to define claims available against
+     * a bribe when the epoch ends.
+     */
+    function registerClaims(uint epoch, bytes32 merkleRoot, address[] calldata collections, uint[] calldata collectionVotes) external;
+
+    /**
+     * Sets our authorised oracle wallet that will upload bribe claims.
+     */
+    function setOracleWallet(address _oracleWallet) external;
+
+    /**
+     * Allows our platform to increase the length of any sweep war bribes.
+     *
+     * @dev This will be called by the {EpochManager} when a New Collection War is created
+     * to extend the duration any Sweep War bribes that would be active at that epoch.
+     */
+    function extendBribes(uint epoch) external;
+
+    /**
+     * Allows our oracle wallet to expire collection bribes when they have expired.
+     */
+    function expireCollectionBribes(address[] calldata collection, uint[] calldata index) external;
+}
+
+
+// File: src/interfaces/utils/EpochEndTriggered.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IEpochEndTriggered {
+    /**
+     * Function that is triggered when an epoch ends.
+     */
+    function endEpoch(uint epoch) external;
+}
+
+
+// File: src/interfaces/voting/NewCollectionWars.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface INewCollectionWars {
+    /**
+     * For each FloorWar that is created, this structure will be created. When
+     * the epoch ends, the FloorWar will remain and will be updated with information
+     * on the winning collection and the votes attributed to each collection.
+     */
+    struct FloorWar {
+        uint index;
+        uint startEpoch;
+        address[] collections;
+    }
+
+    /// Sent when a user casts a vote
+    event VoteCast(address sender, address collection, uint userVotes, uint collectionVotes);
+
+    /// Sent when a collection vote is revoked
+    event VoteRevoked(address sender, address collection, uint collectionVotes);
+
+    /// Sent when a collection NFT is staked to vote
+    event NftVoteCast(address sender, uint war, address collection, uint collectionVotes, uint collectionNftVotes);
+
+    /// Sent when a Collection Addition War is created
+    event CollectionAdditionWarCreated(uint epoch, address[] collections, uint[] floorPrices);
+
+    /// Sent when a Collection Addition War is started
+    event CollectionAdditionWarStarted(uint warIndex);
+
+    /// Sent when a Collection Addition War ends
+    event CollectionAdditionWarEnded(uint warIndex, address collection);
+
+    /// Sent when Collection Addition War NFTs are exercised
+    event CollectionExercised(uint warIndex, address collection, uint value);
+
+    /// Sent when the {NewCollectionWarOptions} contract address is updated
+    event NewCollectionWarOptionsUpdated(address newCollectionWarOptions);
+
+    /// Stores the number of votes a user has placed against a war collection
+    function userVotes(bytes32) external view returns (uint);
+
+    /// Stores the floor spot price of a collection token against a war collection
+    function collectionSpotPrice(bytes32) external view returns (uint);
+
+    /// Stores the total number of votes against a war collection
+    function collectionVotes(bytes32) external view returns (uint);
+    function collectionNftVotes(bytes32) external view returns (uint);
+
+    /// Stores which collection the user has cast their votes towards to allow for
+    /// reallocation on subsequent votes if needed.
+    function userCollectionVote(bytes32) external view returns (address);
+
+    /// Stores the address of the collection that won a Floor War
+    function floorWarWinner(uint _epoch) external view returns (address);
+
+    /// Stores if a collection has been flagged as ERC1155
+    function is1155(address) external returns (bool);
+
+    /// Stores the unlock epoch of a collection in a floor war
+    function collectionEpochLock(bytes32) external returns (uint);
+
+    /**
+     * The total voting power of a user, regardless of if they have cast votes
+     * or not.
+     *
+     * @param _user User address being checked
+     */
+    function userVotingPower(address _user) external view returns (uint);
+
+    /**
+     * The total number of votes that a user has available.
+     *
+     * @param _user User address being checked
+     *
+     * @return uint Number of votes available to the user
+     */
+    function userVotesAvailable(uint _war, address _user) external view returns (uint);
+
+    /**
+     * Allows the user to cast 100% of their voting power against an individual
+     * collection. If the user has already voted on the FloorWar then this will
+     * additionally reallocate their votes.
+     */
+    function vote(address collection) external;
+
+    /**
+     * Allows an approved contract to submit option-related votes against a collection
+     * in the current war.
+     *
+     * @param sender The address of the user that staked the token
+     * @param collection The collection to cast the vote against
+     * @param votingPower The voting power added from the option creation
+     */
+    function optionVote(address sender, uint war, address collection, uint votingPower) external;
+
+    /**
+     * Revokes a user's current votes in the current war.
+     *
+     * @dev This is used when a user unstakes their floor
+     *
+     * @param account The address of the account that is having their vote revoked
+     */
+    function revokeVotes(address account) external;
+
+    /**
+     * Allow an authorised user to create a new floor war to start with a range of
+     * collections from a specific epoch.
+     */
+    function createFloorWar(uint epoch, address[] calldata collections, bool[] calldata isErc1155, uint[] calldata floorPrices)
+        external
+        returns (uint);
+
+    /**
+     * Sets a scheduled {FloorWar} to be active.
+     *
+     * @dev This function is called by the {EpochManager} when a new epoch starts
+     *
+     * @param index The index of the {FloorWar} being started
+     */
+    function startFloorWar(uint index) external;
+
+    /**
+     * When the epoch has come to an end, this function will be called to finalise
+     * the votes and decide which collection has won. This collection will then need
+     * to be added to the {CollectionRegistry}.
+     *
+     * Any NFTs that have been staked will be timelocked for an additional epoch to
+     * give the DAO time to exercise or reject any options.
+     *
+     * @dev We can't action this in one single call as we will need information about
+     * the underlying NFTX token as well.
+     */
+    function endFloorWar() external returns (address highestVoteCollection);
+
+    /**
+     * Allows us to update our collection floor prices if we have seen a noticable difference
+     * since the start of the epoch. This will need to be called for this reason as the floor
+     * price of the collection heavily determines the amount of voting power awarded when
+     * creating an option.
+     */
+    function updateCollectionFloorPrice(address collection, uint floorPrice) external;
+
+    /**
+     * Allows our options contract to be updated.
+     *
+     * @param _contract The new contract to use
+     */
+    function setOptionsContract(address _contract) external;
+
+    /**
+     * Check if a collection is in a FloorWar.
+     */
+    function isCollectionInWar(bytes32 warCollection) external view returns (bool);
+}
+
+
+// File: src/interfaces/EpochManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+ * Handles epoch management for all other contracts.
+ */
+interface IEpochManager {
+
+    /// Emitted when an epoch is ended
+    event EpochEnded(uint epoch, uint timestamp);
+
+    /// Emitted when a new collection war is scheduled
+    event CollectionAdditionWarScheduled(uint epoch, uint index);
+
+    /// Emitted when required contracts are updated
+    event EpochManagerContractsUpdated(address newCollectionWars, address voteMarket);
+
+    /**
+     * The current epoch that is running across the codebase.
+     *
+     * @return The current epoch
+     */
+    function currentEpoch() external view returns (uint);
+
+    /**
+     * Stores a mapping of an epoch to a collection addition war index.
+     *
+     * @param _epoch Epoch to check
+     *
+     * @return Index of the collection addition war. Will return 0 if none found
+     */
+    function collectionEpochs(uint _epoch) external view returns (uint);
+
+    /**
+     * Will return if the current epoch is a collection addition vote.
+     *
+     * @return If the current epoch is a collection addition
+     */
+    function isCollectionAdditionEpoch() external view returns (bool);
+
+    /**
+     * Will return if the specified epoch is a collection addition vote.
+     *
+     * @param epoch The epoch to check
+     *
+     * @return If the specified epoch is a collection addition
+     */
+    function isCollectionAdditionEpoch(uint epoch) external view returns (bool);
+
+    /**
+     * Allows an epoch to be scheduled to be a collection addition vote. An index will
+     * be specified to show which collection addition will be used. The index will not
+     * be a zero value.
+     *
+     * @param epoch The epoch that the Collection Addition will take place in
+     * @param index The Collection Addition array index
+     */
+    function scheduleCollectionAdditionEpoch(uint epoch, uint index) external;
+
+    /**
+     * Triggers an epoch to end.
+     *
+     * @dev More information about this function can be found in the actual contract
+     */
+    function endEpoch() external;
+
+    /**
+     * Provides an estimated timestamp of when an epoch started, and also the earliest
+     * that an epoch in the future could start.
+     *
+     * @param _epoch The epoch to find the estimated timestamp of
+     *
+     * @return The estimated timestamp of when the specified epoch started
+     */
+    function epochIterationTimestamp(uint _epoch) external returns (uint);
+
+    /**
+     * The length of an epoch in seconds.
+     *
+     * @return The length of the epoch in seconds
+     */
+    function EPOCH_LENGTH() external returns (uint);
+
+    /**
+     * Sets contracts that the epoch manager relies on. This doesn't have to include
+     * all of the contracts that are {EpochManaged}, but only needs to set ones that the
+     * {EpochManager} needs to interact with.
+     */
+    function setContracts(address _newCollectionWars, address _voteMarket) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+

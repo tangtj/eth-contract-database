@@ -1,0 +1,1312 @@
+
+// File: src/util/DbrHelper.sol
+pragma solidity ^0.8.20;
+
+import "src/interfaces/IERC20.sol";
+import "src/interfaces/IMarket.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+
+interface ICurvePool {
+    function exchange(
+        uint i,
+        uint j,
+        uint dx,
+        uint min_dy,
+        bool use_eth,
+        address receiver
+    ) external payable returns (uint);
+}
+
+interface IINVEscrow {
+    function claimDBRTo(address to) external;
+
+    function claimable() external returns (uint);
+}
+
+interface IDbr {
+    function markets(address) external view returns (bool);
+}
+
+/// @title DbrHelper
+/// @notice Helper contract to claim DBR, sell it for DOLA and optionally repay debt or sell it for INV and deposit into INV market
+/// @dev Require approving DbrHelper to claim on behalf of the user (via setClaimer function in INVEscrow)
+contract DbrHelper is Ownable, ReentrancyGuard {
+    error NoEscrow(address user);
+    error ReceiverAddressZero(address token);
+    error RepayParamsNotCorrect(
+        uint256 percentage,
+        address to,
+        address market,
+        uint256 sellForDola
+    );
+    error SellPercentageTooHigh();
+    error RepayPercentageTooHigh();
+    error MarketNotFound(address market);
+
+    IMarket public constant INV_MARKET =
+        IMarket(0xb516247596Ca36bf32876199FBdCaD6B3322330B);
+    ICurvePool public constant CURVE_POOL =
+        ICurvePool(0xC7DE47b9Ca2Fc753D6a2F167D8b3e19c6D18b19a);
+    IERC20 public constant DOLA =
+        IERC20(0x865377367054516e17014CcdED1e7d814EDC9ce4);
+    IERC20 public constant DBR =
+        IERC20(0xAD038Eb671c44b853887A7E32528FaB35dC5D710);
+    IERC20 public constant INV =
+        IERC20(0x41D5D79431A913C4aE7d69a668ecdfE5fF9DFB68);
+
+    uint256 public constant DOLA_INDEX = 0;
+    uint256 public constant DBR_INDEX = 1;
+    uint256 public constant INV_INDEX = 2;
+    uint256 public constant DENOMINATOR = 10000; // 100% in basis points
+
+    event Sell(
+        address indexed claimer,
+        uint amountIn,
+        uint amountOut,
+        uint indexOut,
+        address indexed receiver
+    );
+    event RepayDebt(
+        address indexed claimer,
+        address indexed market,
+        address indexed to,
+        uint dolaAmount
+    );
+    event DepositInv(
+        address indexed claimer,
+        address indexed to,
+        uint invAmount
+    );
+    event MarketApproved(address indexed market);
+
+    constructor() Ownable(msg.sender) {
+        DBR.approve(address(CURVE_POOL), type(uint).max);
+        INV.approve(address(INV_MARKET), type(uint).max);
+    }
+
+    struct ClaimAndSell {
+        address toDbr; // Address to receive leftover DBR
+        address toDola; // Address to receive DOLA
+        address toInv; // Address to receive INV deposit
+        uint256 minOutDola;
+        uint256 sellForDola; // Percentage of claimed DBR swapped for DOLA (in basis points)
+        uint256 minOutInv;
+        uint256 sellForInv; // Percentage of claimed DBR swapped for INV (in basis points)
+    }
+
+    struct Repay {
+        address market;
+        address to;
+        uint256 percentage; // Percentage of DOLA swapped from claimed DBR to use for repaying debt (in basis points)
+    }
+
+    /// @notice Approve market to be used for repaying debt
+    /// @dev Must be an active market
+    /// @param market Address of the market
+    function approveMarket(address market) external {
+        if(!IDbr(address(DBR)).markets(market)) revert MarketNotFound(market); 
+        DOLA.approve(market, type(uint).max);
+        emit MarketApproved(market);
+    }
+
+    /// @notice Claim DBR, sell it for DOLA and/or INV and/or repay debt
+    /// @param params ClaimAndSell struct with parameters for claiming and selling
+    /// @param repay Repay struct with parameters for repaying debt
+    /// @return dolaAmount Amount of DOLA received after the sell (includes repaid DOLA)
+    /// @return invAmount Amount of INV deposited into the escrow
+    /// @return repaidAmount Amount of DOLA repaid
+    /// @return dbrAmount Amount of DBR left after selling
+    function claimAndSell(
+        ClaimAndSell calldata params,
+        Repay calldata repay
+    )
+        external
+        nonReentrant
+        returns (
+            uint256 dolaAmount,
+            uint256 invAmount,
+            uint256 repaidAmount,
+            uint256 dbrAmount
+        )
+    {
+        _checkInputs(params, repay);
+
+        uint256 amount = _claimDBR();
+
+        (dolaAmount, invAmount, repaidAmount, dbrAmount) = _sell(
+            params,
+            repay,
+            amount
+        );
+    }
+
+    /// @notice  Sell DBR for DOLA and/or INV and/or repay debt
+    /// @param params ClaimAndSell struct with parameters for selling
+    /// @param repay Repay struct with parameters for repaying debt
+    /// @param amount Amount of DBR available to sell
+    /// @return dolaAmount Amount of DOLA received after the sell (includes repaid DOLA)
+    /// @return invAmount Amount of INV deposited into the escrow
+    /// @return repaidAmount Amount of DOLA repaid
+    /// @return dbrLeft Amount of DBR left after selling
+    function _sell(
+        ClaimAndSell calldata params,
+        Repay calldata repay,
+        uint256 amount
+    )
+        internal
+        returns (
+            uint256 dolaAmount,
+            uint256 invAmount,
+            uint256 repaidAmount,
+            uint256 dbrLeft
+        )
+    {
+        if (params.sellForDola > 0) {
+            uint256 sellAmountForDola = (amount * params.sellForDola) /
+                DENOMINATOR;
+
+            if (repay.percentage != 0) {
+                (dolaAmount, repaidAmount) = _sellAndRepay(
+                    sellAmountForDola,
+                    params.minOutDola,
+                    repay
+                );
+            } else {
+                dolaAmount = _sellDbr(
+                    sellAmountForDola,
+                    params.minOutDola,
+                    DOLA_INDEX,
+                    params.toDola
+                );
+            }
+        }
+
+        if (params.sellForInv > 0) {
+            uint256 sellAmountForInv = (amount * params.sellForInv) /
+                DENOMINATOR;
+            invAmount = _sellAndDeposit(
+                sellAmountForInv,
+                params.minOutInv,
+                params.toInv
+            );
+        }
+
+        // Send leftover DBR to the receiver
+        dbrLeft = DBR.balanceOf(address(this));
+        if (dbrLeft > 0) DBR.transfer(params.toDbr, dbrLeft);
+        // Send leftover DOLA to the receiver
+        uint256 dolaLeft = DOLA.balanceOf(address(this));
+        if (dolaLeft > 0) DOLA.transfer(params.toDola, dolaLeft);
+    }
+
+    /// @notice Sell DBR amount for INV and deposit into the escrow
+    /// @param amount Amount of DBR to sell
+    /// @param minOutInv Minimum amount of INV to receive
+    /// @param to Address to receive INV deposit
+    /// @return invAmount Amount of INV deposited
+    function _sellAndDeposit(
+        uint256 amount,
+        uint256 minOutInv,
+        address to
+    ) internal returns (uint256 invAmount) {
+        // Sell DBR for INV
+        _sellDbr(amount, minOutInv, INV_INDEX, address(this));
+        // Deposit INV
+        invAmount = INV.balanceOf(address(this));
+        INV_MARKET.deposit(to, invAmount);
+
+        emit DepositInv(msg.sender, to, invAmount);
+    }
+
+    /// @notice Sell DBR amount for DOLA and repay debt
+    /// @param amount Amount of DBR to sell
+    /// @param minOutDola Minimum amount of DOLA to receive
+    /// @param repay Repay struct with parameters for repaying debt
+    /// @return dolaAmount Amount of DOLA received after selling DBR
+    /// @return repaidAmount Actual amount of DOLA repaid
+    function _sellAndRepay(
+        uint amount,
+        uint minOutDola,
+        Repay calldata repay
+    ) internal returns (uint256 dolaAmount, uint256 repaidAmount) {
+        // Sell DBR for DOLA
+        dolaAmount = _sellDbr(amount, minOutDola, DOLA_INDEX, address(this));
+        // Repay debt
+        repaidAmount = _repay(repay, dolaAmount);
+    }
+
+    /// @notice Repay debt
+    /// @dev Must transfer any remaining DOLA out of contract after being called
+    /// @param repay Repay struct with parameters for repaying debt
+    /// @param dolaAmount Amount of DOLA available to repay
+    /// @return repaidAmount Actual amount of DOLA repaid
+    function _repay(
+        Repay calldata repay,
+        uint256 dolaAmount
+    ) internal returns (uint256 repaidAmount) {
+        uint256 debt = IMarket(repay.market).debts(repay.to);
+        repaidAmount = (dolaAmount * repay.percentage) / DENOMINATOR;
+        // If repaidAmount is higher than debt, use debt instead
+        if (repaidAmount > debt) {
+            repaidAmount = debt;
+        }
+        // Repay debt
+        IMarket(repay.market).repay(repay.to, repaidAmount);
+
+        emit RepayDebt(msg.sender, repay.market, repay.to, repaidAmount);
+    }
+
+    /// @notice Claim DBR
+    /// @return amount of DBR claimed
+    function _claimDBR() internal returns (uint amount) {
+        IINVEscrow escrow = _getEscrow();
+        escrow.claimDBRTo(address(this));
+        amount = DBR.balanceOf(address(this));
+    }
+
+    /// @notice Get escrow for the user
+    /// @return escrow Escrow for the user
+    function _getEscrow() internal view returns (IINVEscrow escrow) {
+        escrow = IINVEscrow(address(INV_MARKET.escrows(msg.sender)));
+        if (address(escrow) == address(0)) revert NoEscrow(msg.sender);
+    }
+
+    /// @notice Sell DBR for DOLA or INV
+    /// @param amountIn Amount of DBR to sell
+    /// @param minOut Minimum amount of DOLA or INV to receive
+    /// @param indexOut Index of the token to receive (0 for DOLA, 2 for INV)
+    /// @param receiver Address to receive DOLA or INV
+    /// @return amountOut Amount of DOLA or INV received
+    function _sellDbr(
+        uint amountIn,
+        uint minOut,
+        uint indexOut,
+        address receiver
+    ) internal returns (uint256 amountOut) {
+        amountOut = CURVE_POOL.exchange(
+            DBR_INDEX,
+            indexOut,
+            amountIn,
+            minOut,
+            false,
+            receiver
+        );
+        emit Sell(msg.sender, amountIn, amountOut, indexOut, receiver);
+    }
+
+    /// @notice Check inputs
+    /// @param params ClaimAndSell struct with parameters for claiming and selling
+    /// @param repay Repay struct with parameters for repaying debt
+    function _checkInputs(
+        ClaimAndSell calldata params,
+        Repay calldata repay
+    ) internal view {
+        if (
+            params.toDbr == address(0) &&
+            params.sellForDola + params.sellForInv != DENOMINATOR
+        ) revert ReceiverAddressZero(address(DBR));
+        if (params.toDola == address(0) && params.sellForDola > 0)
+            revert ReceiverAddressZero(address(DOLA));
+        if (params.toInv == address(0) && params.sellForInv > 0)
+            revert ReceiverAddressZero(address(INV));
+        if (
+            repay.percentage != 0 &&
+            (repay.to == address(0) ||
+                repay.market == address(0) ||
+                params.sellForDola == 0 ||
+                !IDbr(address(DBR)).markets(repay.market)
+            ))
+            revert RepayParamsNotCorrect(
+                repay.percentage,
+                repay.to,
+                repay.market,
+                params.sellForDola
+            );
+        if (params.sellForDola + params.sellForInv > DENOMINATOR)
+            revert SellPercentageTooHigh();
+        if (repay.percentage > DENOMINATOR) revert RepayPercentageTooHigh();
+    }
+}
+
+
+// File: src/interfaces/IERC20.sol
+pragma solidity ^0.8.13;
+
+interface IERC20 {
+    function approve(address,uint) external;
+    function transfer(address,uint) external returns (bool);
+    function transferFrom(address,address,uint) external returns (bool);
+    function balanceOf(address) external view returns (uint);
+    function allowance(address from, address to) external view returns (uint);
+}
+
+interface IMintable is IERC20 {
+    function mint(address,uint) external;
+    function burn(uint) external;
+    function addMinter(address minter) external;
+}
+
+interface IDelegateableERC20 is IERC20 {
+    function delegate(address delegatee) external;
+    function delegates(address delegator) external view returns (address delegatee);
+}
+
+
+
+// File: src/interfaces/IMarket.sol
+pragma solidity ^0.8.13;
+
+import {IBorrowController, IEscrow, IOracle} from "src/Market.sol";
+
+interface IMarket {
+    function borrow(uint borrowAmount) external;
+    function borrowOnBehalf(address msgSender, uint dolaAmount, uint deadline, uint8 v, bytes32 r, bytes32 s) external;
+    function withdraw(uint amount) external;
+    function withdrawOnBehalf(address msgSender, uint amount, uint deadline, uint8 v, bytes32 r, bytes32 s) external;
+    function deposit(uint amount) external;
+    function deposit(address msgSender, uint collateralAmount) external;
+    function depositAndBorrow(uint collateralAmount, uint borrowAmount) external;
+    function repay(address msgSender, uint amount) external;
+    function liquidate(address borrower, uint liquidationAmount) external;
+    function forceReplenish(address borrower, uint deficitBefore) external;
+    function collateral() external returns(address);
+    function debts(address user) external returns(uint);
+    function recall(uint amount) external;
+    function invalidateNonce() external;
+    function pauseBorrows(bool paused) external;
+    function setBorrowController(IBorrowController borrowController) external;
+    function escrows(address user) external view returns (IEscrow);
+    function predictEscrow(address user) external view returns (IEscrow);
+    function getCollateralValue(address user) external view returns (uint);
+    function getWithdrawalLimit(address user) external view returns (uint);
+    function getCreditLimit(address user) external view returns (uint);
+    function lender() external view returns (address);
+    function escrowImplementation() external view returns (address);
+    function totalDebt() external view returns (uint);
+    function borrowPaused() external view returns (bool);
+    function replenishmentIncentiveBps() external view returns (uint);
+    function liquidationIncentiveBps() external view returns (uint);
+    function collateralFactorBps() external view returns (uint);
+    function setCollateralFactorBps(uint cfBps) external;
+    function setOracle(IOracle oracle) external;
+    function setGov(address newGov) external;
+    function setLender(address newLender) external;
+    function setPauseGuardian(address newPauseGuardian) external;
+    function setReplenismentIncentiveBps(uint riBps) external;
+    function setLiquidationIncentiveBps(uint liBps) external;
+    function setLiquidationFactorBps(uint lfBps) external;
+    function setLiquidationFeeBps(uint lfeeBps) external;
+    function liquidationFeeBps() external view returns (uint);
+    function DOMAIN_SEPARATOR() external view returns (uint);
+}
+
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: src/Market.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+import "src/interfaces/IERC20.sol";
+
+// Caution. We assume all failed transfers cause reverts and ignore the returned bool.
+interface IOracle {
+    function getPrice(address,uint) external returns (uint);
+    function viewPrice(address,uint) external view returns (uint);
+}
+
+interface IEscrow {
+    function initialize(IERC20 _token, address beneficiary) external;
+    function onDeposit() external;
+    function pay(address recipient, uint amount) external;
+    function balance() external view returns (uint);
+}
+
+interface IDolaBorrowingRights {
+    function onBorrow(address user, uint additionalDebt) external;
+    function onRepay(address user, uint repaidDebt) external;
+    function onForceReplenish(address user, address replenisher, uint amount, uint replenisherReward) external;
+    function balanceOf(address user) external view returns (uint);
+    function deficitOf(address user) external view returns (uint);
+    function replenishmentPriceBps() external view returns (uint);
+}
+
+interface IBorrowController {
+    function borrowAllowed(address msgSender, address borrower, uint amount) external returns (bool);
+    function onRepay(uint amount) external;
+}
+
+contract Market {
+
+    address public gov;
+    address public lender;
+    address public pauseGuardian;
+    address public immutable escrowImplementation;
+    IDolaBorrowingRights public immutable dbr;
+    IBorrowController public borrowController;
+    IERC20 public immutable dola = IERC20(0x865377367054516e17014CcdED1e7d814EDC9ce4);
+    IERC20 public immutable collateral;
+    IOracle public oracle;
+    uint public collateralFactorBps;
+    uint public replenishmentIncentiveBps;
+    uint public liquidationIncentiveBps;
+    uint public liquidationFeeBps;
+    uint public liquidationFactorBps = 5000; // 50% by default
+    bool immutable callOnDepositCallback;
+    bool public borrowPaused;
+    uint public totalDebt;
+    uint256 internal immutable INITIAL_CHAIN_ID;
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+    mapping (address => IEscrow) public escrows; // user => escrow
+    mapping (address => uint) public debts; // user => debt
+    mapping(address => uint256) public nonces; // user => nonce
+
+    constructor (
+        address _gov,
+        address _lender,
+        address _pauseGuardian,
+        address _escrowImplementation,
+        IDolaBorrowingRights _dbr,
+        IERC20 _collateral,
+        IOracle _oracle,
+        uint _collateralFactorBps,
+        uint _replenishmentIncentiveBps,
+        uint _liquidationIncentiveBps,
+        bool _callOnDepositCallback
+    ) {
+        require(_collateralFactorBps < 10000, "Invalid collateral factor");
+        require(_liquidationIncentiveBps > 0 && _liquidationIncentiveBps < 10000, "Invalid liquidation incentive");
+        require(_replenishmentIncentiveBps < 10000, "Replenishment incentive must be less than 100%");
+        gov = _gov;
+        lender = _lender;
+        pauseGuardian = _pauseGuardian;
+        escrowImplementation = _escrowImplementation;
+        dbr = _dbr;
+        collateral = _collateral;
+        oracle = _oracle;
+        collateralFactorBps = _collateralFactorBps;
+        replenishmentIncentiveBps = _replenishmentIncentiveBps;
+        liquidationIncentiveBps = _liquidationIncentiveBps;
+        callOnDepositCallback = _callOnDepositCallback;
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+        if(collateralFactorBps > 0){
+            uint unsafeLiquidationIncentive = (10000 - collateralFactorBps) * (liquidationFeeBps + 10000) / collateralFactorBps;
+            require(liquidationIncentiveBps < unsafeLiquidationIncentive,  "Liquidation param allow profitable self liquidation");
+        }
+    }
+    
+    modifier onlyGov {
+        require(msg.sender == gov, "Only gov can call this function");
+        _;
+    }
+
+    modifier liquidationParamChecker {
+        _;
+        if(collateralFactorBps > 0){
+            uint unsafeLiquidationIncentive = (10000 - collateralFactorBps) * (liquidationFeeBps + 10000) / collateralFactorBps;
+            require(liquidationIncentiveBps < unsafeLiquidationIncentive,  "New liquidation param allow profitable self liquidation");
+        }
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes("DBR MARKET")),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /**
+    @notice sets the oracle to a new oracle. Only callable by governance.
+    @param _oracle The new oracle conforming to the IOracle interface.
+    */
+    function setOracle(IOracle _oracle) public onlyGov { oracle = _oracle; }
+
+    /**
+    @notice sets the borrow controller to a new borrow controller. Only callable by governance.
+    @param _borrowController The new borrow controller conforming to the IBorrowController interface.
+    */
+    function setBorrowController(IBorrowController _borrowController) public onlyGov { borrowController = _borrowController; }
+
+    /**
+    @notice sets the address of governance. Only callable by governance.
+    @param _gov Address of the new governance.
+    */
+    function setGov(address _gov) public onlyGov { gov = _gov; }
+
+    /**
+    @notice sets the lender to a new lender. The lender is allowed to recall dola from the contract. Only callable by governance.
+    @param _lender Address of the new lender.
+    */
+    function setLender(address _lender) public onlyGov { lender = _lender; }
+
+    /**
+    @notice sets the pause guardian. The pause guardian can pause borrowing. Only callable by governance.
+    @param _pauseGuardian Address of the new pauseGuardian.
+    */
+    function setPauseGuardian(address _pauseGuardian) public onlyGov { pauseGuardian = _pauseGuardian; }
+    
+    /**
+    @notice sets the Collateral Factor requirement of the market as measured in basis points. 1 = 0.01%. Only callable by governance.
+    @dev Collateral factor mus be set below 100%
+    @param _collateralFactorBps The new collateral factor as measured in basis points. 
+    */
+    function setCollateralFactorBps(uint _collateralFactorBps) public onlyGov liquidationParamChecker {
+        require(_collateralFactorBps < 10000, "Invalid collateral factor");
+        collateralFactorBps = _collateralFactorBps;
+    }
+    
+    /**
+    @notice sets the Liquidation Factor of the market as denoted in basis points.
+     The liquidation Factor denotes the maximum amount of debt that can be liquidated in basis points.
+     At 5000, 50% of of a borrower's underwater debt can be liquidated. Only callable by governance.
+    @dev Must be set between 1 and 10000.
+    @param _liquidationFactorBps The new liquidation factor in basis points. 1 = 0.01%/
+    */
+    function setLiquidationFactorBps(uint _liquidationFactorBps) public onlyGov {
+        require(_liquidationFactorBps > 0 && _liquidationFactorBps <= 10000, "Invalid liquidation factor");
+        liquidationFactorBps = _liquidationFactorBps;
+    }
+
+    /**
+    @notice sets the Replenishment Incentive of the market as denoted in basis points.
+     The Replenishment Incentive is the percentage paid out to replenishers on a successful forceReplenish call, denoted in basis points.
+    @dev Must be set between 1 and 10000.
+    @param _replenishmentIncentiveBps The new replenishment incentive set in basis points. 1 = 0.01%
+    */
+    function setReplenismentIncentiveBps(uint _replenishmentIncentiveBps) public onlyGov {
+        require(_replenishmentIncentiveBps > 0 && _replenishmentIncentiveBps < 10000, "Invalid replenishment incentive");
+        replenishmentIncentiveBps = _replenishmentIncentiveBps;
+    }
+
+    /**
+    @notice sets the Liquidation Incentive of the market as denoted in basis points.
+     The Liquidation Incentive is the percentage paid out to liquidators of a borrower's debt when successfully liquidated.
+    @dev Must be set between 0 and 10000 - liquidation fee.
+    @param _liquidationIncentiveBps The new liqudation incentive set in basis points. 1 = 0.01% 
+    */
+    function setLiquidationIncentiveBps(uint _liquidationIncentiveBps) public onlyGov liquidationParamChecker {
+        require(_liquidationIncentiveBps > 0 && _liquidationIncentiveBps + liquidationFeeBps < 10000, "Invalid liquidation incentive");
+        liquidationIncentiveBps = _liquidationIncentiveBps;
+    }
+
+    /**
+    @notice sets the Liquidation Fee of the market as denoted in basis points.
+     The Liquidation Fee is the percentage paid out to governance of a borrower's debt when successfully liquidated.
+    @dev Must be set between 0 and 10000 - liquidation factor.
+    @param _liquidationFeeBps The new liquidation fee set in basis points. 1 = 0.01%
+    */
+    function setLiquidationFeeBps(uint _liquidationFeeBps) public onlyGov liquidationParamChecker {
+        require(_liquidationFeeBps > 0 && _liquidationFeeBps + liquidationIncentiveBps < 10000, "Invalid liquidation fee");
+        liquidationFeeBps = _liquidationFeeBps;
+    }
+
+    /**
+    @notice Recalls amount of DOLA to the lender.
+    @param amount The amount od DOLA to recall to the the lender.
+    */
+    function recall(uint amount) public {
+        require(msg.sender == lender, "Only lender can recall");
+        dola.transfer(msg.sender, amount);
+    }
+
+    /**
+    @notice Pauses or unpauses borrowing for the market. Only gov can unpause a market, while gov and pauseGuardian can pause it.
+    @param _value Boolean representing the state pause state of borrows. true = paused, false = unpaused.
+    */
+    function pauseBorrows(bool _value) public {
+        if(_value) {
+            require(msg.sender == pauseGuardian || msg.sender == gov, "Only pause guardian or governance can pause");
+        } else {
+            require(msg.sender == gov, "Only governance can unpause");
+        }
+        borrowPaused = _value;
+    }
+
+    /**
+    @notice Internal function for creating an escrow for users to deposit collateral in.
+    @dev Uses create2 and minimal proxies to create the escrow at a deterministic address
+    @param user The address of the user to create an escrow for.
+    */
+    function createEscrow(address user) internal returns (IEscrow instance) {
+        address implementation = escrowImplementation;
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), shl(0x60, implementation))
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
+            instance := create2(0, ptr, 0x37, user)
+        }
+        require(instance != IEscrow(address(0)), "ERC1167: create2 failed");
+        emit CreateEscrow(user, address(instance));
+    }
+
+    /**
+    @notice Internal function for getting the escrow of a user.
+    @dev If the escrow doesn't exist, an escrow contract is deployed.
+    @param user The address of the user owning the escrow.
+    */
+    function getEscrow(address user) internal returns (IEscrow) {
+        if(escrows[user] != IEscrow(address(0))) return escrows[user];
+        IEscrow escrow = createEscrow(user);
+        escrow.initialize(collateral, user);
+        escrows[user] = escrow;
+        return escrow;
+    }
+
+    /**
+    @notice Deposit amount of collateral into escrow
+    @dev Will deposit the amount into the escrow contract.
+    @param amount Amount of collateral token to deposit.
+    */
+    function deposit(uint amount) public {
+        deposit(msg.sender, amount);
+    }
+
+    /**
+    @notice Deposit and borrow in a single transaction.
+    @param amountDeposit Amount of collateral token to deposit into escrow.
+    @param amountBorrow Amount of DOLA to borrow.
+    */
+    function depositAndBorrow(uint amountDeposit, uint amountBorrow) public {
+        deposit(amountDeposit);
+        borrow(amountBorrow);
+    }
+
+    /**
+    @notice Deposit amount of collateral into escrow on behalf of msg.sender
+    @dev Will deposit the amount into the escrow contract.
+    @param user User to deposit on behalf of.
+    @param amount Amount of collateral token to deposit.
+    */
+    function deposit(address user, uint amount) public {
+        IEscrow escrow = getEscrow(user);
+        collateral.transferFrom(msg.sender, address(escrow), amount);
+        if(callOnDepositCallback) {
+            escrow.onDeposit();
+        }
+        emit Deposit(user, amount);
+    }
+
+    /**
+    @notice View function for predicting the deterministic escrow address of a user.
+    @dev Only use deposit() function for deposits and NOT the predicted escrow address unless you know what you're doing
+    @param user Address of the user owning the escrow.
+    */
+    function predictEscrow(address user) public view returns (IEscrow predicted) {
+        address implementation = escrowImplementation;
+        address deployer = address(this);
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), shl(0x60, implementation))
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf3ff00000000000000000000000000000000)
+            mstore(add(ptr, 0x38), shl(0x60, deployer))
+            mstore(add(ptr, 0x4c), user)
+            mstore(add(ptr, 0x6c), keccak256(ptr, 0x37))
+            predicted := keccak256(add(ptr, 0x37), 0x55)
+        }
+    }
+
+    /**
+    @notice View function for getting the dollar value of the user's collateral in escrow for the market.
+    @param user Address of the user.
+    */
+    function getCollateralValue(address user) public view returns (uint) {
+        IEscrow escrow = predictEscrow(user);
+        uint collateralBalance = escrow.balance();
+        return collateralBalance * oracle.viewPrice(address(collateral), collateralFactorBps) / 1 ether;
+    }
+
+    /**
+    @notice Internal function for getting the dollar value of the user's collateral in escrow for the market.
+    @dev Updates the lowest price comparisons of the pessimistic oracle
+    @param user Address of the user.
+    */
+    function getCollateralValueInternal(address user) internal returns (uint) {
+        IEscrow escrow = predictEscrow(user);
+        uint collateralBalance = escrow.balance();
+        return collateralBalance * oracle.getPrice(address(collateral), collateralFactorBps) / 1 ether;
+    }
+
+    /**
+    @notice View function for getting the credit limit of a user.
+    @dev To calculate the available credit, subtract user debt from credit limit.
+    @param user Address of the user.
+    */
+    function getCreditLimit(address user) public view returns (uint) {
+        uint collateralValue = getCollateralValue(user);
+        return collateralValue * collateralFactorBps / 10000;
+    }
+
+    /**
+    @notice Internal function for getting the credit limit of a user.
+    @dev To calculate the available credit, subtract user debt from credit limit. Updates the pessimistic oracle.
+    @param user Address of the user.
+    */
+    function getCreditLimitInternal(address user) internal returns (uint) {
+        uint collateralValue = getCollateralValueInternal(user);
+        return collateralValue * collateralFactorBps / 10000;
+    }
+    /**
+    @notice Internal function for getting the withdrawal limit of a user.
+     The withdrawal limit is how much collateral a user can withdraw before their loan would be underwater. Updates the pessimistic oracle.
+    @param user Address of the user.
+    */
+    function getWithdrawalLimitInternal(address user) internal returns (uint) {
+        IEscrow escrow = predictEscrow(user);
+        uint collateralBalance = escrow.balance();
+        if(collateralBalance == 0) return 0;
+        uint debt = debts[user];
+        if(debt == 0) return collateralBalance;
+        if(collateralFactorBps == 0) return 0;
+        uint minimumCollateral = debt * 1 ether / oracle.getPrice(address(collateral), collateralFactorBps) * 10000 / collateralFactorBps;
+        if(collateralBalance <= minimumCollateral) return 0;
+        return collateralBalance - minimumCollateral;
+    }
+
+    /**
+    @notice View function for getting the withdrawal limit of a user.
+     The withdrawal limit is how much collateral a user can withdraw before their loan would be underwater.
+    @param user Address of the user.
+    */
+    function getWithdrawalLimit(address user) public view returns (uint) {
+        IEscrow escrow = predictEscrow(user);
+        uint collateralBalance = escrow.balance();
+        if(collateralBalance == 0) return 0;
+        uint debt = debts[user];
+        if(debt == 0) return collateralBalance;
+        if(collateralFactorBps == 0) return 0;
+        uint minimumCollateral = debt * 1 ether / oracle.viewPrice(address(collateral), collateralFactorBps) * 10000 / collateralFactorBps;
+        if(collateralBalance <= minimumCollateral) return 0;
+        return collateralBalance - minimumCollateral;
+    }
+
+    /**
+    @notice Internal function for borrowing DOLA against collateral.
+    @dev This internal function is shared between the borrow and borrowOnBehalf function
+    @param borrower The address of the borrower that debt will be accrued to.
+    @param to The address that will receive the borrowed DOLA
+    @param amount The amount of DOLA to be borrowed
+    */
+    function borrowInternal(address borrower, address to, uint amount) internal {
+        require(!borrowPaused, "Borrowing is paused");
+        if(borrowController != IBorrowController(address(0))) {
+            require(borrowController.borrowAllowed(msg.sender, borrower, amount), "Denied by borrow controller");
+        }
+        uint credit = getCreditLimitInternal(borrower);
+        debts[borrower] += amount;
+        require(credit >= debts[borrower], "Exceeded credit limit");
+        totalDebt += amount;
+        dbr.onBorrow(borrower, amount);
+        dola.transfer(to, amount);
+        emit Borrow(borrower, amount);
+    }
+
+    /**
+    @notice Function for borrowing DOLA.
+    @dev Will borrow to msg.sender
+    @param amount The amount of DOLA to be borrowed.
+    */
+    function borrow(uint amount) public {
+        borrowInternal(msg.sender, msg.sender, amount);
+    }
+
+    /**
+    @notice Function for using a signed message to borrow on behalf of an address owning an escrow with collateral.
+    @dev Signed messaged can be invalidated by incrementing the nonce. Will always borrow to the msg.sender.
+    @param from The address of the user being borrowed from
+    @param amount The amount to be borrowed
+    @param deadline Timestamp after which the signed message will be invalid
+    @param v The v param of the ECDSA signature
+    @param r The r param of the ECDSA signature
+    @param s The s param of the ECDSA signature
+    */
+    function borrowOnBehalf(address from, uint amount, uint deadline, uint8 v, bytes32 r, bytes32 s) public {
+        require(deadline >= block.timestamp, "DEADLINE_EXPIRED");
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "BorrowOnBehalf(address caller,address from,uint256 amount,uint256 nonce,uint256 deadline)"
+                                ),
+                                msg.sender,
+                                from,
+                                amount,
+                                nonces[from]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+            require(recoveredAddress != address(0) && recoveredAddress == from, "INVALID_SIGNER");
+            borrowInternal(from, msg.sender, amount);
+        }
+    }
+
+    /**
+    @notice Internal function for withdrawing from the escrow
+    @dev The internal function is shared by the withdraw function and withdrawOnBehalf function
+    @param from The address owning the escrow to withdraw from.
+    @param to The address receiving the tokens
+    @param amount The amount being withdrawn.
+    */
+    function withdrawInternal(address from, address to, uint amount) internal {
+        uint limit = getWithdrawalLimitInternal(from);
+        require(limit >= amount, "Insufficient withdrawal limit");
+        require(dbr.deficitOf(from) == 0, "Can't withdraw with DBR deficit");
+        IEscrow escrow = getEscrow(from);
+        escrow.pay(to, amount);
+        emit Withdraw(from, to, amount);
+    }
+
+    /**
+    @notice Function for withdrawing to msg.sender.
+    @param amount Amount to withdraw.
+    */
+    function withdraw(uint amount) public {
+        withdrawInternal(msg.sender, msg.sender, amount);
+    }
+
+    /**
+    @notice Function for withdrawing maximum allowed to msg.sender.
+    @dev Useful for use with escrows that continously compound tokens, so there won't be dust amounts left
+    @dev Dangerous to use when the user has any amount of debt!
+    */
+    function withdrawMax() public {
+        withdrawInternal(msg.sender, msg.sender, getWithdrawalLimitInternal(msg.sender));
+    }
+
+    /**
+    @notice Function for using a signed message to withdraw on behalf of an address owning an escrow with collateral.
+    @dev Signed messaged can be invalidated by incrementing the nonce. Will always withdraw to the msg.sender.
+    @param from The address of the user owning the escrow being withdrawn from
+    @param amount The amount to be withdrawn
+    @param deadline Timestamp after which the signed message will be invalid
+    @param v The v param of the ECDSA signature
+    @param r The r param of the ECDSA signature
+    @param s The s param of the ECDSA signature
+    */
+    function withdrawOnBehalf(address from, uint amount, uint deadline, uint8 v, bytes32 r, bytes32 s) public {
+        require(deadline >= block.timestamp, "DEADLINE_EXPIRED");
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "WithdrawOnBehalf(address caller,address from,uint256 amount,uint256 nonce,uint256 deadline)"
+                                ),
+                                msg.sender,
+                                from,
+                                amount,
+                                nonces[from]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+            require(recoveredAddress != address(0) && recoveredAddress == from, "INVALID_SIGNER");
+            withdrawInternal(from, msg.sender, amount);
+        }
+    }
+
+    /**
+    @notice Function for using a signed message to withdraw on behalf of an address owning an escrow with collateral.
+    @dev Signed messaged can be invalidated by incrementing the nonce. Will always withdraw to the msg.sender.
+    @dev Useful for use with escrows that continously compound tokens, so there won't be dust amounts left
+    @dev Dangerous to use when the user has any amount of debt!
+    @param from The address of the user owning the escrow being withdrawn from
+    @param deadline Timestamp after which the signed message will be invalid
+    @param v The v param of the ECDSA signature
+    @param r The r param of the ECDSA signature
+    @param s The s param of the ECDSA signature
+    */
+    function withdrawMaxOnBehalf(address from, uint deadline, uint8 v, bytes32 r, bytes32 s) public {
+        require(deadline >= block.timestamp, "DEADLINE_EXPIRED");
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "WithdrawMaxOnBehalf(address caller,address from,uint256 nonce,uint256 deadline)"
+                                ),
+                                msg.sender,
+                                from,
+                                nonces[from]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+            require(recoveredAddress != address(0) && recoveredAddress == from, "INVALID_SIGNER");
+            withdrawInternal(from, msg.sender, getWithdrawalLimitInternal(from));
+        }
+    }
+
+    /**
+    @notice Function for incrementing the nonce of the msg.sender, making their latest signed message unusable.
+    */
+    function invalidateNonce() public {
+        nonces[msg.sender]++;
+    }
+    
+    /**
+    @notice Function for repaying debt on behalf of user. Debt must be repaid in DOLA.
+    @dev If the user has a DBR deficit, they risk initial debt being accrued by forced replenishments.
+    @param user Address of the user whose debt is being repaid
+    @param amount DOLA amount to be repaid. If set to max uint debt will be repaid in full.
+    */
+    function repay(address user, uint amount) public {
+        uint debt = debts[user];
+        if(amount == type(uint).max){
+            amount = debt;
+        }
+        require(debt >= amount, "Repayment greater than debt");
+        debts[user] -= amount;
+        totalDebt -= amount;
+        dbr.onRepay(user, amount);
+        if(address(borrowController) != address(0)){
+            borrowController.onRepay(amount);
+        }
+        dola.transferFrom(msg.sender, address(this), amount);
+        emit Repay(user, msg.sender, amount);
+    }
+
+    /**
+    @notice Bundles repayment and withdrawal into a single function call.
+    @param repayAmount Amount of DOLA to be repaid
+    @param withdrawAmount Amount of underlying to be withdrawn from the escrow
+    */
+    function repayAndWithdraw(uint repayAmount, uint withdrawAmount) public {
+        repay(msg.sender, repayAmount);
+        withdraw(withdrawAmount);
+    }
+
+    /**
+    @notice Function for forcing a user to replenish their DBR deficit at a pre-determined price.
+     The replenishment will accrue additional DOLA debt.
+     On a successful call, the caller will be paid a replenishment incentive.
+    @dev The function will only top the user back up to 0, meaning that the user will have a DBR deficit again in the next block.
+    @param user The address of the user being forced to replenish DBR
+    @param amount The amount of DBR the user will be replenished.
+    */
+    function forceReplenish(address user, uint amount) public {
+        uint deficit = dbr.deficitOf(user);
+        require(deficit > 0, "No DBR deficit");
+        require(deficit >= amount, "Amount > deficit");
+        uint replenishmentCost = amount * dbr.replenishmentPriceBps() / 10000;
+        uint replenisherReward = replenishmentCost * replenishmentIncentiveBps / 10000;
+        debts[user] += replenishmentCost;
+        uint collateralValue = getCollateralValueInternal(user) * (10000 - liquidationIncentiveBps - liquidationFeeBps) / 10000;
+        require(collateralValue >= debts[user], "Exceeded collateral value");
+        totalDebt += replenishmentCost;
+        dbr.onForceReplenish(user, msg.sender, amount, replenisherReward);
+        dola.transfer(msg.sender, replenisherReward);
+    }
+    /**
+    @notice Function for forcing a user to replenish all of their DBR deficit at a pre-determined price.
+     The replenishment will accrue additional DOLA debt.
+     On a successful call, the caller will be paid a replenishment incentive.
+    @dev The function will only top the user back up to 0, meaning that the user will have a DBR deficit again in the next block.
+    @param user The address of the user being forced to replenish DBR
+    */
+    function forceReplenishAll(address user) public {
+        uint deficit = dbr.deficitOf(user);
+        forceReplenish(user, deficit);
+    }
+
+    /**
+    @notice Function for liquidating a user's under water debt. Debt is under water when the value of a user's debt is above their collateral factor.
+    @param user The user to be liquidated
+    @param repaidDebt Th amount of user user debt to liquidate.
+    */
+    function liquidate(address user, uint repaidDebt) public {
+        require(repaidDebt > 0, "Must repay positive debt");
+        uint debt = debts[user];
+        require(getCreditLimitInternal(user) < debt, "User debt is healthy");
+        require(repaidDebt <= debt * liquidationFactorBps / 10000, "Exceeded liquidation factor");
+        uint price = oracle.getPrice(address(collateral), collateralFactorBps);
+        uint liquidatorReward = repaidDebt * 1 ether / price;
+        liquidatorReward += liquidatorReward * liquidationIncentiveBps / 10000;
+        debts[user] -= repaidDebt;
+        totalDebt -= repaidDebt;
+        dbr.onRepay(user, repaidDebt);
+        if(address(borrowController) != address(0)){
+            borrowController.onRepay(repaidDebt);
+        }
+        dola.transferFrom(msg.sender, address(this), repaidDebt);
+        IEscrow escrow = predictEscrow(user);
+        escrow.pay(msg.sender, liquidatorReward);
+        if(liquidationFeeBps > 0) {
+            uint liquidationFee = repaidDebt * 1 ether / price * liquidationFeeBps / 10000;
+            uint balance = escrow.balance();
+            if(balance >= liquidationFee) {
+                escrow.pay(gov, liquidationFee);
+            } else if(balance > 0) {
+                escrow.pay(gov, balance);
+            }
+        }
+        emit Liquidate(user, msg.sender, repaidDebt, liquidatorReward);
+    }
+    
+    event Deposit(address indexed account, uint amount);
+    event Borrow(address indexed account, uint amount);
+    event Withdraw(address indexed account, address indexed to, uint amount);
+    event Repay(address indexed account, address indexed repayer, uint amount);
+    event Liquidate(address indexed account, address indexed liquidator, uint repaidDebt, uint liquidatorReward);
+    event CreateEscrow(address indexed user, address escrow);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+

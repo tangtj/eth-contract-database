@@ -1,0 +1,1491 @@
+
+// File: @gammaswap/v1-core/contracts/base/AbstractGammaPoolFactory.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.4;
+
+import "../interfaces/IGammaPoolFactory.sol";
+import "../interfaces/IProtocol.sol";
+import "../interfaces/IPausable.sol";
+import "../utils/TwoStepOwnable.sol";
+import "../libraries/AddressCalculator.sol";
+
+/// @title Abstract factory contract to create more GammaPool contracts.
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev If another GammaPoolFactory contract is created it is recommended to inherit from this contract
+abstract contract AbstractGammaPoolFactory is IGammaPoolFactory, TwoStepOwnable {
+
+    error Forbidden();
+    error ZeroProtocol();
+    error ProtocolNotSet();
+    error ProtocolExists();
+    error ProtocolMismatch();
+    error ProtocolRestricted();
+    error PoolExists();
+    error DeployFailed();
+    error ZeroAddress();
+    error ExecuteFailed();
+    error NotUpgradable();
+    error ProtocolLocked();
+    error NotLockable();
+
+    /// @dev See {IGammaPoolFactory-getPool}
+    mapping(bytes32 => address) public override getPool; // all GS Pools addresses can be predetermined through key
+
+    /// @dev See {IGammaPoolFactory-getKey}
+    mapping(address => bytes32) public override getKey; // predetermined key maps to pool address
+
+    /// @dev See {IGammaPoolFactory-fee}
+    uint16 public override fee = 10000; // Default value is 10,000 basis points or 10%
+
+    /// @dev See {IGammaPoolFactory-origFeeShare}
+    uint16 public override origFeeShare = 600; // Default value is 600 basis points or 60%
+
+    /// @dev See {IGammaPoolFactory-feeTo}
+    address public override feeTo;
+
+    /// @dev See {IGammaPoolFactory-feeToSetter}
+    address public override feeToSetter;
+
+    /// @dev Initialize `owner` of factory contract
+    constructor(address _owner, address _feeTo, address _feeToSetter) TwoStepOwnable(_owner) {
+        feeTo = _feeTo;
+        feeToSetter = _feeToSetter;
+    }
+
+    /// @dev Revert if sender is not the required address in parameter (e.g. sender not owner or feeToSetter)
+    /// @param _address - address transaction sender must be in order to not revert
+    function isForbidden(address _address) internal virtual view {
+        if(msg.sender != _address) revert Forbidden();
+    }
+
+    /// @dev Revert if address parameter is zero address. This is used transaction that are changing an address state variable
+    /// @param _address - address that must not be zero
+    function isZeroAddress(address _address) internal virtual view {
+        if(_address == address(0)) revert ZeroAddress();
+    }
+
+    /// @dev Revert if key already maps to a GammaPool. This is used to avoid duplicating GammaPool instances
+    /// @param key - unique key used to identify GammaPool instance (e.g. salt)
+    function hasPool(bytes32 key) internal virtual view {
+        if(getPool[key] != address(0)) revert PoolExists();
+    }
+
+    /// @dev See {IGammaPoolFactory-pausePoolFunction}
+    function pausePoolFunction(address _pool, uint8 _functionId) external virtual override onlyOwner returns(uint256) {
+        return IPausable(_pool).pause(_functionId);
+    }
+
+    /// @dev See {IGammaPoolFactory-unpausePoolFunction}
+    function unpausePoolFunction(address _pool, uint8 _functionId) external virtual override onlyOwner returns(uint256) {
+        return IPausable(_pool).unpause(_functionId);
+    }
+
+    /// @dev See {IGammaPoolFactory-execute}
+    function execute(address _pool, bytes calldata _data) external virtual override {
+        isForbidden(feeToSetter);
+        (bool success, bytes memory result) = _pool.call(_data);
+        if (!success) {
+            if (result.length == 0) revert ExecuteFailed();
+            assembly {
+                revert(add(32, result), mload(result))
+            }
+        }
+    }
+
+    /// @dev See {IGammaPoolFactory-setFee}
+    function setFee(uint16 _fee) external virtual override {
+        isForbidden(feeToSetter); // only feeToSetter can set the protocol fee
+        fee = _fee;
+        emit FeeUpdate(address(0), feeTo, _fee, origFeeShare, false);
+    }
+
+    /// @dev See {IGammaPoolFactory-setFeeTo}
+    function setFeeTo(address _feeTo) external virtual override {
+        isForbidden(feeToSetter); // only feeToSetter can set which address receives protocol fees
+        feeTo = _feeTo;
+        emit FeeUpdate(address(0), _feeTo, fee, origFeeShare, false);
+    }
+
+    /// @dev See {IGammaPoolFactory-setOrigFeeShare}
+    function setOrigFeeShare(uint16 _origFeeShare) external virtual override {
+        isForbidden(feeToSetter); // only feeToSetter can set which address receives protocol fees
+        origFeeShare = _origFeeShare;
+        emit FeeUpdate(address(0), feeTo, fee, origFeeShare, false);
+    }
+
+    /// @dev See {IGammaPoolFactory-setFeeToSetter}
+    function setFeeToSetter(address _feeToSetter) external virtual override onlyOwner {
+        isZeroAddress(_feeToSetter); // protocol fee setting privileges can't be transferred to the zero address
+        feeToSetter = _feeToSetter;
+    }
+
+    function cloneDeterministic(address beacon, uint16 protocolId, bytes32 salt) internal virtual returns (address instance) {
+        bytes memory bytecode = AddressCalculator.calcMinimalBeaconProxyBytecode(beacon, protocolId, address(this));
+
+        assembly {
+            instance := create2(0, add(bytecode, 32), mload(bytecode), salt)
+        }
+        if(instance == address(0)) revert DeployFailed();
+    }
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create2 opcode and a `salt` to deterministically deploy
+     * the clone. Using the same `implementation` and `salt` multiple time will revert, since
+     * the clones cannot be deployed twice at the same address.
+     *
+     * @param implementation - implementation address of GammaPool. Because all GammaPools are created as proxy contracts
+     * @param salt - the bytes32 key that is unique to the GammaPool and therefore also used as a unique identifier of the GammaPool
+     * @return instance - address of GammaPool that was created
+     */
+    function cloneDeterministic2(address implementation, bytes32 salt) internal virtual returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create2(0, 0x09, 0x37, salt)
+        }
+        if(instance == address(0)) revert DeployFailed(); // revert if failed to instantiate GammaPool
+    }
+}
+
+
+// File: @gammaswap/v1-core/contracts/GammaPoolFactory.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.21;
+
+import "./base/AbstractGammaPoolFactory.sol";
+import "./rates/storage/AbstractRateParamsStore.sol";
+import "./libraries/AddressCalculator.sol";
+import "./libraries/GammaSwapLibrary.sol";
+import "./observer/AbstractLoanObserverStore.sol";
+import "./utils/LockableMinimalBeacon.sol";
+
+/// @title Factory contract to create more GammaPool contracts.
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Creates new GammaPool instances as minimal proxy contracts (EIP-1167) to implementation contracts identified by a protocol id
+contract GammaPoolFactory is AbstractGammaPoolFactory, AbstractRateParamsStore, AbstractLoanObserverStore {
+
+    struct Fee {
+        uint16 protocol;
+        uint16 origFeeShare;
+        address to;
+        bool isSet;
+    }
+
+    /// @dev See {IGammaPoolFactory-getProtocol}
+    mapping(uint16 => address) public override getProtocol;
+
+    /// @dev See {IGammaPoolFactory-getProtocolBeacon}
+    mapping(uint16 => address) public override getProtocolBeacon;
+
+    /// @dev See {IGammaPoolFactory-isProtocolRestricted}
+    mapping(uint16 => bool) public override isProtocolRestricted;
+
+    /// @dev fee information by GammaPool
+    mapping(address => Fee) private poolFee;
+
+    /// @dev Array of all GammaPool instances created by this factory contract
+    address[] public allPools;
+
+    /// @dev Initializes the contract by setting `feeToSetter`, `feeTo`, and `owner`.
+    constructor(address _feeTo) AbstractGammaPoolFactory(msg.sender, _feeTo, _feeTo){
+    }
+
+    /// @dev See {IGammaPoolFactory-allPoolsLength}
+    function allPoolsLength() external virtual override view returns (uint256) {
+        return allPools.length;
+    }
+
+    /// @dev Revert if GammaPool implementation (protocol) is restricted and msg.sender is not address with permission to create (e.g. owner)
+    /// @param _protocolId - id of implementation contract being checked
+    /// @param _address - address that has permission to bypass restricted protocol setting
+    function isRestricted(uint16 _protocolId, address _address) internal virtual view {
+        if(isProtocolRestricted[_protocolId] == true && msg.sender != _address) revert ProtocolRestricted();
+    }
+
+    /// @dev Revert if there is no implementation contract set for this _protocolId
+    /// @param _protocolId - id of implementation contract being checked
+    function isProtocolNotSet(uint16 _protocolId) internal virtual view {
+        if(getProtocol[_protocolId] == address(0)) revert ProtocolNotSet();
+    }
+
+    /// @dev See {IGammaPoolFactory-addProtocol}
+    function addProtocol(address implementation) external virtual override onlyOwner {
+        uint16 _protocolId = IProtocol(implementation).protocolId();
+        if(_protocolId == 0) revert ZeroProtocol();// implementation protocolId is zero
+        if(getProtocol[_protocolId] != address(0)) revert ProtocolExists(); // protocolId already set
+
+        getProtocol[_protocolId] = implementation; // store implementation
+        if (_protocolId < 10000) {
+            getProtocolBeacon[_protocolId] = address(new LockableMinimalBeacon(address(this), _protocolId)); // only set once
+        }
+    }
+
+    /// @dev See {IGammaPoolFactory-updateProtocol}
+    function updateProtocol(uint16 _protocolId, address _newImplementation) external virtual override onlyOwner {
+        isProtocolNotSet(_protocolId);
+        if(_protocolId >= 10000) revert NotUpgradable();
+        if(IProtocol(_newImplementation).protocolId() == 0) revert ZeroProtocol();
+        if(IProtocol(_newImplementation).protocolId() != _protocolId) revert ProtocolMismatch();
+        if(getProtocol[_protocolId] == _newImplementation) revert ProtocolExists(); // protocolId already set with same implementation
+        if(LockableMinimalBeacon(getProtocolBeacon[_protocolId]).protocol()!= address(0)) revert ProtocolLocked();
+        getProtocol[_protocolId] = _newImplementation;
+    }
+
+    /// @dev See {IGammaPoolFactory-lockProtocol}
+    function lockProtocol(uint16 _protocolId) external virtual override onlyOwner {
+        isProtocolNotSet(_protocolId);
+        if(_protocolId >= 10000) revert NotLockable();
+
+        LockableMinimalBeacon(getProtocolBeacon[_protocolId]).lock();
+    }
+
+    /// @dev See {IGammaPoolFactory-setIsProtocolRestricted}
+    function setIsProtocolRestricted(uint16 _protocolId, bool _isRestricted) external virtual override onlyOwner {
+        isProtocolRestricted[_protocolId] = _isRestricted;
+    }
+
+    /// @dev See {IGammaPoolFactory-createPool}
+    function createPool(uint16 _protocolId, address _cfmm, address[] calldata _tokens, bytes calldata _data) external virtual override returns (address pool) {
+        isProtocolNotSet(_protocolId); // check there is an implementation contract mapped to _protocolId parameter
+        isRestricted(_protocolId, owner); // if implementation is restricted only owner is allowed to create GammaPools for this _protocolId
+
+        // get implementation contract for _protocolId parameter
+        address implementation = getProtocol[_protocolId];
+
+        // check GammaPool can be created with this implementation
+        address[] memory _tokensOrdered = IProtocol(implementation).validateCFMM(_tokens, _cfmm, _data);
+
+        // calculate unique identifier of GammaPool that will also be used as salt for instantiating the proxy contract address
+        bytes32 key = AddressCalculator.getGammaPoolKey(_cfmm, _protocolId);
+
+        hasPool(key); // check this instance hasn't already been created
+
+        // instantiate GammaPool proxy contract address for protocol's implementation contract using unique key as salt for the pool's address
+        if (_protocolId < 10000) {
+            pool = cloneDeterministic(getProtocolBeacon[_protocolId], _protocolId, key);
+        } else {
+            pool = cloneDeterministic2(implementation, key);
+        }
+
+        uint8[] memory _decimals = getDecimals(_tokensOrdered);
+        uint72 _minBorrow = uint72(10**((_decimals[0] + _decimals[1]) / 2));
+        IProtocol(pool).initialize(_cfmm, _tokensOrdered, _decimals, _minBorrow, _data); // initialize GammaPool's state variables
+
+        getPool[key] = pool; // map unique key to new instance of GammaPool
+        getKey[pool] = key; // map unique key to new instance of GammaPool
+        allPools.push(pool); // store new GammaPool instance in an array
+        emit PoolCreated(pool, _cfmm, _protocolId, implementation, _tokensOrdered, allPools.length); // store creation details in blockchain
+    }
+
+    /// @dev Get decimals of ERC20 tokens of GammaPool's CFMM
+    /// @param _tokens - tokens of CFMM tokens in pool
+    /// @return _decimals - decimals of CFMM tokens, indices must match _tokens[] array
+    function getDecimals(address[] memory _tokens) internal virtual returns(uint8[] memory _decimals) {
+        _decimals = new uint8[](_tokens.length);
+        for(uint256 i = 0; i < _tokens.length;) {
+            _decimals[i] = GammaSwapLibrary.decimals(_tokens[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev See {IGammaPoolFactory-getPoolFee}
+    function getPoolFee(address _pool) external view override returns (address _to, uint256 _protocolFee, uint256 _origFeeShare, bool _isSet) {
+        Fee storage _fee = poolFee[_pool];
+        _isSet = _fee.isSet;
+        if(_isSet) {
+            _to = _fee.to;
+            _protocolFee = _fee.protocol;
+            _origFeeShare = _fee.origFeeShare;
+        } else {
+            _to = feeTo;
+            _protocolFee = fee;
+            _origFeeShare = origFeeShare;
+        }
+    }
+
+    /// @dev See {IGammaPoolFactory-setPoolFee}
+    function setPoolFee(address _pool, address _to, uint16 _protocolFee, uint16 _origFeeShare, bool _isSet) external virtual override {
+        isForbidden(feeToSetter); // only feeToSetter can set the protocol fee
+        poolFee[_pool] = Fee({protocol: _protocolFee, origFeeShare: _origFeeShare, to: _to, isSet: _isSet});
+        emit FeeUpdate(_pool, _to, _protocolFee, _origFeeShare, _isSet);
+    }
+
+    /// @dev See {IGammaPoolFactory-feeInfo}
+    function feeInfo() external virtual override view returns(address _feeTo, uint256 _fee, uint256 _origFeeShare) {
+        _feeTo = feeTo;
+        _fee = fee;
+        _origFeeShare = origFeeShare;
+    }
+
+    /// @dev See {IGammaPoolFactory-getPools}.
+    function getPools(uint256 start, uint256 end) external virtual override view returns(address[] memory _pools) {
+        if(start > end || allPools.length == 0) {
+            return new address[](0);
+        }
+        uint256 lastIdx = allPools.length - 1;
+        if(start <= lastIdx) {
+            uint256 _start = start;
+            uint256 _end = lastIdx < end ? lastIdx : end;
+            uint256 _size = _end - _start + 1;
+            _pools = new address[](_size);
+            uint256 k = 0;
+            for(uint256 i = _start; i <= _end;) {
+                _pools[k] = allPools[i];
+                unchecked {
+                    ++k;
+                    ++i;
+                }
+            }
+        }
+    }
+
+    /// @dev See {AbstractRateParamsStore.-_rateParamsStoreOwner};
+    function _rateParamsStoreOwner() internal override virtual view returns(address) {
+        return owner;
+    }
+
+    /// @dev Return rate params store owner
+    function rateParamsStoreOwner() external virtual view returns(address) {
+        return _rateParamsStoreOwner();
+    }
+
+    /// @dev See {AbstractLoanObserverStore.-_loanObserverStoreOwner};
+    function _loanObserverStoreOwner() internal override virtual view returns(address) {
+        return owner;
+    }
+
+    /// @dev Return collateral reference store owner
+    function loanObserverStoreOwner() external virtual view returns(address) {
+        return _loanObserverStoreOwner();
+    }
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/IGammaPoolFactory.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface for factory contract to create more GammaPool contracts.
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev All instantiated GammaPoolFactory contracts must implement this interface
+interface IGammaPoolFactory {
+    /// @dev Event emitted when a new GammaPool is instantiated
+    /// @param pool - address of new pool that is created
+    /// @param cfmm - address of CFMM the GammaPool is created for
+    /// @param protocolId - id identifier of GammaPool protocol (can be thought of as version)
+    /// @param implementation - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts
+    /// @param tokens - ERC20 tokens of CFMM
+    /// @param count - number of GammaPools instantiated including this contract
+    event PoolCreated(address indexed pool, address indexed cfmm, uint16 indexed protocolId, address implementation, address[] tokens, uint256 count);
+
+    /// @dev Event emitted when a GammaPool fee is updated
+    /// @param pool - address of new pool whose fee is updated (zero address is default params)
+    /// @param to - receiving address of protocol fees
+    /// @param protocolFee - protocol fee share charged from interest rate accruals
+    /// @param origFeeShare - protocol fee share charged on origination fees
+    /// @param isSet - bool flag, true use fee information, false use GammaSwap default fees
+    event FeeUpdate(address indexed pool, address indexed to, uint16 protocolFee, uint16 origFeeShare, bool isSet);
+
+    /// @dev Event emitted when a GammaPool parameters are updated
+    /// @param pool - address of GammaPool whose origination fee parameters will be updated
+    /// @param origFee - loan opening origination fee in basis points
+    /// @param extSwapFee - external swap fee in basis points, max 255 basis points = 2.55%
+    /// @param emaMultiplier - multiplier used in EMA calculation of utilization rate
+    /// @param minUtilRate1 - minimum utilization rate to calculate dynamic origination fee using exponential model
+    /// @param minUtilRate2 - minimum utilization rate to calculate dynamic origination fee using linear model
+    /// @param feeDivisor - fee divisor for calculating origination fee, based on 2^(maxUtilRate - minUtilRate1)
+    /// @param liquidationFee - liquidation fee to charge during liquidations in basis points (1 - 255 => 0.01% to 2.55%)
+    /// @param ltvThreshold - ltv threshold (1 - 255 => 0.1% to 25.5%)
+    /// @param minBorrow - minimum liquidity amount that can be borrowed or left unpaid in a loan
+    event PoolParamsUpdate(address indexed pool, uint16 origFee, uint8 extSwapFee, uint8 emaMultiplier, uint8 minUtilRate1, uint8 minUtilRate2, uint16 feeDivisor, uint8 liquidationFee, uint8 ltvThreshold, uint72 minBorrow);
+
+    /// @dev Check if protocol is restricted. Which means only owner of GammaPoolFactory is allowed to instantiate GammaPools using this protocol
+    /// @param _protocolId - id identifier of GammaPool protocol (can be thought of as version) that is being checked
+    /// @return _isRestricted - true if protocol is restricted, false otherwise
+    function isProtocolRestricted(uint16 _protocolId) external view returns(bool);
+
+    /// @dev Set a protocol to be restricted or unrestricted. That means only owner of GammaPoolFactory is allowed to instantiate GammaPools using this protocol
+    /// @param _protocolId - id identifier of GammaPool protocol (can be thought of as version) that is being restricted
+    /// @param _isRestricted - set to true for restricted, set to false for unrestricted
+    function setIsProtocolRestricted(uint16 _protocolId, bool _isRestricted) external;
+
+    /// @notice Only owner of GammaPoolFactory can call this function
+    /// @dev Add a protocol implementation to GammaPoolFactory contract. Which means GammaPoolFactory can create GammaPools with this implementation (protocol)
+    /// @param _implementation - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts
+    function addProtocol(address _implementation) external;
+
+    /// @notice Only owner of GammaPoolFactory can call this function
+    /// @dev Update protocol implementation for a protocol.
+    /// @param _protocolId - id identifier of GammaPool implementation
+    /// @param _newImplementation - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts
+    function updateProtocol(uint16 _protocolId, address _newImplementation) external;
+
+    /// @notice Only owner of GammaPoolFactory can call this function
+    /// @dev Locks protocol implementation for upgradable protocols (<10000) so GammaPoolFactory can no longer update the implementation contract for this upgradable protocol
+    /// @param _protocolId - id identifier of GammaPool implementation
+    function lockProtocol(uint16 _protocolId) external;
+
+    /// @dev Get implementation address that maps to protocolId. This is the actual implementation code that a GammaPool implements for a protocolId
+    /// @param _protocolId - id identifier of GammaPool implementation (can be thought of as version)
+    /// @return _address - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts
+    function getProtocol(uint16 _protocolId) external view returns (address);
+
+    /// @dev Get beacon address that maps to protocolId. This beacon contract contains the implementation address of the GammaPool proxy
+    /// @param _protocolId - id identifier of GammaPool implementation (can be thought of as version)
+    /// @return _address - address of beacon of GammaPool proxy contract. Because all GammaPools are created as proxy contracts if there is one
+    function getProtocolBeacon(uint16 _protocolId) external view returns (address);
+
+    /// @dev Instantiate a new GammaPool for a CFMM based on an existing implementation (protocolId)
+    /// @param _protocolId - id identifier of GammaPool protocol (can be thought of as version)
+    /// @param _cfmm - address of CFMM the GammaPool is created for
+    /// @param _tokens - addresses of ERC20 tokens in CFMM, used for validation during runtime of function
+    /// @param _data - custom struct containing additional information used to verify the `_cfmm`
+    /// @return _address - address of new GammaPool proxy contract that was instantiated
+    function createPool(uint16 _protocolId, address _cfmm, address[] calldata _tokens, bytes calldata _data) external returns(address);
+
+    /// @dev Mapping of bytes32 salts (key) to GammaPool addresses. The salt is predetermined and used to instantiate a GammaPool with a unique address
+    /// @param _salt - the bytes32 key that is unique to the GammaPool and therefore also used as a unique identifier of the GammaPool
+    /// @return _address - address of GammaPool that maps to bytes32 salt (key)
+    function getPool(bytes32 _salt) external view returns(address);
+
+    /// @dev Mapping of bytes32 salts (key) to GammaPool addresses. The salt is predetermined and used to instantiate a GammaPool with a unique address
+    /// @param _pool - address of GammaPool that maps to bytes32 salt (key)
+    /// @return _salt - the bytes32 key that is unique to the GammaPool and therefore also used as a unique identifier of the GammaPool
+    function getKey(address _pool) external view returns(bytes32);
+
+    /// @return count - number of GammaPools that have been instantiated through this GammaPoolFactory contract
+    function allPoolsLength() external view returns (uint256);
+
+    /// @dev Get pool fee parameters used to calculate protocol fees
+    /// @param _pool - pool address identifier
+    /// @return _to - address receiving fee
+    /// @return _protocolFee - protocol fee share charged from interest rate accruals
+    /// @return _origFeeShare - protocol fee share charged on origination fees
+    /// @return _isSet - bool flag, true use fee information, false use GammaSwap default fees
+    function getPoolFee(address _pool) external view returns (address _to, uint256 _protocolFee, uint256 _origFeeShare, bool _isSet);
+
+    /// @dev Set pool fee parameters used to calculate protocol fees
+    /// @param _pool - id identifier of GammaPool protocol (can be thought of as version)
+    /// @param _to - address receiving fee
+    /// @param _protocolFee - protocol fee share charged from interest rate accruals
+    /// @param _origFeeShare - protocol fee share charged on origination fees
+    /// @param _isSet - bool flag, true use fee information, false use GammaSwap default fees
+    function setPoolFee(address _pool, address _to, uint16 _protocolFee, uint16 _origFeeShare, bool _isSet) external;
+
+    /// @dev Call admin function in GammaPool contract
+    /// @param _pool - address of GammaPool whose admin function will be called
+    /// @param _data - custom struct containing information to execute in pool contract
+    function execute(address _pool, bytes calldata _data) external;
+
+    /// @dev Pause a GammaPool's function identified by a `_functionId`
+    /// @param _pool - address of GammaPool whose functions we will pause
+    /// @param _functionId - id of function in GammaPool we want to pause
+    /// @return _functionIds - uint256 number containing all turned on (paused) function ids
+    function pausePoolFunction(address _pool, uint8 _functionId) external returns(uint256 _functionIds) ;
+
+    /// @dev Unpause a GammaPool's function identified by a `_functionId`
+    /// @param _pool - address of GammaPool whose functions we will unpause
+    /// @param _functionId - id of function in GammaPool we want to unpause
+    /// @return _functionIds - uint256 number containing all turned on (paused) function ids
+    function unpausePoolFunction(address _pool, uint8 _functionId) external returns(uint256 _functionIds) ;
+
+    /// @return fee - protocol fee charged by GammaPool to liquidity borrowers in terms of basis points
+    function fee() external view returns(uint16);
+
+    /// @return origFeeShare - protocol fee share charged on origination fees
+    function origFeeShare() external view returns(uint16);
+
+    /// @return feeTo - address that receives protocol fees
+    function feeTo() external view returns(address);
+
+    /// @return feeToSetter - address that has the power to set protocol fees
+    function feeToSetter() external view returns(address);
+
+    /// @return feeTo - address that receives protocol fees
+    /// @return fee - protocol fee charged by GammaPool to liquidity borrowers in terms of basis points
+    /// @return origFeeShare - protocol fee share charged on origination fees
+    function feeInfo() external view returns(address,uint256,uint256);
+
+    /// @dev Get list of pools from start index to end index. If it goes over index it returns up to the max size of allPools array
+    /// @param start - start index of pools to search
+    /// @param end - end index of pools to search
+    /// @return _pools - all pools requested
+    function getPools(uint256 start, uint256 end) external view returns(address[] memory _pools);
+
+    /// @dev See {IGammaPoolFactory-setFee}
+    function setFee(uint16 _fee) external;
+
+    /// @dev See {IGammaPoolFactory-setFeeTo}
+    function setFeeTo(address _feeTo) external;
+
+    /// @dev See {IGammaPoolFactory-setOrigFeeShare}
+    function setOrigFeeShare(uint16 _origFeeShare) external;
+
+    /// @dev See {IGammaPoolFactory-setFeeToSetter}
+    function setFeeToSetter(address _feeToSetter) external;
+
+}
+
+// File: @gammaswap/v1-core/contracts/interfaces/IPausable.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface for Pausable contract
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev All instantiated Pausable contracts must implement this interface so that they can pause individual functions
+interface IPausable {
+
+    error ForbiddenPauser();
+    error Paused(uint8 _functionId);
+    error NotPaused(uint8 _functionId);
+
+    /// @dev Emitted when the pause is triggered by `account`.
+    event Pause(address account, uint8 _functionId);
+
+    /// @dev Emitted when the unpause is triggered by `account`.
+    event Unpause(address account, uint8 _functionId);
+
+    /// @dev Get uint256 number containing all function id bits at their current state
+    /// @return functionIds - uint256 number containing all turned on (paused) function ids
+    function functionIds() external view returns(uint256);
+
+    /// @dev Pause a GammaPool's function identified by a `_functionId`
+    /// @param _functionId - id of function in GammaPool we want to pause
+    /// @return isPaused - true if function identified by `_functionId` is paused
+    function isPaused(uint8 _functionId) external view returns (bool);
+
+    /// @dev Pause a GammaPool's function identified by a `_functionId`
+    /// @param _functionId - id of function in GammaPool we want to pause
+    /// @return _functionIds - uint256 number containing all turned on (paused) function ids
+    function pause(uint8 _functionId) external returns (uint256);
+
+    /// @dev Unpause a GammaPool's function identified by a `_functionId`
+    /// @param _functionId - id of function in GammaPool we want to unpause
+    /// @return _functionIds - uint256 number containing all turned on (paused) function ids
+    function unpause(uint8 _functionId) external returns (uint256);
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/IProtocol.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface for Protocol
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Interface used to add protocols and initialize them in GammaPoolFactory
+interface IProtocol {
+    /// @dev Protocol id of the implementation contract for this GammaPool
+    function protocolId() external view returns(uint16);
+
+    /// @dev Check GammaPool for CFMM and tokens can be created with this implementation
+    /// @param _tokens - assumed tokens of CFMM, validate function should check CFMM is indeed for these tokens
+    /// @param _cfmm - address of CFMM GammaPool will be for
+    /// @param _data - custom struct containing additional information used to verify the `_cfmm`
+    /// @return _tokensOrdered - tokens ordered to match the same order as in CFMM
+    function validateCFMM(address[] calldata _tokens, address _cfmm, bytes calldata _data) external view returns(address[] memory _tokensOrdered);
+
+    /// @dev Function to initialize state variables GammaPool, called usually from GammaPoolFactory contract right after GammaPool instantiation
+    /// @param _cfmm - address of CFMM GammaPool is for
+    /// @param _tokens - ERC20 tokens of CFMM
+    /// @param _decimals - decimals of CFMM tokens, indices must match _tokens[] array
+    /// @param _data - custom struct containing additional information used to verify the `_cfmm`
+    /// @param _minBorrow - minimum amount of liquidity that can be borrowed or left unpaid in a loan
+    function initialize(address _cfmm, address[] calldata _tokens, uint8[] calldata _decimals, uint72 _minBorrow, bytes calldata _data) external;
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/observer/ICollateralManager.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+import "./ILoanObserver.sol";
+
+/// @title Interface for CollateralManager
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Interface used for CollateralManager. External contract that can hold collateral for loan and liquidate debt with its collateral
+/// @notice GammaSwap team will create CollateralManagers that may have hooks available for other developers to extend functionality of GammaPool
+interface ICollateralManager is ILoanObserver {
+
+    /// @dev Get collateral of loan identified by tokenId
+    /// @param gammaPool - address of pool loan identified by tokenId belongs to
+    /// @param tokenId - unique identifier of loan in GammaPool
+    /// @return collateral - loan collateral held outside of GammaPool for loan identified by `tokenId`
+    function getCollateral(address gammaPool, uint256 tokenId) external view returns(uint256 collateral);
+
+    /// @notice Should require authentication that msg.sender is GammaPool of tokenId and GammaPool is registered
+    /// @dev Liquidate loan debt of loan identified by tokenId
+    /// @param cfmm - address of the CFMM GammaPool is for
+    /// @param protocolId - protocol id of the implementation contract for this GammaPool
+    /// @param tokenId - unique identifier of loan in GammaPool
+    /// @param amount - liquidity amount to liquidate
+    /// @param to - address of liquidator
+    /// @return collateral - loan collateral held outside of GammaPool (Only significant when the loan tracks collateral)
+    function liquidateCollateral(address cfmm, uint16 protocolId, uint256 tokenId, uint256 amount, address to) external returns(uint256 collateral);
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/observer/ILoanObserver.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface for LoanObserver
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Interface used for LoanObserver. External contract that can hold collateral for loan or implement after loan update hook
+/// @notice GammaSwap team will create LoanObservers that will either work as Collateral Managers or hooks to update code
+interface ILoanObserver {
+
+    struct LoanObserved {
+        /// @dev Loan counter, used to generate unique tokenId which indentifies the loan in the GammaPool
+        uint256 id;
+
+        // 1x256 bits
+        /// @dev Index of GammaPool interest rate at time loan is created/updated, max 7.9% trillion
+        uint96 rateIndex; // 96 bits
+
+        // 1x256 bits
+        /// @dev Initial loan debt in liquidity invariant units. Only increase when more liquidity is borrowed, decreases when liquidity is paid
+        uint128 initLiquidity; // 128 bits
+        /// @dev Loan debt in liquidity invariant units, increases with every update according to how many blocks have passed
+        uint128 liquidity; // 128 bits
+
+        /// @dev Initial loan debt in terms of LP tokens at time liquidity was borrowed, updates along with initLiquidity
+        uint256 lpTokens;
+        /// @dev Reserve tokens held as collateral for the liquidity debt, indices match GammaPool's tokens[] array indices
+        uint128[] tokensHeld; // array of 128 bit numbers
+
+        /// @dev price at which loan was opened
+        uint256 px;
+    }
+
+    /// @dev Unique identifier of observer
+    function refId() external view returns(uint16);
+
+    /// @dev Observer type (2 = does not track collateral and onLoanUpdate returns zero, 3 = tracks collateral and onLoanUpdate returns collateral held outside of GammaPool)
+    function refType() external view returns(uint16);
+
+    /// @dev Validate observer can work with GammaPool
+    /// @param gammaPool - address of GammaPool observer contract will observe
+    /// @return validated - true if observer can work with `gammaPool`, false otherwise
+    function validate(address gammaPool) external view returns(bool);
+
+    /// @notice Used to identify requests from GammaPool
+    /// @dev Factory contract of GammaPool observer will receive updates from
+    function factory() external view returns(address);
+
+    /// @notice Should require authentication that msg.sender is GammaPool of tokenId and GammaPool is registered
+    /// @dev Update observer when a loan update occurs
+    /// @dev If an observer does not hold collateral for loan it should return 0
+    /// @param cfmm - address of the CFMM GammaPool is for
+    /// @param protocolId - protocol id of the implementation contract for this GammaPool
+    /// @param tokenId - unique identifier of loan in GammaPool
+    /// @param data - data passed by gammaPool (e.g. LoanObserved)
+    /// @return collateral - loan collateral held outside of GammaPool (Only significant when the loan tracks collateral)
+    function onLoanUpdate(address cfmm, uint16 protocolId, uint256 tokenId, bytes memory data) external returns(uint256 collateral);
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/observer/ILoanObserverStore.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface for Loan Observer Store
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Interface used for Loan Observer Store implementations
+interface ILoanObserverStore {
+
+    /// @dev Get external collateral reference for a new position being opened
+    /// @param refId - address of GammaPool we're setting an external reference for
+    /// @param refAddr - address asking collateral reference for (if not permissioned, it should revert. Normally a PositionManager)
+    /// @param refFee - discount on origination fee to be applied to loans using collateral reference address
+    /// @param refType - discount on origination fee to be applied to loans using collateral reference address
+    /// @param active - discount on origination fee to be applied to loans using collateral reference address
+    /// @param restricted - discount on origination fee to be applied to loans using collateral reference address
+    function setLoanObserver(uint256 refId, address refAddr, uint16 refFee, uint8 refType, bool active, bool restricted) external;
+
+    /// @dev Allow users to create loans in pool that will be observed by observer with reference id `refId`
+    /// @param refId - reference id of observer
+    /// @param pool - address of GammaPool we are requesting information for
+    function setPoolObserved(uint256 refId, address pool) external;
+
+    /// @dev Prohibit users to create loans in pool that will be observed by observer with reference id `refId`
+    /// @param refId - reference id of observer
+    /// @param pool - address of GammaPool we are requesting information for
+    function unsetPoolObserved(uint256 refId, address pool) external;
+
+    /// @dev Check if a pool can use observer
+    /// @param refId - reference id of observer
+    /// @param pool - address of GammaPool we are requesting information for
+    /// @return observed - if true observer can observe loans from pool
+    function isPoolObserved(uint256 refId, address pool) external view returns(bool);
+
+    /// @dev Allow a user address to open loans that can be observed by observer
+    /// @param refId - reference id of observer
+    /// @param user - address that can open loans that use observer
+    /// @param isAllowed - if true observer can observe loans created by user
+    function allowToBeObserved(uint256 refId, address user, bool isAllowed) external;
+
+    /// @dev Check if a user can open loans that are observed by observer
+    /// @param refId - reference id of observer
+    /// @param user - address that can open loans that use observer
+    /// @return allowed - if true observer can observe loans created by user
+    function isAllowedToBeObserved(uint256 refId, address user) external view returns(bool);
+
+    /// @dev Get observer identified with reference id `refId`
+    /// @param refId - reference id of information containing collateral reference
+    /// @return refAddr - address of ICollateralManager contract. Provides external collateral information
+    /// @return refFee - discount for loan associated with this reference id
+    /// @return refType - discount for loan associated with this reference id
+    /// @return active - discount on origination fee to be applied to loans using collateral reference address
+    /// @return restricted - discount on origination fee to be applied to loans using collateral reference address
+    function getLoanObserver(uint256 refId) external view returns(address, uint16, uint8, bool, bool);
+
+    /// @dev Get observer for a new loan being opened if the observer exists, the pool is registered with the observer,
+    /// @dev and the user is allowed to create loans observed by observer identified by `refId`
+    /// @param refId - reference id of information containing collateral reference
+    /// @param pool - address asking collateral reference for (if not permissioned, it should revert. Normally a PositionManager)
+    /// @param user - address asking collateral reference for
+    /// @return refAddr - address of ICollateralManager contract. Provides external collateral information
+    /// @return refFee - discount for loan associated with this reference id
+    /// @return refType - discount for loan associated with this reference id
+    function getPoolObserverByUser(uint16 refId, address pool, address user) external view returns(address, uint16, uint8);
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/rates/IRateModel.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface of Interest Rate Model Store
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @notice Interface of contract that saves and retrieves interest rate model parameters
+interface IRateModel {
+    /// @dev Function to validate interest rate model parameters
+    /// @param _data - bytes parameters containing interest rate model parameters
+    /// @return validation - true if parameters passed validation
+    function validateParameters(bytes calldata _data) external view returns(bool);
+
+    /// @dev Gets address of contract containing parameters for interest rate model
+    /// @return address - address of smart contract that stores interest rate parameters
+    function rateParamsStore() external view returns(address);
+}
+
+
+// File: @gammaswap/v1-core/contracts/interfaces/rates/storage/IRateParamsStore.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Interface of Interest Rate Model Store
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @notice Interface of contract that saves and retrieves interest rate model parameters
+interface IRateParamsStore {
+
+    /// @dev Rate model parameters
+    struct RateParams {
+        /// @dev Model parameters as bytes, needs to be decoded into model's specific struct
+        bytes data;
+        /// @dev Boolean value specifying if model parameters from store should be used
+        bool active;
+    }
+
+    /// @dev Event emitted when an interest rate model's parameters are updated
+    /// @param pool - address of GammaPool whose rate model parameters will be updated
+    /// @param data - rate parameter model
+    /// @param active - set rate parameter model active (if false bytes(0) should be returned)
+    event RateParamsUpdate(address indexed pool, bytes data, bool active);
+
+    /// @dev Update rate model parameters of `pool`
+    /// @param pool - address of GammaPool whose rate model parameters will be updated
+    /// @param data - rate parameter model
+    /// @param active - set rate parameter model active (if false bytes(0) should be returned)
+    function setRateParams(address pool, bytes calldata data, bool active) external;
+
+    /// @dev Get rate model parameters for `pool`
+    /// @param pool - address of GammaPool whose rate model parameters will be returned
+    /// @return params - rate model parameters for `pool` as bytes
+    function getRateParams(address pool) external view returns(RateParams memory params);
+}
+
+
+// File: @gammaswap/v1-core/contracts/libraries/AddressCalculator.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+import "../interfaces/IGammaPoolFactory.sol";
+
+/// @title Library used calculate the deterministic addresses used to instantiate GammaPools
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev These algorithms are based on EIP-1014 (https://eips.ethereum.org/EIPS/eip-1014)
+library AddressCalculator {
+
+    /// @dev calculate salt used to create deterministic address, the salt is also used as unique key identifier for the GammaPool
+    /// @param cfmm - address of CFMM the GammaPool is for
+    /// @param protocolId - protocol id of instance address the GammaPool will use (version of GammaPool for this CFMM)
+    /// @return key - key/salt used as unique identifier of GammaPool
+    function getGammaPoolKey(address cfmm, uint16 protocolId) internal pure returns(bytes32) {
+        return keccak256(abi.encode(cfmm, protocolId)); // key is hash of CFMM address and protocolId
+    }
+
+    /// @dev calculate deterministic address to instantiate GammaPool minimal beacon proxy or minimal proxy contract
+    /// @param factory - address of factory that will instantiate GammaPool proxy contract
+    /// @param protocolId - protocol id of instance address the GammaPool will use (version of this GammaPool)
+    /// @param key - salt used in address generation to assure its uniqueness
+    /// @return _address - address of GammaPool that maps to protocolId and key
+    function calcAddress(address factory, uint16 protocolId, bytes32 key) internal view returns (address) {
+        if (protocolId < 10000) {
+            return predictDeterministicAddress(IGammaPoolFactory(factory).getProtocolBeacon(protocolId), protocolId, key, factory);
+        } else {
+            return predictDeterministicAddress2(IGammaPoolFactory(factory).getProtocol(protocolId), key, factory);
+        }
+    }
+
+    /// @dev calculate a deterministic address based on init code hash
+    /// @param factory - address of factory that instantiated or will instantiate this contract
+    /// @param salt - salt used in address generation to assure its uniqueness
+    /// @param initCodeHash - init code hash of template contract which will be used to instantiate contract with deterministic address
+    /// @return _address - address of contract that maps to salt and init code hash that is created by factory contract
+    function calcAddress(address factory, bytes32 salt, bytes32 initCodeHash) internal pure returns (address) {
+        return address(uint160(uint256(keccak256(abi.encodePacked(hex"ff",factory,salt,initCodeHash)))));
+    }
+
+    /// @dev Compute bytecode of a minimal beacon proxy contract, excluding bytecode metadata hash
+    /// @param beacon - address of beacon of minimal beacon proxy
+    /// @param protocolId - id of protocol
+    /// @param factory - address of factory that instantiated or will instantiate this contract
+    /// @return bytecode - the calculated bytecode for minimal beacon proxy contract
+    function calcMinimalBeaconProxyBytecode(
+        address beacon,
+        uint16 protocolId,
+        address factory
+    ) internal pure returns(bytes memory) {
+        return abi.encodePacked(
+            hex"608060405234801561001057600080fd5b5073",
+            beacon,
+            hex"7f",
+            hex"a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50",
+            hex"5560",
+            protocolId < 256 ? hex"6c" : hex"6d",
+            hex"806100566000396000f3fe",
+            hex"608060408190526334b1f0a960e21b8152",
+            protocolId < 256 ? hex"60" : hex"61",
+            protocolId < 256 ? abi.encodePacked(uint8(protocolId)) : abi.encodePacked(protocolId),
+            hex"60845260208160248173",
+            factory,
+            hex"5afa60",
+            protocolId < 256 ? hex"3a" : hex"3b",
+            hex"573d6000fd5b5060805160003681823780813683855af491503d81823e81801560",
+            protocolId < 256 ? hex"5b" : hex"5c",
+            hex"573d82f35b3d82fdfea164736f6c6343000815000a"
+        );
+    }
+
+    /// @dev Computes the address of a minimal beacon proxy contract
+    /// @param protocolId - id of protocol
+    /// @param salt - salt used in address generation to assure its uniqueness
+    /// @param factory - address of factory that instantiated or will instantiate this contract
+    /// @return predicted - the calculated address
+    function predictDeterministicAddress(
+        address beacon,
+        uint16 protocolId,
+        bytes32 salt,
+        address factory
+    ) internal pure returns (address) {
+        bytes memory bytecode = calcMinimalBeaconProxyBytecode(beacon, protocolId, factory);
+
+        // Compute the hash of the initialization code.
+        bytes32 bytecodeHash = keccak256(bytecode);
+
+        // Compute the final CREATE2 address
+        bytes32 data = keccak256(abi.encodePacked(bytes1(0xff), factory, salt, bytecodeHash));
+        return address(uint160(uint256(data)));
+    }
+
+    /// @dev Computes the address of a minimal proxy contract
+    /// @param implementation - address of implementation contract of this minimal proxy contract
+    /// @param salt - salt used in address generation to assure its uniqueness
+    /// @param factory - address of factory that instantiated or will instantiate this contract
+    /// @return predicted - the calculated address
+    function predictDeterministicAddress2(
+        address implementation,
+        bytes32 salt,
+        address factory
+    ) internal pure returns (address predicted) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(add(ptr, 0x38), factory)
+            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)
+            mstore(add(ptr, 0x14), implementation)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)
+            mstore(add(ptr, 0x58), salt)
+            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))
+            predicted := keccak256(add(ptr, 0x43), 0x55)
+        }
+    }
+}
+
+// File: @gammaswap/v1-core/contracts/libraries/GammaSwapLibrary.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.13;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @title Library used to perform common ERC20 transactions
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Library performs approvals, transfers and views ERC20 state fields
+library GammaSwapLibrary {
+
+    error ST_Fail();
+    error STF_Fail();
+    error SA_Fail();
+    error STE_Fail();
+
+    /// @dev Check the ERC20 balance of an address
+    /// @param _token - address of ERC20 token we're checking the balance of
+    /// @param _address - Ethereum address we're checking for balance of ERC20 token
+    /// @return balanceOf - amount of _token held in _address
+    function balanceOf(address _token, address _address) internal view returns (uint256) {
+        (bool success, bytes memory data) = _token.staticcall(abi.encodeCall(IERC20.balanceOf, _address));
+
+        require(success && data.length >= 32);
+
+        return abi.decode(data, (uint256));
+    }
+
+    /// @dev Get how much of an ERC20 token is in existence (minted)
+    /// @param _token - address of ERC20 token we're checking the total minted amount of
+    /// @return totalSupply - total amount of _token that is in existence (minted and not burned)
+    function totalSupply(address _token) internal view returns (uint256) {
+        (bool success, bytes memory data) = _token.staticcall(abi.encodeCall(IERC20.totalSupply,()));
+
+        require(success && data.length >= 32);
+
+        return abi.decode(data, (uint256));
+    }
+
+    /// @dev Get decimals of ERC20 token
+    /// @param _token - address of ERC20 token we are getting the decimal information from
+    /// @return decimals - decimals of ERC20 token
+    function decimals(address _token) internal view returns (uint8) {
+        (bool success, bytes memory data) = _token.staticcall(abi.encodeWithSignature("decimals()")); // requesting via ERC20 decimals implementation
+
+        require(success && data.length >= 1);
+
+        return abi.decode(data, (uint8));
+    }
+
+    /// @dev Get symbol of ERC20 token
+    /// @param _token - address of ERC20 token we are getting the symbol information from
+    /// @return symbol - symbol of ERC20 token
+    function symbol(address _token) internal view returns (string memory) {
+        (bool success, bytes memory data) = _token.staticcall(abi.encodeWithSignature("symbol()")); // requesting via ERC20 symbol implementation
+
+        require(success && data.length >= 1);
+
+        return abi.decode(data, (string));
+    }
+
+    /// @dev Get name of ERC20 token
+    /// @param _token - address of ERC20 token we are getting the name information from
+    /// @return name - name of ERC20 token
+    function name(address _token) internal view returns (string memory) {
+        (bool success, bytes memory data) = _token.staticcall(abi.encodeWithSignature("name()")); // requesting via ERC20 name implementation
+
+        require(success && data.length >= 1);
+
+        return abi.decode(data, (string));
+    }
+
+    /// @dev Safe transfer any ERC20 token, only used internally
+    /// @param _token - address of ERC20 token that will be transferred
+    /// @param _to - destination address where ERC20 token will be sent to
+    /// @param _amount - quantity of ERC20 token to be transferred
+    function safeTransfer(address _token, address _to, uint256 _amount) internal {
+        (bool success, bytes memory data) = _token.call(abi.encodeCall(IERC20.transfer, (_to, _amount)));
+
+        if(!(success && (data.length == 0 || abi.decode(data, (bool))))) revert ST_Fail();
+    }
+
+    /// @dev Moves `amount` of ERC20 token `_token` from `_from` to `_to` using the allowance mechanism. `_amount` is then deducted from the caller's allowance.
+    /// @param _token - address of ERC20 token that will be transferred
+    /// @param _from - address sending _token (not necessarily caller's address)
+    /// @param _to - address receiving _token
+    /// @param _amount - amount of _token being sent
+    function safeTransferFrom(address _token, address _from, address _to, uint256 _amount) internal {
+        (bool success, bytes memory data) = _token.call(abi.encodeCall(IERC20.transferFrom, (_from, _to, _amount)));
+
+        if(!(success && (data.length == 0 || abi.decode(data, (bool))))) revert STF_Fail();
+    }
+
+    /// @dev Safe approve any ERC20 token to be spent by another address (`_spender`), only used internally
+    /// @param _token - address of ERC20 token that will be approved
+    /// @param _spender - address that will be granted approval to spend msg.sender tokens
+    /// @param _amount - quantity of ERC20 token that `_spender` will be approved to spend
+    function safeApprove(address _token, address _spender, uint256 _amount) internal {
+        (bool success, bytes memory data) = _token.call(abi.encodeCall(IERC20.approve, (_spender, _amount)));
+
+        if(!(success && (data.length == 0 || abi.decode(data, (bool))))) revert SA_Fail();
+    }
+
+    /// @dev Safe transfer any ERC20 token, only used internally
+    /// @param _to - destination address where ETH will be sent to
+    /// @param _amount - quantity of ERC20 token to be transferred
+    function safeTransferETH(address _to, uint256 _amount) internal {
+        (bool success, ) = _to.call{value: _amount}("");
+
+        if(!success) revert STE_Fail();
+    }
+
+    /// @dev Check if `account` is a smart contract's address and it has been instantiated (has code)
+    /// @param account - Ethereum address to check if it's a smart contract address
+    /// @return bool - true if it is a smart contract address
+    function isContract(address account) internal view returns (bool) {
+        return account.code.length > 0;
+    }
+
+    function convertUint128ToUint256Array(uint128[] memory arr) internal pure returns(uint256[] memory res) {
+        res = new uint256[](arr.length);
+        for(uint256 i = 0; i < arr.length;) {
+            res[i] = uint256(arr[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function convertUint128ToRatio(uint128[] memory arr) internal pure returns(uint256[] memory res) {
+        res = new uint256[](arr.length);
+        for(uint256 i = 0; i < arr.length;) {
+            res[i] = uint256(arr[i]) * 1000;
+            unchecked {
+                ++i;
+            }
+        }
+    }
+}
+
+// File: @gammaswap/v1-core/contracts/observer/AbstractLoanObserverStore.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.4;
+
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+
+import "../interfaces/observer/ILoanObserverStore.sol";
+import "../interfaces/observer/ILoanObserver.sol";
+import "../interfaces/observer/ICollateralManager.sol";
+
+/// @title Collateral Tracker Store contract
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Stores Collateral Manager (CM) addresses that can be used by GammaPools (GP) mapped to reference ids.
+/// @notice The mapping can be many to many, depending on the implementation of the CM but preferably one GP to many CMs
+/// @notice Collateral References can use a discount to lower the origination fees charged by GammaPools
+abstract contract AbstractLoanObserverStore is ILoanObserverStore {
+
+    /// @dev struct containing information about LoanObserver that will run after every state update to a loan
+    struct LoanObserver {
+        /// @dev address of observer contract, can be null in which case the observer is not used
+        address refAddr; // address of observer
+        /// @dev fee discount in basis points, when refAddr is address(0), only fee discount is used
+        uint16 refFee;
+        /// @dev observer type, when set to 1 refAddr is expected to be the zero address
+        uint8 refType; // 0 = not set, 1 = discount only (null observer), 2 = observer does not track collateral (has addr), 3 = observer tracks collateral (has addr, collMgr, can have discount)
+        /// @dev if true loans can be observed by observer, otherwise it will always return the zero values when called by observed contract
+        bool active;
+        /// @dev if true, an address must have permission to request its loan to be observed by this observer
+        bool restricted;
+    }
+
+    /// @dev mapping of observers to reference ids
+    mapping(uint256 => LoanObserver) observers;
+    /// @dev address of pools registered with observer
+    mapping(uint256 => mapping(address => bool)) public override isPoolObserved;
+    /// @dev addresses allowed to create observed loans
+    mapping(uint256 => mapping(address => bool)) public override isAllowedToBeObserved;
+
+    bytes4 private constant COLLATERAL_MANAGER_INTERFACE = type(ICollateralManager).interfaceId;
+    bytes4 private constant LOAN_OBSERVER_INTERFACE = type(ILoanObserver).interfaceId;
+
+    /// @dev Get owner of LoanObserverStoreOwner contract to perform permissioned transactions
+    function _loanObserverStoreOwner() internal virtual view returns(address);
+
+    /// @dev See {ILoanObserverStore.-getLoanObserver};
+    function getLoanObserver(uint256 refId) external override virtual view returns(address, uint16, uint8, bool, bool) {
+        LoanObserver memory exRef = observers[refId];
+        return(exRef.refAddr, exRef.refFee, exRef.refType, exRef.active, exRef.restricted);
+    }
+
+    /// @dev See {ILoanObserverStore.-setLoanObserver};
+    function setLoanObserver(uint256 refId, address refAddr, uint16 refFee, uint8 refType, bool active, bool restricted) external override virtual {
+        require(msg.sender == _loanObserverStoreOwner(), "FORBIDDEN");
+        require(refType > 0 && refType < 4, "INVALID_TYPE");
+        require(refId > 0, "INVALID_REF_ID");
+
+        LoanObserver storage exRef = observers[refId];
+        if(exRef.refType == 0) {
+            if(refType == 1) {
+                require(refAddr == address(0), "NOT_ZERO_ADDRESS");
+                observers[refId] = LoanObserver({ refAddr: address(0), refFee: refFee, refType: refType, active: active, restricted: restricted });
+            } else if(refType == 2 || refType == 3) {
+                require(refAddr != address(0), "ZERO_ADDRESS");
+                require(IERC165(refAddr).supportsInterface(LOAN_OBSERVER_INTERFACE), "NOT_LOAN_OBSERVER");
+                require(refType != 3 || IERC165(refAddr).supportsInterface(COLLATERAL_MANAGER_INTERFACE), "NOT_COLLATERAL_MANAGER");
+                require(ILoanObserver(refAddr).refId() == refId, "REF_ID");
+                observers[refId] = LoanObserver({ refAddr: refAddr, refFee: refFee, refType: refType, active: active, restricted: restricted });
+            }
+        } else { // refId, refAddr, and refType do not change
+            require(exRef.refAddr == refAddr, "INVALID_REF_ADDR");
+            require(exRef.refType == refType, "REF_TYPE_UPDATE");
+            exRef.refFee = refFee;
+            exRef.active = active;
+            exRef.restricted = restricted;
+        }
+    }
+
+    /// @dev See {ILoanObserverStore.-getPoolObserverByUser};
+    function getPoolObserverByUser(uint16 refId, address pool, address user) external override virtual view returns(address, uint16, uint8) {
+        require(refId > 0, "REF_ID");
+        require(pool != address(0), "ZERO_ADDRESS_POOL");
+        require(user != address(0), "ZERO_ADDRESS_USER");
+        require(isPoolObserved[refId][pool], "NOT_SET");
+
+        LoanObserver memory exRef = observers[refId];
+        if(!exRef.active) {
+            return(address(0), 0, 0);
+        }
+
+        require(!exRef.restricted || isAllowedToBeObserved[refId][user], "FORBIDDEN");
+
+        return(exRef.refAddr, exRef.refFee, exRef.refType);
+    }
+
+    /// @dev See {ILoanObserverStore.-unsetPoolObserved};
+    function unsetPoolObserved(uint256 refId, address pool) external override virtual {
+        require(msg.sender == _loanObserverStoreOwner(), "FORBIDDEN");
+        isPoolObserved[refId][pool] = false;
+    }
+
+    /// @dev See {ILoanObserverStore.-setPoolObserved};
+    function setPoolObserved(uint256 refId, address pool) external override virtual {
+        require(msg.sender == _loanObserverStoreOwner(), "FORBIDDEN");
+        require(pool != address(0), "ZERO_ADDRESS");
+        require(refId > 0, "INVALID_REF_ID");
+
+        LoanObserver storage ref = observers[refId];
+
+        require(ref.refType > 0, "NOT_EXISTS");
+        require(ref.refType < 2 || ILoanObserver(ref.refAddr).validate(pool), "INVALID_POOL") ;
+
+        isPoolObserved[refId][pool] = true;
+    }
+
+    /// @dev See {ILoanObserverStore.-allowToBeObserved};
+    function allowToBeObserved(uint256 refId, address user, bool isAllowed) external override virtual {
+        require(msg.sender == _loanObserverStoreOwner(), "FORBIDDEN");
+        require(refId > 0, "REF_ID");
+        require(user != address(0), "ZERO_ADDRESS");
+        require(observers[refId].refType > 0, "NOT_EXISTS");
+
+        isAllowedToBeObserved[refId][user] = isAllowed;
+    }
+
+}
+
+
+// File: @gammaswap/v1-core/contracts/rates/storage/AbstractRateParamsStore.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.4;
+
+import "../../interfaces/rates/IRateModel.sol";
+import "../../interfaces/rates/storage/IRateParamsStore.sol";
+
+/// @title Contract to implement common functions from IRateParamsStore
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Abstract contract meant to be inherited by every Rate Parameter store contract
+abstract contract AbstractRateParamsStore is IRateParamsStore {
+
+    /// @dev rate information by GammaPool
+    mapping(address => RateParams) private rateParams;
+
+    /// @dev Get owner of RateParamsStore contract to perform permissioned transactions
+    function _rateParamsStoreOwner() internal virtual view returns(address);
+
+    /// @dev See {IRateParamsStore-setRateParams}
+    function setRateParams(address _pool, bytes calldata data, bool active) external override virtual {
+        require(msg.sender == _rateParamsStoreOwner(), "FORBIDDEN");
+        require(_validateParameters(_pool, data), "VALIDATE");
+        rateParams[_pool] = RateParams({ data: data, active: active});
+        emit RateParamsUpdate(_pool, data, active);
+    }
+
+    /// @dev validate the rate model parameters that we'll store for the pool
+    /// @param _rateModel - address of rate model
+    /// @param _data - rate model parameters in bytes
+    /// @return validated - true if parameters are validated by the rate model
+    function _validateParameters(address _rateModel, bytes calldata _data) internal virtual view returns(bool validated) {
+        try IRateModel(_rateModel).validateParameters(_data) returns (bool _validated){
+            validated = _validated;
+        } catch {
+            validated = false;
+        }
+    }
+
+    /// @dev See {IRateParamsStore-getRateParams}
+    function getRateParams(address _pool) external override virtual view returns(RateParams memory) {
+        return rateParams[_pool];
+    }
+}
+
+
+// File: @gammaswap/v1-core/contracts/utils/LockableMinimalBeacon.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+import "./MinimalBeacon.sol";
+
+/// @title Lockable Minimal Beacon Contract
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Locks last protocol implementation from GammaPoolFactory for this protocolId
+contract LockableMinimalBeacon is MinimalBeacon {
+    address public protocol;
+
+    constructor(address _factory, uint16 _protocolId) MinimalBeacon(_factory, _protocolId) {
+    }
+
+    function lock() external {
+        require(msg.sender == factory, "FORBIDDEN");
+        require(protocol == address(0), "LOCKED");
+
+        protocol = _implementation();
+
+        require(protocol != address(0), "ZERO_ADDRESS");
+    }
+
+    function implementation() external view override returns (address) {
+        if(protocol == address(0)) {
+            return _implementation();
+        } else {
+            return protocol;
+        }
+    }
+}
+
+
+// File: @gammaswap/v1-core/contracts/utils/MinimalBeacon.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+/// @title Minimal Beacon Contract
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Gets protocol implementation from GammaPoolFactory
+/// @dev Follows OpenZeppelin's Beacon implementation
+contract MinimalBeacon {
+    address immutable public factory;
+    uint16 immutable public protocolId;
+
+    constructor(address _factory, uint16 _protocolId) {
+        factory = _factory;
+        protocolId = _protocolId;
+    }
+
+    function implementation() external virtual view returns (address) {
+        return _implementation();
+    }
+
+    function _implementation() internal view returns(address impl) {
+        address _factory = factory;
+        uint16 _protocolId = protocolId;
+        assembly {
+            let p := mload(0x40)
+            // Call GammaPoolFactory -> getProtocol(uint16)
+            mstore(p, 0xd2c7c2a400000000000000000000000000000000000000000000000000000000)
+            mstore(add(p, 4), _protocolId)
+            let result := staticcall(gas(), _factory, p, 0x24, 0x80, 0x20)
+            if iszero(result) {
+                revert(0, returndatasize())
+            }
+            impl := mload(0x80)
+        }
+    }
+}
+
+
+// File: @gammaswap/v1-core/contracts/utils/TwoStepOwnable.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity >=0.8.0;
+
+/// @title Two Step Ownership Contract implementation
+/// @author Daniel D. Alcarraz (https://github.com/0xDanr)
+/// @dev Transfers ownership of contract to another address using a two step method
+contract TwoStepOwnable {
+    /// @dev Event emitted when ownership of GammaPoolFactory contract is transferred to a new address
+    /// @param previousOwner - previous address that owned factory contract
+    /// @param newOwner - new address that owns factory contract
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /// @dev Event emitted when change of ownership of GammaPoolFactory contract is started
+    /// @param currentOwner - current address that owns factory contract
+    /// @param newOwner - new address that will own factory contract
+    event OwnershipTransferStarted(address indexed currentOwner, address indexed newOwner);
+
+    /// @dev Owner of contract
+    address public owner;
+
+    /// @dev Pending owner to implement transfer of ownership in two steps
+    address public pendingOwner;
+
+    /// @dev Initialize `owner` of smart contract
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    /// @dev Throws if called by any account other than the owner.
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        require(owner == msg.sender, "Forbidden");
+    }
+
+    /// @dev Starts ownership transfer to new account. Replaces the pending transfer if there is one. Can only be called by the current owner.
+    /// @param newOwner - new address that will have the owner privileges over the factory contract
+    function transferOwnership(address newOwner) external virtual onlyOwner {
+        require(newOwner != address(0), "ZeroAddress");// not allow to transfer ownership to zero address (renounce ownership forever)
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// @notice The new owner accepts the ownership transfer.
+    /// @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.
+    function acceptOwnership() external virtual {
+        address newOwner = msg.sender;
+        require(pendingOwner == newOwner, "NotNewOwner");
+        address oldOwner = owner;
+        owner = newOwner;
+        delete pendingOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+
+}
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+

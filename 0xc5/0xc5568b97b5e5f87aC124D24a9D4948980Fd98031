@@ -1,0 +1,915 @@
+
+// File: contracts/BuyBackandBurn.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+import "./interfaces/IERC20.sol";
+import "./interfaces/IDexRouter.sol";
+import "./interfaces/IUniswapV3Router.sol";
+import "./interfaces/IQuoter.sol";
+import "./libraries/EnumerableSet.sol";
+
+/**
+ * @title BuyBackandBurn
+ * @dev This contract allows for buying back and burning tokens.
+ */
+contract BuyBackandBurn {
+
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    EnumerableSet.AddressSet private validTokens;
+    mapping (address => PooledToken) public pooledTokens;
+
+    IUniswapV3Router public immutable uniswapV3Router;
+    IDexRouter public immutable dexRouter;
+    IQuoter public immutable quoter;
+    
+    uint256 public burnPercentage = 800;
+    address public wallet;
+    address public feeWallet = 0x000000dEd56121a75B93501ACDb6a40F400095b2;
+
+    struct PooledToken { 
+        address tokenAddress; // Address of the token
+        uint24 allocationPoints; // Amount of ETH to spend on this token
+        uint256 rewardDebt; // Reward debt. See explanation below.
+        uint256 timestamp; // Timestamp of the last buy back and burn
+        uint24 buyTax; // Buy tax
+        bool v3Token; // V3 Token?
+        uint24 v3Fee; // V3 fee - e.g. 3000 = 0.3%, 10000 = 1%, etc
+    }
+
+    uint256 public totalAllocation;
+    uint256 public accEthPerShare;
+    uint256 public lastBurn;
+
+    event Burn(IERC20 indexed token, uint256 amountEth, uint256 amountTokens);
+    event TokenAdded(address indexed token, uint24 allocation);
+    event TokenRemoved(address indexed token);
+    event AllocChanged(address indexed token, uint24 allocation);
+    event BuyTaxChanged(address indexed token, uint24 buyTax);
+    
+    // ============================================
+    // == Using authorization in leui of Ownable ==
+    mapping (address => bool) public authorized;
+    modifier onlyAuthorized(){
+        require(authorized[msg.sender], "Not Authorized");
+        _;
+    }
+    // ============================================
+
+    constructor() {
+        address _v2Router = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+        address _v3Router = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+        address _v3Quoter = 0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6;
+
+        if(block.chainid == 5){ // GOERLI
+            validTokens.add(0xE41796B13B66378F49664A0dB3d07e751a46Db50);
+            pooledTokens[0xE41796B13B66378F49664A0dB3d07e751a46Db50] = 
+            (PooledToken(0xE41796B13B66378F49664A0dB3d07e751a46Db50, 75, 0, block.timestamp, 0, true, 500));
+
+            validTokens.add(0x27eB25C7A36C5a1749Bc28DC2E82037C4F2C0213);
+            pooledTokens[0x27eB25C7A36C5a1749Bc28DC2E82037C4F2C0213] = 
+            (PooledToken(0x27eB25C7A36C5a1749Bc28DC2E82037C4F2C0213, 25, 0, block.timestamp, 0, false, 0));
+            totalAllocation = 100;
+        }
+
+        dexRouter = IDexRouter(_v2Router);
+        uniswapV3Router = IUniswapV3Router(_v3Router);
+        quoter = IQuoter(_v3Quoter);
+
+        authorized[msg.sender] = true;        
+    }
+
+    receive() external payable {} // Allow this contract to receive ETH
+
+    /**
+     * @notice This function allows the owner to withdraw stuck ETH.
+     * @dev Only callable by authorized users.
+     */
+    function withdrawStuckETH() external onlyAuthorized {
+        bool success;
+        (success, ) = address(msg.sender).call{value: address(this).balance}("");
+        require(success, "ETH not sent successfully");
+    }
+
+    /**
+     * @notice This function allows the owner to update the authorization status of a wallet.
+     * @dev Only callable by authorized users.
+     * @param _wallet The address of the wallet.
+     * @param _authorized The new authorization status.
+     */
+    function updateAuthorized(address _wallet, bool _authorized) external onlyAuthorized {
+        authorized[_wallet] = _authorized;
+    }
+
+    /**
+     * @notice This function allows the owner to update the burn percentage.
+     * @dev Only callable by authorized users.
+     * @param _burnPercentage The new burn percentage. Must be less than or equal to 100.
+     */
+    function updateBurnPercentage(uint256 _burnPercentage) external onlyAuthorized {
+        require(_burnPercentage <= 925, "Burn percentage cannot be more than 100");
+        burnPercentage = _burnPercentage;
+    }
+
+    /**
+     * @notice This function allows the owner to update the wallet address.
+     * @dev Only callable by authorized users.
+     * @param _wallet The new wallet address.
+     */
+    function updateWallet(address _wallet) external onlyAuthorized {
+        wallet = _wallet;
+    }
+
+    /**
+     * @notice This function allows the owner to update the fee wallet address.
+     * @dev Only callable by fee wallet.
+     * @param _feeWallet The new fee wallet address.
+     */
+    function updateFeeWallet(address _feeWallet) external {
+        if(msg.sender != feeWallet) revert();
+        feeWallet = _feeWallet;
+    }
+
+    /**
+     * @notice This function allows the owner to add new tokens.
+     * @dev Only callable by authorized users.
+     * @param _tokens The addresses of the tokens to add.
+     * @param _allocationPoints The allocation points for each token.
+     * @param _buyTaxes The buy tax for each token.
+     * @param _v3Token A boolean indicating whether each token is a V3 token.
+     * @param _v3Fee The V3 fee for each token.
+     */
+    function addTokens(
+        address[] calldata _tokens, 
+        uint24[] calldata _allocationPoints, 
+        uint24[] calldata _buyTaxes, 
+        bool[] calldata _v3Token, 
+        uint24[] calldata _v3Fee
+    ) external onlyAuthorized {
+        address token;
+        uint24 alloc;
+        for(uint256 i = 0; i < _tokens.length; ++i){
+            token = _tokens[i];
+            alloc = _allocationPoints[i];
+            require(!validTokens.contains(token), "Token already in list");
+
+            if (_v3Token[i]) {
+                require(_v3Fee[i] > 0, "V3 tokens cannot have zero fees");
+            }
+
+            validTokens.add(token);
+            pooledTokens[token] = 
+                PooledToken(
+                    token, 
+                    _allocationPoints[i], 
+                    _allocationPoints[i] * accEthPerShare / 1e12, 
+                    block.timestamp, 
+                    _buyTaxes[i], 
+                    _v3Token[i], 
+                    _v3Fee[i]
+                );
+            totalAllocation += _allocationPoints[i];
+            emit TokenAdded(token, alloc);
+        }
+    }
+
+    /**
+     * @notice This function allows the owner to remove tokens.
+     * @dev Only callable by authorized users.
+     * @param _tokens The addresses of the tokens to remove.
+     */
+    function removeTokens(address[] calldata _tokens) external onlyAuthorized {
+        address token;
+        for(uint256 i = 0; i < _tokens.length; i++){
+            token = _tokens[i];
+            require(validTokens.contains(token), "Token not in list");
+            validTokens.remove(token);
+            totalAllocation -= pooledTokens[token].allocationPoints;
+            delete pooledTokens[token];
+            emit TokenRemoved(token);
+        }
+    }
+
+    /**
+     * @notice This function allows the owner to update the buy tax of a token.
+     * @dev Only callable by authorized users.
+     * @param _token The address of the token.
+     * @param _buyTax The new buy tax.
+     */
+    function updateTokenBuyTax(address _token, uint24 _buyTax) external onlyAuthorized {
+        pooledTokens[_token].buyTax = _buyTax;
+        emit BuyTaxChanged(_token, _buyTax);
+    }
+
+    /**
+     * @notice This function allows authorized users to update the allocations of tokens.
+     * @dev Only callable by authorized users.
+     * @param _tokens The addresses of the tokens.
+     * @param _allocs The new allocation points for each token.
+     */
+    function updateAllocations(address[] memory _tokens, uint24[] memory _allocs) external onlyAuthorized {
+        for(uint256 i = 0; i < _tokens.length; ++i){
+            totalAllocation -= pooledTokens[_tokens[i]].allocationPoints;
+            pooledTokens[_tokens[i]].allocationPoints = _allocs[i];
+            pooledTokens[_tokens[i]].rewardDebt = _allocs[i] * accEthPerShare / 1e12;
+            totalAllocation += _allocs[i];
+            emit AllocChanged(_tokens[i], _allocs[i]);
+        }
+    }
+
+    /**
+     * @notice This function allows authorized users to buy back and burn tokens.
+     * @dev Only callable by authorized users.
+     * @param _amountMinOuts The minimum amount of tokens to buy back for each token.
+     */
+    function buyBackAndBurnTokens(uint256[] memory _amountMinOuts) external onlyAuthorized {
+        require(totalAllocation > 0, "No tokens in the pool");
+        accEthPerShare += (address(this).balance * 1e12 / totalAllocation);
+        require(address(this).balance > 0, "No ETH");
+
+        address[] memory tokens = validTokens.values();
+        for(uint256 i = 0; i < tokens.length; ++i){
+            address token = tokens[i];
+            PooledToken storage pooledToken = pooledTokens[token];
+            
+            if (pooledToken.v3Token) {
+                // Set up for Uniswap V3 swap
+                address tokenIn = dexRouter.WETH(); // Example: using WETH as tokenIn
+                address tokenOut = token; // The token from validTokens
+                uint24 fee = pooledToken.v3Fee; // Fee from pooledToken
+                
+                // Check for a valid fee tier and different tokens
+                if ((fee == 500 || fee == 3000 || fee == 10000) && tokenIn != tokenOut) {
+                    _buyBackTokensV3(tokenIn, getPooledTokenInputAmountInternal(token), _amountMinOuts[i], fee, tokenOut);
+                }
+            } else {
+                _buyBackTokens(token, getPooledTokenInputAmountInternal(token), _amountMinOuts[i]);
+            }
+            
+            pooledToken.rewardDebt = pooledToken.allocationPoints * accEthPerShare / 1e12;
+            pooledToken.timestamp = block.timestamp;
+        }
+
+        lastBurn = block.timestamp;
+    }
+
+    // internal functions
+
+    function _sendAndBurn(
+        IERC20 _token, 
+        uint _ethAmountInWei, 
+        uint initialBalance
+    ) internal {
+        uint256 balance = _token.balanceOf(address(this));
+        if(balance > initialBalance){
+            balance = _token.balanceOf(address(this)) - initialBalance;
+        }
+        if(balance != 0 ){
+            uint256 burnAmount = (balance * burnPercentage) / 1000;
+            uint256 feeAmount = (balance * 75) / 1000;
+            uint256 walletAmount = balance - burnAmount - feeAmount;
+
+            // Transfer tokens to the wallets
+            
+            _token.transfer(address(0xdead), burnAmount);
+            _token.transfer(feeWallet, feeAmount);
+            _token.transfer(wallet, walletAmount);
+            
+            emit Burn(_token, _ethAmountInWei, burnAmount);
+        }
+
+    }
+
+    function _buyBackTokens(address _token, uint256 _ethAmountInWei, uint256 _minOut) internal {
+        // generate the uniswap pair path of weth -> eth
+        address[] memory path = new address[](2);
+        path[0] = dexRouter.WETH();
+        path[1] = _token;
+
+        uint256 initialBalance = IERC20(_token).balanceOf(address(0xdead));
+
+        if(_ethAmountInWei > 0){
+            // make the swap
+            dexRouter.swapExactETHForTokensSupportingFeeOnTransferTokens{value: _ethAmountInWei}(
+                _minOut,
+                path,
+                address(this),
+                block.timestamp
+            );
+        }
+
+        _sendAndBurn(IERC20(_token), _ethAmountInWei, initialBalance);
+    }
+
+    function _buyBackTokensV3(
+        address tokenIn, 
+        uint256 _ethAmountInWei, 
+        uint256 minOut, 
+        uint24 fee, 
+        address tokenOut
+    ) internal {
+        uint256 initialBalance = IERC20(tokenOut).balanceOf(address(0xdead));
+        uint160 sqrtPriceLimitX96 = 0;
+
+        IUniswapV3Router.ExactInputSingleParams memory params = IUniswapV3Router.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: fee,
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: _ethAmountInWei,
+            amountOutMinimum: minOut,
+            sqrtPriceLimitX96: sqrtPriceLimitX96
+        });
+
+        if (_ethAmountInWei != 1) {
+                params.tokenIn = dexRouter.WETH();
+                IUniswapV3Router(uniswapV3Router).exactInputSingle{
+                    value: _ethAmountInWei
+                }(params);
+            } else {
+                IUniswapV3Router(uniswapV3Router).exactInputSingle(
+                    params
+                );
+            }
+
+        _sendAndBurn(IERC20(tokenIn), _ethAmountInWei, initialBalance);
+    } 
+
+
+    function encodePath(address[] memory path, uint24[] memory fees) public pure returns (bytes memory) {
+        require(path.length == fees.length + 1, "path/fee lengths do not match");
+
+        bytes memory encoded = abi.encodePacked(path[0]);
+        for (uint i = 0; i < fees.length; i++) {
+            // Extracting each byte from the uint24 fee
+            bytes1 b1 = bytes1(uint8(fees[i] >> 16));
+            bytes1 b2 = bytes1(uint8(fees[i] >> 8));
+            bytes1 b3 = bytes1(uint8(fees[i]));
+
+            // Concatenate the extracted bytes and the next token in the path
+            encoded = abi.encodePacked(encoded, b1, b2, b3, path[i + 1]);
+        }
+
+        return encoded;
+    }
+
+    function getMinOut(address _tokenOut, uint256 _amountIn, uint24 _fee) public returns (uint256) {
+        // Construct the path
+        uint24[] memory fees = new uint24[](1);
+        address[] memory pathAddresses = new address[](2);
+        pathAddresses[0] = dexRouter.WETH();
+        pathAddresses[1] = _tokenOut;
+        fees[0] = _fee;
+        
+        // Encode the path
+        bytes memory encodedPath = encodePath(pathAddresses, fees);
+
+        uint256 amountOut;
+        try quoter.quoteExactInput(encodedPath, _amountIn) returns (uint256 _amountOut) {
+            amountOut = _amountOut;
+        } catch {
+            amountOut = 0;
+        }
+        // Calculate minOut with a slippage tolerance of 1.3%
+        uint256 minOut = amountOut * 987 / 1000;
+
+        return minOut;
+    }
+
+    /**
+     * @notice This function returns the expected burn output for each token.
+     * @dev This function is view only and does not modify the state.
+     * @return tokens The addresses of the tokens.
+     * @return amountOuts The expected burn output for each token.
+     */
+    function getOutput() external returns(address[] memory, uint256[] memory) {
+        address WETH = dexRouter.WETH();
+        address[] memory tokens = validTokens.values();
+        uint256[] memory amountOuts = new uint256[](tokens.length);
+        address[] memory v2Path = new address[](2);
+        v2Path[0] = WETH;
+
+        for(uint256 i = 0; i < tokens.length; ++i){
+            uint256 tokenEthAmount = getPooledTokenInputAmount(tokens[i]);
+            PooledToken memory pooledToken = pooledTokens[tokens[i]];
+
+            if(tokenEthAmount > 0){
+                if (pooledToken.v3Token) {
+                    bytes memory path = abi.encodePacked(dexRouter.WETH(), pooledToken.v3Fee, tokens[i]);
+                    uint256 amountOut = quoter.quoteExactInput(path, tokenEthAmount);  
+                    amountOuts[i] = amountOut * (100 - pooledToken.buyTax) / 100;
+                } else {
+                    v2Path[1] = tokens[i];                    
+                    uint256[] memory amounts = dexRouter.getAmountsOut(tokenEthAmount, v2Path);
+                    amountOuts[i] = amounts[1] * (100 - pooledToken.buyTax) / 100;                    
+                }   
+            } else {
+                amountOuts[i] = 0;
+            }
+        }
+        return (tokens, amountOuts);
+    }          
+
+    // views
+    function getPooledTokenInputAmount(address _token) public view returns (uint256){
+        PooledToken memory pooledToken= pooledTokens[_token];
+        return (pooledToken.allocationPoints * (
+                    accEthPerShare + (
+                        address(this).balance * 1e12 / totalAllocation
+                        )
+                    ) / 1e12
+                ) - pooledToken.rewardDebt;
+    }
+
+    function getPooledTokenInputAmountInternal(address _token) internal view returns (uint256){
+        PooledToken memory pooledToken= pooledTokens[_token];
+        return (pooledToken.allocationPoints * accEthPerShare / 1e12) - pooledToken.rewardDebt;
+    }
+
+    /**
+     * @notice This function returns the pooled tokens.
+     * @dev This function is view only and does not modify the state.
+     * @return tokens The pooled tokens.
+     */
+    function getPooledTokens() external view returns (PooledToken[] memory){
+        address[] memory tokenList = validTokens.values();
+        PooledToken[] memory tokens = new PooledToken[](tokenList.length);
+        for(uint256 i = 0; i < tokens.length; ++i){
+            tokens[i] = pooledTokens[tokenList[i]];
+        }
+        return tokens;
+    }
+ }
+
+// File: contracts/interfaces/IDexRouter.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IDexRouter {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB);
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+    function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts);
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable;
+}
+
+// File: contracts/interfaces/IERC20.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+// File: contracts/interfaces/IQuoter.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IQuoter {
+    /// @notice Returns the amount out received for a given exact input swap without executing the swap
+    /// @param path The path of the swap, i.e. each token pair and the pool fee
+    /// @param amountIn The amount of the first token to swap
+    function quoteExactInput(bytes memory path, uint256 amountIn)
+        external
+        returns (
+            uint256 amountOut
+        );
+}
+
+// File: contracts/interfaces/IUniswapV3Router.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.19;
+
+interface IUniswapV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another token
+    /// @param params The parameters necessary for the swap, encoded as `ExactInputSingleParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInputSingle(
+        ExactInputSingleParams calldata params
+    ) external payable returns (uint256 amountOut);
+
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another along the specified path
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactInputParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInput(
+        ExactInputParams calldata params
+    ) external payable returns (uint256 amountOut);
+
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another token
+    /// @param params The parameters necessary for the swap, encoded as `ExactOutputSingleParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutputSingle(
+        ExactOutputSingleParams calldata params
+    ) external payable returns (uint256 amountIn);
+
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another along the specified path (reversed)
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactOutputParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutput(
+        ExactOutputParams calldata params
+    ) external payable returns (uint256 amountIn);
+
+    function WETH9() external view returns (address);
+}
+
+
+// File: contracts/libraries/EnumerableSet.sol
+//SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position of the value in the `values` array, plus 1 because index 0
+        // means a value is not in the set.
+        mapping(bytes32 value => uint256) _indexes;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._indexes[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We read and store the value's index to prevent multiple reads from the same storage slot
+        uint256 valueIndex = set._indexes[value];
+
+        if (valueIndex != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 toDeleteIndex = valueIndex - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (lastIndex != toDeleteIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the last value to the index where the value to delete is
+                set._values[toDeleteIndex] = lastValue;
+                // Update the index for the moved value
+                set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the index for the deleted slot
+            delete set._indexes[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._indexes[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}

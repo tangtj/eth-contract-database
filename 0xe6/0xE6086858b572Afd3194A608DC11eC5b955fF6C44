@@ -1,0 +1,480 @@
+
+// File: src/QorpoPower.sol
+//SPDX-License-Identifier: GPL 3
+pragma solidity ^0.8.25;
+
+import "./utils/TokenAccessControlLight.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract QorpoPower is TokenAccessControlLight {
+    address public tokenAddress;
+    IERC20 private token;
+
+    // There are 2 option for stainkg QORPO tokens
+    // 1. Staking without APY - User can stake without APY and earn offchain rewards for holding,
+    // he can increase or decrease the stake amount anytime without any penalty or time limit
+    // 2. Staking with APY - User can stake with APY and earn offchain rewards and also onchain rewards for staking,
+    // he cannot increase the amount of the existing stake, he can unstake before the stake ends,
+    // but there is a penalty for early unstake
+
+    // Structure for the staking config with APY and penalites for early unstake
+    // minStake - minimum amount of stake
+    // maxStake - maximum amount of stake
+    // apyFraction - Reward fraction for the stake
+    // duration - Duration of the stake to earn the reward
+    // penalties - List of penalties for early unstake
+    // There will 2 StakeApyTypes which will be set by the owner after the contract deployment
+    // 1. minStake = 15001, maxStake = 50000, apyFraction = 15%, duration = 1 year
+    // 2. minStake = 50001, maxStake = 999 999 999, apyFraction = 30%, duration = 1 years
+    // Both the stake types will have the same penalty for early unstake:
+    // 0-30 days - 30% penalty
+    // 31-60 days - 15% penalty
+    // 61-90 days - 10% penalty
+    // 91+ days - 0% penalty
+
+    struct StakeApyType {
+        uint256 minStake;
+        uint256 maxStake;
+        uint96 apyFraction;
+        uint256 duration;
+        StakeApyPenalty[] penalties;
+    }
+
+    struct StakeApyPenalty {
+        uint256 duration;
+        uint96 penaltyFraction;
+    }
+
+    // Structure for the staking with APY
+    struct StakeApy {
+        uint256 amount;
+        uint256 startTime;
+        uint8 stakeType;
+        bool finished;
+    }
+
+    // This is just the pool of staked amount without APY for the given address,
+    // we do not need to track the time for each since there is no APY
+    // and user earns offchain rewards for holding
+    mapping(address => uint256) public stakeNoApy;
+    // This is the  stake types config for the APY staking
+    mapping(uint8 => StakeApyType) public stakeTypes;
+    // This is list of stakes with APY for the given address
+    // in this case we need to track the time for each stake
+    mapping(address => StakeApy[]) public stakesApy;
+    // There is an limit how much stake reward can be given
+    uint256 public maxStakePayout;
+    // This is the expected stake payout of active APY stakes
+    uint256 public expectedStakePayout = 0;
+    uint256 public totalStaked = 0;
+
+    // Events are playing crucial role in this smart contract since
+    // we are going to index them to track the offchain rewards
+
+    event SetStakeType(
+        uint8 indexed stakeType,
+        uint256 minStake,
+        uint256 maxStake,
+        uint96 apyFraction,
+        uint256 duration,
+        StakeApyPenalty[] penalties
+    );
+
+    event StakedNoApy(address indexed staker, uint256 amount);
+    event UnstakedNoApy(address indexed staker, uint256 amount);
+
+    event StakedApy(
+        address indexed staker,
+        uint8 indexed stakeType,
+        uint256 amount,
+        uint256 stakeIndex
+    );
+
+    event UpgradedToStakeApy(
+        address indexed staker,
+        uint8 indexed stakeType,
+        uint256 amount,
+        uint256 depositAmount,
+        uint256 stakeIndex
+    );
+
+    event UnstakedApy(
+        address indexed staker,
+        uint256 baseAmount,
+        uint256 penaltyAmount,
+        uint256 profitAmount,
+        uint256 stakeIndex
+    );
+
+    event SetMaxPayout(uint256 maxPayout);
+
+    constructor(address _tokenAddress, uint256 _maxStakePayout) {
+        owner = msg.sender;
+        tokenAddress = _tokenAddress;
+        token = IERC20(tokenAddress);
+        maxStakePayout = _maxStakePayout;
+    }
+
+    // Owner can change the max reward payout for APY staking
+    function setMaxStakePayout(uint256 _maxStakePayout) public onlyOwner {
+        maxStakePayout = _maxStakePayout;
+        emit SetMaxPayout(_maxStakePayout);
+    }
+
+    // Owner can set the configuration of the stake type for APY staking
+    function setStakeType(
+        uint8 _stakeType,
+        uint256 _minStake,
+        uint256 _maxStake,
+        uint96 _apyFraction,
+        uint256 _duration,
+        StakeApyPenalty[] memory _penalties
+    ) public onlyOwner {
+        require(_maxStake > 0, "QorpoPower: max stake must be greater than 0");
+        StakeApyType storage stakeType = stakeTypes[_stakeType];
+        require(stakeType.maxStake == 0, "QorpoPower: stake type already set");
+        stakeType.minStake = _minStake;
+        stakeType.maxStake = _maxStake;
+        stakeType.apyFraction = _apyFraction;
+        stakeType.duration = _duration;
+        for (uint256 i = 0; i < _penalties.length; i++) {
+            stakeType.penalties.push(_penalties[i]);
+        }
+        emit SetStakeType(
+            _stakeType,
+            _minStake,
+            _maxStake,
+            _apyFraction,
+            _duration,
+            _penalties
+        );
+    }
+
+    // Function to get configuration for the specific stake type
+    function getStakeType(
+        uint8 _stakeType
+    )
+        public
+        view
+        returns (uint256, uint256, uint96, uint256, StakeApyPenalty[] memory)
+    {
+        StakeApyType storage stakeType = stakeTypes[_stakeType];
+        return (
+            stakeType.minStake,
+            stakeType.maxStake,
+            stakeType.apyFraction,
+            stakeType.duration,
+            stakeType.penalties
+        );
+    }
+
+    // Function to stake without APY, user can stake without APY and earn offchain rewards for holding
+    // there is no need to distinguish the stakes, since there is no APY
+    function stakeWithNoApy(uint256 _amount) public {
+        stakeNoApy[msg.sender] += _amount;
+        totalStaked += _amount;
+        token.transferFrom(msg.sender, address(this), _amount);
+        emit StakedNoApy(msg.sender, _amount);
+    }
+
+    // Function to get the stake amount without APY for the given address
+    function getStakeWithNoApy(address _from) public view returns (uint256) {
+        return stakeNoApy[_from];
+    }
+
+    // Function to unstake from the pool without APY, user can unstake anytime without any penalty
+    function unstakeWithNoApy(uint256 _amount) public {
+        uint256 stakeNoApySender = stakeNoApy[msg.sender];
+        require(
+            stakeNoApySender >= _amount,
+            "QorpoPower: insufficient balance"
+        );
+        stakeNoApySender -= _amount;
+        stakeNoApy[msg.sender] = stakeNoApySender;
+        token.transfer(msg.sender, _amount);
+        totalStaked -= _amount;
+        emit UnstakedNoApy(msg.sender, _amount);
+    }
+
+    // Internal function to create stake with APY
+    // user choose the stake type and amount to stake also we need to track expected stake payout
+    // since we have a limited budget as to how much tokens can be distributed out for staking
+    function _stakeApy(uint8 _stakeType, uint256 _amount) internal {
+        StakeApyType storage stakeType = stakeTypes[_stakeType];
+        uint256 maxStake = stakeType.maxStake;
+        require(maxStake > 0, "QorpoPower: invalid stake type");
+        require(
+            _amount >= stakeType.minStake,
+            "QorpoPower: insufficient amount"
+        );
+        require(_amount <= stakeType.maxStake, "QorpoPower: excess amount");
+        uint256 expectedReward = (_amount * stakeType.apyFraction) / 10000;
+        require(
+            expectedReward + expectedStakePayout <= maxStakePayout,
+            "QorpoPower: stake already reached"
+        );
+        stakesApy[msg.sender].push(
+            StakeApy(_amount, block.timestamp, _stakeType, false)
+        );
+        expectedStakePayout += expectedReward;
+    }
+
+    // Function to stake with APY
+    function stakeWithApy(uint8 _stakeType, uint256 _amount) public {
+        token.transferFrom(msg.sender, address(this), _amount);
+        _stakeApy(_stakeType, _amount);
+        totalStaked += _amount;
+        emit StakedApy(
+            msg.sender,
+            _stakeType,
+            _amount,
+            stakesApy[msg.sender].length - 1
+        );
+    }
+
+    // Function to upgrade the existing no APY stake to APY stake
+    // user can increase (or dont need to increase) the amount of the existing no APY stake and convert it to APY stake
+    function upgradeToWithStakeApy(uint8 _stakeType, uint256 _amount) public {
+        if (_amount > 0) {
+            token.transferFrom(msg.sender, address(this), _amount);
+        }
+        uint256 _depositedAmount = _amount;
+        _amount += stakeNoApy[msg.sender];
+        stakeNoApy[msg.sender] = 0;
+        _stakeApy(_stakeType, _amount);
+        totalStaked += _depositedAmount;
+        emit UpgradedToStakeApy(
+            msg.sender,
+            _stakeType,
+            _amount,
+            _depositedAmount,
+            stakesApy[msg.sender].length - 1
+        );
+    }
+
+    // Function to get the list of stakes with APY for the given address
+    function getStakesWithApy(
+        address _from
+    ) public view returns (StakeApy[] memory) {
+        return stakesApy[_from];
+    }
+
+    // Function to get the specific stake with APY for the given address
+    function getStakeWithApy(
+        address _from,
+        uint256 _index
+    ) public view returns (uint256, uint256, uint8, bool) {
+        StakeApy memory stake = stakesApy[_from][_index];
+        return (stake.amount, stake.startTime, stake.stakeType, stake.finished);
+    }
+
+    // Function to unstake with APY, user can also unstake before the stake ends,
+    // reward can be earned only if the stake duration is completed
+    function unstakeWithApy(uint256 _index) public {
+        uint256 stakesApyLength = stakesApy[msg.sender].length;
+        StakeApy storage stake = stakesApy[msg.sender][_index];
+        require(stakesApyLength > _index, "QorpoPower: invalid stake index");
+        require(stake.finished == false, "QorpoPower: stake already finished");
+        StakeApyType memory stakeType = stakeTypes[stake.stakeType];
+        uint256 duration = block.timestamp - stake.startTime;
+        uint256 penaltyAmount = 0;
+        uint256 profitAmount = 0;
+        if (duration >= stakeType.duration) {
+            profitAmount = (stake.amount * stakeType.apyFraction) / 10000;
+            // do not allow pay reward from other users stakes
+            require(
+                profitAmount <= token.balanceOf(address(this)) - totalStaked,
+                "QorpoPower: insufficient balance to pay reward"
+            );
+        } else {
+            for (uint256 i = 0; i < stakeType.penalties.length; i++) {
+                StakeApyPenalty memory penalty = stakeType.penalties[i];
+                if (duration <= penalty.duration) {
+                    penaltyAmount =
+                        (stake.amount * penalty.penaltyFraction) /
+                        10000;
+                    break;
+                }
+            }
+            // we need to reduce the expected stake payout since user unstaked early and will not get the reward
+            expectedStakePayout -= ((stake.amount * stakeType.apyFraction) /
+                10000);
+        }
+        token.transfer(msg.sender, stake.amount + profitAmount - penaltyAmount);
+        stake.finished = true;
+        totalStaked -= stake.amount;
+        emit UnstakedApy(
+            msg.sender,
+            stake.amount,
+            penaltyAmount,
+            profitAmount,
+            _index
+        );
+    }
+
+    function unstakeWithApyEmergency(uint256 _index) public {
+        uint256 stakesApyLength = stakesApy[msg.sender].length;
+        StakeApy storage stake = stakesApy[msg.sender][_index];
+        require(stakesApyLength > _index, "QorpoPower: invalid stake index");
+        require(stake.finished == false, "QorpoPower: stake already finished");
+        StakeApyType memory stakeType = stakeTypes[stake.stakeType];
+        uint256 duration = block.timestamp - stake.startTime;
+        require(
+            duration >= stakeType.duration,
+            "QorpoPower: stake duration not completed"
+        );
+        expectedStakePayout -= ((stake.amount * stakeType.apyFraction) / 10000);
+        token.transfer(msg.sender, stake.amount);
+        stake.finished = true;
+        totalStaked -= stake.amount;
+        emit UnstakedApy(msg.sender, stake.amount, 0, 0, _index);
+    }
+
+    // Function for emergency withdraw of the tokens by the owner, cannot withdraw user staked tokens
+    function withdraw(uint256 _amount) public onlyOwner {
+        require(
+            _amount <= token.balanceOf(address(this)) - totalStaked,
+            "QorpoPower: insufficient balance"
+        );
+        token.transfer(owner, _amount);
+    }
+}
+
+
+// File: src/utils/TokenAccessControlLight.sol
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.7.0 <0.9.0;
+
+contract TokenAccessControlLight {
+    bool public paused = false;
+    address public owner;
+    address public newContractOwner;
+
+    event SetPause(bool pause);
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+    event AuthorizedUserSet(address indexed operator, bool approve);
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier ifNotPaused() {
+        require(!paused, "contract is paused");
+        _;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "caller is not an owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(owner, address(0));
+        owner = address(0);
+    }
+
+    function transferOwnership(address _newOwner) public onlyOwner {
+        require(_newOwner != address(0));
+        newContractOwner = _newOwner;
+    }
+
+    function acceptOwnership() public ifNotPaused {
+        require(msg.sender == newContractOwner);
+        emit OwnershipTransferred(owner, newContractOwner);
+        owner = newContractOwner;
+        newContractOwner = address(0);
+    }
+
+    function setPause(bool _paused) public onlyOwner {
+        paused = _paused;
+        if (paused) {
+            emit SetPause(paused);
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+

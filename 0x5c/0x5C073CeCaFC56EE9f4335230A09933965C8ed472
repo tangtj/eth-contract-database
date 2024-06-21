@@ -1,0 +1,745 @@
+
+// File: contracts/SeasonRewardsDistributor.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {LowLevelERC20Transfer} from "@looksrare/contracts-libs/contracts/lowLevelCallers/LowLevelERC20Transfer.sol";
+import {OwnableTwoSteps} from "@looksrare/contracts-libs/contracts/OwnableTwoSteps.sol";
+import {Pausable} from "@looksrare/contracts-libs/contracts/Pausable.sol";
+import {ReentrancyGuard} from "@looksrare/contracts-libs/contracts/ReentrancyGuard.sol";
+
+import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+/**
+ * @title SeasonRewardsDistributor
+ * @notice It distributes LOOKS tokens with rolling Merkle airdrops.
+ */
+contract SeasonRewardsDistributor is Pausable, ReentrancyGuard, OwnableTwoSteps, LowLevelERC20Transfer {
+    uint256 public constant BUFFER_ADMIN_WITHDRAW = 3 days;
+
+    address public immutable looksRareToken;
+
+    // Current reward round (users can only claim pending rewards for the current round)
+    uint256 public currentRewardRound;
+
+    // Last paused timestamp
+    uint256 public lastPausedTimestamp;
+
+    // Max amount per user in current tree
+    uint256 public maximumAmountPerUserInCurrentTree;
+
+    // Total amount claimed by user (in LOOKS)
+    mapping(address => uint256) public amountClaimedByUser;
+
+    // Merkle root for a reward round
+    mapping(uint256 => bytes32) public merkleRootOfRewardRound;
+
+    // Checks whether a merkle root was used
+    mapping(bytes32 => bool) public merkleRootUsed;
+
+    // Keeps track on whether user has claimed at a given reward round
+    mapping(uint256 => mapping(address => bool)) public hasUserClaimedForRewardRound;
+
+    event RewardsClaim(address indexed user, uint256 indexed rewardRound, uint256 amount);
+    event UpdateSeasonRewards(uint256 indexed rewardRound);
+    event TokenWithdrawnOwner(uint256 amount);
+
+    error AlreadyClaimed();
+    error AmountHigherThanMax();
+    error InvalidProof();
+    error MerkleRootAlreadyUsed();
+    error TooEarlyToWithdraw();
+
+    /**
+     * @notice Constructor
+     * @param _looksRareToken address of the LooksRare token
+     * @param _owner address of the owner
+     */
+    constructor(address _looksRareToken, address _owner) OwnableTwoSteps(_owner) {
+        looksRareToken = _looksRareToken;
+        merkleRootUsed[bytes32(0)] = true;
+    }
+
+    /**
+     * @notice Claim pending rewards
+     * @param amount amount to claim
+     * @param merkleProof array containing the merkle proof
+     */
+    function claim(uint256 amount, bytes32[] calldata merkleProof) external whenNotPaused nonReentrant {
+        // Verify the reward round is not claimed already
+        if (hasUserClaimedForRewardRound[currentRewardRound][msg.sender]) {
+            revert AlreadyClaimed();
+        }
+
+        (bool claimStatus, uint256 adjustedAmount) = _canClaim(msg.sender, amount, merkleProof);
+
+        if (!claimStatus) {
+            revert InvalidProof();
+        }
+        if (amount > maximumAmountPerUserInCurrentTree) {
+            revert AmountHigherThanMax();
+        }
+
+        // Set mapping for user and round as true
+        hasUserClaimedForRewardRound[currentRewardRound][msg.sender] = true;
+
+        // Adjust amount claimed
+        amountClaimedByUser[msg.sender] += adjustedAmount;
+
+        // Transfer adjusted amount
+        _executeERC20DirectTransfer(looksRareToken, msg.sender, adjustedAmount);
+
+        emit RewardsClaim(msg.sender, currentRewardRound, adjustedAmount);
+    }
+
+    /**
+     * @notice Update season rewards with a new merkle root
+     * @dev It automatically increments the currentRewardRound
+     * @param merkleRoot root of the computed merkle tree
+     */
+    function updateSeasonRewards(bytes32 merkleRoot, uint256 newMaximumAmountPerUser) external onlyOwner {
+        if (merkleRootUsed[merkleRoot]) {
+            revert MerkleRootAlreadyUsed();
+        }
+
+        currentRewardRound++;
+        merkleRootOfRewardRound[currentRewardRound] = merkleRoot;
+        merkleRootUsed[merkleRoot] = true;
+        maximumAmountPerUserInCurrentTree = newMaximumAmountPerUser;
+
+        emit UpdateSeasonRewards(currentRewardRound);
+    }
+
+    /**
+     * @notice Pause distribution
+     */
+    function pauseDistribution() external onlyOwner whenNotPaused {
+        lastPausedTimestamp = block.timestamp;
+        _pause();
+    }
+
+    /**
+     * @notice Unpause distribution
+     */
+    function unpauseDistribution() external onlyOwner whenPaused {
+        _unpause();
+    }
+
+    /**
+     * @notice Transfer LOOKS tokens back to owner
+     * @dev It is for emergency purposes
+     * @param amount amount to withdraw
+     */
+    function withdrawTokenRewards(uint256 amount) external onlyOwner whenPaused {
+        if (block.timestamp <= (lastPausedTimestamp + BUFFER_ADMIN_WITHDRAW)) {
+            revert TooEarlyToWithdraw();
+        }
+        _executeERC20DirectTransfer(looksRareToken, msg.sender, amount);
+
+        emit TokenWithdrawnOwner(amount);
+    }
+
+    /**
+     * @notice Check whether it is possible to claim and how much based on previous distribution
+     * @param user address of the user
+     * @param amount amount to claim
+     * @param merkleProof array with the merkle proof
+     */
+    function canClaim(
+        address user,
+        uint256 amount,
+        bytes32[] calldata merkleProof
+    ) external view returns (bool, uint256) {
+        return _canClaim(user, amount, merkleProof);
+    }
+
+    /**
+     * @notice Check whether it is possible to claim and how much based on previous distribution
+     * @param user address of the user
+     * @param amount amount to claim
+     * @param merkleProof array with the merkle proof
+     */
+    function _canClaim(
+        address user,
+        uint256 amount,
+        bytes32[] calldata merkleProof
+    ) internal view returns (bool, uint256) {
+        // Compute the node and verify the merkle proof
+        bytes32 node = keccak256(bytes.concat(keccak256(abi.encodePacked(user, amount))));
+
+        bool canUserClaim = MerkleProof.verify(merkleProof, merkleRootOfRewardRound[currentRewardRound], node);
+
+        if ((!canUserClaim) || (hasUserClaimedForRewardRound[currentRewardRound][user])) {
+            return (false, 0);
+        } else {
+            return (true, amount - amountClaimedByUser[user]);
+        }
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/lowLevelCallers/LowLevelERC20Transfer.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+// Interfaces
+import {IERC20} from "../interfaces/generic/IERC20.sol";
+
+// Errors
+import {ERC20TransferFail, ERC20TransferFromFail} from "../errors/LowLevelErrors.sol";
+import {NotAContract} from "../errors/GenericErrors.sol";
+
+/**
+ * @title LowLevelERC20Transfer
+ * @notice This contract contains low-level calls to transfer ERC20 tokens.
+ * @author LooksRare protocol team (👀,💎)
+ */
+contract LowLevelERC20Transfer {
+    /**
+     * @notice Execute ERC20 transferFrom
+     * @param currency Currency address
+     * @param from Sender address
+     * @param to Recipient address
+     * @param amount Amount to transfer
+     */
+    function _executeERC20TransferFrom(address currency, address from, address to, uint256 amount) internal {
+        if (currency.code.length == 0) {
+            revert NotAContract();
+        }
+
+        (bool status, bytes memory data) = currency.call(abi.encodeCall(IERC20.transferFrom, (from, to, amount)));
+
+        if (!status) {
+            revert ERC20TransferFromFail();
+        }
+
+        if (data.length > 0) {
+            if (!abi.decode(data, (bool))) {
+                revert ERC20TransferFromFail();
+            }
+        }
+    }
+
+    /**
+     * @notice Execute ERC20 (direct) transfer
+     * @param currency Currency address
+     * @param to Recipient address
+     * @param amount Amount to transfer
+     */
+    function _executeERC20DirectTransfer(address currency, address to, uint256 amount) internal {
+        if (currency.code.length == 0) {
+            revert NotAContract();
+        }
+
+        (bool status, bytes memory data) = currency.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+
+        if (!status) {
+            revert ERC20TransferFail();
+        }
+
+        if (data.length > 0) {
+            if (!abi.decode(data, (bool))) {
+                revert ERC20TransferFail();
+            }
+        }
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/OwnableTwoSteps.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+// Interfaces
+import {IOwnableTwoSteps} from "./interfaces/IOwnableTwoSteps.sol";
+
+/**
+ * @title OwnableTwoSteps
+ * @notice This contract offers transfer of ownership in two steps with potential owner
+ *         having to confirm the transaction to become the owner.
+ *         Renouncement of the ownership is also a two-step process since the next potential owner is the address(0).
+ * @author LooksRare protocol team (👀,💎)
+ */
+abstract contract OwnableTwoSteps is IOwnableTwoSteps {
+    /**
+     * @notice Address of the current owner.
+     */
+    address public owner;
+
+    /**
+     * @notice Address of the potential owner.
+     */
+    address public potentialOwner;
+
+    /**
+     * @notice Ownership status.
+     */
+    Status public ownershipStatus;
+
+    /**
+     * @notice Modifier to wrap functions for contracts that inherit this contract.
+     */
+    modifier onlyOwner() {
+        _onlyOwner();
+        _;
+    }
+
+    /**
+     * @notice Constructor
+     * @param _owner The contract's owner
+     */
+    constructor(address _owner) {
+        owner = _owner;
+        emit NewOwner(_owner);
+    }
+
+    /**
+     * @notice This function is used to cancel the ownership transfer.
+     * @dev This function can be used for both cancelling a transfer to a new owner and
+     *      cancelling the renouncement of the ownership.
+     */
+    function cancelOwnershipTransfer() external onlyOwner {
+        Status _ownershipStatus = ownershipStatus;
+        if (_ownershipStatus == Status.NoOngoingTransfer) {
+            revert NoOngoingTransferInProgress();
+        }
+
+        if (_ownershipStatus == Status.TransferInProgress) {
+            delete potentialOwner;
+        }
+
+        delete ownershipStatus;
+
+        emit CancelOwnershipTransfer();
+    }
+
+    /**
+     * @notice This function is used to confirm the ownership renouncement.
+     */
+    function confirmOwnershipRenouncement() external onlyOwner {
+        if (ownershipStatus != Status.RenouncementInProgress) {
+            revert RenouncementNotInProgress();
+        }
+
+        delete owner;
+        delete ownershipStatus;
+
+        emit NewOwner(address(0));
+    }
+
+    /**
+     * @notice This function is used to confirm the ownership transfer.
+     * @dev This function can only be called by the current potential owner.
+     */
+    function confirmOwnershipTransfer() external {
+        if (ownershipStatus != Status.TransferInProgress) {
+            revert TransferNotInProgress();
+        }
+
+        if (msg.sender != potentialOwner) {
+            revert WrongPotentialOwner();
+        }
+
+        owner = msg.sender;
+        delete ownershipStatus;
+        delete potentialOwner;
+
+        emit NewOwner(msg.sender);
+    }
+
+    /**
+     * @notice This function is used to initiate the transfer of ownership to a new owner.
+     * @param newPotentialOwner New potential owner address
+     */
+    function initiateOwnershipTransfer(address newPotentialOwner) external onlyOwner {
+        if (ownershipStatus != Status.NoOngoingTransfer) {
+            revert TransferAlreadyInProgress();
+        }
+
+        ownershipStatus = Status.TransferInProgress;
+        potentialOwner = newPotentialOwner;
+
+        /**
+         * @dev This function can only be called by the owner, so msg.sender is the owner.
+         *      We don't have to SLOAD the owner again.
+         */
+        emit InitiateOwnershipTransfer(msg.sender, newPotentialOwner);
+    }
+
+    /**
+     * @notice This function is used to initiate the ownership renouncement.
+     */
+    function initiateOwnershipRenouncement() external onlyOwner {
+        if (ownershipStatus != Status.NoOngoingTransfer) {
+            revert TransferAlreadyInProgress();
+        }
+
+        ownershipStatus = Status.RenouncementInProgress;
+
+        emit InitiateOwnershipRenouncement();
+    }
+
+    function _onlyOwner() private view {
+        if (msg.sender != owner) revert NotOwner();
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/Pausable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @title Pausable
+ * @notice This contract makes it possible to pause the contract.
+ *         It is adjusted from OpenZeppelin.
+ * @author LooksRare protocol team (👀,💎)
+ */
+abstract contract Pausable {
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    error IsPaused();
+    error NotPaused();
+
+    bool private _paused;
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        if (paused()) {
+            revert IsPaused();
+        }
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        if (!paused()) {
+            revert NotPaused();
+        }
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(msg.sender);
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(msg.sender);
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+// Interfaces
+import {IReentrancyGuard} from "./interfaces/IReentrancyGuard.sol";
+
+/**
+ * @title ReentrancyGuard
+ * @notice This contract protects against reentrancy attacks.
+ *         It is adjusted from OpenZeppelin.
+ * @author LooksRare protocol team (👀,💎)
+ */
+abstract contract ReentrancyGuard is IReentrancyGuard {
+    uint256 private _status;
+
+    /**
+     * @notice Modifier to wrap functions to prevent reentrancy calls.
+     */
+    modifier nonReentrant() {
+        if (_status == 2) {
+            revert ReentrancyFail();
+        }
+
+        _status = 2;
+        _;
+        _status = 1;
+    }
+
+    constructor() {
+        _status = 1;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/cryptography/MerkleProof.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/cryptography/MerkleProof.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev These functions deal with verification of Merkle Trees proofs.
+ *
+ * The proofs can be generated using the JavaScript library
+ * https://github.com/miguelmota/merkletreejs[merkletreejs].
+ * Note: the hashing algorithm should be keccak256 and pair sorting should be enabled.
+ *
+ * See `test/utils/cryptography/MerkleProof.test.js` for some examples.
+ */
+library MerkleProof {
+    /**
+     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree
+     * defined by `root`. For this, a `proof` must be provided, containing
+     * sibling hashes on the branch from the leaf to the root of the tree. Each
+     * pair of leaves and each pair of pre-images are assumed to be sorted.
+     */
+    function verify(
+        bytes32[] memory proof,
+        bytes32 root,
+        bytes32 leaf
+    ) internal pure returns (bool) {
+        return processProof(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Returns the rebuilt hash obtained by traversing a Merklee tree up
+     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt
+     * hash matches the root of the tree. When processing the proof, the pairs
+     * of leafs & pre-images are assumed to be sorted.
+     *
+     * _Available since v4.4._
+     */
+    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            bytes32 proofElement = proof[i];
+            if (computedHash <= proofElement) {
+                // Hash(current computed hash + current element of the proof)
+                computedHash = keccak256(abi.encodePacked(computedHash, proofElement));
+            } else {
+                // Hash(current element of the proof + current computed hash)
+                computedHash = keccak256(abi.encodePacked(proofElement, computedHash));
+            }
+        }
+        return computedHash;
+    }
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/interfaces/generic/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IERC20 {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/errors/LowLevelErrors.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @notice It is emitted if the ETH transfer fails.
+ */
+error ETHTransferFail();
+
+/**
+ * @notice It is emitted if the ERC20 approval fails.
+ */
+error ERC20ApprovalFail();
+
+/**
+ * @notice It is emitted if the ERC20 transfer fails.
+ */
+error ERC20TransferFail();
+
+/**
+ * @notice It is emitted if the ERC20 transferFrom fails.
+ */
+error ERC20TransferFromFail();
+
+/**
+ * @notice It is emitted if the ERC721 transferFrom fails.
+ */
+error ERC721TransferFromFail();
+
+/**
+ * @notice It is emitted if the ERC1155 safeTransferFrom fails.
+ */
+error ERC1155SafeTransferFromFail();
+
+/**
+ * @notice It is emitted if the ERC1155 safeBatchTransferFrom fails.
+ */
+error ERC1155SafeBatchTransferFromFail();
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/errors/GenericErrors.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @notice It is emitted if the call recipient is not a contract.
+ */
+error NotAContract();
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/interfaces/IOwnableTwoSteps.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @title IOwnableTwoSteps
+ * @author LooksRare protocol team (👀,💎)
+ */
+interface IOwnableTwoSteps {
+    /**
+     * @notice This enum keeps track of the ownership status.
+     * @param NoOngoingTransfer The default status when the owner is set
+     * @param TransferInProgress The status when a transfer to a new owner is initialized
+     * @param RenouncementInProgress The status when a transfer to address(0) is initialized
+     */
+    enum Status {
+        NoOngoingTransfer,
+        TransferInProgress,
+        RenouncementInProgress
+    }
+
+    /**
+     * @notice This is returned when there is no transfer of ownership in progress.
+     */
+    error NoOngoingTransferInProgress();
+
+    /**
+     * @notice This is returned when the caller is not the owner.
+     */
+    error NotOwner();
+
+    /**
+     * @notice This is returned when there is no renouncement in progress but
+     *         the owner tries to validate the ownership renouncement.
+     */
+    error RenouncementNotInProgress();
+
+    /**
+     * @notice This is returned when the transfer is already in progress but the owner tries
+     *         initiate a new ownership transfer.
+     */
+    error TransferAlreadyInProgress();
+
+    /**
+     * @notice This is returned when there is no ownership transfer in progress but the
+     *         ownership change tries to be approved.
+     */
+    error TransferNotInProgress();
+
+    /**
+     * @notice This is returned when the ownership transfer is attempted to be validated by the
+     *         a caller that is not the potential owner.
+     */
+    error WrongPotentialOwner();
+
+    /**
+     * @notice This is emitted if the ownership transfer is cancelled.
+     */
+    event CancelOwnershipTransfer();
+
+    /**
+     * @notice This is emitted if the ownership renouncement is initiated.
+     */
+    event InitiateOwnershipRenouncement();
+
+    /**
+     * @notice This is emitted if the ownership transfer is initiated.
+     * @param previousOwner Previous/current owner
+     * @param potentialOwner Potential/future owner
+     */
+    event InitiateOwnershipTransfer(address previousOwner, address potentialOwner);
+
+    /**
+     * @notice This is emitted when there is a new owner.
+     */
+    event NewOwner(address newOwner);
+}
+
+
+// File: node_modules/@looksrare/contracts-libs/contracts/interfaces/IReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/**
+ * @title IReentrancyGuard
+ * @author LooksRare protocol team (👀,💎)
+ */
+interface IReentrancyGuard {
+    /**
+     * @notice This is returned when there is a reentrant call.
+     */
+    error ReentrancyFail();
+}
+

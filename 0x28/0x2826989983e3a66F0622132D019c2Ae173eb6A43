@@ -1,0 +1,5679 @@
+
+// File: contracts/ousg/ousgInstantManager.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+import "contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol";
+import "contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "contracts/external/openzeppelin/contracts/token/IERC20Metadata.sol";
+import "contracts/external/chainlink/AggregatorV3Interface.sol";
+import "contracts/ousg/rOUSG.sol";
+import "contracts/interfaces/IRWALike.sol";
+import "contracts/external/circle/IRedemption.sol";
+import "contracts/InstantMintTimeBasedRateLimiter.sol";
+import "contracts/interfaces/IOUSGInstantManager.sol";
+import "contracts/interfaces/IMulticall.sol";
+import "contracts/interfaces/IInvestorBasedRateLimiter.sol";
+
+/**
+ * @title OUSGInstantManager
+ * @author Ondo Finance
+ * @notice This contract is responsible for minting
+ *         and redeeming OUSG and rOUSG against USDC. Addresses
+ *         with the DEFAULT_ADMIN_ROLE able to set optional mint and
+ *         redeem fees. It is implemented in terms of a
+ *         InstantMintTimeBasedRateLimiter, which imposes mint and redeem limits within
+ *         specified intervals. Additionally, addresses with the PAUSER role in
+ *         the registry can pause mints and redemptions, while addresses with
+ *         the DEFAULT_ADMIN role can unpause mints or redemptions.
+ *
+ * @dev Please be aware of the differences of decimals representations between
+ *      OUSG, rOUSG, USDC, and BUIDL. This contract multiplies
+ *      or divides quantities by a scaling factor (see `decimalsMultiplier`) to
+ *      account for this. Due to the way the difference in decimals is
+ *      calculated, the decimals value of the usdc token MUST be less
+ *      than or equal to OUSG's decimals value or else contract deployment
+ *      will fail.
+ */
+contract OUSGInstantManager is
+  ReentrancyGuard,
+  InstantMintTimeBasedRateLimiter,
+  AccessControlEnumerable,
+  IOUSGInstantManager,
+  IMulticall
+{
+  // Role to configure the contract
+  bytes32 public constant CONFIGURER_ROLE = keccak256("CONFIGURER_ROLE");
+
+  // Role to pause minting and redemptions
+  bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+
+  // Role to sweep tokens from the contract using retrieveTokens
+  bytes32 public constant RETRIEVER_ROLE = keccak256("RETRIEVER_ROLE");
+
+  // Safety circuit breaker in case of Oracle malfunction
+  uint256 public constant MINIMUM_OUSG_PRICE = 105894206000000000000;
+
+  // Safety circuit breaker in case of USDC Depeg event
+  int256 public constant MINIMUM_USDC_PRICE = 995e5;
+
+  // Helper constant that allows us to precisely specify fees in basis points
+  uint256 public constant FEE_GRANULARITY = 10_000;
+
+  // Helper constant that allows us to convert between OUSG and rOUSG shares
+  uint256 public constant OUSG_TO_ROUSG_SHARES_MULTIPLIER = 10_000;
+
+  // USDC contract
+  IERC20 public immutable usdc; // 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+
+  // OUSG contract
+  IRWALike public immutable ousg;
+
+  // Rebasing OUSG Contract
+  ROUSG public immutable rousg;
+
+  // BUIDL token contract
+  IERC20 public immutable buidl;
+
+  // Redeemer contract used for instant redemptions of BUIDL
+  IRedemption public immutable buidlRedeemer;
+
+  // Scaling factor to account for differences in decimals between OUSG/rOUSG and BUIDL/USDC
+  uint256 public immutable decimalsMultiplier;
+
+  // The address that receives USDC for subscriptions
+  address public usdcReceiver;
+
+  // Address of the oracle that provides the `ousgPrice`
+  IRWAOracle public oracle;
+
+  // The address in which USDC should be sent to as a fee for minting and redeeming
+  address public feeReceiver;
+
+  // Fee collected when minting OUSG (in basis points)
+  uint256 public mintFee;
+
+  // Fee collected when redeeming OUSG (in basis points)
+  uint256 public redeemFee;
+
+  // Minimum amount of USDC that must be deposited to mint OUSG or rOUSG
+  // Denoted in 6 decimals for USDC
+  uint256 public minimumDepositAmount = 100_000e6;
+
+  // Minimum amount of USDC that must be redeemed for to redeem OUSG or rOUSG
+  // Denoted in 6 decimals for USDC
+  uint256 public minimumRedemptionAmount = 49_999e6;
+
+  // Whether minting is paused for this contract
+  bool public mintPaused;
+
+  // Whether redemptions are paused for this contract
+  bool public redeemPaused;
+
+  // The minimum amount of BUIDL that must be redeemed in a single redemption
+  // with the BUIDLRedeemer contract
+  uint256 public minBUIDLRedeemAmount = 250_000e6;
+
+  // Chainlink USDC Price Oracle
+  AggregatorV3Interface public priceFeedUSDCUSD =
+    AggregatorV3Interface(0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6);
+
+  // Optional investor-based rate limiting contract reference
+  IInvestorBasedRateLimiter public investorBasedRateLimiter;
+
+  /**
+   * @notice Constructor.
+   *
+   * @param defaultAdmin        Address that receives all roles during init DEFAULT_ADMIN_ROLE
+   * @param _usdc               USDC's token contract address
+   * @param _usdcReciever       Address that receives USDC during minting
+   * @param _feeReceiver        Address that receives mint and redemption fees
+   * @param _ousgOracle         OUSG's oracle contract address
+   * @param _ousg               OUSG's token contract address
+   * @param _rousg              rOUSG's token contract address
+   * @param _buidl              BUIDL token contract address
+   * @param _buidlRedeemer      Contract address used for instant redemptions of BUIDL
+   * @param rateLimiterConfig   See IOUSGInstantManager.sol & InstantMintTimeBasedRateLimiter.sol
+   *
+   * @dev We calculate `decimalsMultiplier` by subtracting OUSG's decimals by
+   *      the `usdc` contract's decimals and performing 10 ^ difference.
+   *      Deployment will fail if the difference is a negative number via
+   *      runtime underflow protections provided by our solidity version.
+   */
+  constructor(
+    address defaultAdmin,
+    address _usdc,
+    address _usdcReciever,
+    address _feeReceiver,
+    address _ousgOracle,
+    address _ousg,
+    address _rousg,
+    address _buidl,
+    address _buidlRedeemer,
+    RateLimiterConfig memory rateLimiterConfig
+  )
+    InstantMintTimeBasedRateLimiter(
+      rateLimiterConfig.mintLimitDuration,
+      rateLimiterConfig.redeemLimitDuration,
+      rateLimiterConfig.mintLimit,
+      rateLimiterConfig.redeemLimit
+    )
+  {
+    require(
+      address(_usdc) != address(0),
+      "OUSGInstantManager: USDC cannot be 0x0"
+    );
+    require(
+      address(_usdcReciever) != address(0),
+      "OUSGInstantManager: USDC Receiver cannot be 0x0"
+    );
+    require(
+      address(_feeReceiver) != address(0),
+      "OUSGInstantManager: feeReceiver cannot be 0x0"
+    );
+    require(
+      address(_ousgOracle) != address(0),
+      "OUSGInstantManager: OUSG Oracle cannot be 0x0"
+    );
+    require(_ousg != address(0), "OUSGInstantManager: OUSG cannot be 0x0");
+    require(_rousg != address(0), "OUSGInstantManager: rOUSG cannot be 0x0");
+    require(_buidl != address(0), "OUSGInstantManager: BUIDL cannot be 0x0");
+    require(
+      address(_buidlRedeemer) != address(0),
+      "OUSGInstantManager: BUIDL Redeemer cannot be 0x0"
+    );
+    require(
+      IERC20Metadata(_ousg).decimals() == IERC20Metadata(_rousg).decimals(),
+      "OUSGInstantManager: OUSG decimals must be equal to rOUSG decimals"
+    );
+    require(
+      IERC20Metadata(_usdc).decimals() == IERC20Metadata(_buidl).decimals(),
+      "OUSGInstantManager: USDC decimals must be equal to BUIDL decimals"
+    );
+    require(
+      priceFeedUSDCUSD.decimals() == 8,
+      "OUSGInstantManager::Invalid oracle decimals"
+    );
+
+    usdc = IERC20(_usdc);
+    usdcReceiver = _usdcReciever;
+    feeReceiver = _feeReceiver;
+    oracle = IRWAOracle(_ousgOracle);
+    ousg = IRWALike(_ousg);
+    rousg = ROUSG(_rousg);
+    buidl = IERC20(_buidl);
+    buidlRedeemer = IRedemption(_buidlRedeemer);
+    decimalsMultiplier =
+      10 **
+        (IERC20Metadata(_ousg).decimals() - IERC20Metadata(_usdc).decimals());
+    require(
+      OUSG_TO_ROUSG_SHARES_MULTIPLIER ==
+        rousg.OUSG_TO_ROUSG_SHARES_MULTIPLIER(),
+      "OUSGInstantManager: OUSG to rOUSG shares multiplier must be equal to rOUSG's"
+    );
+
+    _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
+    _grantRole(CONFIGURER_ROLE, defaultAdmin);
+    _grantRole(PAUSER_ROLE, defaultAdmin);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                            Mint/Redeem
+  //////////////////////////////////////////////////////////////*/
+  /**
+   * @notice Calculates fees and triggers minting OUSG for a given amount of USDC
+   *
+   * @dev Please note that the fees are accumulated in `feeReceiver`
+   *
+   * @param usdcAmountIn amount of USDC exchanged for OUSG (in whatever decimals
+   *                     specifed by usdc token contract)
+   *
+   * @return ousgAmountOut The quantity of OUSG minted for the user
+   *                       (18 decimals per OUSG contract)
+   */
+  function mint(
+    uint256 usdcAmountIn
+  )
+    external
+    override
+    nonReentrant
+    whenMintNotPaused
+    returns (uint256 ousgAmountOut)
+  {
+    ousgAmountOut = _mint(usdcAmountIn, msg.sender);
+    emit InstantMintOUSG(msg.sender, usdcAmountIn, ousgAmountOut);
+  }
+
+  /**
+   * @notice Calculates fees and triggers minting rOUSG for a given amount of USDC
+   *
+   * @dev Please note that the fees are accumulated in `feeReceiver`
+   *
+   * @param usdcAmountIn amount of USDC exchanged for rOUSG (in whatever decimals
+   *                     specifed by usdc token contract)
+   *
+   * @return rousgAmountOut The quantity of rOUSG minted for the user
+   *                        (18 decimals per rOUSG contract)
+   */
+  function mintRebasingOUSG(
+    uint256 usdcAmountIn
+  )
+    external
+    override
+    nonReentrant
+    whenMintNotPaused
+    returns (uint256 rousgAmountOut)
+  {
+    uint256 ousgAmountOut = _mint(usdcAmountIn, address(this));
+    ousg.approve(address(rousg), ousgAmountOut);
+    rousg.wrap(ousgAmountOut);
+    rousgAmountOut = rousg.transferShares(
+      msg.sender,
+      ousgAmountOut * OUSG_TO_ROUSG_SHARES_MULTIPLIER
+    );
+
+    emit InstantMintRebasingOUSG(
+      msg.sender,
+      usdcAmountIn,
+      ousgAmountOut,
+      rousgAmountOut
+    );
+  }
+
+  function _mint(
+    uint256 usdcAmountIn,
+    address to
+  ) internal returns (uint256 ousgAmountOut) {
+    require(
+      IERC20Metadata(address(usdc)).decimals() == 6,
+      "OUSGInstantManager::_mint: USDC decimals must be 6"
+    );
+    _assertUSDCPrice();
+    require(
+      usdcAmountIn >= minimumDepositAmount,
+      "OUSGInstantManager::_mint: Deposit amount too small"
+    );
+    _checkAndUpdateInstantMintLimit(usdcAmountIn);
+    if (address(investorBasedRateLimiter) != address(0)) {
+      investorBasedRateLimiter.checkAndUpdateMintLimit(
+        msg.sender,
+        usdcAmountIn
+      );
+    }
+
+    require(
+      usdc.allowance(msg.sender, address(this)) >= usdcAmountIn,
+      "OUSGInstantManager::_mint: Allowance must be given to OUSGInstantManager"
+    );
+
+    uint256 usdcFees = _getInstantMintFees(usdcAmountIn);
+    uint256 usdcAmountAfterFee = usdcAmountIn - usdcFees;
+
+    // Calculate the mint amount based on mint fees and usdc quantity
+    uint256 ousgPrice = getOUSGPrice();
+    ousgAmountOut = _getMintAmount(usdcAmountAfterFee, ousgPrice);
+
+    // Transfer USDC
+    if (usdcFees > 0) {
+      usdc.transferFrom(msg.sender, feeReceiver, usdcFees);
+    }
+    usdc.transferFrom(msg.sender, usdcReceiver, usdcAmountAfterFee);
+
+    emit MintFeesDeducted(msg.sender, feeReceiver, usdcFees, usdcAmountIn);
+
+    ousg.mint(to, ousgAmountOut);
+  }
+
+  /**
+   * @notice Calculates fees and triggers a redemption of OUSG for a given amount of USDC
+   *
+   * @dev Please note that the fees are accumulated in `feeReceiver`
+   *
+   * @param ousgAmountIn Amount of OUSG to redeem
+   *
+   * @return usdcAmountOut The amount of USDC returned to the user
+   */
+  function redeem(
+    uint256 ousgAmountIn
+  )
+    external
+    override
+    nonReentrant
+    whenRedeemNotPaused
+    returns (uint256 usdcAmountOut)
+  {
+    require(
+      ousg.allowance(msg.sender, address(this)) >= ousgAmountIn,
+      "OUSGInstantManager::redeem: Insufficient allowance"
+    );
+    ousg.transferFrom(msg.sender, address(this), ousgAmountIn);
+    usdcAmountOut = _redeem(ousgAmountIn);
+    emit InstantRedemptionOUSG(msg.sender, ousgAmountIn, usdcAmountOut);
+  }
+
+  /**
+   * @notice Calculates fees and triggers minting rOUSG for a given amount of USDC
+   *
+   * @dev Please note that the fees are actually accumulated in `feeReceiver`
+   *
+   * @param rousgAmountIn Amount of rOUSG to redeem
+   *
+   * @return usdcAmountOut The amount of USDC returned to the user
+   */
+  function redeemRebasingOUSG(
+    uint256 rousgAmountIn
+  )
+    external
+    override
+    nonReentrant
+    whenRedeemNotPaused
+    returns (uint256 usdcAmountOut)
+  {
+    require(
+      rousg.allowance(msg.sender, address(this)) >= rousgAmountIn,
+      "OUSGInstantManager::redeemRebasingOUSG: Insufficient allowance"
+    );
+    rousg.transferFrom(msg.sender, address(this), rousgAmountIn);
+    rousg.unwrap(rousgAmountIn);
+    uint256 ousgAmountIn = rousg.getSharesByROUSG(rousgAmountIn) /
+      OUSG_TO_ROUSG_SHARES_MULTIPLIER;
+    usdcAmountOut = _redeem(ousgAmountIn);
+    emit InstantRedemptionRebasingOUSG(
+      msg.sender,
+      rousgAmountIn,
+      ousgAmountIn,
+      usdcAmountOut
+    );
+  }
+
+  function _redeem(
+    uint256 ousgAmountIn
+  ) internal returns (uint256 usdcAmountOut) {
+    require(
+      IERC20Metadata(address(usdc)).decimals() == 6,
+      "OUSGInstantManager::_redeem: USDC decimals must be 6"
+    );
+    require(
+      IERC20Metadata(address(buidl)).decimals() == 6,
+      "OUSGInstantManager::_redeem: BUIDL decimals must be 6"
+    );
+    _assertUSDCPrice();
+    uint256 ousgPrice = getOUSGPrice();
+    uint256 usdcAmountToRedeem = _getRedemptionAmount(ousgAmountIn, ousgPrice);
+
+    require(
+      usdcAmountToRedeem >= minimumRedemptionAmount,
+      "OUSGInstantManager::_redeem: Redemption amount too small"
+    );
+    _checkAndUpdateInstantRedemptionLimit(usdcAmountToRedeem);
+
+    if (address(investorBasedRateLimiter) != address(0)) {
+      investorBasedRateLimiter.checkAndUpdateRedemptionLimit(
+        msg.sender,
+        usdcAmountToRedeem
+      );
+    }
+
+    uint256 usdcFees = _getInstantRedemptionFees(usdcAmountToRedeem);
+    usdcAmountOut = usdcAmountToRedeem - usdcFees;
+
+    ousg.burn(ousgAmountIn);
+
+    uint256 usdcBalance = usdc.balanceOf(address(this));
+    if (usdcAmountToRedeem <= usdcBalance) {
+      // There is enough USDC in the contract to cover the redemption and fees,
+      // use it without redeeming more BUIDL.
+      emit BUIDLRedemptionSkipped(
+        msg.sender,
+        usdcAmountToRedeem,
+        usdcBalance - usdcAmountToRedeem
+      );
+    } else if (usdcAmountToRedeem - usdcBalance >= minBUIDLRedeemAmount) {
+      // The amount of additional USDC needed in this contract is over minBUIDLRedeemAmount,
+      // do a BUIDL redemption to cover the difference.
+      _redeemBUIDL(usdcAmountToRedeem - usdcBalance);
+    } else {
+      // There isn't enough USDC held by this contract to cover the redemption,
+      // so we perform a BUIDL redemption of BUIDL's minimum required amount.
+      // The remaining amount of USDC will be held in the contract for future redemptions.
+      _redeemBUIDL(minBUIDLRedeemAmount);
+      emit MinimumBUIDLRedemption(
+        msg.sender,
+        minBUIDLRedeemAmount,
+        usdcBalance + minBUIDLRedeemAmount - usdcAmountToRedeem
+      );
+    }
+
+    if (usdcFees > 0) {
+      usdc.transfer(feeReceiver, usdcFees);
+    }
+    emit RedeemFeesDeducted(msg.sender, feeReceiver, usdcFees, usdcAmountOut);
+
+    usdc.transfer(msg.sender, usdcAmountOut);
+  }
+
+  function _redeemBUIDL(uint256 buidlAmountToRedeem) internal {
+    require(
+      buidl.balanceOf(address(this)) >= buidlAmountToRedeem,
+      "OUSGInstantManager::_redeemBUIDL: Insufficient BUIDL balance"
+    );
+    uint256 usdcBalanceBefore = usdc.balanceOf(address(this));
+    buidl.approve(address(buidlRedeemer), buidlAmountToRedeem);
+    buidlRedeemer.redeem(buidlAmountToRedeem);
+    require(
+      usdc.balanceOf(address(this)) == usdcBalanceBefore + buidlAmountToRedeem,
+      "OUSGInstantManager::_redeemBUIDL: BUIDL:USDC not 1:1"
+    );
+  }
+
+  /**
+   * @notice Returns the current price of OUSG in USDC
+   *
+   * @dev Sanity check: this function will revert if the price is unexpectedly low
+   *
+   * @return price The current price of OUSG in USDC
+   */
+  function getOUSGPrice() public view returns (uint256 price) {
+    (price, ) = oracle.getPriceData();
+    require(
+      price >= MINIMUM_OUSG_PRICE,
+      "OUSGInstantManager::getOUSGPrice: Price unexpectedly low"
+    );
+  }
+
+  function _assertUSDCPrice() internal view {
+    (, int price, , uint256 updatedAt, ) = priceFeedUSDCUSD.latestRoundData();
+    require(
+      updatedAt >= block.timestamp - 1 days - 6 hours,
+      "OUSGInstantManager::_assertUSDCPrice: Price outdated"
+    );
+
+    // price of USDC must be recent and greater than MINIMUM_USDC_PRICE at all times.
+    require(
+      price >= MINIMUM_USDC_PRICE,
+      "OUSGInstantManager::_assertUSDCPrice: USDC price too low"
+    );
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                    Rate Limiter Configuration
+  //////////////////////////////////////////////////////////////*/
+  /**
+   * @notice Set the mintLimit constraint inside the InstantMintTimeBasedRateLimiter
+   *         base contract
+   *
+   * @param _instantMintLimit New limit that dicates how much USDC can be transfered
+   *                     for minting in a specified duration
+   *                     (in 6 decimals per the USDC contract)
+   */
+  function setInstantMintLimit(
+    uint256 _instantMintLimit
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    _setInstantMintLimit(_instantMintLimit);
+  }
+
+  /**
+   * @notice Set the redeemLimit constraint inside the InstantMintTimeBasedRateLimiter
+   *         base contract
+   *
+   * @param _instantRedemptionLimit New limit that dicates how much USDC
+   *                       can be redeemed in a specified duration
+   *                       (in 6 decimals per the USDC contract)
+   */
+  function setInstantRedemptionLimit(
+    uint256 _instantRedemptionLimit
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    _setInstantRedemptionLimit(_instantRedemptionLimit);
+  }
+
+  /**
+   * @notice Sets mintLimitDuration constraint inside the InstantMintTimeBasedRateLimiter
+   *         base contract
+   *
+   * @param _instantMintLimitDuration New limit that specifies the interval
+   *                             (in seconds) in which only `mintLimit` USDC
+   *                             can be used for minting within
+   */
+  function setInstantMintLimitDuration(
+    uint256 _instantMintLimitDuration
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    _setInstantMintLimitDuration(_instantMintLimitDuration);
+  }
+
+  /**
+   * @notice Sets redeemLimitDuration inside the InstantMintTimeBasedRateLimiter
+   *         base contract
+   *
+   * @param _instantRedemptionLimitDuration New limit that specifies the interval
+   *                               (in seconds) in which only `redeemLimit` USDC
+   *                               can be redeemed within
+   */
+  function setInstantRedemptionLimitDuration(
+    uint256 _instantRedemptionLimitDuration
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    _setInstantRedemptionLimitDuration(_instantRedemptionLimitDuration);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                    Mint/Redeem Configuration
+  //////////////////////////////////////////////////////////////*/
+  /**
+   * @notice Sets the mint fee
+   *
+   * @param _mintFee new mint fee specified in basis points
+   */
+  function setMintFee(
+    uint256 _mintFee
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    require(_mintFee < 200, "OUSGInstantManager::setMintFee: Fee too high");
+    emit MintFeeSet(mintFee, _mintFee);
+    mintFee = _mintFee;
+  }
+
+  /**
+   * @notice Sets the redeem fee.
+   *
+   * @param _redeemFee new redeem fee specified in basis points
+   */
+  function setRedeemFee(
+    uint256 _redeemFee
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    require(_redeemFee < 200, "OUSGInstantManager::setRedeemFee: Fee too high");
+    emit RedeemFeeSet(redeemFee, _redeemFee);
+    redeemFee = _redeemFee;
+  }
+
+  /**
+   * @notice Admin function to set the minimum amount required for a deposit
+   *
+   * @param _minimumDepositAmount The minimum amount required to submit a deposit
+   *                          request
+   */
+  function setMinimumDepositAmount(
+    uint256 _minimumDepositAmount
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    require(
+      _minimumDepositAmount >= FEE_GRANULARITY,
+      "OUSGInstantManager::setMinimumDepositAmount: Amount too small"
+    );
+
+    emit MinimumDepositAmountSet(minimumDepositAmount, _minimumDepositAmount);
+    minimumDepositAmount = _minimumDepositAmount;
+  }
+
+  /**
+   * @notice Admin function to set the minimum amount to redeem
+   *
+   * @param _minimumRedemptionAmount The minimum amount required to submit a
+   *                                 redemption request
+   */
+  function setMinimumRedemptionAmount(
+    uint256 _minimumRedemptionAmount
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    require(
+      _minimumRedemptionAmount >= FEE_GRANULARITY,
+      "OUSGInstantManager::setMinimumRedemptionAmount: Amount too small"
+    );
+    emit MinimumRedemptionAmountSet(
+      minimumRedemptionAmount,
+      _minimumRedemptionAmount
+    );
+    minimumRedemptionAmount = _minimumRedemptionAmount;
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                    General Configuration
+  //////////////////////////////////////////////////////////////*/
+
+  /**
+   * @notice Admin function to set the USDC receiver
+   *
+   * @param _usdcReceiver The new USDC receiver
+   */
+  function setUsdcReceiver(
+    address _usdcReceiver
+  ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    require(
+      _usdcReceiver != address(0),
+      "OUSGInstantManager::setUsdcReceiver: USDC receiver cannot be 0x0"
+    );
+    emit UsdcReceiverSet(usdcReceiver, _usdcReceiver);
+    usdcReceiver = _usdcReceiver;
+  }
+
+  /**
+   * @notice Admin function to set the minimum amount required to redeem BUIDL
+   *
+   * @param _minimumBUIDLRedemptionAmount The minimum amount required to redeem BUIDL
+   */
+  function setMinimumBUIDLRedemptionAmount(
+    uint256 _minimumBUIDLRedemptionAmount
+  ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    emit MinimumBUIDLRedemptionAmountSet(
+      minBUIDLRedeemAmount,
+      _minimumBUIDLRedemptionAmount
+    );
+    minBUIDLRedeemAmount = _minimumBUIDLRedemptionAmount;
+  }
+
+  /**
+   * @notice Admin function to set the oracle address
+   *
+   * @param _oracle The address of the oracle that provides the OUSG price
+   *                in USDC
+   */
+  function setOracle(
+    address _oracle
+  ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    require(
+      _oracle != address(0),
+      "OUSGInstantManager::setOracle: Oracle cannot be 0x0"
+    );
+    emit OracleSet(address(oracle), _oracle);
+    oracle = IRWAOracle(_oracle);
+  }
+
+  /**
+   * @notice Admin function to set the USDC/USD oracle address
+   *
+   * @param _priceFeedUSDCUSD The address of the oracle that provides the USDC price
+   *                          in USD with 8 decimals
+   */
+  function setUSDCOracle(
+    address _priceFeedUSDCUSD
+  ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    require(
+      _priceFeedUSDCUSD != address(0),
+      "OUSGInstantManager::setUSDCOracle: Oracle cannot be 0x0"
+    );
+    emit USDCOracleSet(address(priceFeedUSDCUSD), _priceFeedUSDCUSD);
+    priceFeedUSDCUSD = AggregatorV3Interface(_priceFeedUSDCUSD);
+    require(
+      priceFeedUSDCUSD.decimals() == 8,
+      "OUSGInstantManager::setUSDCOracle: Invalid oracle decimals"
+    );
+    _assertUSDCPrice();
+  }
+
+  /**
+   * @notice Admin function to set the fee receiver address
+
+   * @param _feeReceiver The address to receive the mint and redemption fees
+   */
+  function setFeeReceiver(
+    address _feeReceiver
+  ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    require(
+      _feeReceiver != address(0),
+      "OUSGInstantManager::setFeeReceiver: FeeReceiver cannot be 0x0"
+    );
+    emit FeeReceiverSet(feeReceiver, _feeReceiver);
+    feeReceiver = _feeReceiver;
+  }
+
+  /**
+   * @notice Admin function to set the optional investor-based rate limiter
+   *
+   * @param _investorBasedRateLimiter The address of the investor-based rate limiter contract
+   */
+  function setInvestorBasedRateLimiter(
+    address _investorBasedRateLimiter
+  ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    emit InvestorBasedRateLimiterSet(
+      address(investorBasedRateLimiter),
+      _investorBasedRateLimiter
+    );
+    investorBasedRateLimiter = IInvestorBasedRateLimiter(
+      _investorBasedRateLimiter
+    );
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                  Helper fee conversion functions
+  //////////////////////////////////////////////////////////////*/
+
+  /**
+   * @notice Given a deposit amount and a price, returns the OUSG amount due
+   *
+   * @param usdcAmountIn The amount deposited in units of USDC
+   * @param price        The price at which to mint
+   */
+  function _getMintAmount(
+    uint256 usdcAmountIn,
+    uint256 price
+  ) internal view returns (uint256 ousgAmountOut) {
+    uint256 amountE36 = _scaleUp(usdcAmountIn) * 1e18;
+    ousgAmountOut = amountE36 / price;
+  }
+
+  /**
+   * @notice Given a redemption amount and a price, returns the USDC amount due
+   *
+   * @param ousgAmountBurned The amount of OUSG burned for a redemption
+   * @param price            The price at which to redeem
+   */
+  function _getRedemptionAmount(
+    uint256 ousgAmountBurned,
+    uint256 price
+  ) internal view returns (uint256 usdcOwed) {
+    uint256 amountE36 = ousgAmountBurned * price;
+    usdcOwed = _scaleDown(amountE36 / 1e18);
+  }
+
+  /**
+   * @notice Given amount of USDC, returns how much in fees are owed
+   *
+   * @param usdcAmount Amount of USDC to calculate fees
+   *                   (in 6 decimals)
+   */
+  function _getInstantMintFees(
+    uint256 usdcAmount
+  ) internal view returns (uint256) {
+    return (usdcAmount * mintFee) / FEE_GRANULARITY;
+  }
+
+  /**
+   * @notice Given amount of USDC, returns how much in fees are owed
+   *
+   * @param usdcAmount Amount USDC to calculate fees
+   *                   (in decimals of USDC)
+   */
+  function _getInstantRedemptionFees(
+    uint256 usdcAmount
+  ) internal view returns (uint256) {
+    return (usdcAmount * redeemFee) / FEE_GRANULARITY;
+  }
+
+  /**
+   * @notice Scale provided amount up by `decimalsMultiplier`
+   *
+   * @dev This helper is used for converting a USDC amount's decimals
+   *      representation to the rOUSG/OUSG decimals representation.
+   */
+  function _scaleUp(uint256 amount) internal view returns (uint256) {
+    return amount * decimalsMultiplier;
+  }
+
+  /**
+   * @notice Scale provided amount down by `decimalsMultiplier`
+   *
+   * @dev This helper is used for converting an rOUSG/OUSG amount's decimals
+   *      representation to the USDC decimals representation.
+   */
+  function _scaleDown(uint256 amount) internal view returns (uint256) {
+    return amount / decimalsMultiplier;
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                          Pause/Unpause
+  //////////////////////////////////////////////////////////////*/
+
+  /// @notice Ensure that the mint functionality is not paused
+  modifier whenMintNotPaused() {
+    require(!mintPaused, "OUSGInstantManager: Mint paused");
+    _;
+  }
+
+  /// @notice Ensure that the redeem functionality is not paused
+  modifier whenRedeemNotPaused() {
+    require(!redeemPaused, "OUSGInstantManager: Redeem paused");
+    _;
+  }
+
+  /// @notice Pause the mint functionality
+  function pauseMint() external onlyRole(PAUSER_ROLE) {
+    mintPaused = true;
+    emit MintPaused();
+  }
+
+  /// @notice Unpause the mint functionality
+  function unpauseMint() external onlyRole(DEFAULT_ADMIN_ROLE) {
+    mintPaused = false;
+    emit MintUnpaused();
+  }
+
+  /// @notice Pause the redeem functionality
+  function pauseRedeem() external onlyRole(PAUSER_ROLE) {
+    redeemPaused = true;
+    emit RedeemPaused();
+  }
+
+  /// @notice Unpause the redeem functionality
+  function unpauseRedeem() external onlyRole(DEFAULT_ADMIN_ROLE) {
+    redeemPaused = false;
+    emit RedeemUnpaused();
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                          Miscellaneous
+  //////////////////////////////////////////////////////////////*/
+  function multiexcall(
+    ExCallData[] calldata exCallData
+  )
+    external
+    payable
+    override
+    onlyRole(DEFAULT_ADMIN_ROLE)
+    returns (bytes[] memory results)
+  {
+    results = new bytes[](exCallData.length);
+    for (uint256 i; i < exCallData.length; ++i) {
+      (bool success, bytes memory ret) = address(exCallData[i].target).call{
+        value: exCallData[i].value
+      }(exCallData[i].data);
+      require(success, "Call Failed");
+      results[i] = ret;
+    }
+  }
+
+  /**
+   * @notice Rescue and transfer tokens locked in this contract
+   * @param token The address of the token
+   * @param to The address of the recipient
+   * @param amount The amount of token to transfer
+   */
+  function retrieveTokens(
+    address token,
+    address to,
+    uint256 amount
+  ) external onlyRole(RETRIEVER_ROLE) {
+    IERC20(token).transfer(to, amount);
+  }
+}
+
+
+// File: contracts/InstantMintTimeBasedRateLimiter.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+/**
+ * @title InstantMintTimeBasedRateLimiter
+ *
+ * @notice This abstract contract implements two rate limiters: one for minting
+ *         and one for redeeming. Each limit is completely independent: mints
+ *         and redemption don't offset each other. Each limit is associated
+ *         with a duration, after which the tracked amount is reset. The
+ *         amounts tracked are agnostic to a specific token; the usage is
+ *         determined by the inheriting contracts.
+ *
+ * @dev Although this contract has all of its functions implemented, this
+ *      contract is marked abstract to prevent an accidental deployment and to
+ *      signify that we would never deploy this contract standalone.
+ *
+ */
+abstract contract InstantMintTimeBasedRateLimiter {
+  // `currentInstantMintAmount` resets after this interval (in seconds)
+  uint256 public resetInstantMintDuration;
+  // timestamp when `currentInstantMintAmount` was last reset
+  uint256 public lastResetInstantMintTime;
+
+  // maximum amount that can be minted during a `resetInstantMintDuration` window
+  uint256 public instantMintLimit;
+  // amount already minted during the current `resetInstantMintDuration` window
+  uint256 public currentInstantMintAmount;
+
+  // `currentInstantRedemptionAmount` resets after this interval (in seconds)
+  uint256 public resetInstantRedemptionDuration;
+  // timestamp when the `currentInstantRedemptionAmount` was last reset
+  uint256 public lastResetInstantRedemptionTime;
+
+  // maximum amount that can be redeemed during a `resetInstantRedemptionDuration` window
+  uint256 public instantRedemptionLimit;
+  // amount already redeemed during the current `resetInstantRedemptionDuration` window
+  uint256 public currentInstantRedemptionAmount;
+
+  /**
+   * @notice In the constructor, we initialize the variables for the mint and
+   *         redemption rate limiters.
+   *
+   * @param _instantMintResetDuration   `currentInstantMintAmount` resets after this interval
+   *                                    (in seconds)
+   * @param _instantRedemptionResetDuration `currentInstantRedemptionAmount` resets after this
+   *                                    interval (in seconds)
+   * @param _instantMintLimit           maximum amount that can be minted during a
+   *                                    `resetInstantMintDuration` window
+   * @param _instantRedemptionLimit     maximum amount that can be redeemed during a
+   *                                    `resetInstantRedemptionDuration` window
+   *
+   * @dev If a duration is zero, the limit resets before each mint/redemption.
+   * @dev If a limit is zero, the relevant check always fails.
+   */
+  constructor(
+    uint256 _instantMintResetDuration,
+    uint256 _instantRedemptionResetDuration,
+    uint256 _instantMintLimit,
+    uint256 _instantRedemptionLimit
+  ) {
+    resetInstantMintDuration = _instantMintResetDuration;
+    resetInstantRedemptionDuration = _instantRedemptionResetDuration;
+    instantMintLimit = _instantMintLimit; // can be zero to disable minting
+    instantRedemptionLimit = _instantRedemptionLimit; // can be zero to disable redemptions
+
+    lastResetInstantMintTime = block.timestamp;
+    lastResetInstantRedemptionTime = block.timestamp;
+  }
+
+  /**
+   * @notice Checks the requested mint amount against the rate limiter (and
+   *         updates the remaining amount)
+   *
+   * @param amount The requested mint amount
+   *
+   * @dev Reverts if the requested mint amount exceeds the current limit
+   */
+  function _checkAndUpdateInstantMintLimit(uint256 amount) internal {
+    require(amount > 0, "RateLimit: mint amount can't be zero");
+
+    if (
+      block.timestamp >= lastResetInstantMintTime + resetInstantMintDuration
+    ) {
+      // time has passed, reset
+      currentInstantMintAmount = 0;
+      lastResetInstantMintTime = block.timestamp;
+    }
+    require(
+      currentInstantMintAmount + amount <= instantMintLimit,
+      "RateLimit: Mint exceeds rate limit"
+    );
+
+    currentInstantMintAmount += amount;
+  }
+
+  /**
+   * @notice Checks the requested redemption amount against the rate limiter
+   *         (and updates the remaining amount)
+   *
+   * @param amount The requested redemption amount
+   *
+   * @dev Reverts if the requested redemption amount exceeds the current
+   *      limit
+   */
+  function _checkAndUpdateInstantRedemptionLimit(uint256 amount) internal {
+    require(amount > 0, "RateLimit: redemption amount can't be zero");
+
+    if (
+      block.timestamp >=
+      lastResetInstantRedemptionTime + resetInstantRedemptionDuration
+    ) {
+      // time has passed, reset
+      currentInstantRedemptionAmount = 0;
+      lastResetInstantRedemptionTime = block.timestamp;
+    }
+    require(
+      currentInstantRedemptionAmount + amount <= instantRedemptionLimit,
+      "RateLimit: Redemption exceeds rate limit"
+    );
+    currentInstantRedemptionAmount += amount;
+  }
+
+  /**
+   * @notice Update the amount of token that can be minted during one duration
+   *
+   * @param _instantMintLimit The token amount
+   *
+   * @dev If a limit is zero, the relevant check always fails.
+   */
+  function _setInstantMintLimit(uint256 _instantMintLimit) internal {
+    instantMintLimit = _instantMintLimit;
+    emit InstantMintLimitSet(_instantMintLimit);
+  }
+
+  /**
+   * @notice Update the amount of token that can be redeemed during one duration
+   *
+   * @param _redemptionLimit The token amount
+   *
+   * @dev If a limit is zero, the relevant check always fails.
+   */
+  function _setInstantRedemptionLimit(uint256 _redemptionLimit) internal {
+    instantRedemptionLimit = _redemptionLimit;
+    emit InstantRedemptionLimitSet(_redemptionLimit);
+  }
+
+  /**
+   * @notice Update the duration for the mint rate limiter
+   *
+   * @param _instantMintResetDuration The duration in seconds
+   *
+   * @dev If a duration is zero, the limit resets before each mint/redemption
+   */
+  function _setInstantMintLimitDuration(
+    uint256 _instantMintResetDuration
+  ) internal {
+    resetInstantMintDuration = _instantMintResetDuration;
+    emit InstantMintLimitDurationSet(_instantMintResetDuration);
+  }
+
+  /**
+   * @notice Update the duration for the redemption rate limiter
+   *
+   * @param _instantRedemptionResetDuration The duration in seconds
+   *
+   * @dev If a duration is zero, the limit resets before each mint/redemption
+   */
+  function _setInstantRedemptionLimitDuration(
+    uint256 _instantRedemptionResetDuration
+  ) internal {
+    resetInstantRedemptionDuration = _instantRedemptionResetDuration;
+    emit InstantRedemptionLimitDurationSet(_instantRedemptionResetDuration);
+  }
+
+  /**
+   * @notice Event emitted when instant mint limit is set
+   *
+   * @param instantMintLimit How much of some token can be minted within
+   *                  an interval of length `resetInstantMintDuration`
+   *
+   * @dev See inheriting contract for representation
+   */
+  event InstantMintLimitSet(uint256 instantMintLimit);
+
+  /**
+   * @notice Event emitted when instant redemption limit is set
+   *
+   * @param instantRedemptionLimit How much of some token can be redeemed within
+   *                    an interval of length `resetInstantRedemptionDuration`
+   *
+   * @dev See inheriting contract for representation
+   */
+  event InstantRedemptionLimitSet(uint256 instantRedemptionLimit);
+
+  /**
+   * @notice Event emitted when mint limit duration is set
+   *
+   * @param instantMintLimitDuration The time window in which `instantMintLimit`
+   *                          of some token can be minted
+   *
+   * @dev instantMintLimitDuration is specified in seconds
+   */
+  event InstantMintLimitDurationSet(uint256 instantMintLimitDuration);
+
+  /**
+   * @notice Event emitted when redemption limit duration is set
+   *
+   * @param redemptionLimitDuration The time window in which `instantRedemptionLimit`
+   *                            of some token can be redeemed
+   *
+   * @dev redemptionLimitDuration is specified in seconds.
+   */
+  event InstantRedemptionLimitDurationSet(uint256 redemptionLimitDuration);
+}
+
+
+// File: contracts/interfaces/IRWALike.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+ */
+pragma solidity 0.8.16;
+
+// This interface is not inherited directly by RWA, instead, it is a
+// subset of functions provided by all RWA tokens that the RWA Hub
+// Client uses.
+import "contracts/external/openzeppelin/contracts/token/IERC20.sol";
+
+interface IRWALike is IERC20 {
+  function mint(address to, uint256 amount) external;
+
+  function burn(uint256 amount) external;
+
+  function burnFrom(address from, uint256 amount) external;
+}
+
+
+// File: contracts/ousg/rOUSG.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+import "contracts/external/openzeppelin/contracts/token/IERC20.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/token/ERC20/IERC20MetadataUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
+import "contracts/kyc/KYCRegistryClientUpgradeable.sol";
+import "contracts/rwaOracles/IRWAOracle.sol";
+
+/**
+ * @title Interest-bearing ERC20-like token for OUSG.
+ *
+ * rOUSG balances are dynamic and represent the holder's share of the underlying OUSG
+ * controlled by the protocol. To calculate each account's balance, we do
+ *
+ *   shares[account] * ousgPrice
+ *
+ * For example, if we assume that we have the following:
+ *
+ *   ousgPrice = 105 (18 decimals)
+ *   rousg.sharesOf(user1) -> 1 (22 decimals)
+ *   rousg.sharesOf(user2) -> 4 (22 decimals)
+ *   ousg.balanceOf(rousg) -> 5 OUSG (18 decimals)
+ *
+ * Below would be the balances of the users:
+ *
+ *   rousg.balanceOf(user1) -> 105 rOUSG (18 decimals)
+ *   rousg.balanceOf(user2) -> 420 rOUSG (18 decimals)
+ *
+ * Since balances of all token holders change when the price of OUSG changes, this
+ * token cannot fully implement ERC20 standard: it only emits `Transfer` events
+ * upon explicit transfer between holders. In contrast, when total amount of pooled
+ * Cash increases, no `Transfer` events are generated: doing so would require emitting
+ * an event for each token holder and thus running an unbounded loop.
+ *
+ */
+
+contract ROUSG is
+  Initializable,
+  ContextUpgradeable,
+  PausableUpgradeable,
+  AccessControlEnumerableUpgradeable,
+  KYCRegistryClientUpgradeable,
+  IERC20Upgradeable,
+  IERC20MetadataUpgradeable
+{
+  /**
+   * @dev rOUSG balances are dynamic and are calculated based on the accounts' shares (OUSG)
+   * and the the price of OUSG. Account shares aren't
+   * normalized, so the contract also stores the sum of all shares to calculate
+   * each account's token balance which equals to:
+   *
+   *   shares[account] * ousgPrice
+   */
+  mapping(address => uint256) private shares;
+
+  /// @dev Allowances are nominated in tokens, not token shares.
+  mapping(address => mapping(address => uint256)) private allowances;
+
+  // Total shares in existence
+  uint256 public totalShares;
+
+  // Address of the oracle that provides the `ousgPrice`
+  IRWAOracle public oracle;
+
+  // Address of the OUSG token
+  IERC20 public ousg;
+
+  // Used to scale up ousg amount -> shares
+  uint256 public constant OUSG_TO_ROUSG_SHARES_MULTIPLIER = 10_000;
+
+  // Name of the token
+  string internal _name;
+
+  // Symbol of the token
+  string internal _symbol;
+
+  // Error when redeeming shares < `OUSG_TO_ROUSG_SHARES_MULTIPLIER`
+  error UnwrapTooSmall();
+
+  // Error when setting the oracle address to zero
+  error CannotSetToZeroAddress();
+
+  /// @dev Role based access control roles
+  bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+  bytes32 public constant BURNER_ROLE = keccak256("BURN_ROLE");
+  bytes32 public constant CONFIGURER_ROLE = keccak256("CONFIGURER_ROLE");
+
+  /// @custom:oz-upgrades-unsafe-allow constructor
+  constructor() {
+    _disableInitializers();
+  }
+
+  function initialize(
+    address _kycRegistry,
+    uint256 requirementGroup,
+    address _ousg,
+    address guardian,
+    address _oracle
+  ) public virtual initializer {
+    __rOUSG_init(_kycRegistry, requirementGroup, _ousg, guardian, _oracle);
+  }
+
+  function __rOUSG_init(
+    address _kycRegistry,
+    uint256 requirementGroup,
+    address _ousg,
+    address guardian,
+    address _oracle
+  ) internal onlyInitializing {
+    __rOUSG_init_unchained(
+      _kycRegistry,
+      requirementGroup,
+      _ousg,
+      guardian,
+      _oracle
+    );
+  }
+
+  function __rOUSG_init_unchained(
+    address _kycRegistry,
+    uint256 _requirementGroup,
+    address _ousg,
+    address guardian,
+    address _oracle
+  ) internal onlyInitializing {
+    __KYCRegistryClientInitializable_init(_kycRegistry, _requirementGroup);
+    ousg = IERC20(_ousg);
+    oracle = IRWAOracle(_oracle);
+    _grantRole(DEFAULT_ADMIN_ROLE, guardian);
+    _grantRole(PAUSER_ROLE, guardian);
+    _grantRole(BURNER_ROLE, guardian);
+    _grantRole(CONFIGURER_ROLE, guardian);
+    _name = "Rebasing OUSG";
+    _symbol = "rOUSG";
+  }
+
+  /**
+   * @notice Emitted when the name is set
+   *
+   * @param oldName The old name of the token
+   * @param newName The new name of the token
+   */
+  event NameSet(string oldName, string newName);
+
+  /**
+   * @notice Emitted when the symbol is set
+   *
+   * @param oldSymbol The old symbol of the token
+   * @param newSymbol The new symbol of the token
+   */
+
+  event SymbolSet(string oldSymbol, string newSymbol);
+  /**
+   * @notice An executed shares transfer from `sender` to `recipient`.
+   *
+   * @dev emitted in pair with an ERC20-defined `Transfer` event.
+   */
+  event TransferShares(
+    address indexed from,
+    address indexed to,
+    uint256 sharesValue
+  );
+
+  /**
+   * @notice Emitted when the oracle address is set
+   *
+   * @param oldOracle The address of the old oracle
+   * @param newOracle The address of the new oracle
+   */
+  event OracleSet(address indexed oldOracle, address indexed newOracle);
+
+  /**
+   * @return the name of the token.
+   */
+  function name() public view returns (string memory) {
+    return _name;
+  }
+
+  /**
+   * @return the symbol of the token, usually a shorter version of the
+   * name.
+   */
+  function symbol() public view returns (string memory) {
+    return _symbol;
+  }
+
+  /**
+   * @return the number of decimals for getting user representation of a token amount.
+   */
+  function decimals() public pure returns (uint8) {
+    return 18;
+  }
+
+  /**
+   * @return the amount of tokens in existence.
+   */
+  function totalSupply() public view returns (uint256) {
+    return
+      (totalShares * getOUSGPrice()) / (1e18 * OUSG_TO_ROUSG_SHARES_MULTIPLIER);
+  }
+
+  /**
+   * @return the amount of tokens owned by the `_account`.
+   *
+   * @dev Balances are dynamic and equal the `_account`'s OUSG shares multiplied
+   *      by the price of OUSG
+   */
+  function balanceOf(address _account) public view returns (uint256) {
+    return
+      (_sharesOf(_account) * getOUSGPrice()) /
+      (1e18 * OUSG_TO_ROUSG_SHARES_MULTIPLIER);
+  }
+
+  /**
+   * @notice Moves `_amount` tokens from the caller's account to the `_recipient` account.
+   *
+   * @return a boolean value indicating whether the operation succeeded.
+   * Emits a `Transfer` event.
+   * Emits a `TransferShares` event.
+   *
+   * Requirements:
+   *
+   * - `_recipient` cannot be the zero address.
+   * - the caller must have a balance of at least `_amount`.
+   * - the contract must not be paused.
+   *
+   * @dev The `_amount` argument is the amount of tokens, not shares.
+   */
+  function transfer(address _recipient, uint256 _amount) public returns (bool) {
+    _transfer(msg.sender, _recipient, _amount);
+    return true;
+  }
+
+  /**
+   * @return the remaining number of tokens that `_spender` is allowed to spend
+   * on behalf of `_owner` through `transferFrom`. This is zero by default.
+   *
+   * @dev This value changes when `approve` or `transferFrom` is called.
+   */
+  function allowance(
+    address _owner,
+    address _spender
+  ) public view returns (uint256) {
+    return allowances[_owner][_spender];
+  }
+
+  /**
+   * @notice Sets `_amount` as the allowance of `_spender` over the caller's tokens.
+   *
+   * @return a boolean value indicating whether the operation succeeded.
+   * Emits an `Approval` event.
+   *
+   * Requirements:
+   *
+   * - `_spender` cannot be the zero address.
+   * - the contract must not be paused.
+   *
+   * @dev The `_amount` argument is the amount of tokens, not shares.
+   */
+  function approve(address _spender, uint256 _amount) public returns (bool) {
+    _approve(msg.sender, _spender, _amount);
+    return true;
+  }
+
+  /**
+   * @notice Moves `_amount` tokens from `_sender` to `_recipient` using the
+   * allowance mechanism. `_amount` is then deducted from the caller's
+   * allowance.
+   *
+   * @return a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a `Transfer` event.
+   * Emits a `TransferShares` event.
+   * Emits an `Approval` event indicating the updated allowance.
+   *
+   * Requirements:
+   *
+   * - `_sender` and `_recipient` cannot be the zero addresses.
+   * - `_sender` must have a balance of at least `_amount`.
+   * - the caller must have allowance for `_sender`'s tokens of at least `_amount`.
+   * - the contract must not be paused.
+   *
+   * @dev The `_amount` argument is the amount of tokens, not shares.
+   */
+  function transferFrom(
+    address _sender,
+    address _recipient,
+    uint256 _amount
+  ) public returns (bool) {
+    uint256 currentAllowance = allowances[_sender][msg.sender];
+    require(currentAllowance >= _amount, "TRANSFER_AMOUNT_EXCEEDS_ALLOWANCE");
+
+    _transfer(_sender, _recipient, _amount);
+    _approve(_sender, msg.sender, currentAllowance - _amount);
+    return true;
+  }
+
+  /**
+   * @notice Atomically increases the allowance granted to `_spender` by the caller by `_addedValue`.
+   *
+   * This is an alternative to `approve` that can be used as a mitigation for
+   * problems described in:
+   * https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/IERC20.sol#L42
+   * Emits an `Approval` event indicating the updated allowance.
+   *
+   * Requirements:
+   *
+   * - `_spender` cannot be the the zero address.
+   * - the contract must not be paused.
+   */
+  function increaseAllowance(
+    address _spender,
+    uint256 _addedValue
+  ) public returns (bool) {
+    _approve(
+      msg.sender,
+      _spender,
+      allowances[msg.sender][_spender] + _addedValue
+    );
+    return true;
+  }
+
+  /**
+   * @notice Atomically decreases the allowance granted to `_spender` by the caller by `_subtractedValue`.
+   *
+   * This is an alternative to `approve` that can be used as a mitigation for
+   * problems described in:
+   * https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/IERC20.sol#L42
+   * Emits an `Approval` event indicating the updated allowance.
+   *
+   * Requirements:
+   *
+   * - `_spender` cannot be the zero address.
+   * - `_spender` must have allowance for the caller of at least `_subtractedValue`.
+   * - the contract must not be paused.
+   */
+  function decreaseAllowance(
+    address _spender,
+    uint256 _subtractedValue
+  ) public returns (bool) {
+    uint256 currentAllowance = allowances[msg.sender][_spender];
+    require(
+      currentAllowance >= _subtractedValue,
+      "DECREASED_ALLOWANCE_BELOW_ZERO"
+    );
+    _approve(msg.sender, _spender, currentAllowance - _subtractedValue);
+    return true;
+  }
+
+  /**
+   * @return the amount of shares owned by `_account`.
+   *
+   * @dev This is the equivalent to the amount of OUSG wrapped by `_account`.
+   */
+  function sharesOf(address _account) public view returns (uint256) {
+    return _sharesOf(_account);
+  }
+
+  /**
+   * @return the amount of shares that corresponds to `_rOUSGAmount` of rOUSG
+   */
+  function getSharesByROUSG(
+    uint256 _rOUSGAmount
+  ) public view returns (uint256) {
+    return
+      (_rOUSGAmount * 1e18 * OUSG_TO_ROUSG_SHARES_MULTIPLIER) / getOUSGPrice();
+  }
+
+  /**
+   * @return the amount of rOUSG that corresponds to `_shares` of OUSG.
+   */
+  function getROUSGByShares(uint256 _shares) public view returns (uint256) {
+    return
+      (_shares * getOUSGPrice()) / (1e18 * OUSG_TO_ROUSG_SHARES_MULTIPLIER);
+  }
+
+  function getOUSGPrice() public view returns (uint256 price) {
+    (price, ) = oracle.getPriceData();
+  }
+
+  /**
+   * @notice Moves `_sharesAmount` token shares from the caller's account to the `_recipient` account.
+   *
+   * @return amount of transferred tokens.
+   * Emits a `TransferShares` event.
+   * Emits a `Transfer` event.
+   *
+   * Requirements:
+   *
+   * - `_recipient` cannot be the zero address.
+   * - the caller must have at least `_sharesAmount` shares.
+   * - the contract must not be paused.
+   *
+   * @dev The `_sharesAmount` argument is the amount of shares, not tokens.
+   */
+  function transferShares(
+    address _recipient,
+    uint256 _sharesAmount
+  ) public returns (uint256) {
+    _transferShares(msg.sender, _recipient, _sharesAmount);
+    emit TransferShares(msg.sender, _recipient, _sharesAmount);
+    uint256 tokensAmount = getROUSGByShares(_sharesAmount);
+    emit Transfer(msg.sender, _recipient, tokensAmount);
+    return tokensAmount;
+  }
+
+  /**
+   * @notice Function called by users to wrap their OUSG tokens
+   *
+   * @param _OUSGAmount The amount of OUSG Tokens to wrap
+   *
+   * @dev KYC checks implicit in OUSG Transfer
+   */
+  function wrap(uint256 _OUSGAmount) external whenNotPaused {
+    require(_OUSGAmount > 0, "rOUSG: can't wrap zero OUSG tokens");
+    uint256 ousgSharesAmount = _OUSGAmount * OUSG_TO_ROUSG_SHARES_MULTIPLIER;
+    _mintShares(msg.sender, ousgSharesAmount);
+    ousg.transferFrom(msg.sender, address(this), _OUSGAmount);
+    emit Transfer(address(0), msg.sender, getROUSGByShares(ousgSharesAmount));
+    emit TransferShares(address(0), msg.sender, ousgSharesAmount);
+  }
+
+  /**
+   * @notice Function called by users to unwrap their rOUSG tokens by rOUSG amount
+   *
+   * @param _rOUSGAmount The amount of rOUSG to unwrap
+   *
+   * @dev KYC checks implicit in OUSG Transfer
+   */
+  function unwrap(uint256 _rOUSGAmount) external whenNotPaused {
+    require(_rOUSGAmount > 0, "rOUSG: can't unwrap zero rOUSG tokens");
+    uint256 ousgSharesAmount = getSharesByROUSG(_rOUSGAmount);
+    if (ousgSharesAmount < OUSG_TO_ROUSG_SHARES_MULTIPLIER)
+      revert UnwrapTooSmall();
+    _burnShares(msg.sender, ousgSharesAmount);
+    ousg.transfer(
+      msg.sender,
+      ousgSharesAmount / OUSG_TO_ROUSG_SHARES_MULTIPLIER
+    );
+    emit Transfer(msg.sender, address(0), _rOUSGAmount);
+    emit TransferShares(msg.sender, address(0), ousgSharesAmount);
+  }
+
+  /**
+   * @notice Function called by users to unwrap their rOUSG tokens by shares
+   *
+   * @param _sharesAmount The amount of shares to transfer
+   *
+   * @dev KYC checks implicit in OUSG Transfer
+   * @dev This is a more precise unwrap, as it avoids the division by price when converting rOUSG to shares
+   */
+  function unwrapShares(uint256 _sharesAmount) external whenNotPaused {
+    if (_sharesAmount < OUSG_TO_ROUSG_SHARES_MULTIPLIER)
+      revert UnwrapTooSmall();
+
+    uint256 rOUSGAmount = getROUSGByShares(_sharesAmount);
+
+    _burnShares(msg.sender, _sharesAmount);
+    ousg.transfer(msg.sender, _sharesAmount / OUSG_TO_ROUSG_SHARES_MULTIPLIER);
+    emit Transfer(msg.sender, address(0), rOUSGAmount);
+    emit TransferShares(msg.sender, address(0), _sharesAmount);
+  }
+
+  /**
+   * @notice Moves `_amount` tokens from `_sender` to `_recipient`.
+   * Emits a `Transfer` event.
+   * Emits a `TransferShares` event.
+   */
+  function _transfer(
+    address _sender,
+    address _recipient,
+    uint256 _amount
+  ) internal {
+    uint256 _sharesToTransfer = getSharesByROUSG(_amount);
+    _transferShares(_sender, _recipient, _sharesToTransfer);
+    emit Transfer(_sender, _recipient, _amount);
+    emit TransferShares(_sender, _recipient, _sharesToTransfer);
+  }
+
+  /**
+   * @notice Sets `_amount` as the allowance of `_spender` over the `_owner` s tokens.
+   *
+   * Emits an `Approval` event.
+   *
+   * Requirements:
+   *
+   * - `_owner` cannot be the zero address.
+   * - `_spender` cannot be the zero address.
+   * - the contract must not be paused.
+   */
+  function _approve(
+    address _owner,
+    address _spender,
+    uint256 _amount
+  ) internal whenNotPaused {
+    require(_owner != address(0), "APPROVE_FROM_ZERO_ADDRESS");
+    require(_spender != address(0), "APPROVE_TO_ZERO_ADDRESS");
+
+    allowances[_owner][_spender] = _amount;
+    emit Approval(_owner, _spender, _amount);
+  }
+
+  /**
+   * @return the amount of shares owned by `_account`.
+   */
+  function _sharesOf(address _account) internal view returns (uint256) {
+    return shares[_account];
+  }
+
+  /**
+   * @notice Moves `_sharesAmount` shares from `_sender` to `_recipient`.
+   *
+   * Requirements:
+   *
+   * - `_sender` cannot be the zero address.
+   * - `_recipient` cannot be the zero address.
+   * - `_sender` must hold at least `_sharesAmount` shares.
+   * - the contract must not be paused.
+   */
+  function _transferShares(
+    address _sender,
+    address _recipient,
+    uint256 _sharesAmount
+  ) internal whenNotPaused {
+    require(_sender != address(0), "TRANSFER_FROM_THE_ZERO_ADDRESS");
+    require(_recipient != address(0), "TRANSFER_TO_THE_ZERO_ADDRESS");
+
+    _beforeTokenTransfer(_sender, _recipient, _sharesAmount);
+
+    uint256 currentSenderShares = shares[_sender];
+    require(
+      _sharesAmount <= currentSenderShares,
+      "TRANSFER_AMOUNT_EXCEEDS_BALANCE"
+    );
+
+    shares[_sender] = currentSenderShares - _sharesAmount;
+    shares[_recipient] += _sharesAmount;
+  }
+
+  /**
+   * @notice Creates `_sharesAmount` shares and assigns them to `_recipient`, increasing the total amount of shares.
+   *
+   * Requirements:
+   *
+   * - `_recipient` cannot be the zero address.
+   * - the contract must not be paused.
+   */
+  function _mintShares(address _recipient, uint256 _sharesAmount) internal {
+    require(_recipient != address(0), "MINT_TO_THE_ZERO_ADDRESS");
+
+    _beforeTokenTransfer(address(0), _recipient, _sharesAmount);
+
+    totalShares += _sharesAmount;
+
+    shares[_recipient] += _sharesAmount;
+  }
+
+  /**
+   * @notice Destroys `_sharesAmount` shares from `_account`'s holdings, decreasing the total amount of shares.
+   * @dev This doesn't decrease the token total supply.
+   *
+   * Requirements:
+   *
+   * - `_account` cannot be the zero address.
+   * - `_account` must hold at least `_sharesAmount` shares.
+   * - the contract must not be paused.
+   */
+  function _burnShares(address _account, uint256 _sharesAmount) internal {
+    require(_account != address(0), "BURN_FROM_THE_ZERO_ADDRESS");
+
+    _beforeTokenTransfer(_account, address(0), _sharesAmount);
+
+    uint256 accountShares = shares[_account];
+    require(_sharesAmount <= accountShares, "BURN_AMOUNT_EXCEEDS_BALANCE");
+
+    totalShares -= _sharesAmount;
+
+    shares[_account] = accountShares - _sharesAmount;
+  }
+
+  /**
+   * @dev Hook that is called before any transfer of tokens. This includes
+   * minting and burning.
+   *
+   * Calling conditions:
+   *
+   * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+   * will be transferred to `to`.
+   * - when `from` is zero, `amount` tokens will be minted for `to`.
+   * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+   * - `from` and `to` are never both zero.
+   *
+   * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+   */
+  function _beforeTokenTransfer(
+    address from,
+    address to,
+    uint256
+  ) internal view {
+    // Check constraints when `transferFrom` is called to facliitate
+    // a transfer between two parties that are not `from` or `to`.
+    if (from != msg.sender && to != msg.sender) {
+      require(_getKYCStatus(msg.sender), "rOUSG: 'sender' address not KYC'd");
+    }
+
+    if (from != address(0)) {
+      // If not minting
+      require(_getKYCStatus(from), "rOUSG: 'from' address not KYC'd");
+    }
+
+    if (to != address(0)) {
+      // If not burning
+      require(_getKYCStatus(to), "rOUSG: 'to' address not KYC'd");
+    }
+  }
+
+  /**
+   * @notice Sets the Oracle address
+   * @dev The new oracle must comply with the IRWAOracle interface
+   * @param _oracle Address of the new oracle
+   */
+  function setOracle(address _oracle) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    if (_oracle == address(0)) {
+      revert CannotSetToZeroAddress();
+    }
+    emit OracleSet(address(oracle), _oracle);
+    oracle = IRWAOracle(_oracle);
+  }
+
+  /**
+   * @notice Sets the token name
+   * @param newName New name of the token
+   */
+  function setName(
+    string memory newName
+  ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    emit NameSet(_name, newName);
+    _name = newName;
+  }
+
+  /**
+   * @notice Sets the token symbol
+   * @param newSymbol New symbol of the token
+   */
+  function setSymbol(
+    string memory newSymbol
+  ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    emit SymbolSet(_symbol, newSymbol);
+    _symbol = newSymbol;
+  }
+
+  /**
+   * @notice Admin burn function to burn rOUSG tokens from any account
+   * @param _account The account to burn tokens from
+   * @param _sharesAmount  The amount of OUSG shares to burn
+   * @dev Burns shares and transfers OUSG (if any) to `msg.sender`
+   */
+  function burnShares(
+    address _account,
+    uint256 _sharesAmount
+  ) external onlyRole(BURNER_ROLE) {
+    require(_sharesAmount > 0, "rOUSG: can't burn zero shares");
+
+    uint256 rOUSGAmount = getROUSGByShares(_sharesAmount);
+
+    _burnShares(_account, _sharesAmount);
+    emit TransferShares(_account, address(0), _sharesAmount);
+
+    if (_sharesAmount >= OUSG_TO_ROUSG_SHARES_MULTIPLIER) {
+      ousg.transfer(
+        msg.sender,
+        _sharesAmount / OUSG_TO_ROUSG_SHARES_MULTIPLIER
+      );
+      emit Transfer(_account, address(0), rOUSGAmount);
+    }
+  }
+
+  function pause() external onlyRole(PAUSER_ROLE) {
+    _pause();
+  }
+
+  function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+    _unpause();
+  }
+
+  function setKYCRegistry(
+    address registry
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    _setKYCRegistry(registry);
+  }
+
+  function setKYCRequirementGroup(
+    uint256 group
+  ) external override onlyRole(CONFIGURER_ROLE) {
+    _setKYCRequirementGroup(group);
+  }
+}
+
+
+// File: contracts/interfaces/IOUSGInstantManager.sol
+/**SPDX-License-Identifier: BUSL-1.1
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+ */
+pragma solidity 0.8.16;
+
+/**
+ * @title IOUSGInstantManager
+ * @author Ondo Finance
+ * @notice The interface for Ondo's conversion modules for between OUSG and USDC
+ */
+interface IOUSGInstantManager {
+  struct RateLimiterConfig {
+    uint256 mintLimitDuration;
+    uint256 redeemLimitDuration;
+    uint256 mintLimit;
+    uint256 redeemLimit;
+  }
+
+  /**
+   * @notice Exchange USDC for OUSG token
+   *
+   * @param usdcAmountIn Amount of USDC to be exchanged for OUSG
+   *
+   * @return ousgAmountOut Amount of OUSG minted for the user
+   */
+  function mint(uint256 usdcAmountIn) external returns (uint256 ousgAmountOut);
+
+  /**
+   * @notice Exchange USDC for rOUSG token
+   *
+   * @param usdcAmountIn Amount of USDC to be exchanged for rOUSG
+   *
+   * @return rousgAmountOut Amount of rOUSG minted for the user
+   */
+
+  function mintRebasingOUSG(
+    uint256 usdcAmountIn
+  ) external returns (uint256 rousgAmountOut);
+
+  /**
+   * @notice Exchange OUSG for USDC
+   *
+   * @param ousgAmountIn Amount of OUSG to redeem for USDC
+   *
+   * @return usdcAmountOut Amount of USDC returned to the user
+   */
+  function redeem(
+    uint256 ousgAmountIn
+  ) external returns (uint256 usdcAmountOut);
+
+  /**
+   * @notice Exchange rOUSG for USDC
+   *
+   * @param rousgAmountIn Amount of rOUSG to redeem for USDC
+   *
+   * @return usdcAmountOut Amount of USDC returned to the user
+   */
+  function redeemRebasingOUSG(
+    uint256 rousgAmountIn
+  ) external returns (uint256 usdcAmountOut);
+
+  /*//////////////////////////////////////////////////////////////
+                    Configuration Setters
+  //////////////////////////////////////////////////////////////*/
+  function setInstantMintLimit(uint256 _instantMintLimit) external;
+
+  function setInstantRedemptionLimit(uint256 _instantRedemptionLimit) external;
+
+  function setInstantMintLimitDuration(
+    uint256 _instantMintLimitDuration
+  ) external;
+
+  function setInstantRedemptionLimitDuration(
+    uint256 _instantRedemptionLimitDuration
+  ) external;
+
+  function setMintFee(uint256 _mintFee) external;
+
+  function setRedeemFee(uint256 _redeemFee) external;
+
+  function setMinimumDepositAmount(uint256 _minimumDepositAmount) external;
+
+  function setMinimumRedemptionAmount(
+    uint256 _minimumRedemptionAmount
+  ) external;
+
+  function setMinimumBUIDLRedemptionAmount(
+    uint256 _minimumBUIDLRedemptionAmount
+  ) external;
+
+  function setUsdcReceiver(address _usdcReceiver) external;
+
+  function setOracle(address _oracle) external;
+
+  function setUSDCOracle(address _oracle) external;
+
+  function setFeeReceiver(address _feeReceiver) external;
+
+  function setInvestorBasedRateLimiter(
+    address _investorBasedRateLimiter
+  ) external;
+
+  /**
+   * @notice Event emitted when a user exchanges USDC for OUSG
+   *
+   * @param sender        Address of the transaction's message sender
+   * @param usdcAmountIn  Amount of the USDC sent from the user
+   * @param ousgAmountOut Amount of OUSG sent to user
+   */
+  event InstantMintOUSG(
+    address indexed sender,
+    uint256 usdcAmountIn,
+    uint256 ousgAmountOut
+  );
+
+  /**
+   * @notice Event emitted when a user exchanges USDC for rOUSG
+   *
+   * @param sender         Address of the transaction's message sender
+   * @param usdcAmountIn   Amount of the USDC sent from the user
+   * @param ousgAmountOut  Amount of OUSG wrapped for the user
+   * @param rousgAmountOut Amount of rOUSG sent to user
+   */
+  event InstantMintRebasingOUSG(
+    address indexed sender,
+    uint256 usdcAmountIn,
+    uint256 ousgAmountOut,
+    uint256 rousgAmountOut
+  );
+
+  /**
+   * @notice Event emitted when a user incurs mint Fees
+   *
+   * @param sender       Address of the transaction's message sender
+   * @param feeReceiver  Address of the USDC fee receiver
+   * @param usdcFees     Amount of USDC deducted as fees
+   * @param usdcAmountIn Amount of USDC sent from the user
+   */
+  event MintFeesDeducted(
+    address indexed sender,
+    address indexed feeReceiver,
+    uint256 usdcFees,
+    uint256 usdcAmountIn
+  );
+
+  /**
+   * @notice Event emitted when a user incurs redemption Fees
+   *
+   * @param sender        Address of the transaction's message sender
+   * @param feeReceiver   Address of the USDC fee receiver
+   * @param usdcFees      Amount of USDC deducted as fees
+   * @param usdcAmountOut Amount of USDC sent to the user
+   */
+  event RedeemFeesDeducted(
+    address indexed sender,
+    address indexed feeReceiver,
+    uint256 usdcFees,
+    uint256 usdcAmountOut
+  );
+
+  /**
+   * @notice Event emitted when a user exchanges OUSG for USDC
+   *
+   * @param sender        Address of the transaction's message sender
+   * @param ousgAmountIn  Amount of the OUSG burned for the redemption
+   * @param usdcAmountOut Amount of usdc sent to the user
+   */
+  event InstantRedemptionOUSG(
+    address indexed sender,
+    uint256 ousgAmountIn,
+    uint256 usdcAmountOut
+  );
+
+  /**
+   * @notice Event emitted when a user exchanges rOUSG for USDC
+   *
+   * @param sender        Address of the transaction's message sender
+   * @param rousgAmountIn Amount of the rOUSG burned for the redemption
+   * @param ousgAmountIn  Amount of OUSG unwrapped for the user
+   * @param usdcAmountOut Amount of USDC sent to the user
+   */
+  event InstantRedemptionRebasingOUSG(
+    address indexed sender,
+    uint256 rousgAmountIn,
+    uint256 ousgAmountIn,
+    uint256 usdcAmountOut
+  );
+
+  /**
+   * @notice Event emitted for when a user performs a redemption of less than
+   *         the minimum BUIDL redemption amount as required by BUIDL and MORE
+   *         than the existing amount of USDC in the contract
+   *
+   * @param sender              Address of the transaction's message sender
+   * @param buidlAmountRedeemed Amount of BUIDL that was redeemed
+   * @param usdcAmountKept      Portion of USDC that was kept in the contract and
+   *                            not sent back to the user
+   */
+  event MinimumBUIDLRedemption(
+    address indexed sender,
+    uint256 buidlAmountRedeemed,
+    uint256 usdcAmountKept
+  );
+
+  /**
+   * @notice Event emitted for when a user performs a redemption of less than
+   *         the minimum BUIDL redemption amount as required by BUIDL and LESS
+   *         than the existing amount of USDC in the contract
+   *
+   * @param sender              Address of the transaction's message sender
+   * @param usdcAmountRedeemed  Amount of USDC sent back to the user
+   * @param usdcAmountRemaining Amount of USDC remaining in the contract
+   */
+  event BUIDLRedemptionSkipped(
+    address indexed sender,
+    uint256 usdcAmountRedeemed,
+    uint256 usdcAmountRemaining
+  );
+
+  /**
+   * @notice Event emitted when mint functionality is paused
+   */
+  event MintPaused();
+
+  /**
+   * @notice Event emitted when mint functionality is unpaused
+   */
+  event MintUnpaused();
+
+  /**
+   * @notice Event emitted when redeem functionality is paused
+   */
+  event RedeemPaused();
+
+  /**
+   * @notice Event emitted when redeem functionality is unpaused
+   */
+  event RedeemUnpaused();
+
+  /**
+   * @notice Event emitted when mint fee is set
+   *
+   * @param oldMintFee Old fee collected for minting OUSG
+   * @param newMintFee New fee collected for minting OUSG
+   *
+   * @dev See inheriting contract for representation
+   */
+  event MintFeeSet(uint256 oldMintFee, uint256 newMintFee);
+
+  /**
+   * @notice Event emitted when redeem fee is set
+   *
+   * @param oldRedeemFee Old fee collected for redeeming OUSG
+   * @param newRedeemFee New fee collected for redeeming OUSG
+   *
+   * @dev See inheriting contract for representation
+   */
+  event RedeemFeeSet(uint256 oldRedeemFee, uint256 newRedeemFee);
+
+  /**
+   * @notice Event emitted when mint limit is set
+   *
+   * @param oldMinDepositAmount Old mint minimum
+   * @param newMinDepositAmount New mint minimum
+   */
+  event MinimumDepositAmountSet(
+    uint256 oldMinDepositAmount,
+    uint256 newMinDepositAmount
+  );
+
+  /**
+   * @notice Event emitted when redeem limit is set
+   *
+   * @param oldMinRedemptionAmount Old redeem minimum
+   * @param newMinRedemptionAmount New redeem minimum
+   */
+  event MinimumRedemptionAmountSet(
+    uint256 oldMinRedemptionAmount,
+    uint256 newMinRedemptionAmount
+  );
+
+  /**
+   * @notice Event emitted when minimum BUIDL redemption amount is set
+   *
+   * @param oldMinBUIDLRedemptionAmount Old minimum BUIDL minimum redemption amount
+   * @param newMinBUIDLRedemptionAmount New minimum BUIDL minimum redemption amount
+   */
+  event MinimumBUIDLRedemptionAmountSet(
+    uint256 oldMinBUIDLRedemptionAmount,
+    uint256 newMinBUIDLRedemptionAmount
+  );
+
+  /**
+   * @notice Event emitted when USDC receiver is set
+   *
+   * @param oldUsdcReceiver Old USDC receiver
+   * @param newUsdcReceiver New USDC receiver
+   */
+  event UsdcReceiverSet(address oldUsdcReceiver, address newUsdcReceiver);
+
+  /**
+   * @notice Event emitted when oracle is set
+   *
+   * @param oldOracle Old oracle address
+   * @param newOracle New oracle address
+   */
+  event OracleSet(address oldOracle, address newOracle);
+
+  /**
+   * @notice Event emitted when USDC oracle is set
+   *
+   * @param oldUSDCOracle Old oracle address
+   * @param newUSDCOracle New oracle address
+   */
+  event USDCOracleSet(address oldUSDCOracle, address newUSDCOracle);
+
+  /**
+   * @notice Event emitted when fee receiver is set
+   *
+   * @param oldFeeReceiver Old fee receiver address
+   * @param newFeeReceiver New fee receiver address
+   */
+  event FeeReceiverSet(address oldFeeReceiver, address newFeeReceiver);
+
+  /**
+   * @notice Event emitted when investor-based rate limiter is set
+   *
+   * @param oldInvestorBasedRateLimiter Old rate limiter address
+   * @param newInvestorBasedRateLimiter New rate limiter address
+   */
+  event InvestorBasedRateLimiterSet(
+    address oldInvestorBasedRateLimiter,
+    address newInvestorBasedRateLimiter
+  );
+}
+
+
+// File: contracts/external/chainlink/AggregatorV3Interface.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.16;
+
+interface AggregatorV3Interface {
+  function decimals() external view returns (uint8);
+
+  function description() external view returns (string memory);
+
+  function version() external view returns (uint256);
+
+  function getRoundData(
+    uint80 _roundId
+  )
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+  function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+}
+
+
+// File: contracts/interfaces/IInvestorBasedRateLimiter.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+interface IInvestorBasedRateLimiter {
+  /**
+   * @notice Rate limits mints for the provided investor
+   *
+   * @param investorAddress Address of the investor
+   * @param mintAmount Amount of token to be minted
+   *
+   */
+  function checkAndUpdateMintLimit(
+    address investorAddress,
+    uint256 mintAmount
+  ) external;
+
+  /**
+   * @notice Rate limits redemptions for the provided investor
+   *
+   * @param investorAddress Address of the investor
+   * @param redemptionAmount Amount of token to be redeemed
+   *
+   */
+  function checkAndUpdateRedemptionLimit(
+    address investorAddress,
+    uint256 redemptionAmount
+  ) external;
+}
+
+
+// File: contracts/interfaces/IMulticall.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+/**
+ * @title IMulticall
+ * @author Ondo Finance
+ * @notice This interface dictates the required external functions for Ondo's
+ *         multicall contract.
+ */
+interface IMulticall {
+  /// @dev External call data structure
+  struct ExCallData {
+    // The contract we intend to call
+    address target;
+    // The encoded function data for the call
+    bytes data;
+    // The ether value to be sent in the call
+    uint256 value;
+  }
+
+  /**
+   * @notice Batches multiple function calls to different target contracts
+   *         and returns the resulting data provided all calls were successful
+   *
+   * @dev The `msg.sender` is always the contract from which this function
+   *      is being called
+   *
+   * @param exdata The ExCallData struct array containing the information
+   *               regarding which contract to call, what data to call with,
+   *               and what ether value to send along with the call
+   *
+   * @return results The resulting data returned from each call made
+   */
+  function multiexcall(
+    ExCallData[] calldata exdata
+  ) external payable returns (bytes[] memory results);
+}
+
+
+// File: contracts/external/circle/IRedemption.sol
+/**
+ * Copyright 2024 Circle Internet Financial, LTD. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+pragma solidity ^0.8.16;
+
+/**
+ * @title IRedemption
+ */
+interface IRedemption {
+    /**
+     * @notice The asset being redeemed.
+     * @return The address of the asset token.
+     */
+    function asset() external view returns (address);
+
+    /**
+     * @notice The liquidity token that the asset is being redeemed for.
+     * @return The address of the liquidity token.
+     */
+    function liquidity() external view returns (address);
+
+    /**
+     * @notice Redeems an amount of asset for liquidity
+     * @param amount The amount of the asset token to redeem
+     */
+    function redeem(uint256 amount) external;
+}
+
+
+// File: contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControlEnumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol";
+import "contracts/external/openzeppelin/contracts/access/AccessControl.sol";
+import "contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol";
+
+/**
+ * @dev Extension of {AccessControl} that allows enumerating the members of each role.
+ */
+abstract contract AccessControlEnumerable is
+  IAccessControlEnumerable,
+  AccessControl
+{
+  using EnumerableSet for EnumerableSet.AddressSet;
+
+  mapping(bytes32 => EnumerableSet.AddressSet) private _roleMembers;
+
+  /**
+   * @dev See {IERC165-supportsInterface}.
+   */
+  function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return
+      interfaceId == type(IAccessControlEnumerable).interfaceId ||
+      super.supportsInterface(interfaceId);
+  }
+
+  /**
+   * @dev Returns one of the accounts that have `role`. `index` must be a
+   * value between 0 and {getRoleMemberCount}, non-inclusive.
+   *
+   * Role bearers are not sorted in any particular way, and their ordering may
+   * change at any point.
+   *
+   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+   * you perform all queries on the same block. See the following
+   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+   * for more information.
+   */
+  function getRoleMember(bytes32 role, uint256 index)
+    public
+    view
+    virtual
+    override
+    returns (address)
+  {
+    return _roleMembers[role].at(index);
+  }
+
+  /**
+   * @dev Returns the number of accounts that have `role`. Can be used
+   * together with {getRoleMember} to enumerate all bearers of a role.
+   */
+  function getRoleMemberCount(bytes32 role)
+    public
+    view
+    virtual
+    override
+    returns (uint256)
+  {
+    return _roleMembers[role].length();
+  }
+
+  /**
+   * @dev Overload {_grantRole} to track enumerable memberships
+   */
+  function _grantRole(bytes32 role, address account) internal virtual override {
+    super._grantRole(role, account);
+    _roleMembers[role].add(account);
+  }
+
+  /**
+   * @dev Overload {_revokeRole} to track enumerable memberships
+   */
+  function _revokeRole(bytes32 role, address account)
+    internal
+    virtual
+    override
+  {
+    super._revokeRole(role, account);
+    _roleMembers[role].remove(account);
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+  // Booleans are more expensive than uint256 or any type that takes up a full
+  // word because each write operation emits an extra SLOAD to first read the
+  // slot's contents, replace the bits taken up by the boolean, and then write
+  // back. This is the compiler's defense against contract upgrades and
+  // pointer aliasing, and it cannot be disabled.
+
+  // The values being non-zero value makes deployment a bit more expensive,
+  // but in exchange the refund on every call to nonReentrant will be lower in
+  // amount. Since refunds are capped to a percentage of the total
+  // transaction's gas, it is best to keep them low in cases like this one, to
+  // increase the likelihood of the full refund coming into effect.
+  uint256 private constant _NOT_ENTERED = 1;
+  uint256 private constant _ENTERED = 2;
+
+  uint256 private _status;
+
+  constructor() {
+    _status = _NOT_ENTERED;
+  }
+
+  /**
+   * @dev Prevents a contract from calling itself, directly or indirectly.
+   * Calling a `nonReentrant` function from another `nonReentrant`
+   * function is not supported. It is possible to prevent this from happening
+   * by making the `nonReentrant` function external, and making it call a
+   * `private` function that does the actual work.
+   */
+  modifier nonReentrant() {
+    // On the first call to nonReentrant, _notEntered will be true
+    require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+    // Any calls to nonReentrant after this point will fail
+    _status = _ENTERED;
+
+    _;
+
+    // By storing the original value once again, a refund is triggered (see
+    // https://eips.ethereum.org/EIPS/eip-2200)
+    _status = _NOT_ENTERED;
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/token/IERC20Metadata.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/token/IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+  /**
+   * @dev Returns the name of the token.
+   */
+  function name() external view returns (string memory);
+
+  /**
+   * @dev Returns the symbol of the token.
+   */
+  function symbol() external view returns (string memory);
+
+  /**
+   * @dev Returns the decimals places of the token.
+   */
+  function decimals() external view returns (uint8);
+}
+
+
+// File: contracts/external/openzeppelin/contracts/token/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+  /**
+   * @dev Returns the amount of tokens in existence.
+   */
+  function totalSupply() external view returns (uint256);
+
+  /**
+   * @dev Returns the amount of tokens owned by `account`.
+   */
+  function balanceOf(address account) external view returns (uint256);
+
+  /**
+   * @dev Moves `amount` tokens from the caller's account to `to`.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transfer(address to, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Returns the remaining number of tokens that `spender` will be
+   * allowed to spend on behalf of `owner` through {transferFrom}. This is
+   * zero by default.
+   *
+   * This value changes when {approve} or {transferFrom} are called.
+   */
+  function allowance(address owner, address spender)
+    external
+    view
+    returns (uint256);
+
+  /**
+   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * IMPORTANT: Beware that changing an allowance with this method brings the risk
+   * that someone may use both the old and the new allowance by unfortunate
+   * transaction ordering. One possible solution to mitigate this race
+   * condition is to first reduce the spender's allowance to 0 and set the
+   * desired value afterwards:
+   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+   *
+   * Emits an {Approval} event.
+   */
+  function approve(address spender, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Moves `amount` tokens from `from` to `to` using the
+   * allowance mechanism. `amount` is then deducted from the caller's
+   * allowance.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transferFrom(
+    address from,
+    address to,
+    uint256 amount
+  ) external returns (bool);
+
+  /**
+   * @dev Emitted when `value` tokens are moved from one account (`from`) to
+   * another (`to`).
+   *
+   * Note that `value` may be zero.
+   */
+  event Transfer(address indexed from, address indexed to, uint256 value);
+
+  /**
+   * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+   * a call to {approve}. `value` is the new allowance.
+   */
+  event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+
+// File: contracts/kyc/KYCRegistryClientUpgradeable.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+import "contracts/kyc/IKYCRegistry.sol";
+import "contracts/kyc/IKYCRegistryClient.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+
+/**
+ * @title KYCRegistryClientInitializable
+ * @author Ondo Finance
+ * @notice This abstract contract manages state required for clients
+ *         of the KYC registry.
+ */
+abstract contract KYCRegistryClientUpgradeable is
+  Initializable,
+  IKYCRegistryClient
+{
+  // KYC Registry address
+  IKYCRegistry public override kycRegistry;
+  // KYC requirement group
+  uint256 public override kycRequirementGroup;
+
+  /**
+   * @notice Initialize the contract by setting registry variable
+   *
+   * @param _kycRegistry         Address of the registry contract
+   * @param _kycRequirementGroup KYC requirement group associated with this
+   *                             client
+   *
+   * @dev Function should be called by the inheriting contract on
+   *      initialization
+   */
+  function __KYCRegistryClientInitializable_init(
+    address _kycRegistry,
+    uint256 _kycRequirementGroup
+  ) internal onlyInitializing {
+    __KYCRegistryClientInitializable_init_unchained(
+      _kycRegistry,
+      _kycRequirementGroup
+    );
+  }
+
+  /**
+   * @dev Internal function to future-proof parent linearization. Matches OZ
+   *      upgradeable suggestions
+   */
+  function __KYCRegistryClientInitializable_init_unchained(
+    address _kycRegistry,
+    uint256 _kycRequirementGroup
+  ) internal onlyInitializing {
+    _setKYCRegistry(_kycRegistry);
+    _setKYCRequirementGroup(_kycRequirementGroup);
+  }
+
+  /**
+   * @notice Sets the KYC registry address for this client
+   *
+   * @param _kycRegistry The new KYC registry address
+   */
+  function _setKYCRegistry(address _kycRegistry) internal {
+    if (_kycRegistry == address(0)) {
+      revert RegistryZeroAddress();
+    }
+    address oldKYCRegistry = address(kycRegistry);
+    kycRegistry = IKYCRegistry(_kycRegistry);
+    emit KYCRegistrySet(oldKYCRegistry, _kycRegistry);
+  }
+
+  /**
+   * @notice Sets the KYC registry requirement group for this
+   *         client to check kyc status for
+   *
+   * @param _kycRequirementGroup The new KYC group
+   */
+  function _setKYCRequirementGroup(uint256 _kycRequirementGroup) internal {
+    uint256 oldKYCLevel = kycRequirementGroup;
+    kycRequirementGroup = _kycRequirementGroup;
+    emit KYCRequirementGroupSet(oldKYCLevel, _kycRequirementGroup);
+  }
+
+  /**
+   * @notice Checks whether an address has been KYC'd
+   *
+   * @param account The address to check
+   */
+  function _getKYCStatus(address account) internal view returns (bool) {
+    return kycRegistry.getKYCStatus(kycRequirementGroup, account);
+  }
+
+  /**
+   * @dev This empty reserved space is put in place to allow future versions to add new
+   * variables without shifting down storage in the inheritance chain.
+   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+   */
+  uint256[50] private __gap;
+}
+
+
+// File: contracts/rwaOracles/IRWAOracle.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+interface IRWAOracle {
+  /// @notice Retrieve RWA price data
+  function getPriceData()
+    external
+    view
+    returns (uint256 price, uint256 timestamp);
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract ContextUpgradeable is Initializable {
+  function __Context_init() internal onlyInitializing {}
+
+  function __Context_init_unchained() internal onlyInitializing {}
+
+  function _msgSender() internal view virtual returns (address) {
+    return msg.sender;
+  }
+
+  function _msgData() internal view virtual returns (bytes calldata) {
+    return msg.data;
+  }
+
+  /**
+   * @dev This empty reserved space is put in place to allow future versions to add new
+   * variables without shifting down storage in the inheritance chain.
+   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+   */
+  uint256[50] private __gap;
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (proxy/utils/Initializable.sol)
+
+pragma solidity ^0.8.2;
+
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+
+/**
+ * @dev This is a base contract to aid in writing upgradeable contracts, or any kind of contract that will be deployed
+ * behind a proxy. Since proxied contracts do not make use of a constructor, it's common to move constructor logic to an
+ * external initializer function, usually called `initialize`. It then becomes necessary to protect this initializer
+ * function so it can only be called once. The {initializer} modifier provided by this contract will have this effect.
+ *
+ * The initialization functions use a version number. Once a version number is used, it is consumed and cannot be
+ * reused. This mechanism prevents re-execution of each "step" but allows the creation of new initialization steps in
+ * case an upgrade adds a module that needs to be initialized.
+ *
+ * For example:
+ *
+ * [.hljs-theme-light.nopadding]
+ * ```
+ * contract MyToken is ERC20Upgradeable {
+ *     function initialize() initializer public {
+ *         __ERC20_init("MyToken", "MTK");
+ *     }
+ * }
+ * contract MyTokenV2 is MyToken, ERC20PermitUpgradeable {
+ *     function initializeV2() reinitializer(2) public {
+ *         __ERC20Permit_init("MyToken");
+ *     }
+ * }
+ * ```
+ *
+ * TIP: To avoid leaving the proxy in an uninitialized state, the initializer function should be called as early as
+ * possible by providing the encoded function call as the `_data` argument to {ERC1967Proxy-constructor}.
+ *
+ * CAUTION: When used with inheritance, manual care must be taken to not invoke a parent initializer twice, or to ensure
+ * that all initializers are idempotent. This is not verified automatically as constructors are by Solidity.
+ *
+ * [CAUTION]
+ * ====
+ * Avoid leaving a contract uninitialized.
+ *
+ * An uninitialized contract can be taken over by an attacker. This applies to both a proxy and its implementation
+ * contract, which may impact the proxy. To prevent the implementation contract from being used, you should invoke
+ * the {_disableInitializers} function in the constructor to automatically lock it when it is deployed:
+ *
+ * [.hljs-theme-light.nopadding]
+ * ```
+ * /// @custom:oz-upgrades-unsafe-allow constructor
+ * constructor() {
+ *     _disableInitializers();
+ * }
+ * ```
+ * ====
+ */
+abstract contract Initializable {
+  /**
+   * @dev Indicates that the contract has been initialized.
+   * @custom:oz-retyped-from bool
+   */
+  uint8 private _initialized;
+
+  /**
+   * @dev Indicates that the contract is in the process of being initialized.
+   */
+  bool private _initializing;
+
+  /**
+   * @dev Triggered when the contract has been initialized or reinitialized.
+   */
+  event Initialized(uint8 version);
+
+  /**
+   * @dev A modifier that defines a protected initializer function that can be invoked at most once. In its scope,
+   * `onlyInitializing` functions can be used to initialize parent contracts. Equivalent to `reinitializer(1)`.
+   */
+  modifier initializer() {
+    bool isTopLevelCall = !_initializing;
+    require(
+      (isTopLevelCall && _initialized < 1) ||
+        (!AddressUpgradeable.isContract(address(this)) && _initialized == 1),
+      "Initializable: contract is already initialized"
+    );
+    _initialized = 1;
+    if (isTopLevelCall) {
+      _initializing = true;
+    }
+    _;
+    if (isTopLevelCall) {
+      _initializing = false;
+      emit Initialized(1);
+    }
+  }
+
+  /**
+   * @dev A modifier that defines a protected reinitializer function that can be invoked at most once, and only if the
+   * contract hasn't been initialized to a greater version before. In its scope, `onlyInitializing` functions can be
+   * used to initialize parent contracts.
+   *
+   * `initializer` is equivalent to `reinitializer(1)`, so a reinitializer may be used after the original
+   * initialization step. This is essential to configure modules that are added through upgrades and that require
+   * initialization.
+   *
+   * Note that versions can jump in increments greater than 1; this implies that if multiple reinitializers coexist in
+   * a contract, executing them in the right order is up to the developer or operator.
+   */
+  modifier reinitializer(uint8 version) {
+    require(
+      !_initializing && _initialized < version,
+      "Initializable: contract is already initialized"
+    );
+    _initialized = version;
+    _initializing = true;
+    _;
+    _initializing = false;
+    emit Initialized(version);
+  }
+
+  /**
+   * @dev Modifier to protect an initialization function so that it can only be invoked by functions with the
+   * {initializer} and {reinitializer} modifiers, directly or indirectly.
+   */
+  modifier onlyInitializing() {
+    require(_initializing, "Initializable: contract is not initializing");
+    _;
+  }
+
+  /**
+   * @dev Locks the contract, preventing any future reinitialization. This cannot be part of an initializer call.
+   * Calling this in the constructor of a contract will prevent that contract from being initialized or reinitialized
+   * to any version. It is recommended to use this to lock implementation contracts that are designed to be called
+   * through proxies.
+   */
+  function _disableInitializers() internal virtual {
+    require(!_initializing, "Initializable: contract is initializing");
+    if (_initialized < type(uint8).max) {
+      _initialized = type(uint8).max;
+      emit Initialized(type(uint8).max);
+    }
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControlEnumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlEnumerableUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/EnumerableSetUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+
+/**
+ * @dev Extension of {AccessControl} that allows enumerating the members of each role.
+ */
+abstract contract AccessControlEnumerableUpgradeable is
+  Initializable,
+  IAccessControlEnumerableUpgradeable,
+  AccessControlUpgradeable
+{
+  function __AccessControlEnumerable_init() internal onlyInitializing {}
+
+  function __AccessControlEnumerable_init_unchained()
+    internal
+    onlyInitializing
+  {}
+
+  using EnumerableSetUpgradeable for EnumerableSetUpgradeable.AddressSet;
+
+  mapping(bytes32 => EnumerableSetUpgradeable.AddressSet) private _roleMembers;
+
+  /**
+   * @dev See {IERC165-supportsInterface}.
+   */
+  function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return
+      interfaceId == type(IAccessControlEnumerableUpgradeable).interfaceId ||
+      super.supportsInterface(interfaceId);
+  }
+
+  /**
+   * @dev Returns one of the accounts that have `role`. `index` must be a
+   * value between 0 and {getRoleMemberCount}, non-inclusive.
+   *
+   * Role bearers are not sorted in any particular way, and their ordering may
+   * change at any point.
+   *
+   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+   * you perform all queries on the same block. See the following
+   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+   * for more information.
+   */
+  function getRoleMember(bytes32 role, uint256 index)
+    public
+    view
+    virtual
+    override
+    returns (address)
+  {
+    return _roleMembers[role].at(index);
+  }
+
+  /**
+   * @dev Returns the number of accounts that have `role`. Can be used
+   * together with {getRoleMember} to enumerate all bearers of a role.
+   */
+  function getRoleMemberCount(bytes32 role)
+    public
+    view
+    virtual
+    override
+    returns (uint256)
+  {
+    return _roleMembers[role].length();
+  }
+
+  /**
+   * @dev Overload {_grantRole} to track enumerable memberships
+   */
+  function _grantRole(bytes32 role, address account) internal virtual override {
+    super._grantRole(role, account);
+    _roleMembers[role].add(account);
+  }
+
+  /**
+   * @dev Overload {_revokeRole} to track enumerable memberships
+   */
+  function _revokeRole(bytes32 role, address account)
+    internal
+    virtual
+    override
+  {
+    super._revokeRole(role, account);
+    _roleMembers[role].remove(account);
+  }
+
+  /**
+   * @dev This empty reserved space is put in place to allow future versions to add new
+   * variables without shifting down storage in the inheritance chain.
+   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+   */
+  uint256[49] private __gap;
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (security/Pausable.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract PausableUpgradeable is Initializable, ContextUpgradeable {
+  /**
+   * @dev Emitted when the pause is triggered by `account`.
+   */
+  event Paused(address account);
+
+  /**
+   * @dev Emitted when the pause is lifted by `account`.
+   */
+  event Unpaused(address account);
+
+  bool private _paused;
+
+  /**
+   * @dev Initializes the contract in unpaused state.
+   */
+  function __Pausable_init() internal onlyInitializing {
+    __Pausable_init_unchained();
+  }
+
+  function __Pausable_init_unchained() internal onlyInitializing {
+    _paused = false;
+  }
+
+  /**
+   * @dev Modifier to make a function callable only when the contract is not paused.
+   *
+   * Requirements:
+   *
+   * - The contract must not be paused.
+   */
+  modifier whenNotPaused() {
+    _requireNotPaused();
+    _;
+  }
+
+  /**
+   * @dev Modifier to make a function callable only when the contract is paused.
+   *
+   * Requirements:
+   *
+   * - The contract must be paused.
+   */
+  modifier whenPaused() {
+    _requirePaused();
+    _;
+  }
+
+  /**
+   * @dev Returns true if the contract is paused, and false otherwise.
+   */
+  function paused() public view virtual returns (bool) {
+    return _paused;
+  }
+
+  /**
+   * @dev Throws if the contract is paused.
+   */
+  function _requireNotPaused() internal view virtual {
+    require(!paused(), "Pausable: paused");
+  }
+
+  /**
+   * @dev Throws if the contract is not paused.
+   */
+  function _requirePaused() internal view virtual {
+    require(paused(), "Pausable: not paused");
+  }
+
+  /**
+   * @dev Triggers stopped state.
+   *
+   * Requirements:
+   *
+   * - The contract must not be paused.
+   */
+  function _pause() internal virtual whenNotPaused {
+    _paused = true;
+    emit Paused(_msgSender());
+  }
+
+  /**
+   * @dev Returns to normal state.
+   *
+   * Requirements:
+   *
+   * - The contract must be paused.
+   */
+  function _unpause() internal virtual whenPaused {
+    _paused = false;
+    emit Unpaused(_msgSender());
+  }
+
+  /**
+   * @dev This empty reserved space is put in place to allow future versions to add new
+   * variables without shifting down storage in the inheritance chain.
+   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+   */
+  uint256[49] private __gap;
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20Upgradeable {
+  /**
+   * @dev Emitted when `value` tokens are moved from one account (`from`) to
+   * another (`to`).
+   *
+   * Note that `value` may be zero.
+   */
+  event Transfer(address indexed from, address indexed to, uint256 value);
+
+  /**
+   * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+   * a call to {approve}. `value` is the new allowance.
+   */
+  event Approval(address indexed owner, address indexed spender, uint256 value);
+
+  /**
+   * @dev Returns the amount of tokens in existence.
+   */
+  function totalSupply() external view returns (uint256);
+
+  /**
+   * @dev Returns the amount of tokens owned by `account`.
+   */
+  function balanceOf(address account) external view returns (uint256);
+
+  /**
+   * @dev Moves `amount` tokens from the caller's account to `to`.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transfer(address to, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Returns the remaining number of tokens that `spender` will be
+   * allowed to spend on behalf of `owner` through {transferFrom}. This is
+   * zero by default.
+   *
+   * This value changes when {approve} or {transferFrom} are called.
+   */
+  function allowance(address owner, address spender)
+    external
+    view
+    returns (uint256);
+
+  /**
+   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * IMPORTANT: Beware that changing an allowance with this method brings the risk
+   * that someone may use both the old and the new allowance by unfortunate
+   * transaction ordering. One possible solution to mitigate this race
+   * condition is to first reduce the spender's allowance to 0 and set the
+   * desired value afterwards:
+   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+   *
+   * Emits an {Approval} event.
+   */
+  function approve(address spender, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Moves `amount` tokens from `from` to `to` using the
+   * allowance mechanism. `amount` is then deducted from the caller's
+   * allowance.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transferFrom(
+    address from,
+    address to,
+    uint256 amount
+  ) external returns (bool);
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/token/ERC20/IERC20MetadataUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20MetadataUpgradeable is IERC20Upgradeable {
+  /**
+   * @dev Returns the name of the token.
+   */
+  function name() external view returns (string memory);
+
+  /**
+   * @dev Returns the symbol of the token.
+   */
+  function symbol() external view returns (string memory);
+
+  /**
+   * @dev Returns the decimals places of the token.
+   */
+  function decimals() external view returns (uint8);
+}
+
+
+// File: contracts/kyc/IKYCRegistry.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+/**
+ * @title IKYCRegistry
+ * @author Ondo Finance
+ * @notice The interface for Ondo's KYC Registry contract
+ */
+interface IKYCRegistry {
+  /**
+   * @notice Retrieves KYC status of an account
+   *
+   * @param kycRequirementGroup The KYC group for which we wish to check
+   * @param account             The account we wish to retrieve KYC status for
+   *
+   * @return bool Whether the `account` is KYC'd
+   */
+  function getKYCStatus(
+    uint256 kycRequirementGroup,
+    address account
+  ) external view returns (bool);
+
+  /**
+   * @notice View function for the public nested mapping of kycState
+   *
+   * @param kycRequirementGroup The KYC group to view
+   * @param account             The account to check if KYC'd
+   */
+  function kycState(
+    uint256 kycRequirementGroup,
+    address account
+  ) external view returns (bool);
+}
+
+
+// File: contracts/kyc/IKYCRegistryClient.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+import "contracts/kyc/IKYCRegistry.sol";
+
+/**
+ * @title IKYCRegistryClient
+ * @author Ondo Finance
+ * @notice The client interface Ondo's KYC Registry contract.
+ */
+interface IKYCRegistryClient {
+  /// @notice Returns what KYC group this client checks accounts for
+  function kycRequirementGroup() external view returns (uint256);
+
+  /// @notice Returns reference to the KYC registry that this client queries
+  function kycRegistry() external view returns (IKYCRegistry);
+
+  /// @notice Sets the KYC group
+  function setKYCRequirementGroup(uint256 group) external;
+
+  /// @notice Sets the KYC registry reference
+  function setKYCRegistry(address registry) external;
+
+  /// @notice Error for when caller attempts to set the KYC registry refernce
+  ///         to the zero address.
+  error RegistryZeroAddress();
+
+  /**
+   * @dev Event for when the KYC registry reference is set
+   *
+   * @param oldRegistry The old registry
+   * @param newRegistry The new registry
+   */
+  event KYCRegistrySet(address oldRegistry, address newRegistry);
+
+  /**
+   * @dev Event for when the KYC group for this client is set
+   *
+   * @param oldRequirementGroup The old KYC group
+   * @param newRequirementGroup The new KYC group
+   */
+  event KYCRequirementGroupSet(
+    uint256 oldRequirementGroup,
+    uint256 newRequirementGroup
+  );
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library AddressUpgradeable {
+  /**
+   * @dev Returns true if `account` is a contract.
+   *
+   * [IMPORTANT]
+   * ====
+   * It is unsafe to assume that an address for which this function returns
+   * false is an externally-owned account (EOA) and not a contract.
+   *
+   * Among others, `isContract` will return false for the following
+   * types of addresses:
+   *
+   *  - an externally-owned account
+   *  - a contract in construction
+   *  - an address where a contract will be created
+   *  - an address where a contract lived, but was destroyed
+   * ====
+   *
+   * [IMPORTANT]
+   * ====
+   * You shouldn't rely on `isContract` to protect against flash loan attacks!
+   *
+   * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+   * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+   * constructor.
+   * ====
+   */
+  function isContract(address account) internal view returns (bool) {
+    // This method relies on extcodesize/address.code.length, which returns 0
+    // for contracts in construction, since the code is only stored at the end
+    // of the constructor execution.
+
+    return account.code.length > 0;
+  }
+
+  /**
+   * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+   * `recipient`, forwarding all available gas and reverting on errors.
+   *
+   * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+   * of certain opcodes, possibly making contracts go over the 2300 gas limit
+   * imposed by `transfer`, making them unable to receive funds via
+   * `transfer`. {sendValue} removes this limitation.
+   *
+   * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+   *
+   * IMPORTANT: because control is transferred to `recipient`, care must be
+   * taken to not create reentrancy vulnerabilities. Consider using
+   * {ReentrancyGuard} or the
+   * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+   */
+  function sendValue(address payable recipient, uint256 amount) internal {
+    require(address(this).balance >= amount, "Address: insufficient balance");
+
+    (bool success, ) = recipient.call{value: amount}("");
+    require(
+      success,
+      "Address: unable to send value, recipient may have reverted"
+    );
+  }
+
+  /**
+   * @dev Performs a Solidity function call using a low level `call`. A
+   * plain `call` is an unsafe replacement for a function call: use this
+   * function instead.
+   *
+   * If `target` reverts with a revert reason, it is bubbled up by this
+   * function (like regular Solidity function calls).
+   *
+   * Returns the raw returned data. To convert to the expected return value,
+   * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+   *
+   * Requirements:
+   *
+   * - `target` must be a contract.
+   * - calling `target` with `data` must not revert.
+   *
+   * _Available since v3.1._
+   */
+  function functionCall(address target, bytes memory data)
+    internal
+    returns (bytes memory)
+  {
+    return functionCall(target, data, "Address: low-level call failed");
+  }
+
+  /**
+   * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+   * `errorMessage` as a fallback revert reason when `target` reverts.
+   *
+   * _Available since v3.1._
+   */
+  function functionCall(
+    address target,
+    bytes memory data,
+    string memory errorMessage
+  ) internal returns (bytes memory) {
+    return functionCallWithValue(target, data, 0, errorMessage);
+  }
+
+  /**
+   * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+   * but also transferring `value` wei to `target`.
+   *
+   * Requirements:
+   *
+   * - the calling contract must have an ETH balance of at least `value`.
+   * - the called Solidity function must be `payable`.
+   *
+   * _Available since v3.1._
+   */
+  function functionCallWithValue(
+    address target,
+    bytes memory data,
+    uint256 value
+  ) internal returns (bytes memory) {
+    return
+      functionCallWithValue(
+        target,
+        data,
+        value,
+        "Address: low-level call with value failed"
+      );
+  }
+
+  /**
+   * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+   * with `errorMessage` as a fallback revert reason when `target` reverts.
+   *
+   * _Available since v3.1._
+   */
+  function functionCallWithValue(
+    address target,
+    bytes memory data,
+    uint256 value,
+    string memory errorMessage
+  ) internal returns (bytes memory) {
+    require(
+      address(this).balance >= value,
+      "Address: insufficient balance for call"
+    );
+    require(isContract(target), "Address: call to non-contract");
+
+    (bool success, bytes memory returndata) = target.call{value: value}(data);
+    return verifyCallResult(success, returndata, errorMessage);
+  }
+
+  /**
+   * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+   * but performing a static call.
+   *
+   * _Available since v3.3._
+   */
+  function functionStaticCall(address target, bytes memory data)
+    internal
+    view
+    returns (bytes memory)
+  {
+    return
+      functionStaticCall(target, data, "Address: low-level static call failed");
+  }
+
+  /**
+   * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+   * but performing a static call.
+   *
+   * _Available since v3.3._
+   */
+  function functionStaticCall(
+    address target,
+    bytes memory data,
+    string memory errorMessage
+  ) internal view returns (bytes memory) {
+    require(isContract(target), "Address: static call to non-contract");
+
+    (bool success, bytes memory returndata) = target.staticcall(data);
+    return verifyCallResult(success, returndata, errorMessage);
+  }
+
+  /**
+   * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the
+   * revert reason using the provided one.
+   *
+   * _Available since v4.3._
+   */
+  function verifyCallResult(
+    bool success,
+    bytes memory returndata,
+    string memory errorMessage
+  ) internal pure returns (bytes memory) {
+    if (success) {
+      return returndata;
+    } else {
+      // Look for revert reason and bubble it up if present
+      if (returndata.length > 0) {
+        // The easiest way to bubble the revert reason is using memory via assembly
+        /// @solidity memory-safe-assembly
+        assembly {
+          let returndata_size := mload(returndata)
+          revert(add(32, returndata), returndata_size)
+        }
+      } else {
+        revert(errorMessage);
+      }
+    }
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlEnumerableUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControlEnumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IAccessControlUpgradeable.sol";
+
+/**
+ * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.
+ */
+interface IAccessControlEnumerableUpgradeable is IAccessControlUpgradeable {
+  /**
+   * @dev Returns one of the accounts that have `role`. `index` must be a
+   * value between 0 and {getRoleMemberCount}, non-inclusive.
+   *
+   * Role bearers are not sorted in any particular way, and their ordering may
+   * change at any point.
+   *
+   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+   * you perform all queries on the same block. See the following
+   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+   * for more information.
+   */
+  function getRoleMember(bytes32 role, uint256 index)
+    external
+    view
+    returns (address);
+
+  /**
+   * @dev Returns the number of accounts that have `role`. Can be used
+   * together with {getRoleMember} to enumerate all bearers of a role.
+   */
+  function getRoleMemberCount(bytes32 role) external view returns (uint256);
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/ERC165Upgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it.
+ */
+abstract contract AccessControlUpgradeable is
+  Initializable,
+  ContextUpgradeable,
+  IAccessControlUpgradeable,
+  ERC165Upgradeable
+{
+  function __AccessControl_init() internal onlyInitializing {}
+
+  function __AccessControl_init_unchained() internal onlyInitializing {}
+
+  struct RoleData {
+    mapping(address => bool) members;
+    bytes32 adminRole;
+  }
+
+  mapping(bytes32 => RoleData) private _roles;
+
+  bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+  /**
+   * @dev Modifier that checks that an account has a specific role. Reverts
+   * with a standardized message including the required role.
+   *
+   * The format of the revert reason is given by the following regular expression:
+   *
+   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+   *
+   * _Available since v4.1._
+   */
+  modifier onlyRole(bytes32 role) {
+    _checkRole(role);
+    _;
+  }
+
+  /**
+   * @dev See {IERC165-supportsInterface}.
+   */
+  function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return
+      interfaceId == type(IAccessControlUpgradeable).interfaceId ||
+      super.supportsInterface(interfaceId);
+  }
+
+  /**
+   * @dev Returns `true` if `account` has been granted `role`.
+   */
+  function hasRole(bytes32 role, address account)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return _roles[role].members[account];
+  }
+
+  /**
+   * @dev Revert with a standard message if `_msgSender()` is missing `role`.
+   * Overriding this function changes the behavior of the {onlyRole} modifier.
+   *
+   * Format of the revert message is described in {_checkRole}.
+   *
+   * _Available since v4.6._
+   */
+  function _checkRole(bytes32 role) internal view virtual {
+    _checkRole(role, _msgSender());
+  }
+
+  /**
+   * @dev Revert with a standard message if `account` is missing `role`.
+   *
+   * The format of the revert reason is given by the following regular expression:
+   *
+   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+   */
+  function _checkRole(bytes32 role, address account) internal view virtual {
+    if (!hasRole(role, account)) {
+      revert(
+        string(
+          abi.encodePacked(
+            "AccessControl: account ",
+            StringsUpgradeable.toHexString(uint160(account), 20),
+            " is missing role ",
+            StringsUpgradeable.toHexString(uint256(role), 32)
+          )
+        )
+      );
+    }
+  }
+
+  /**
+   * @dev Returns the admin role that controls `role`. See {grantRole} and
+   * {revokeRole}.
+   *
+   * To change a role's admin, use {_setRoleAdmin}.
+   */
+  function getRoleAdmin(bytes32 role)
+    public
+    view
+    virtual
+    override
+    returns (bytes32)
+  {
+    return _roles[role].adminRole;
+  }
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * If `account` had not been already granted `role`, emits a {RoleGranted}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   *
+   * May emit a {RoleGranted} event.
+   */
+  function grantRole(bytes32 role, address account)
+    public
+    virtual
+    override
+    onlyRole(getRoleAdmin(role))
+  {
+    _grantRole(role, account);
+  }
+
+  /**
+   * @dev Revokes `role` from `account`.
+   *
+   * If `account` had been granted `role`, emits a {RoleRevoked} event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   *
+   * May emit a {RoleRevoked} event.
+   */
+  function revokeRole(bytes32 role, address account)
+    public
+    virtual
+    override
+    onlyRole(getRoleAdmin(role))
+  {
+    _revokeRole(role, account);
+  }
+
+  /**
+   * @dev Revokes `role` from the calling account.
+   *
+   * Roles are often managed via {grantRole} and {revokeRole}: this function's
+   * purpose is to provide a mechanism for accounts to lose their privileges
+   * if they are compromised (such as when a trusted device is misplaced).
+   *
+   * If the calling account had been revoked `role`, emits a {RoleRevoked}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must be `account`.
+   *
+   * May emit a {RoleRevoked} event.
+   */
+  function renounceRole(bytes32 role, address account) public virtual override {
+    require(
+      account == _msgSender(),
+      "AccessControl: can only renounce roles for self"
+    );
+
+    _revokeRole(role, account);
+  }
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * If `account` had not been already granted `role`, emits a {RoleGranted}
+   * event. Note that unlike {grantRole}, this function doesn't perform any
+   * checks on the calling account.
+   *
+   * May emit a {RoleGranted} event.
+   *
+   * [WARNING]
+   * ====
+   * This function should only be called from the constructor when setting
+   * up the initial roles for the system.
+   *
+   * Using this function in any other way is effectively circumventing the admin
+   * system imposed by {AccessControl}.
+   * ====
+   *
+   * NOTE: This function is deprecated in favor of {_grantRole}.
+   */
+  function _setupRole(bytes32 role, address account) internal virtual {
+    _grantRole(role, account);
+  }
+
+  /**
+   * @dev Sets `adminRole` as ``role``'s admin role.
+   *
+   * Emits a {RoleAdminChanged} event.
+   */
+  function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+    bytes32 previousAdminRole = getRoleAdmin(role);
+    _roles[role].adminRole = adminRole;
+    emit RoleAdminChanged(role, previousAdminRole, adminRole);
+  }
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * Internal function without access restriction.
+   *
+   * May emit a {RoleGranted} event.
+   */
+  function _grantRole(bytes32 role, address account) internal virtual {
+    if (!hasRole(role, account)) {
+      _roles[role].members[account] = true;
+      emit RoleGranted(role, account, _msgSender());
+    }
+  }
+
+  /**
+   * @dev Revokes `role` from `account`.
+   *
+   * Internal function without access restriction.
+   *
+   * May emit a {RoleRevoked} event.
+   */
+  function _revokeRole(bytes32 role, address account) internal virtual {
+    if (hasRole(role, account)) {
+      _roles[role].members[account] = false;
+      emit RoleRevoked(role, account, _msgSender());
+    }
+  }
+
+  /**
+   * @dev This empty reserved space is put in place to allow future versions to add new
+   * variables without shifting down storage in the inheritance chain.
+   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+   */
+  uint256[49] private __gap;
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/utils/EnumerableSetUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/structs/EnumerableSet.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ *  Trying to delete such a structure from storage will likely result in data corruption, rendering the structure unusable.
+ *  See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ *  In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an array of EnumerableSet.
+ * ====
+ */
+library EnumerableSetUpgradeable {
+  // To implement this library for multiple types with as little code
+  // repetition as possible, we write it in terms of a generic Set type with
+  // bytes32 values.
+  // The Set implementation uses private functions, and user-facing
+  // implementations (such as AddressSet) are just wrappers around the
+  // underlying Set.
+  // This means that we can only create new EnumerableSets for types that fit
+  // in bytes32.
+
+  struct Set {
+    // Storage of set values
+    bytes32[] _values;
+    // Position of the value in the `values` array, plus 1 because index 0
+    // means a value is not in the set.
+    mapping(bytes32 => uint256) _indexes;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function _add(Set storage set, bytes32 value) private returns (bool) {
+    if (!_contains(set, value)) {
+      set._values.push(value);
+      // The value is stored at length-1, but we add 1 to all indexes
+      // and use 0 as a sentinel value
+      set._indexes[value] = set._values.length;
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function _remove(Set storage set, bytes32 value) private returns (bool) {
+    // We read and store the value's index to prevent multiple reads from the same storage slot
+    uint256 valueIndex = set._indexes[value];
+
+    if (valueIndex != 0) {
+      // Equivalent to contains(set, value)
+      // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+      // the array, and then remove the last element (sometimes called as 'swap and pop').
+      // This modifies the order of the array, as noted in {at}.
+
+      uint256 toDeleteIndex = valueIndex - 1;
+      uint256 lastIndex = set._values.length - 1;
+
+      if (lastIndex != toDeleteIndex) {
+        bytes32 lastValue = set._values[lastIndex];
+
+        // Move the last value to the index where the value to delete is
+        set._values[toDeleteIndex] = lastValue;
+        // Update the index for the moved value
+        set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex
+      }
+
+      // Delete the slot where the moved value was stored
+      set._values.pop();
+
+      // Delete the index for the deleted slot
+      delete set._indexes[value];
+
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function _contains(Set storage set, bytes32 value)
+    private
+    view
+    returns (bool)
+  {
+    return set._indexes[value] != 0;
+  }
+
+  /**
+   * @dev Returns the number of values on the set. O(1).
+   */
+  function _length(Set storage set) private view returns (uint256) {
+    return set._values.length;
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function _at(Set storage set, uint256 index) private view returns (bytes32) {
+    return set._values[index];
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function _values(Set storage set) private view returns (bytes32[] memory) {
+    return set._values;
+  }
+
+  // Bytes32Set
+
+  struct Bytes32Set {
+    Set _inner;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+    return _add(set._inner, value);
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function remove(Bytes32Set storage set, bytes32 value)
+    internal
+    returns (bool)
+  {
+    return _remove(set._inner, value);
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function contains(Bytes32Set storage set, bytes32 value)
+    internal
+    view
+    returns (bool)
+  {
+    return _contains(set._inner, value);
+  }
+
+  /**
+   * @dev Returns the number of values in the set. O(1).
+   */
+  function length(Bytes32Set storage set) internal view returns (uint256) {
+    return _length(set._inner);
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function at(Bytes32Set storage set, uint256 index)
+    internal
+    view
+    returns (bytes32)
+  {
+    return _at(set._inner, index);
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function values(Bytes32Set storage set)
+    internal
+    view
+    returns (bytes32[] memory)
+  {
+    return _values(set._inner);
+  }
+
+  // AddressSet
+
+  struct AddressSet {
+    Set _inner;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function add(AddressSet storage set, address value) internal returns (bool) {
+    return _add(set._inner, bytes32(uint256(uint160(value))));
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function remove(AddressSet storage set, address value)
+    internal
+    returns (bool)
+  {
+    return _remove(set._inner, bytes32(uint256(uint160(value))));
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function contains(AddressSet storage set, address value)
+    internal
+    view
+    returns (bool)
+  {
+    return _contains(set._inner, bytes32(uint256(uint160(value))));
+  }
+
+  /**
+   * @dev Returns the number of values in the set. O(1).
+   */
+  function length(AddressSet storage set) internal view returns (uint256) {
+    return _length(set._inner);
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function at(AddressSet storage set, uint256 index)
+    internal
+    view
+    returns (address)
+  {
+    return address(uint160(uint256(_at(set._inner, index))));
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function values(AddressSet storage set)
+    internal
+    view
+    returns (address[] memory)
+  {
+    bytes32[] memory store = _values(set._inner);
+    address[] memory result;
+
+    /// @solidity memory-safe-assembly
+    assembly {
+      result := store
+    }
+
+    return result;
+  }
+
+  // UintSet
+
+  struct UintSet {
+    Set _inner;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function add(UintSet storage set, uint256 value) internal returns (bool) {
+    return _add(set._inner, bytes32(value));
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function remove(UintSet storage set, uint256 value) internal returns (bool) {
+    return _remove(set._inner, bytes32(value));
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function contains(UintSet storage set, uint256 value)
+    internal
+    view
+    returns (bool)
+  {
+    return _contains(set._inner, bytes32(value));
+  }
+
+  /**
+   * @dev Returns the number of values on the set. O(1).
+   */
+  function length(UintSet storage set) internal view returns (uint256) {
+    return _length(set._inner);
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function at(UintSet storage set, uint256 index)
+    internal
+    view
+    returns (uint256)
+  {
+    return uint256(_at(set._inner, index));
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function values(UintSet storage set)
+    internal
+    view
+    returns (uint256[] memory)
+  {
+    bytes32[] memory store = _values(set._inner);
+    uint256[] memory result;
+
+    /// @solidity memory-safe-assembly
+    assembly {
+      result := store
+    }
+
+    return result;
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControlUpgradeable {
+  /**
+   * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+   *
+   * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+   * {RoleAdminChanged} not being emitted signaling this.
+   *
+   * _Available since v3.1._
+   */
+  event RoleAdminChanged(
+    bytes32 indexed role,
+    bytes32 indexed previousAdminRole,
+    bytes32 indexed newAdminRole
+  );
+
+  /**
+   * @dev Emitted when `account` is granted `role`.
+   *
+   * `sender` is the account that originated the contract call, an admin role
+   * bearer except when using {AccessControl-_setupRole}.
+   */
+  event RoleGranted(
+    bytes32 indexed role,
+    address indexed account,
+    address indexed sender
+  );
+
+  /**
+   * @dev Emitted when `account` is revoked `role`.
+   *
+   * `sender` is the account that originated the contract call:
+   *   - if using `revokeRole`, it is the admin role bearer
+   *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+   */
+  event RoleRevoked(
+    bytes32 indexed role,
+    address indexed account,
+    address indexed sender
+  );
+
+  /**
+   * @dev Returns `true` if `account` has been granted `role`.
+   */
+  function hasRole(bytes32 role, address account) external view returns (bool);
+
+  /**
+   * @dev Returns the admin role that controls `role`. See {grantRole} and
+   * {revokeRole}.
+   *
+   * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+   */
+  function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * If `account` had not been already granted `role`, emits a {RoleGranted}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   */
+  function grantRole(bytes32 role, address account) external;
+
+  /**
+   * @dev Revokes `role` from `account`.
+   *
+   * If `account` had been granted `role`, emits a {RoleRevoked} event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   */
+  function revokeRole(bytes32 role, address account) external;
+
+  /**
+   * @dev Revokes `role` from the calling account.
+   *
+   * Roles are often managed via {grantRole} and {revokeRole}: this function's
+   * purpose is to provide a mechanism for accounts to lose their privileges
+   * if they are compromised (such as when a trusted device is misplaced).
+   *
+   * If the calling account had been granted `role`, emits a {RoleRevoked}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must be `account`.
+   */
+  function renounceRole(bytes32 role, address account) external;
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Strings.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev String operations.
+ */
+library StringsUpgradeable {
+  bytes16 private constant _HEX_SYMBOLS = "0123456789abcdef";
+  uint8 private constant _ADDRESS_LENGTH = 20;
+
+  /**
+   * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+   */
+  function toString(uint256 value) internal pure returns (string memory) {
+    // Inspired by OraclizeAPI's implementation - MIT licence
+    // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol
+
+    if (value == 0) {
+      return "0";
+    }
+    uint256 temp = value;
+    uint256 digits;
+    while (temp != 0) {
+      digits++;
+      temp /= 10;
+    }
+    bytes memory buffer = new bytes(digits);
+    while (value != 0) {
+      digits -= 1;
+      buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+      value /= 10;
+    }
+    return string(buffer);
+  }
+
+  /**
+   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+   */
+  function toHexString(uint256 value) internal pure returns (string memory) {
+    if (value == 0) {
+      return "0x00";
+    }
+    uint256 temp = value;
+    uint256 length = 0;
+    while (temp != 0) {
+      length++;
+      temp >>= 8;
+    }
+    return toHexString(value, length);
+  }
+
+  /**
+   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+   */
+  function toHexString(uint256 value, uint256 length)
+    internal
+    pure
+    returns (string memory)
+  {
+    bytes memory buffer = new bytes(2 * length + 2);
+    buffer[0] = "0";
+    buffer[1] = "x";
+    for (uint256 i = 2 * length + 1; i > 1; --i) {
+      buffer[i] = _HEX_SYMBOLS[value & 0xf];
+      value >>= 4;
+    }
+    require(value == 0, "Strings: hex length insufficient");
+    return string(buffer);
+  }
+
+  /**
+   * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal representation.
+   */
+  function toHexString(address addr) internal pure returns (string memory) {
+    return toHexString(uint256(uint160(addr)), _ADDRESS_LENGTH);
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/utils/ERC165Upgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts-upgradeable/utils/IERC165Upgradeable.sol";
+import "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ *
+ * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.
+ */
+abstract contract ERC165Upgradeable is Initializable, IERC165Upgradeable {
+  function __ERC165_init() internal onlyInitializing {}
+
+  function __ERC165_init_unchained() internal onlyInitializing {}
+
+  /**
+   * @dev See {IERC165-supportsInterface}.
+   */
+  function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return interfaceId == type(IERC165Upgradeable).interfaceId;
+  }
+
+  /**
+   * @dev This empty reserved space is put in place to allow future versions to add new
+   * variables without shifting down storage in the inheritance chain.
+   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+   */
+  uint256[50] private __gap;
+}
+
+
+// File: contracts/external/openzeppelin/contracts-upgradeable/utils/IERC165Upgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165Upgradeable {
+  /**
+   * @dev Returns true if this contract implements the interface defined by
+   * `interfaceId`. See the corresponding
+   * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+   * to learn more about how these ids are created.
+   *
+   * This function call must use less than 30 000 gas.
+   */
+  function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControlEnumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/access/IAccessControl.sol";
+
+/**
+ * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.
+ */
+interface IAccessControlEnumerable is IAccessControl {
+  /**
+   * @dev Returns one of the accounts that have `role`. `index` must be a
+   * value between 0 and {getRoleMemberCount}, non-inclusive.
+   *
+   * Role bearers are not sorted in any particular way, and their ordering may
+   * change at any point.
+   *
+   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+   * you perform all queries on the same block. See the following
+   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+   * for more information.
+   */
+  function getRoleMember(bytes32 role, uint256 index)
+    external
+    view
+    returns (address);
+
+  /**
+   * @dev Returns the number of accounts that have `role`. Can be used
+   * together with {getRoleMember} to enumerate all bearers of a role.
+   */
+  function getRoleMemberCount(bytes32 role) external view returns (uint256);
+}
+
+
+// File: contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/structs/EnumerableSet.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ */
+library EnumerableSet {
+  // To implement this library for multiple types with as little code
+  // repetition as possible, we write it in terms of a generic Set type with
+  // bytes32 values.
+  // The Set implementation uses private functions, and user-facing
+  // implementations (such as AddressSet) are just wrappers around the
+  // underlying Set.
+  // This means that we can only create new EnumerableSets for types that fit
+  // in bytes32.
+
+  struct Set {
+    // Storage of set values
+    bytes32[] _values;
+    // Position of the value in the `values` array, plus 1 because index 0
+    // means a value is not in the set.
+    mapping(bytes32 => uint256) _indexes;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function _add(Set storage set, bytes32 value) private returns (bool) {
+    if (!_contains(set, value)) {
+      set._values.push(value);
+      // The value is stored at length-1, but we add 1 to all indexes
+      // and use 0 as a sentinel value
+      set._indexes[value] = set._values.length;
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function _remove(Set storage set, bytes32 value) private returns (bool) {
+    // We read and store the value's index to prevent multiple reads from the same storage slot
+    uint256 valueIndex = set._indexes[value];
+
+    if (valueIndex != 0) {
+      // Equivalent to contains(set, value)
+      // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+      // the array, and then remove the last element (sometimes called as 'swap and pop').
+      // This modifies the order of the array, as noted in {at}.
+
+      uint256 toDeleteIndex = valueIndex - 1;
+      uint256 lastIndex = set._values.length - 1;
+
+      if (lastIndex != toDeleteIndex) {
+        bytes32 lastvalue = set._values[lastIndex];
+
+        // Move the last value to the index where the value to delete is
+        set._values[toDeleteIndex] = lastvalue;
+        // Update the index for the moved value
+        set._indexes[lastvalue] = valueIndex; // Replace lastvalue's index to valueIndex
+      }
+
+      // Delete the slot where the moved value was stored
+      set._values.pop();
+
+      // Delete the index for the deleted slot
+      delete set._indexes[value];
+
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function _contains(Set storage set, bytes32 value)
+    private
+    view
+    returns (bool)
+  {
+    return set._indexes[value] != 0;
+  }
+
+  /**
+   * @dev Returns the number of values on the set. O(1).
+   */
+  function _length(Set storage set) private view returns (uint256) {
+    return set._values.length;
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function _at(Set storage set, uint256 index) private view returns (bytes32) {
+    return set._values[index];
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function _values(Set storage set) private view returns (bytes32[] memory) {
+    return set._values;
+  }
+
+  // Bytes32Set
+
+  struct Bytes32Set {
+    Set _inner;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+    return _add(set._inner, value);
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function remove(Bytes32Set storage set, bytes32 value)
+    internal
+    returns (bool)
+  {
+    return _remove(set._inner, value);
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function contains(Bytes32Set storage set, bytes32 value)
+    internal
+    view
+    returns (bool)
+  {
+    return _contains(set._inner, value);
+  }
+
+  /**
+   * @dev Returns the number of values in the set. O(1).
+   */
+  function length(Bytes32Set storage set) internal view returns (uint256) {
+    return _length(set._inner);
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function at(Bytes32Set storage set, uint256 index)
+    internal
+    view
+    returns (bytes32)
+  {
+    return _at(set._inner, index);
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function values(Bytes32Set storage set)
+    internal
+    view
+    returns (bytes32[] memory)
+  {
+    return _values(set._inner);
+  }
+
+  // AddressSet
+
+  struct AddressSet {
+    Set _inner;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function add(AddressSet storage set, address value) internal returns (bool) {
+    return _add(set._inner, bytes32(uint256(uint160(value))));
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function remove(AddressSet storage set, address value)
+    internal
+    returns (bool)
+  {
+    return _remove(set._inner, bytes32(uint256(uint160(value))));
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function contains(AddressSet storage set, address value)
+    internal
+    view
+    returns (bool)
+  {
+    return _contains(set._inner, bytes32(uint256(uint160(value))));
+  }
+
+  /**
+   * @dev Returns the number of values in the set. O(1).
+   */
+  function length(AddressSet storage set) internal view returns (uint256) {
+    return _length(set._inner);
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function at(AddressSet storage set, uint256 index)
+    internal
+    view
+    returns (address)
+  {
+    return address(uint160(uint256(_at(set._inner, index))));
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function values(AddressSet storage set)
+    internal
+    view
+    returns (address[] memory)
+  {
+    bytes32[] memory store = _values(set._inner);
+    address[] memory result;
+
+    assembly {
+      result := store
+    }
+
+    return result;
+  }
+
+  // UintSet
+
+  struct UintSet {
+    Set _inner;
+  }
+
+  /**
+   * @dev Add a value to a set. O(1).
+   *
+   * Returns true if the value was added to the set, that is if it was not
+   * already present.
+   */
+  function add(UintSet storage set, uint256 value) internal returns (bool) {
+    return _add(set._inner, bytes32(value));
+  }
+
+  /**
+   * @dev Removes a value from a set. O(1).
+   *
+   * Returns true if the value was removed from the set, that is if it was
+   * present.
+   */
+  function remove(UintSet storage set, uint256 value) internal returns (bool) {
+    return _remove(set._inner, bytes32(value));
+  }
+
+  /**
+   * @dev Returns true if the value is in the set. O(1).
+   */
+  function contains(UintSet storage set, uint256 value)
+    internal
+    view
+    returns (bool)
+  {
+    return _contains(set._inner, bytes32(value));
+  }
+
+  /**
+   * @dev Returns the number of values on the set. O(1).
+   */
+  function length(UintSet storage set) internal view returns (uint256) {
+    return _length(set._inner);
+  }
+
+  /**
+   * @dev Returns the value stored at position `index` in the set. O(1).
+   *
+   * Note that there are no guarantees on the ordering of values inside the
+   * array, and it may change when more values are added or removed.
+   *
+   * Requirements:
+   *
+   * - `index` must be strictly less than {length}.
+   */
+  function at(UintSet storage set, uint256 index)
+    internal
+    view
+    returns (uint256)
+  {
+    return uint256(_at(set._inner, index));
+  }
+
+  /**
+   * @dev Return the entire set in an array
+   *
+   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+   * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+   */
+  function values(UintSet storage set)
+    internal
+    view
+    returns (uint256[] memory)
+  {
+    bytes32[] memory store = _values(set._inner);
+    uint256[] memory result;
+
+    assembly {
+      result := store
+    }
+
+    return result;
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/access/AccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/access/IAccessControl.sol";
+import "contracts/external/openzeppelin/contracts/utils/Context.sol";
+import "contracts/external/openzeppelin/contracts/utils/Strings.sol";
+import "contracts/external/openzeppelin/contracts/utils/ERC165.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it.
+ */
+abstract contract AccessControl is Context, IAccessControl, ERC165 {
+  struct RoleData {
+    mapping(address => bool) members;
+    bytes32 adminRole;
+  }
+
+  mapping(bytes32 => RoleData) private _roles;
+
+  bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+  /**
+   * @dev Modifier that checks that an account has a specific role. Reverts
+   * with a standardized message including the required role.
+   *
+   * The format of the revert reason is given by the following regular expression:
+   *
+   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+   *
+   * _Available since v4.1._
+   */
+  modifier onlyRole(bytes32 role) {
+    _checkRole(role, _msgSender());
+    _;
+  }
+
+  /**
+   * @dev See {IERC165-supportsInterface}.
+   */
+  function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return
+      interfaceId == type(IAccessControl).interfaceId ||
+      super.supportsInterface(interfaceId);
+  }
+
+  /**
+   * @dev Returns `true` if `account` has been granted `role`.
+   */
+  function hasRole(bytes32 role, address account)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return _roles[role].members[account];
+  }
+
+  /**
+   * @dev Revert with a standard message if `account` is missing `role`.
+   *
+   * The format of the revert reason is given by the following regular expression:
+   *
+   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+   */
+  function _checkRole(bytes32 role, address account) internal view virtual {
+    if (!hasRole(role, account)) {
+      revert(
+        string(
+          abi.encodePacked(
+            "AccessControl: account ",
+            Strings.toHexString(uint160(account), 20),
+            " is missing role ",
+            Strings.toHexString(uint256(role), 32)
+          )
+        )
+      );
+    }
+  }
+
+  /**
+   * @dev Returns the admin role that controls `role`. See {grantRole} and
+   * {revokeRole}.
+   *
+   * To change a role's admin, use {_setRoleAdmin}.
+   */
+  function getRoleAdmin(bytes32 role)
+    public
+    view
+    virtual
+    override
+    returns (bytes32)
+  {
+    return _roles[role].adminRole;
+  }
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * If `account` had not been already granted `role`, emits a {RoleGranted}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   */
+  function grantRole(bytes32 role, address account)
+    public
+    virtual
+    override
+    onlyRole(getRoleAdmin(role))
+  {
+    _grantRole(role, account);
+  }
+
+  /**
+   * @dev Revokes `role` from `account`.
+   *
+   * If `account` had been granted `role`, emits a {RoleRevoked} event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   */
+  function revokeRole(bytes32 role, address account)
+    public
+    virtual
+    override
+    onlyRole(getRoleAdmin(role))
+  {
+    _revokeRole(role, account);
+  }
+
+  /**
+   * @dev Revokes `role` from the calling account.
+   *
+   * Roles are often managed via {grantRole} and {revokeRole}: this function's
+   * purpose is to provide a mechanism for accounts to lose their privileges
+   * if they are compromised (such as when a trusted device is misplaced).
+   *
+   * If the calling account had been revoked `role`, emits a {RoleRevoked}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must be `account`.
+   */
+  function renounceRole(bytes32 role, address account) public virtual override {
+    require(
+      account == _msgSender(),
+      "AccessControl: can only renounce roles for self"
+    );
+
+    _revokeRole(role, account);
+  }
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * If `account` had not been already granted `role`, emits a {RoleGranted}
+   * event. Note that unlike {grantRole}, this function doesn't perform any
+   * checks on the calling account.
+   *
+   * [WARNING]
+   * ====
+   * This function should only be called from the constructor when setting
+   * up the initial roles for the system.
+   *
+   * Using this function in any other way is effectively circumventing the admin
+   * system imposed by {AccessControl}.
+   * ====
+   *
+   * NOTE: This function is deprecated in favor of {_grantRole}.
+   */
+  function _setupRole(bytes32 role, address account) internal virtual {
+    _grantRole(role, account);
+  }
+
+  /**
+   * @dev Sets `adminRole` as ``role``'s admin role.
+   *
+   * Emits a {RoleAdminChanged} event.
+   */
+  function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+    bytes32 previousAdminRole = getRoleAdmin(role);
+    _roles[role].adminRole = adminRole;
+    emit RoleAdminChanged(role, previousAdminRole, adminRole);
+  }
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * Internal function without access restriction.
+   */
+  function _grantRole(bytes32 role, address account) internal virtual {
+    if (!hasRole(role, account)) {
+      _roles[role].members[account] = true;
+      emit RoleGranted(role, account, _msgSender());
+    }
+  }
+
+  /**
+   * @dev Revokes `role` from `account`.
+   *
+   * Internal function without access restriction.
+   */
+  function _revokeRole(bytes32 role, address account) internal virtual {
+    if (hasRole(role, account)) {
+      _roles[role].members[account] = false;
+      emit RoleRevoked(role, account, _msgSender());
+    }
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+  /**
+   * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+   *
+   * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+   * {RoleAdminChanged} not being emitted signaling this.
+   *
+   * _Available since v3.1._
+   */
+  event RoleAdminChanged(
+    bytes32 indexed role,
+    bytes32 indexed previousAdminRole,
+    bytes32 indexed newAdminRole
+  );
+
+  /**
+   * @dev Emitted when `account` is granted `role`.
+   *
+   * `sender` is the account that originated the contract call, an admin role
+   * bearer except when using {AccessControl-_setupRole}.
+   */
+  event RoleGranted(
+    bytes32 indexed role,
+    address indexed account,
+    address indexed sender
+  );
+
+  /**
+   * @dev Emitted when `account` is revoked `role`.
+   *
+   * `sender` is the account that originated the contract call:
+   *   - if using `revokeRole`, it is the admin role bearer
+   *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+   */
+  event RoleRevoked(
+    bytes32 indexed role,
+    address indexed account,
+    address indexed sender
+  );
+
+  /**
+   * @dev Returns `true` if `account` has been granted `role`.
+   */
+  function hasRole(bytes32 role, address account) external view returns (bool);
+
+  /**
+   * @dev Returns the admin role that controls `role`. See {grantRole} and
+   * {revokeRole}.
+   *
+   * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+   */
+  function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+  /**
+   * @dev Grants `role` to `account`.
+   *
+   * If `account` had not been already granted `role`, emits a {RoleGranted}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   */
+  function grantRole(bytes32 role, address account) external;
+
+  /**
+   * @dev Revokes `role` from `account`.
+   *
+   * If `account` had been granted `role`, emits a {RoleRevoked} event.
+   *
+   * Requirements:
+   *
+   * - the caller must have ``role``'s admin role.
+   */
+  function revokeRole(bytes32 role, address account) external;
+
+  /**
+   * @dev Revokes `role` from the calling account.
+   *
+   * Roles are often managed via {grantRole} and {revokeRole}: this function's
+   * purpose is to provide a mechanism for accounts to lose their privileges
+   * if they are compromised (such as when a trusted device is misplaced).
+   *
+   * If the calling account had been granted `role`, emits a {RoleRevoked}
+   * event.
+   *
+   * Requirements:
+   *
+   * - the caller must be `account`.
+   */
+  function renounceRole(bytes32 role, address account) external;
+}
+
+
+// File: contracts/external/openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+  function _msgSender() internal view virtual returns (address) {
+    return msg.sender;
+  }
+
+  function _msgData() internal view virtual returns (bytes calldata) {
+    return msg.data;
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/utils/Strings.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Strings.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+  bytes16 private constant _HEX_SYMBOLS = "0123456789abcdef";
+
+  /**
+   * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+   */
+  function toString(uint256 value) internal pure returns (string memory) {
+    // Inspired by OraclizeAPI's implementation - MIT licence
+    // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol
+
+    if (value == 0) {
+      return "0";
+    }
+    uint256 temp = value;
+    uint256 digits;
+    while (temp != 0) {
+      digits++;
+      temp /= 10;
+    }
+    bytes memory buffer = new bytes(digits);
+    while (value != 0) {
+      digits -= 1;
+      buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+      value /= 10;
+    }
+    return string(buffer);
+  }
+
+  /**
+   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+   */
+  function toHexString(uint256 value) internal pure returns (string memory) {
+    if (value == 0) {
+      return "0x00";
+    }
+    uint256 temp = value;
+    uint256 length = 0;
+    while (temp != 0) {
+      length++;
+      temp >>= 8;
+    }
+    return toHexString(value, length);
+  }
+
+  /**
+   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+   */
+  function toHexString(uint256 value, uint256 length)
+    internal
+    pure
+    returns (string memory)
+  {
+    bytes memory buffer = new bytes(2 * length + 2);
+    buffer[0] = "0";
+    buffer[1] = "x";
+    for (uint256 i = 2 * length + 1; i > 1; --i) {
+      buffer[i] = _HEX_SYMBOLS[value & 0xf];
+      value >>= 4;
+    }
+    require(value == 0, "Strings: hex length insufficient");
+    return string(buffer);
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/utils/ERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/utils/IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ *
+ * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.
+ */
+abstract contract ERC165 is IERC165 {
+  /**
+   * @dev See {IERC165-supportsInterface}.
+   */
+  function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    virtual
+    override
+    returns (bool)
+  {
+    return interfaceId == type(IERC165).interfaceId;
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/utils/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+  /**
+   * @dev Returns true if this contract implements the interface defined by
+   * `interfaceId`. See the corresponding
+   * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+   * to learn more about how these ids are created.
+   *
+   * This function call must use less than 30 000 gas.
+   */
+  function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+

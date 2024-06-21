@@ -1,0 +1,2163 @@
+
+// File: src/EbtcZapRouter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import {ICdpManagerData} from "@ebtc/contracts/interfaces/ICdpManagerData.sol";
+import {ICdpManager} from "@ebtc/contracts/interfaces/ICdpManager.sol";
+import {IBorrowerOperations} from "@ebtc/contracts/interfaces/IBorrowerOperations.sol";
+import {IPositionManagers} from "@ebtc/contracts/interfaces/IPositionManagers.sol";
+import {IERC20} from "@ebtc/contracts/Dependencies/IERC20.sol";
+import {SafeERC20} from "@ebtc/contracts/Dependencies/SafeERC20.sol";
+import {IStETH} from "./interface/IStETH.sol";
+import {IWrappedETH} from "./interface/IWrappedETH.sol";
+import {IEbtcZapRouter} from "./interface/IEbtcZapRouter.sol";
+import {IWstETH} from "./interface/IWstETH.sol";
+
+interface IMinChangeGetter {
+    function MIN_CHANGE() external view returns (uint256);
+}
+
+contract EbtcZapRouter is IEbtcZapRouter {
+    using SafeERC20 for IERC20;
+
+    address public constant NATIVE_ETH_ADDRESS =
+        0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 public constant LIQUIDATOR_REWARD = 2e17;
+    uint256 public constant MIN_NET_STETH_BALANCE = 2e18;
+
+    IStETH public immutable stEth;
+    IERC20 public immutable ebtc;
+    IERC20 public immutable wrappedEth;
+    IERC20 public immutable wstEth;
+    IBorrowerOperations public immutable borrowerOperations;
+    ICdpManager public immutable cdpManager;
+    address public immutable owner;
+    uint256 public immutable MIN_CHANGE;
+
+    constructor(
+        IERC20 _wstEth,
+        IERC20 _wEth,
+        IStETH _stEth,
+        IERC20 _ebtc,
+        IBorrowerOperations _borrowerOperations,
+        ICdpManager _cdpManager,
+        address _owner
+    ) {
+        wstEth = _wstEth;
+        wrappedEth = _wEth;
+        stEth = _stEth;
+        ebtc = _ebtc;
+        borrowerOperations = _borrowerOperations;
+        cdpManager = _cdpManager;
+        owner = _owner;
+
+        // Infinite Approvals @TODO: do these stay at max for each token?
+        stEth.approve(address(borrowerOperations), type(uint256).max);
+        wrappedEth.approve(address(wrappedEth), type(uint256).max);
+        wstEth.approve(address(wstEth), type(uint256).max);
+        stEth.approve(address(wstEth), type(uint256).max);
+
+        MIN_CHANGE = IMinChangeGetter(address(borrowerOperations)).MIN_CHANGE();
+    }
+
+    /// @dev This is to allow wrapped ETH related Zap
+    receive() external payable {
+        require(
+            msg.sender == address(wrappedEth),
+            "EbtcZapRouter: only allow Wrapped ETH to send Ether!"
+        );
+    }
+
+    /// @dev Open a CDP with stEth
+    function openCdp(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalance,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external returns (bytes32 cdpId) {
+        uint256 _collVal = _transferInitialStETHFromCaller(_stEthBalance);
+
+        cdpId = _openCdpWithPermit(
+            _debt,
+            _upperHint,
+            _lowerHint,
+            _collVal,
+            _positionManagerPermit
+        );
+
+        emit ZapOperationEthVariant(
+            cdpId, 
+            EthVariantZapOperationType.OpenCdp, 
+            true, 
+            address(stEth), 
+            _stEthBalance, 
+            _collVal,
+            msg.sender
+        );
+    }
+
+    /// @dev Open a CDP with raw native Ether
+    /// @param _debt The total expected debt for new CDP
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _ethBalance The total stETH collateral (converted from raw Ether) amount deposited (added) for the specified Cdp
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function openCdpWithEth(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _ethBalance,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external payable returns (bytes32 cdpId) {
+        uint256 _collVal = _convertRawEthToStETH(_ethBalance);
+
+        cdpId = _openCdpWithPermit(
+            _debt,
+            _upperHint,
+            _lowerHint,
+            _collVal,
+            _positionManagerPermit
+        );
+
+        emit ZapOperationEthVariant(
+            cdpId, 
+            EthVariantZapOperationType.OpenCdp, 
+            true, 
+            NATIVE_ETH_ADDRESS, 
+            _ethBalance, 
+            _collVal,
+            msg.sender
+        );
+    }
+
+    /// @dev Open a CDP with Wrapped Ether
+    /// @param _debt The total expected debt for new CDP
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _wethBalance The total stETH collateral (converted from wrapped Ether) amount deposited (added) for the specified Cdp
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function openCdpWithWrappedEth(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wethBalance,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external returns (bytes32 cdpId) {
+        uint256 _collVal = _convertWrappedEthToStETH(_wethBalance);
+
+        cdpId = _openCdpWithPermit(
+            _debt,
+            _upperHint,
+            _lowerHint,
+            _collVal,
+            _positionManagerPermit
+        );
+        
+        emit ZapOperationEthVariant(
+            cdpId, 
+            EthVariantZapOperationType.OpenCdp, 
+            true, 
+            address(wrappedEth), 
+            _wethBalance, 
+            _collVal,
+            msg.sender
+        );
+    }
+
+    /// @dev Open a CDP with Wrapped StETH
+    /// @param _debt The total expected debt for new CDP
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _wstEthBalance The total stETH collateral (converted from wrapped stETH) amount deposited (added) for the specified Cdp
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function openCdpWithWstEth(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wstEthBalance,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external returns (bytes32 cdpId) {
+        uint256 _collVal = _convertWstEthToStETH(_wstEthBalance);
+
+        cdpId = _openCdpWithPermit(
+            _debt,
+            _upperHint,
+            _lowerHint,
+            _collVal,
+            _positionManagerPermit
+        );
+
+        emit ZapOperationEthVariant(
+            cdpId, 
+            EthVariantZapOperationType.OpenCdp, 
+            true, 
+            address(wstEth), 
+            _wstEthBalance, 
+            _collVal,
+            msg.sender
+        );
+    }
+
+    /// @dev Close a CDP with original collateral(stETH) returned to CDP owner
+    /// @dev Note plain collateral(stETH) is returned no matter whatever asset is zapped in
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function closeCdp(
+        bytes32 _cdpId,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external {
+        _closeCdpWithPermit(_cdpId, false, _positionManagerPermit);
+    }
+
+    /// @dev Close a CDP with wrapped version of collateral(WstETH) returned to CDP owner
+    /// @dev Note plain collateral(stETH) is returned no matter whatever asset is zapped in
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function closeCdpForWstETH(
+        bytes32 _cdpId,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external {
+        _closeCdpWithPermit(_cdpId, true, _positionManagerPermit);
+    }
+
+    /// @notice Function that allows various operations which might change both collateral (increase collateral with raw native Ether) and debt of a Cdp
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _collBalanceDecrease The total stETH collateral amount withdrawn from the specified Cdp
+    /// @param _debtChange The total eBTC debt amount withdrawn or repaid for the specified Cdp
+    /// @param _isDebtIncrease The flag (true or false) to indicate whether this is a eBTC token withdrawal (debt increase) or a repayment (debt reduce)
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _ethBalanceIncrease The total stETH collateral (converted from raw native Ether) amount deposited (added) for the specified Cdp
+    /// @param _useWstETHForDecrease Indicator whether withdrawn collateral is original(stETH) or wrapped version(WstETH)
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function adjustCdpWithEth(
+        bytes32 _cdpId,
+        uint256 _collBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _ethBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external payable {
+        _adjustCdpWithEth(
+            _cdpId,
+            _collBalanceDecrease,
+            _debtChange,
+            _isDebtIncrease,
+            _upperHint,
+            _lowerHint,
+            _ethBalanceIncrease,
+            _useWstETHForDecrease,
+            _positionManagerPermit
+        );
+    }
+
+    function _adjustCdpWithEth(
+        bytes32 _cdpId,
+        uint256 _collBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _ethBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) internal {
+        uint256 _collBalanceIncrease = _ethBalanceIncrease;
+        if (_ethBalanceIncrease > 0) {
+            _collBalanceIncrease = _convertRawEthToStETH(_ethBalanceIncrease);
+            emit ZapOperationEthVariant(
+                _cdpId, 
+                EthVariantZapOperationType.AdjustCdp, 
+                true, 
+                NATIVE_ETH_ADDRESS, 
+                _ethBalanceIncrease, 
+                _collBalanceIncrease,
+                msg.sender
+            );
+        }
+
+        _adjustCdpWithPermit(
+            _cdpId,
+            _collBalanceDecrease,
+            _debtChange,
+            _isDebtIncrease,
+            _upperHint,
+            _lowerHint,
+            _collBalanceIncrease,
+            _useWstETHForDecrease,
+            _positionManagerPermit
+        );
+    }
+
+    /// @notice Function that allows various operations which might change both collateral (increase collateral with wrapped Ether) and debt of a Cdp
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _collBalanceDecrease The total stETH collateral amount withdrawn from the specified Cdp
+    /// @param _debtChange The total eBTC debt amount withdrawn or repaid for the specified Cdp
+    /// @param _isDebtIncrease The flag (true or false) to indicate whether this is a eBTC token withdrawal (debt increase) or a repayment (debt reduce)
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _wethBalanceIncrease The total stETH collateral (converted from wrapped Ether) amount deposited (added) for the specified Cdp
+    /// @param _useWstETHForDecrease Indicator whether withdrawn collateral is original(stETH) or wrapped version(WstETH)
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function adjustCdpWithWrappedEth(
+        bytes32 _cdpId,
+        uint256 _collBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wethBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external {
+        uint256 _collBalanceIncrease = _wethBalanceIncrease;
+        if (_wethBalanceIncrease > 0) {
+            _collBalanceIncrease = _convertWrappedEthToStETH(
+                _wethBalanceIncrease
+            );
+            emit ZapOperationEthVariant(
+                _cdpId, 
+                EthVariantZapOperationType.AdjustCdp, 
+                true, 
+                address(wrappedEth), 
+                _wethBalanceIncrease, 
+                _collBalanceIncrease,
+                msg.sender
+            );
+        }
+
+        _adjustCdpWithPermit(
+            _cdpId,
+            _collBalanceDecrease,
+            _debtChange,
+            _isDebtIncrease,
+            _upperHint,
+            _lowerHint,
+            _collBalanceIncrease,
+            _useWstETHForDecrease,
+            _positionManagerPermit
+        );
+    }
+
+    /// @notice Function that allows various operations which might change both collateral (increase collateral with wrapped Ether) and debt of a Cdp
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _collBalanceDecrease The total stETH collateral amount withdrawn from the specified Cdp
+    /// @param _debtChange The total eBTC debt amount withdrawn or repaid for the specified Cdp
+    /// @param _isDebtIncrease The flag (true or false) to indicate whether this is a eBTC token withdrawal (debt increase) or a repayment (debt reduce)
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _wstEthBalanceIncrease The total stETH collateral (converted from wrapped stETH) amount deposited (added) for the specified Cdp
+    /// @param _useWstETHForDecrease Indicator whether withdrawn collateral is original(stETH) or wrapped version(WstETH)
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function adjustCdpWithWstEth(
+        bytes32 _cdpId,
+        uint256 _collBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wstEthBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external {
+        uint256 _collBalanceIncrease = _wstEthBalanceIncrease;
+
+        // wstETH In
+        if (_wstEthBalanceIncrease > 0) {
+            _collBalanceIncrease = _convertWstEthToStETH(
+                _wstEthBalanceIncrease
+            );
+            emit ZapOperationEthVariant(
+                _cdpId, 
+                EthVariantZapOperationType.AdjustCdp, 
+                true, 
+                address(wstEth), 
+                _wstEthBalanceIncrease, 
+                _collBalanceIncrease,
+                msg.sender
+            );
+        } 
+
+        _adjustCdpWithPermit(
+            _cdpId,
+            _collBalanceDecrease,
+            _debtChange,
+            _isDebtIncrease,
+            _upperHint,
+            _lowerHint,
+            _collBalanceIncrease,
+            _useWstETHForDecrease,
+            _positionManagerPermit
+        );
+    }
+
+    /// @notice Function that allows various operations which might change both collateral and debt of a Cdp
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _collBalanceDecrease The total stETH collateral amount withdrawn from the specified Cdp
+    /// @param _debtChange The total eBTC debt amount withdrawn or repaid for the specified Cdp
+    /// @param _isDebtIncrease The flag (true or false) to indicate whether this is a eBTC token withdrawal (debt increase) or a repayment (debt reduce)
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _collBalanceIncrease The total stETH collateral amount deposited (added) for the specified Cdp
+    /// @param _useWstETHForDecrease Indicator whether withdrawn collateral is original(stETH) or wrapped version(WstETH)
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function adjustCdp(
+        bytes32 _cdpId,
+        uint256 _collBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _collBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external {
+        if (_collBalanceIncrease > 0) {
+            uint256 _collVal = _transferInitialStETHFromCaller(_collBalanceIncrease);
+            emit ZapOperationEthVariant(
+                _cdpId, 
+                EthVariantZapOperationType.AdjustCdp, 
+                true, 
+                address(stEth), 
+                _collBalanceIncrease, 
+                _collVal,
+                msg.sender
+            );
+        }
+        _adjustCdpWithPermit(
+            _cdpId,
+            _collBalanceDecrease,
+            _debtChange,
+            _isDebtIncrease,
+            _upperHint,
+            _lowerHint,
+            _collBalanceIncrease,
+            _useWstETHForDecrease,
+            _positionManagerPermit
+        );
+    }
+
+    /// @dev Increase the collateral for given CDP with raw native Ether
+    /// @param _cdpId The CdpId on which this operation is operated
+    /// @param _upperHint The expected CdpId of neighboring higher ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _lowerHint The expected CdpId of neighboring lower ICR within SortedCdps, could be simply bytes32(0)
+    /// @param _ethBalanceIncrease The total stETH collateral (converted from raw Ether) amount deposited (added) for the specified Cdp
+    /// @param _positionManagerPermit PositionPermit required for Zap approved by calling user
+    function addCollWithEth(
+        bytes32 _cdpId,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _ethBalanceIncrease,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) external payable {        
+        _adjustCdpWithEth(
+            _cdpId,
+            0,
+            0,
+            false,
+            _upperHint,
+            _lowerHint,
+            _ethBalanceIncrease,
+            false,
+            _positionManagerPermit
+        );
+    }
+
+    /// @notice Transfer an arbitrary token back to you
+    function sweepToken(address token, uint256 amount) public {
+        require(owner == msg.sender, "Must be owner");
+
+        if (amount > 0) {
+            IERC20(token).safeTransfer(msg.sender, amount);
+        }
+    }
+
+    function _openCdpWithPermit(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalance,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) internal returns (bytes32 cdpId) {
+        // Check token balances of Zap before operation
+        require(
+            stEth.balanceOf(address(this)) >= _stEthBalance,
+            "EbtcZapRouter: not enough collateral for open!"
+        );
+
+        _requireZeroOrMinAdjustment(_debt);
+        _requireAtLeastMinNetStEthBalance(_stEthBalance - LIQUIDATOR_REWARD);
+
+        _permitPositionManagerApproval(_positionManagerPermit);
+
+        cdpId = borrowerOperations.openCdpFor(
+            _debt,
+            _upperHint,
+            _lowerHint,
+            _stEthBalance,
+            msg.sender
+        );
+
+        ebtc.transfer(msg.sender, _debt);
+
+        // Token balances should not have changed after operation
+        // Created CDP should be owned by borrower
+    }
+
+    function _closeCdpWithPermit(
+        bytes32 _cdpId,
+        bool _useWstETH,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) internal {
+        require(
+            msg.sender == _getOwnerAddress(_cdpId),
+            "EbtcZapRouter: not owner for close!"
+        );
+
+        // for debt repayment
+        uint256 _debt = ICdpManagerData(address(cdpManager)).getSyncedCdpDebt(
+            _cdpId
+        );
+        ebtc.transferFrom(msg.sender, address(this), _debt);
+
+        _permitPositionManagerApproval(_positionManagerPermit);
+
+        uint256 _zapStEthBalanceBefore = stEth.balanceOf(address(this));
+        borrowerOperations.closeCdp(_cdpId);
+        uint256 _zapStEthBalanceAfter = stEth.balanceOf(address(this));
+        uint256 _stETHDiff = _zapStEthBalanceAfter - _zapStEthBalanceBefore;
+
+        _transferStEthToCaller(_cdpId, EthVariantZapOperationType.CloseCdp, _useWstETH, _stETHDiff);
+    }
+
+    function _transferStEthToCaller(
+        bytes32 _cdpId,
+        EthVariantZapOperationType _operationType,
+        bool _useWstETH,
+        uint256 _stEthVal
+    ) internal {
+        if (_useWstETH) {
+            // return wrapped version(WstETH)
+            uint256 _wstETHVal = IWstETH(address(wstEth)).wrap(_stEthVal);
+            emit ZapOperationEthVariant(
+                _cdpId, 
+                _operationType, 
+                false, 
+                address(wstEth), 
+                _wstETHVal, 
+                _stEthVal,
+                msg.sender
+            );
+
+            wstEth.transfer(msg.sender, _wstETHVal);
+        } else {
+            // return original collateral(stETH)
+            emit ZapOperationEthVariant(
+                _cdpId, 
+                _operationType, 
+                false, 
+                address(stEth), 
+                _stEthVal, 
+                _stEthVal,
+                msg.sender
+            );
+            stEth.transfer(msg.sender, _stEthVal);
+        }
+    }
+
+    function _adjustCdpWithPermit(
+        bytes32 _cdpId,
+        uint256 _collBalanceDecrease,
+        uint256 _debtChange,
+        bool isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _collBalanceIncrease,
+        bool _useWstETH,
+        PositionManagerPermit calldata _positionManagerPermit
+    ) internal {
+        require(
+            msg.sender == _getOwnerAddress(_cdpId),
+            "EbtcZapRouter: not owner for adjust!"
+        );
+        require(
+            (_collBalanceDecrease > 0 && _collBalanceIncrease == 0) ||
+                (_collBalanceIncrease > 0 && _collBalanceDecrease == 0) ||
+                (_collBalanceIncrease == 0 && _collBalanceDecrease == 0),
+            "EbtcZapRouter: can't add and remove collateral at the same time!"
+        );
+
+        _requireNonZeroAdjustment(_collBalanceIncrease, _collBalanceDecrease, _debtChange);
+        _requireZeroOrMinAdjustment(_debtChange);
+        _requireZeroOrMinAdjustment(_collBalanceIncrease);
+        _requireZeroOrMinAdjustment(_collBalanceDecrease);
+
+        _permitPositionManagerApproval(_positionManagerPermit);
+
+        // for debt decrease
+        if (!isDebtIncrease && _debtChange > 0) {
+            ebtc.transferFrom(msg.sender, address(this), _debtChange);
+        }
+
+        uint256 _zapStEthBalanceBefore = stEth.balanceOf(address(this));
+        borrowerOperations.adjustCdpWithColl(
+            _cdpId,
+            _collBalanceDecrease,
+            _debtChange,
+            isDebtIncrease,
+            _upperHint,
+            _lowerHint,
+            _collBalanceIncrease
+        );
+        uint256 _zapStEthBalanceAfter = stEth.balanceOf(address(this));
+
+        // Send any withdrawn debt back to borrower
+        if (isDebtIncrease && _debtChange > 0) {
+            ebtc.transfer(msg.sender, _debtChange);
+        }
+
+        // Send any withdrawn collateral to back to borrower
+        if (_collBalanceDecrease > 0) {
+            _transferStEthToCaller(
+                _cdpId,
+                EthVariantZapOperationType.AdjustCdp,
+                _useWstETH,
+                _zapStEthBalanceAfter - _zapStEthBalanceBefore
+            );
+        }
+    }
+
+    function _transferInitialStETHFromCaller(
+        uint256 _initialStETH
+    ) internal returns (uint256) {
+        // check before-after balances for 1-wei corner case
+        uint256 _balBefore = stEth.balanceOf(address(this));
+        stEth.transferFrom(msg.sender, address(this), _initialStETH);
+        uint256 _deposit = stEth.balanceOf(address(this)) - _balBefore;
+        return _deposit;
+    }
+
+    function _convertRawEthToStETH(
+        uint256 _initialETH
+    ) internal returns (uint256) {
+        require(
+            msg.value == _initialETH,
+            "EbtcZapRouter: Incorrect ETH amount"
+        );
+        return _depositRawEthIntoLido(_initialETH);
+    }
+
+    function _depositRawEthIntoLido(
+        uint256 _initialETH
+    ) internal returns (uint256) {
+        // check before-after balances for 1-wei corner case
+        uint256 _balBefore = stEth.balanceOf(address(this));
+        // TODO call submit() with a referral?
+        payable(address(stEth)).call{value: _initialETH}("");
+        uint256 _deposit = stEth.balanceOf(address(this)) - _balBefore;
+        return _deposit;
+    }
+
+    function _convertWrappedEthToStETH(
+        uint256 _initialWETH
+    ) internal returns (uint256) {
+        uint256 _wETHBalBefore = wrappedEth.balanceOf(address(this));
+        wrappedEth.transferFrom(msg.sender, address(this), _initialWETH);
+        uint256 _wETHReiceived = wrappedEth.balanceOf(address(this)) -
+            _wETHBalBefore;
+
+        uint256 _rawETHBalBefore = address(this).balance;
+        IWrappedETH(address(wrappedEth)).withdraw(_wETHReiceived);
+        uint256 _rawETHConverted = address(this).balance - _rawETHBalBefore;
+        return _depositRawEthIntoLido(_rawETHConverted);
+    }
+
+    function _convertWstEthToStETH(
+        uint256 _initialWstETH
+    ) internal returns (uint256) {
+        require(
+            wstEth.transferFrom(msg.sender, address(this), _initialWstETH),
+            "EbtcZapRouter: transfer wstETH failure!"
+        );
+
+        uint256 _stETHBalBefore = stEth.balanceOf(address(this));
+        IWstETH(address(wstEth)).unwrap(_initialWstETH);
+        uint256 _stETHReiceived = stEth.balanceOf(address(this)) -
+            _stETHBalBefore;
+
+        return _stETHReiceived;
+    }
+
+    function _permitPositionManagerApproval(
+        PositionManagerPermit calldata _positionManagerPermit
+    ) internal {
+        try
+            borrowerOperations.permitPositionManagerApproval(
+                msg.sender,
+                address(this),
+                IPositionManagers.PositionManagerApproval.OneTime,
+                _positionManagerPermit.deadline,
+                _positionManagerPermit.v,
+                _positionManagerPermit.r,
+                _positionManagerPermit.s
+            )
+        {} catch {
+            /// @notice adding try...catch around to mitigate potential permit front-running
+            /// see: https://www.trust-security.xyz/post/permission-denied
+        }
+    }
+
+    function _getOwnerAddress(bytes32 cdpId) internal pure returns (address) {
+        uint256 _tmp = uint256(cdpId) >> 96;
+        return address(uint160(_tmp));
+    }
+
+    function _requireZeroOrMinAdjustment(uint256 _change) internal view {
+        require(
+            _change == 0 || _change >= MIN_CHANGE,
+            "EbtcZapRouter: Debt or collateral change must be zero or above min"
+        );
+    }
+
+    function _requireAtLeastMinNetStEthBalance(uint256 _stEthBalance) internal pure {
+        require(
+            _stEthBalance >= MIN_NET_STETH_BALANCE,
+            "EbtcZapRouter: Cdp's net stEth balance must not fall below minimum"
+        );
+    }
+
+    function _requireNonZeroAdjustment(
+        uint256 _stEthBalanceIncrease,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange
+    ) internal pure {
+        require(
+            _stEthBalanceIncrease > 0 || _stEthBalanceDecrease > 0 || _debtChange > 0,
+            "EbtcZapRouter: There must be either a collateral or debt change"
+        );
+    }
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/ICdpManagerData.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+import "./ICollSurplusPool.sol";
+import "./IEBTCToken.sol";
+import "./ISortedCdps.sol";
+import "./IActivePool.sol";
+import "./IRecoveryModeGracePeriod.sol";
+import "../Dependencies/ICollateralTokenOracle.sol";
+
+// Common interface for the Cdp Manager.
+interface ICdpManagerData is IRecoveryModeGracePeriod {
+    // --- Events ---
+
+    event StakingRewardSplitSet(uint256 _stakingRewardSplit);
+    event RedemptionFeeFloorSet(uint256 _redemptionFeeFloor);
+    event MinuteDecayFactorSet(uint256 _minuteDecayFactor);
+    event BetaSet(uint256 _beta);
+    event RedemptionsPaused(bool _paused);
+
+    event Liquidation(uint256 _liquidatedDebt, uint256 _liquidatedColl, uint256 _liqReward);
+    event Redemption(
+        uint256 _debtToRedeemExpected,
+        uint256 _debtToRedeemActual,
+        uint256 _collSharesSent,
+        uint256 _feeCollShares,
+        address indexed _redeemer
+    );
+    event CdpUpdated(
+        bytes32 indexed _cdpId,
+        address indexed _borrower,
+        address indexed _executor,
+        uint256 _oldDebt,
+        uint256 _oldCollShares,
+        uint256 _debt,
+        uint256 _collShares,
+        uint256 _stake,
+        CdpOperation _operation
+    );
+    event CdpLiquidated(
+        bytes32 indexed _cdpId,
+        address indexed _borrower,
+        uint _debt,
+        uint _collShares,
+        CdpOperation _operation,
+        address indexed _liquidator,
+        uint _premiumToLiquidator
+    );
+    event CdpPartiallyLiquidated(
+        bytes32 indexed _cdpId,
+        address indexed _borrower,
+        uint256 _debt,
+        uint256 _collShares,
+        CdpOperation operation,
+        address indexed _liquidator,
+        uint _premiumToLiquidator
+    );
+    event BaseRateUpdated(uint256 _baseRate);
+    event LastRedemptionTimestampUpdated(uint256 _lastFeeOpTime);
+    event TotalStakesUpdated(uint256 _newTotalStakes);
+    event SystemSnapshotsUpdated(uint256 _totalStakesSnapshot, uint256 _totalCollateralSnapshot);
+    event SystemDebtRedistributionIndexUpdated(uint256 _systemDebtRedistributionIndex);
+    event CdpDebtRedistributionIndexUpdated(bytes32 _cdpId, uint256 _cdpDebtRedistributionIndex);
+    event CdpArrayIndexUpdated(bytes32 _cdpId, uint256 _newIndex);
+    event StEthIndexUpdated(uint256 _oldIndex, uint256 _newIndex, uint256 _updTimestamp);
+    event CollateralFeePerUnitUpdated(uint256 _oldPerUnit, uint256 _newPerUnit, uint256 _feeTaken);
+    event CdpFeeSplitApplied(
+        bytes32 _cdpId,
+        uint256 _oldPerUnitCdp,
+        uint256 _newPerUnitCdp,
+        uint256 _collReduced,
+        uint256 _collLeft
+    );
+
+    enum CdpOperation {
+        openCdp,
+        closeCdp,
+        adjustCdp,
+        syncAccounting,
+        liquidateInNormalMode,
+        liquidateInRecoveryMode,
+        redeemCollateral,
+        partiallyLiquidate,
+        failedPartialRedemption
+    }
+
+    enum Status {
+        nonExistent,
+        active,
+        closedByOwner,
+        closedByLiquidation,
+        closedByRedemption
+    }
+
+    // Store the necessary data for a cdp
+    struct Cdp {
+        uint256 debt;
+        uint256 coll;
+        uint256 stake;
+        uint128 liquidatorRewardShares;
+        Status status;
+    }
+
+    /*
+     * --- Variable container structs for liquidations ---
+     *
+     * These structs are used to hold, return and assign variables inside the liquidation functions,
+     * in order to avoid the error: "CompilerError: Stack too deep".
+     **/
+
+    struct CdpDebtAndCollShares {
+        uint256 debt;
+        uint256 collShares;
+    }
+
+    struct LiquidationLocals {
+        bytes32 cdpId;
+        uint256 partialAmount; // used only for partial liquidation, default 0 means full liquidation
+        uint256 price;
+        uint256 ICR;
+        bytes32 upperPartialHint;
+        bytes32 lowerPartialHint;
+        bool recoveryModeAtStart;
+        uint256 TCR;
+        uint256 totalSurplusCollShares;
+        uint256 totalCollSharesToSend;
+        uint256 totalDebtToBurn;
+        uint256 totalDebtToRedistribute;
+        uint256 totalLiquidatorRewardCollShares;
+    }
+
+    struct LiquidationRecoveryModeLocals {
+        uint256 entireSystemDebt;
+        uint256 entireSystemColl;
+        uint256 totalDebtToBurn;
+        uint256 totalCollSharesToSend;
+        uint256 totalSurplusCollShares;
+        bytes32 cdpId;
+        uint256 price;
+        uint256 ICR;
+        uint256 totalDebtToRedistribute;
+        uint256 totalLiquidatorRewardCollShares;
+    }
+
+    struct LocalVariables_OuterLiquidationFunction {
+        uint256 price;
+        bool recoveryModeAtStart;
+        uint256 liquidatedDebt;
+        uint256 liquidatedColl;
+    }
+
+    struct LocalVariables_LiquidationSequence {
+        uint256 i;
+        uint256 ICR;
+        bytes32 cdpId;
+        bool backToNormalMode;
+        uint256 entireSystemDebt;
+        uint256 entireSystemColl;
+        uint256 price;
+        uint256 TCR;
+    }
+
+    struct SingleRedemptionInputs {
+        bytes32 cdpId;
+        uint256 maxEBTCamount;
+        uint256 price;
+        bytes32 upperPartialRedemptionHint;
+        bytes32 lowerPartialRedemptionHint;
+        uint256 partialRedemptionHintNICR;
+    }
+
+    struct LiquidationValues {
+        uint256 entireCdpDebt;
+        uint256 debtToBurn;
+        uint256 totalCollToSendToLiquidator;
+        uint256 debtToRedistribute;
+        uint256 collSurplus;
+        uint256 liquidatorCollSharesReward;
+    }
+
+    struct LiquidationTotals {
+        uint256 totalDebtInSequence;
+        uint256 totalDebtToBurn;
+        uint256 totalCollToSendToLiquidator;
+        uint256 totalDebtToRedistribute;
+        uint256 totalCollSurplus;
+        uint256 totalCollReward;
+    }
+
+    // --- Variable container structs for redemptions ---
+
+    struct RedemptionTotals {
+        uint256 remainingDebtToRedeem;
+        uint256 debtToRedeem;
+        uint256 collSharesDrawn;
+        uint256 totalCollSharesSurplus;
+        uint256 feeCollShares;
+        uint256 collSharesToRedeemer;
+        uint256 decayedBaseRate;
+        uint256 price;
+        uint256 systemDebtAtStart;
+        uint256 twapSystemDebtAtStart;
+        uint256 systemCollSharesAtStart;
+        uint256 tcrAtStart;
+    }
+
+    struct SingleRedemptionValues {
+        uint256 debtToRedeem;
+        uint256 collSharesDrawn;
+        uint256 collSurplus;
+        uint256 liquidatorRewardShares;
+        bool cancelledPartial;
+        bool fullRedemption;
+        uint256 newPartialNICR;
+    }
+
+    function getActiveCdpsCount() external view returns (uint256);
+
+    function totalStakes() external view returns (uint256);
+
+    function ebtcToken() external view returns (IEBTCToken);
+
+    function systemStEthFeePerUnitIndex() external view returns (uint256);
+
+    function systemStEthFeePerUnitIndexError() external view returns (uint256);
+
+    function stEthIndex() external view returns (uint256);
+
+    function calcFeeUponStakingReward(
+        uint256 _newIndex,
+        uint256 _prevIndex
+    ) external view returns (uint256, uint256, uint256);
+
+    function syncGlobalAccounting() external; // Accrues StEthFeeSplit without influencing Grace Period
+
+    function syncGlobalAccountingAndGracePeriod() external; // Accrues StEthFeeSplit and influences Grace Period
+
+    function getAccumulatedFeeSplitApplied(
+        bytes32 _cdpId,
+        uint256 _systemStEthFeePerUnitIndex
+    ) external view returns (uint256, uint256);
+
+    function getCachedNominalICR(bytes32 _cdpId) external view returns (uint256);
+
+    function getCachedICR(bytes32 _cdpId, uint256 _price) external view returns (uint256);
+
+    function getSyncedCdpDebt(bytes32 _cdpId) external view returns (uint256);
+
+    function getSyncedCdpCollShares(bytes32 _cdpId) external view returns (uint256);
+
+    function getSyncedICR(bytes32 _cdpId, uint256 _price) external view returns (uint256);
+
+    function getSyncedTCR(uint256 _price) external view returns (uint256);
+
+    function getSyncedSystemCollShares() external view returns (uint256);
+
+    function getSyncedNominalICR(bytes32 _cdpId) external view returns (uint256);
+
+    function getPendingRedistributedDebt(bytes32 _cdpId) external view returns (uint256);
+
+    function hasPendingRedistributedDebt(bytes32 _cdpId) external view returns (bool);
+
+    function getSyncedDebtAndCollShares(
+        bytes32 _cdpId
+    ) external view returns (uint256 debt, uint256 collShares);
+
+    function canLiquidateRecoveryMode(uint256 icr, uint256 tcr) external view returns (bool);
+
+    function totalCollateralSnapshot() external view returns (uint256);
+
+    function totalStakesSnapshot() external view returns (uint256);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/ICdpManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+import "./IEbtcBase.sol";
+import "./ICdpManagerData.sol";
+
+// Common interface for the Cdp Manager.
+interface ICdpManager is IEbtcBase, ICdpManagerData {
+    // --- Functions ---
+    function liquidate(bytes32 _cdpId) external;
+
+    function partiallyLiquidate(
+        bytes32 _cdpId,
+        uint256 _partialAmount,
+        bytes32 _upperPartialHint,
+        bytes32 _lowerPartialHint
+    ) external;
+
+    function batchLiquidateCdps(bytes32[] calldata _cdpArray) external;
+
+    function redeemCollateral(
+        uint256 _EBTCAmount,
+        bytes32 _firstRedemptionHint,
+        bytes32 _upperPartialRedemptionHint,
+        bytes32 _lowerPartialRedemptionHint,
+        uint256 _partialRedemptionHintNICR,
+        uint256 _maxIterations,
+        uint256 _maxFee
+    ) external;
+
+    function updateStakeAndTotalStakes(bytes32 _cdpId) external returns (uint256);
+
+    function syncAccounting(bytes32 _cdpId) external;
+
+    function closeCdp(bytes32 _cdpId, address _borrower, uint256 _debt, uint256 _coll) external;
+
+    function getRedemptionRate() external view returns (uint256);
+
+    function getRedemptionRateWithDecay() external view returns (uint256);
+
+    function getRedemptionFeeWithDecay(uint256 _stETHToRedeem) external view returns (uint256);
+
+    function getCdpStatus(bytes32 _cdpId) external view returns (uint256);
+
+    function getCdpStake(bytes32 _cdpId) external view returns (uint256);
+
+    function getCdpDebt(bytes32 _cdpId) external view returns (uint256);
+
+    function getCdpCollShares(bytes32 _cdpId) external view returns (uint256);
+
+    function getCdpLiquidatorRewardShares(bytes32 _cdpId) external view returns (uint);
+
+    function initializeCdp(
+        bytes32 _cdpId,
+        uint256 _debt,
+        uint256 _coll,
+        uint256 _liquidatorRewardShares,
+        address _borrower
+    ) external;
+
+    function updateCdp(
+        bytes32 _cdpId,
+        address _borrower,
+        uint256 _coll,
+        uint256 _debt,
+        uint256 _newColl,
+        uint256 _newDebt
+    ) external;
+
+    function getCachedTCR(uint256 _price) external view returns (uint256);
+
+    function checkRecoveryMode(uint256 _price) external view returns (bool);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IBorrowerOperations.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+import "./IPositionManagers.sol";
+
+// Common interface for the Cdp Manager.
+interface IBorrowerOperations is IPositionManagers {
+    // --- Events ---
+
+    event FeeRecipientAddressChanged(address indexed _feeRecipientAddress);
+    event FlashLoanSuccess(
+        address indexed _receiver,
+        address indexed _token,
+        uint256 _amount,
+        uint256 _fee
+    );
+
+    // --- Functions ---
+
+    function openCdp(
+        uint256 _EBTCAmount,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalance
+    ) external returns (bytes32);
+
+    function openCdpFor(
+        uint _EBTCAmount,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint _collAmount,
+        address _borrower
+    ) external returns (bytes32);
+
+    function addColl(
+        bytes32 _cdpId,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalanceIncrease
+    ) external;
+
+    function withdrawColl(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint
+    ) external;
+
+    function withdrawDebt(
+        bytes32 _cdpId,
+        uint256 _amount,
+        bytes32 _upperHint,
+        bytes32 _lowerHint
+    ) external;
+
+    function repayDebt(
+        bytes32 _cdpId,
+        uint256 _amount,
+        bytes32 _upperHint,
+        bytes32 _lowerHint
+    ) external;
+
+    function closeCdp(bytes32 _cdpId) external;
+
+    function adjustCdp(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange,
+        bool isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint
+    ) external;
+
+    function adjustCdpWithColl(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange,
+        bool isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalanceIncrease
+    ) external;
+
+    function claimSurplusCollShares() external;
+
+    function feeRecipientAddress() external view returns (address);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IPositionManagers.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+interface IPositionManagers {
+    enum PositionManagerApproval {
+        None,
+        OneTime,
+        Persistent
+    }
+
+    event PositionManagerApprovalSet(
+        address indexed _borrower,
+        address indexed _positionManager,
+        PositionManagerApproval _approval
+    );
+
+    function getPositionManagerApproval(
+        address _borrower,
+        address _positionManager
+    ) external view returns (PositionManagerApproval);
+
+    function setPositionManagerApproval(
+        address _positionManager,
+        PositionManagerApproval _approval
+    ) external;
+
+    function revokePositionManagerApproval(address _positionManager) external;
+
+    function renouncePositionManagerApproval(address _borrower) external;
+
+    function permitPositionManagerApproval(
+        address _borrower,
+        address _positionManager,
+        PositionManagerApproval _approval,
+        uint _deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    function version() external view returns (string memory);
+
+    function permitTypeHash() external view returns (bytes32);
+
+    function domainSeparator() external view returns (bytes32);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/Dependencies/IERC20.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+/**
+ * Based on the OpenZeppelin IER20 interface:
+ * https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/IERC20.sol
+ *
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function increaseAllowance(address spender, uint256 addedValue) external returns (bool);
+
+    function decreaseAllowance(address spender, uint256 subtractedValue) external returns (bool);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `sender` to `recipient` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+
+    function name() external view returns (string memory);
+
+    function symbol() external view returns (string memory);
+
+    function decimals() external view returns (uint8);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/Dependencies/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity 0.8.17;
+
+import "./IERC20.sol";
+import "./Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /// @dev Calls approve while checking bool return value, handles no-return tokens
+    function safeApprove(IERC20 token, address spender, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, amount));
+    }
+
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(
+            token,
+            abi.encodeWithSelector(token.transferFrom.selector, from, to, value)
+        );
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(
+            data,
+            "SafeERC20: low-level call failed"
+        );
+        require(
+            returndata.length == 0 || abi.decode(returndata, (bool)),
+            "SafeERC20: ERC20 operation did not succeed"
+        );
+    }
+}
+
+
+// File: src/interface/IStETH.sol
+// SPDX-FileCopyrightText: 2020 Lido <info@lido.fi>
+
+// SPDX-License-Identifier: GPL-3.0
+
+/* See contracts/COMPILERS.md */
+pragma solidity 0.8.17;
+
+import "@ebtc/contracts/Dependencies/ICollateralToken.sol";
+
+/// @notice Add submit functionality to eBTC stETH interface
+interface IStETH is ICollateralToken {
+    function submit(address _referral) external payable returns (uint256);
+}
+
+
+// File: src/interface/IWrappedETH.sol
+// SPDX-License-Identifier: GPL-3.0
+
+/* See contracts/COMPILERS.md */
+pragma solidity 0.8.17;
+
+/// @notice Wrapped ETH (version 9)
+/// @dev check https://etherscan.io/token/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2#code
+interface IWrappedETH {
+    function withdraw(uint wad) external;
+}
+
+
+// File: src/interface/IEbtcZapRouter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IEbtcZapRouter {
+    struct PositionManagerPermit {
+        uint256 deadline;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    enum EthVariantZapOperationType {
+        OpenCdp,
+        AdjustCdp,
+        CloseCdp
+    }
+
+    event ZapOperationEthVariant(
+        bytes32 indexed cdpId,
+        EthVariantZapOperationType indexed operation,
+        bool isCollateralIncrease,
+        address indexed collateralToken,
+        uint256 collateralTokenDelta,
+        uint256 stEthDelta,
+        address cdpOwner
+    );
+
+    function openCdp(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalance,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external returns (bytes32 cdpId);
+
+    function openCdpWithEth(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _ethBalance,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external payable returns (bytes32 cdpId);
+
+    function openCdpWithWrappedEth(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wethBalance,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external returns (bytes32 cdpId);
+
+    function openCdpWithWstEth(
+        uint256 _debt,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wstEthBalance,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external returns (bytes32 cdpId);
+
+    function adjustCdp(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _stEthBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external;
+
+    function adjustCdpWithEth(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _ethBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external payable;
+
+    function adjustCdpWithWrappedEth(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wethBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external;
+
+    function adjustCdpWithWstEth(
+        bytes32 _cdpId,
+        uint256 _stEthBalanceDecrease,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        bytes32 _upperHint,
+        bytes32 _lowerHint,
+        uint256 _wstEthBalanceIncrease,
+        bool _useWstETHForDecrease,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external;
+
+    function closeCdp(
+        bytes32 _cdpId,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external;
+
+    function closeCdpForWstETH(
+        bytes32 _cdpId,
+        PositionManagerPermit memory _positionManagerPermit
+    ) external;
+}
+
+
+// File: src/interface/IWstETH.sol
+// SPDX-FileCopyrightText: 2020 Lido <info@lido.fi>
+
+// SPDX-License-Identifier: GPL-3.0
+
+/* See contracts/COMPILERS.md */
+pragma solidity 0.8.17;
+
+/// @notice Check https://etherscan.io/token/0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0#code
+interface IWstETH {
+    /// @notice Exchanges wstETH to stETH
+    function unwrap(uint256 _wstETHAmount) external returns (uint256);
+
+    /// @notice Exchanges stETH to wstETH
+    function wrap(uint256 _stETHAmount) external returns (uint256);
+
+    /// @notice Get amount of wstETH for a given amount of stETH
+    function getWstETHByStETH(
+        uint256 _stETHAmount
+    ) external view returns (uint256);
+
+    /// @notice Get amount of stETH for a given amount of wstETH
+    function getStETHByWstETH(
+        uint256 _stETHAmount
+    ) external view returns (uint256);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/ICollSurplusPool.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+interface ICollSurplusPool {
+    // --- Events ---
+
+    event SurplusCollSharesAdded(
+        bytes32 indexed _cdpId,
+        address indexed _account,
+        uint256 _claimableSurplusCollShares,
+        uint256 _surplusCollSharesAddedFromCollateral,
+        uint256 _surplusCollSharesAddedFromLiquidatorReward
+    );
+    event CollSharesTransferred(address indexed _to, uint256 _amount);
+
+    event SweepTokenSuccess(address indexed _token, uint256 _amount, address indexed _recipient);
+
+    // --- Contract setters ---
+
+    function getTotalSurplusCollShares() external view returns (uint256);
+
+    function getSurplusCollShares(address _account) external view returns (uint256);
+
+    function increaseSurplusCollShares(
+        bytes32 _cdpId,
+        address _account,
+        uint256 _collateralShares,
+        uint256 _liquidatorRewardShares
+    ) external;
+
+    function claimSurplusCollShares(address _account) external;
+
+    function increaseTotalSurplusCollShares(uint256 _value) external;
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IEBTCToken.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+import "../Dependencies/IERC20.sol";
+import "../Dependencies/IERC2612.sol";
+
+interface IEBTCToken is IERC20, IERC2612 {
+    // --- Functions ---
+
+    function mint(address _account, uint256 _amount) external;
+
+    function burn(address _account, uint256 _amount) external;
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/ISortedCdps.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+// Common interface for the SortedCdps Doubly Linked List.
+interface ISortedCdps {
+    // --- Events ---
+
+    event NodeAdded(bytes32 _id, uint _NICR);
+    event NodeRemoved(bytes32 _id);
+
+    // --- Functions ---
+
+    function remove(bytes32 _id) external;
+
+    function batchRemove(bytes32[] memory _ids) external;
+
+    function reInsert(bytes32 _id, uint256 _newICR, bytes32 _prevId, bytes32 _nextId) external;
+
+    function contains(bytes32 _id) external view returns (bool);
+
+    function isFull() external view returns (bool);
+
+    function isEmpty() external view returns (bool);
+
+    function getSize() external view returns (uint256);
+
+    function getMaxSize() external view returns (uint256);
+
+    function getFirst() external view returns (bytes32);
+
+    function getLast() external view returns (bytes32);
+
+    function getNext(bytes32 _id) external view returns (bytes32);
+
+    function getPrev(bytes32 _id) external view returns (bytes32);
+
+    function validInsertPosition(
+        uint256 _ICR,
+        bytes32 _prevId,
+        bytes32 _nextId
+    ) external view returns (bool);
+
+    function findInsertPosition(
+        uint256 _ICR,
+        bytes32 _prevId,
+        bytes32 _nextId
+    ) external view returns (bytes32, bytes32);
+
+    function insert(
+        address owner,
+        uint256 _ICR,
+        bytes32 _prevId,
+        bytes32 _nextId
+    ) external returns (bytes32);
+
+    function getOwnerAddress(bytes32 _id) external pure returns (address);
+
+    function nonExistId() external view returns (bytes32);
+
+    function cdpCountOf(address owner) external view returns (uint256);
+
+    function getCdpCountOf(
+        address owner,
+        bytes32 startNodeId,
+        uint maxNodes
+    ) external view returns (uint256, bytes32);
+
+    function getCdpsOf(address owner) external view returns (bytes32[] memory);
+
+    function getAllCdpsOf(
+        address owner,
+        bytes32 startNodeId,
+        uint maxNodes
+    ) external view returns (bytes32[] memory, uint256, bytes32);
+
+    function cdpOfOwnerByIndex(address owner, uint256 index) external view returns (bytes32);
+
+    function cdpOfOwnerByIdx(
+        address owner,
+        uint256 index,
+        bytes32 startNodeId,
+        uint maxNodes
+    ) external view returns (bytes32, bool);
+
+    function toCdpId(
+        address owner,
+        uint256 blockHeight,
+        uint256 nonce
+    ) external pure returns (bytes32);
+
+    function nextCdpNonce() external view returns (uint256);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IActivePool.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+import "./IPool.sol";
+import "./ITwapWeightedObserver.sol";
+
+interface IActivePool is IPool, ITwapWeightedObserver {
+    // --- Events ---
+    event ActivePoolEBTCDebtUpdated(uint256 _EBTCDebt);
+    event SystemCollSharesUpdated(uint256 _coll);
+    event FeeRecipientClaimableCollSharesIncreased(uint256 _coll, uint256 _fee);
+    event FeeRecipientClaimableCollSharesDecreased(uint256 _coll, uint256 _fee);
+    event FlashLoanSuccess(
+        address indexed _receiver,
+        address indexed _token,
+        uint256 _amount,
+        uint256 _fee
+    );
+    event SweepTokenSuccess(address indexed _token, uint256 _amount, address indexed _recipient);
+
+    // --- Functions ---
+    function transferSystemCollShares(address _account, uint256 _amount) external;
+
+    function increaseSystemCollShares(uint256 _value) external;
+
+    function transferSystemCollSharesAndLiquidatorReward(
+        address _account,
+        uint256 _shares,
+        uint256 _liquidatorRewardShares
+    ) external;
+
+    function allocateSystemCollSharesToFeeRecipient(uint256 _shares) external;
+
+    function claimFeeRecipientCollShares(uint256 _shares) external;
+
+    function feeRecipientAddress() external view returns (address);
+
+    function getFeeRecipientClaimableCollShares() external view returns (uint256);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IRecoveryModeGracePeriod.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+// Interface for State Updates that can trigger RM Liquidations
+interface IRecoveryModeGracePeriod {
+    event TCRNotified(uint256 TCR); /// NOTE: Mostly for debugging to ensure synch
+
+    // NOTE: Ts is implicit in events (it's added by GETH)
+    event GracePeriodStart();
+    event GracePeriodEnd();
+    event GracePeriodDurationSet(uint256 _recoveryModeGracePeriodDuration);
+
+    function notifyStartGracePeriod(uint256 tcr) external;
+
+    function notifyEndGracePeriod(uint256 tcr) external;
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/Dependencies/ICollateralTokenOracle.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+/**
+ * Based on the stETH:
+ *  -   https://docs.lido.fi/contracts/lido#
+ */
+interface ICollateralTokenOracle {
+    // Return beacon specification data.
+    function getBeaconSpec()
+        external
+        view
+        returns (
+            uint64 epochsPerFrame,
+            uint64 slotsPerEpoch,
+            uint64 secondsPerSlot,
+            uint64 genesisTime
+        );
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IEbtcBase.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+import "./IPriceFeed.sol";
+
+interface IEbtcBase {
+    function priceFeed() external view returns (IPriceFeed);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/Dependencies/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/Address.sol)
+
+pragma solidity 0.8.17;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/Dependencies/ICollateralToken.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+import "./IERC20.sol";
+
+/**
+ * Based on the stETH:
+ *  -   https://docs.lido.fi/contracts/lido#
+ */
+interface ICollateralToken is IERC20 {
+    // Returns the amount of shares that corresponds to _ethAmount protocol-controlled Ether
+    function getSharesByPooledEth(uint256 _ethAmount) external view returns (uint256);
+
+    // Returns the amount of Ether that corresponds to _sharesAmount token shares
+    function getPooledEthByShares(uint256 _sharesAmount) external view returns (uint256);
+
+    // Moves `_sharesAmount` token shares from the caller's account to the `_recipient` account.
+    function transferShares(address _recipient, uint256 _sharesAmount) external returns (uint256);
+
+    // Returns the amount of shares owned by _account
+    function sharesOf(address _account) external view returns (uint256);
+
+    // Returns authorized oracle address
+    function getOracle() external view returns (address);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/Dependencies/IERC2612.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+/**
+ * @dev Interface of the ERC2612 standard as defined in the EIP.
+ *
+ * Adds the {permit} method, which can be used to change one's
+ * {IERC20-allowance} without having to send a transaction, by signing a
+ * message. This allows users to spend tokens without having to hold Ether.
+ *
+ * See https://eips.ethereum.org/EIPS/eip-2612.
+ *
+ * Code adapted from https://github.com/OpenZeppelin/openzeppelin-contracts/pull/2237/
+ */
+interface IERC2612 {
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over `owner`'s tokens,
+     * given `owner`'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current ERC2612 nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases `owner`'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     *
+     * `owner` can limit the time a Permit is valid for by setting `deadline` to
+     * a value in the near future. The deadline argument can be set to uint256(-1) to
+     * create Permits that effectively never expire.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    function version() external view returns (string memory);
+
+    function permitTypeHash() external view returns (bytes32);
+
+    function domainSeparator() external view returns (bytes32);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IPool.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+// Common interface for the Pools.
+interface IPool {
+    // --- Events ---
+
+    event ETHBalanceUpdated(uint256 _newBalance);
+    event EBTCBalanceUpdated(uint256 _newBalance);
+    event CollSharesTransferred(address indexed _to, uint256 _amount);
+
+    // --- Functions ---
+
+    function getSystemCollShares() external view returns (uint256);
+
+    function getSystemDebt() external view returns (uint256);
+
+    function increaseSystemDebt(uint256 _amount) external;
+
+    function decreaseSystemDebt(uint256 _amount) external;
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/ITwapWeightedObserver.sol
+// SPDX-License Identifier: MIT
+pragma solidity 0.8.17;
+import {IBaseTwapWeightedObserver} from "./IBaseTwapWeightedObserver.sol";
+
+interface ITwapWeightedObserver is IBaseTwapWeightedObserver {
+    event TwapDisabled();
+
+    function PERIOD() external view returns (uint256);
+
+    function valueToTrack() external view returns (uint128);
+
+    function timeToAccrue() external view returns (uint64);
+
+    function getLatestAccumulator() external view returns (uint128);
+
+    function observe() external returns (uint256);
+
+    function update() external;
+
+    function twapDisabled() external view returns (bool);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IPriceFeed.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.17;
+
+interface IPriceFeed {
+    // --- Events ---
+    event LastGoodPriceUpdated(uint256 _lastGoodPrice);
+    event PriceFeedStatusChanged(Status newStatus);
+    event FallbackCallerChanged(
+        address indexed _oldFallbackCaller,
+        address indexed _newFallbackCaller
+    );
+    event UnhealthyFallbackCaller(address indexed _fallbackCaller, uint256 timestamp);
+    event CollateralFeedSourceUpdated(address indexed stEthFeed);
+
+    // --- Structs ---
+
+    struct ChainlinkResponse {
+        uint80 roundEthBtcId;
+        uint80 roundStEthEthId;
+        uint256 answer;
+        uint256 timestampEthBtc;
+        uint256 timestampStEthEth;
+        bool success;
+    }
+
+    struct FallbackResponse {
+        uint256 answer;
+        uint256 timestamp;
+        bool success;
+    }
+
+    // --- Enum ---
+
+    enum Status {
+        chainlinkWorking,
+        usingFallbackChainlinkUntrusted,
+        bothOraclesUntrusted,
+        usingFallbackChainlinkFrozen,
+        usingChainlinkFallbackUntrusted
+    }
+
+    // --- Function ---
+    function fetchPrice() external returns (uint256);
+}
+
+
+// File: lib/ebtc/packages/contracts/contracts/interfaces/IBaseTwapWeightedObserver.sol
+// SPDX-License Identifier: MIT
+pragma solidity 0.8.17;
+
+interface IBaseTwapWeightedObserver {
+    // NOTE: Packing manually is cheaper, but this is simpler to understand and follow
+    struct PackedData {
+        // Slot 0
+        // Seconds in a year: 3.154e+7
+        /// @dev Accumulator value recorded for TWAP Observer until last update
+        uint128 observerCumuVal; // 3.154e+7 * 80 * 100e27 = 2.5232e+38 | log_2(100e27 * 3.154e+7 * 80) = 127.568522171
+        /// @dev Accumulator for TWAP globally
+        uint128 accumulator; // 3.154e+7 * 80 * 100e27 = 2.5232e+38 | log_2(100e27 * 3.154e+7 * 80) = 127.568522171
+        // NOTE: We can further compress this slot but we will not be able to use only one (see u72 impl)
+        /// So what's the point of making the code more complex?
+
+        // Slot 1
+        /// @dev last update timestamp for TWAP Observer
+        uint64 lastObserved; // Thousands of Years, if we use relative time we can use u32 | Relative to deploy time (as immutable)
+        /// @dev last update timestamp for TWAP global track(spot) value
+        uint64 lastAccrued; // Thousands of years
+        // Expect eBTC debt to never surpass 100e27, which is 100 BILLION eBTC
+        // log_2(100e27) = 96.3359147517 | log_2(100e27 / 1e18) = 36.5412090438
+        // We could use a u64
+        /// @dev average value since last observe
+        uint128 lastObservedAverage;
+    }
+}
+

@@ -1,0 +1,1 @@
+contract a{address immutable o;string public d;constructor(address m){o = m;}function s(string calldata n)external{assert(o==msg.sender);d = n;}}

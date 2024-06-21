@@ -1,0 +1,2041 @@
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&@@&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&@@@&%&@&&&&@@&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&@@@@&&@@&&@@@&&&&&&&#/(&%##&@&&&&&&&&@@@&&&&&&@@@@&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&@@@@@@@@@@@@@@@&&&%%%&&&&&&%/*(&%(/#&&&&&&&&&&&@@@@@@@@@@@@&&&@@&&&&&&&&&&&&
+//&&&&&&&&&&&&&@@@@@@@@@@@@@&&%%%%%%%&&&&@&#,,(&%(*(%@&&&%%%%%%%%&&@@@@@@@@@@@@&&&&&&&&&&&&&
+//&&&&&&&&&&@&&@@@@@@@@@@&&%###%%%%&&@@@@@&(.,(&%(**%@@@@&&&%%%%%%#%%&@@@@@@@@@&&&&&&&&&&&&&
+//&&&&&&&&&&&&&@@@@@@@@@#//#%%%%&@@@@@@@@@%* ,(&%(*,(@@@@@&&&&&&%%%%#/(&@@@&@@@&&&&&&&&&&&&&
+//&&&&&&&&&&&&@@@@@@@&%*,/#%%&&@@@@@@@@@@@#, ,(&&#*.(&@@@@@@@@@@@&%%%#/*#&@@@&@@@&&&&&&&&&&&
+//&&&&&&&&&&&@@@@@@@@(,,(%%%&@@@@@@@@@@@@@#. ,(&&#*./%@@@@@@@@@@@@&&%%%/,/%@@&@&&&&&&&&&&&&&
+//&&&&&&&&&&&&@@@@@@(,,(%%%&@@@@@@@@@@@@@@(. ,(&&#*.*%@@&@@@@@@@@@@&%&&%/*/&@@@&&&&&&&&&&&&&
+//&&&&&&&&&&&&@@@@&%,,(&%%&@@@@@@@@@@@@@@&/../#&&%/.*%@@@@@@@@@@&@@@&%%&%/.(&@@@@&&&&&&&&&&&
+//&&&&&&&&&&&@&&@@%*.*(%%&@@@@@@@@@@@@@@@%/.*/#&&%/.,(@@@@@@@&&&&&&@@&&&%(,,#@&@&&&&&&&&&&&&
+//&&&&&&&&&&&&&@&@#,,/%%%&@@@@@@@@@@@@@@@#*.#%%&&#/.,(&@@@@@@&&&&&&@@&&%%#*./&@@&&&&&&&&&&&&
+//&&&&&&&&&&&@@@&&#..(&%%&@@@@@@@@@@@@@&%#*  /%&@%/.*(%&@@@@@@@@@@@&&&%%&#* /%@&&&&&&&&&&&&&
+//&&&&&&&&&&&@@@@&#.,/%%%&@@@@@@@@@@@@&%%%(..*#%%&&,*#&%&@@@@@@@@@@@@&&%%#*./%@&&&&&&&&&&&&&
+//&&&&&&&&&&&@&&@@#. .*#%&@@@@@@@@@@@@%%%%(,,/#&&%#,/#&%%&@@@@&&&@@&@&&%(, .(&@@&&&&&&&&&&&&
+//&&&&&&&&&&&&&&@@%/,,*/#%@@@@@@@&@@@%%%%%(..*#&%#*.*#&%#%&@&&@@@@@@&%#(/***#@@@&&&&&&&&&&&&
+//&&&&&&&&&&&@@@@@&%*,,*#%&@@@@@@@@@&##%%%(*,*(##/*,/#%%##&&@@&@@&&&&%#(*,,(&@&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&@&@@@#/**(%&%&@@@@@@&%##%##(/,*/(//**(######&@&&&@&&%%%#(((#&@@&@@&&&&&&&&&&&
+//&&&&&&&&&&&@@@&@@@@%(*/(#%%&&&@@&%(%%####(**///***(%%##%##&@@@@&%%%####%&@@@@@@&&&&&&&&&&&
+//&&&&&&&&&&&@&&&@@@@@&#**(%%%%%&@%##%&&&%#(****/*,/#%&&&%%##&&&%%&&%%%%&&@@@@@@&&&&&&&&&&&&
+//&&&&&&&&&&&&&@@@@&@@@@&(,*(%%%%%%%%&&&%##((//(((/((#&&&&&&%%&&&&&%%%&@@@&@@@&&&&&&&&&&&&&&
+//&&&&&&&&&&&&@@@@@&@@&@@@&(/(%%&&%%%%%%##%%((###((%%##%&%%%&&&&&&%%&@@@@@@@@@@&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&@@@@@@@@@@@@@&###%&&&&&%%%%%#%%#####%%%%%&&&&&&&&&@@@@@@@@@@@@@@&&&&&&&&&&&&
+//&&&&&&&&&&&@@@&@@@&#(%&@@@@@&@@&&&&&&%%%%&&&%(%&&&%%%%&&&&&&&@@@@@@@@&%&@@@@&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&@@&&/,*%(/(%&&@@@@&&@&&&&%&&%%%%%%%&&&&&&@@@@@@@@@&%/##(.,#&@@@&&&&&&&&&&&&&
+//&&&&&&&&&&&&@@&@@@%#%#/(%**/%((%&&&&@@@@@@@@@&@@@&&@&&@@&&&####*/#/*/%##%&&&@@&&&&&&&&&&&&
+//&&&&&&&&&&&&&@@&&@&&&@@&(*/(*,*%**/#/*(###((%@&%(&@%//(#,,/(,*#/**%&&@@@&&@@&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&@&@&&&&&@&&%*/(/,,(//(,/#@&#*%@&(,,(/#&%%%&@@@&&&@@&&&@&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&%&@&@&%&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+//&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&%&&&%&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+
+
+
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+// @@                                                                                                @@
+// @@   This token was launched using StarBase. To learn more or to launch                           @@
+// @@   your own token, visit: https://starbase.services                                             @@
+// @@                                                                                                @@
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+ 
+
+
+/**
+ Make China Great Again 
+*/
+//Telegram:  https://t.me/MCGAETH 
+// Website:  MCGAETH.COM 
+//Twitter: https://x.com/mcgatoken  
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.21;
+
+
+
+interface IERCBurn {
+    function burn(uint256 _amount) external;
+    function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+}
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error AddressInsufficientBalance(address account);
+
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedInnerCall();
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert AddressInsufficientBalance(address(this));
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert FailedInnerCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {FailedInnerCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert AddressInsufficientBalance(address(this));
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {FailedInnerCall}) in case of an
+     * unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {FailedInnerCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {FailedInnerCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert FailedInnerCall();
+        }
+    }
+}
+
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position is the index of the value in the `values` array plus 1.
+        // Position 0 is used to mean a value is not in the set.
+        mapping(bytes32 value => uint256) _positions;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._positions[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We cache the value's position to prevent multiple reads from the same storage slot
+        uint256 position = set._positions[value];
+
+        if (position != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 valueIndex = position - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (valueIndex != lastIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the lastValue to the index where the value to delete is
+                set._values[valueIndex] = lastValue;
+                // Update the tracked position of the lastValue (that was just moved)
+                set._positions[lastValue] = position;
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the tracked position for the deleted slot
+            delete set._positions[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._positions[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+interface IUniswapV2Factory {
+    event PairCreated(address indexed token0, address indexed token1, address pair, uint);
+
+    function feeTo() external view returns (address);
+    function feeToSetter() external view returns (address);
+
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+    function allPairs(uint) external view returns (address pair);
+    function allPairsLength() external view returns (uint);
+
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+
+    function setFeeTo(address) external;
+    function setFeeToSetter(address) external;
+}
+
+interface IUniswapV2Pair {
+    event Approval(address indexed owner, address indexed spender, uint value);
+    event Transfer(address indexed from, address indexed to, uint value);
+
+    function name() external pure returns (string memory);
+    function symbol() external pure returns (string memory);
+    function decimals() external pure returns (uint8);
+    function totalSupply() external view returns (uint);
+    function balanceOf(address owner) external view returns (uint);
+    function allowance(address owner, address spender) external view returns (uint);
+
+    function approve(address spender, uint value) external returns (bool);
+    function transfer(address to, uint value) external returns (bool);
+    function transferFrom(address from, address to, uint value) external returns (bool);
+
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+    function PERMIT_TYPEHASH() external pure returns (bytes32);
+    function nonces(address owner) external view returns (uint);
+
+    function permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s) external;
+
+    event Mint(address indexed sender, uint amount0, uint amount1);
+    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
+    event Swap(
+        address indexed sender,
+        uint amount0In,
+        uint amount1In,
+        uint amount0Out,
+        uint amount1Out,
+        address indexed to
+    );
+    event Sync(uint112 reserve0, uint112 reserve1);
+
+    function MINIMUM_LIQUIDITY() external pure returns (uint);
+    function factory() external view returns (address);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function price0CumulativeLast() external view returns (uint);
+    function price1CumulativeLast() external view returns (uint);
+    function kLast() external view returns (uint);
+
+    function mint(address to) external returns (uint liquidity);
+    function burn(address to) external returns (uint amount0, uint amount1);
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+    function skim(address to) external;
+    function sync() external;
+
+    function initialize(address, address) external;
+}
+
+interface IUniswapV2Locker {
+  struct UserInfo {
+    EnumerableSet.AddressSet lockedTokens; // records all tokens the user has locked
+    mapping(address => uint256[]) locksForToken; // map erc20 address to lock id for that token
+  }
+
+  struct TokenLock {
+    uint256 lockDate; // the date the token was locked
+    uint256 amount; // the amount of tokens still locked (initialAmount minus withdrawls)
+    uint256 initialAmount; // the initial lock amount
+    uint256 unlockDate; // the date the token can be withdrawn
+    uint256 lockID; // lockID nonce per uni pair
+    address owner;
+  }
+
+  struct FeeStruct {
+    uint256 ethFee; // Small eth fee to prevent spam on the platform
+    IERCBurn secondaryFeeToken; // UNCX or UNCL
+    uint256 secondaryTokenFee; // optional, UNCX or UNCL
+    uint256 secondaryTokenDiscount; // discount on liquidity fee for burning secondaryToken
+    uint256 liquidityFee; // fee on univ2 liquidity tokens
+    uint256 referralPercent; // fee for referrals
+    IERCBurn referralToken; // token the refferer must hold to qualify as a referrer
+    uint256 referralHold; // balance the referrer must hold to qualify as a referrer
+    uint256 referralDiscount; // discount on flatrate fees for using a valid referral address
+  }
+
+  function setDev(address payable _devaddr) external;
+
+
+  function setSecondaryFeeToken(address _secondaryFeeToken) external;
+
+  /**
+   * @notice referrers need to hold the specified token and hold amount to be elegible for referral fees
+   */
+  function setReferralTokenAndHold(
+    IERCBurn _referralToken,
+    uint256 _hold
+  ) external;
+
+  function setFees(
+    uint256 _referralPercent,
+    uint256 _referralDiscount,
+    uint256 _ethFee,
+    uint256 _secondaryTokenFee,
+    uint256 _secondaryTokenDiscount,
+    uint256 _liquidityFee
+  ) external;
+
+  /**
+   * @notice whitelisted accounts dont pay flatrate fees on locking
+   */
+  function whitelistFeeAccount(address _user, bool _add) external;
+
+  /**
+   * @notice Creates a new lock
+   * @param _lpToken the univ2 token address
+   * @param _amount amount of LP tokens to lock
+   * @param _unlock_date the unix timestamp (in seconds) until unlock
+   * @param _referral the referrer address if any or address(0) for none
+   * @param _fee_in_eth fees can be paid in eth or in a secondary token such as UNCX with a discount on univ2 tokens
+   * @param _withdrawer the user who can withdraw liquidity once the lock expires.
+   */
+  function lockLPToken(
+    address _lpToken,
+    uint256 _amount,
+    uint256 _unlock_date,
+    address payable _referral,
+    bool _fee_in_eth,
+    address payable _withdrawer
+  ) external payable;
+
+  /**
+   * @notice extend a lock with a new unlock date, _index and _lockID ensure the correct lock is changed
+   * this prevents errors when a user performs multiple tx per block possibly with varying gas prices
+   */
+  function relock(
+    address _lpToken,
+    uint256 _index,
+    uint256 _lockID,
+    uint256 _unlock_date
+  ) external;
+
+  /**
+   * @notice withdraw a specified amount from a lock. _index and _lockID ensure the correct lock is changed
+   * this prevents errors when a user performs multiple tx per block possibly with varying gas prices
+   */
+  function withdraw(
+    address _lpToken,
+    uint256 _index,
+    uint256 _lockID,
+    uint256 _amount
+  ) external;
+
+  /**
+   * @notice increase the amount of tokens per a specific lock, this is preferable to creating a new lock, less fees, and faster loading on our live block explorer
+   */
+  function incrementLock(
+    address _lpToken,
+    uint256 _index,
+    uint256 _lockID,
+    uint256 _amount
+  ) external;
+
+  /**
+   * @notice split a lock into two seperate locks, useful when a lock is about to expire and youd like to relock a portion
+   * and withdraw a smaller portion
+   */
+  function splitLock(
+    address _lpToken,
+    uint256 _index,
+    uint256 _lockID,
+    uint256 _amount
+  ) external payable;
+
+  /**
+   * @notice transfer a lock to a new owner, e.g. presale project -> project owner
+   */
+  function transferLockOwnership(
+    address _lpToken,
+    uint256 _index,
+    uint256 _lockID,
+    address payable _newOwner
+  ) external;
+
+  /**
+   * @notice migrates liquidity to uniswap v3
+   */
+  function migrate(
+    address _lpToken,
+    uint256 _index,
+    uint256 _lockID,
+    uint256 _amount
+  ) external;
+
+  function getNumLocksForToken(
+    address _lpToken
+  ) external view returns (uint256);
+
+  function getNumLockedTokens() external view returns (uint256);
+
+  function getLockedTokenAtIndex(
+    uint256 _index
+  ) external view returns (address);
+
+  // user functions
+  function getUserNumLockedTokens(
+    address _user
+  ) external view returns (uint256);
+
+  function getUserLockedTokenAtIndex(
+    address _user,
+    uint256 _index
+  ) external view returns (address);
+
+  function getUserNumLocksForToken(
+    address _user,
+    address _lpToken
+  ) external view returns (uint256);
+
+  function getUserLockForTokenAtIndex(
+    address _user,
+    address _lpToken,
+    uint256 _index
+  )
+    external
+    view
+    returns (uint256, uint256, uint256, uint256, uint256, address);
+
+  // whitelist
+  function getWhitelistedUsersLength() external view returns (uint256);
+
+  function getWhitelistedUserAtIndex(
+    uint256 _index
+  ) external view returns (address);
+
+  function getUserWhitelistStatus(address _user) external view returns (bool);
+}
+
+interface IUniswapV2Router01 {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB, uint liquidity);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB);
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountToken, uint amountETH);
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountA, uint amountB);
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountToken, uint amountETH);
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapTokensForExactTokens(
+        uint amountOut,
+        uint amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+    function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+
+    function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB);
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut);
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external pure returns (uint amountIn);
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+    function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+interface IUniswapV2Router02 is IUniswapV2Router01 {
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountETH);
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountETH);
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable;
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+}
+
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+interface IAgoraERC20Config {
+
+    /**
+     * @dev information used to construct the token.
+     */
+    struct TokenConstructorParameters {
+        bytes baseParameters;
+        bytes taxParameters;
+        bytes tokenLPInfo;
+    }
+
+    /**
+     * @dev Basic info of the token
+     */
+    struct TokenInfoParameters {
+        string name;
+        string symbol;
+        bool autoCreateLiquidity;
+        uint256 maxSupply;
+        address tokensRecepient;
+        uint256 maxTokensWallet;
+        bool payInTax;
+        bool protectLiquidity;
+    }
+
+    /**
+     *  @dev This struct express the taxes on per 1000, to allow percetanges between 0 and 1. 
+     */
+    struct TaxParameters {
+        uint256 buyTax;
+        uint256 sellTax;
+        uint256 lpBuyTax;
+        uint256 lpSellTax;
+        uint256 maxTxBuy;
+        uint256 maxTxSell;
+        address taxSwapRecepient;
+    }
+
+    /**
+     * @dev Liquidity pool supply information
+     */
+    struct TokenLpInfo {
+        uint256 lpTokensupply;
+        uint256 ethForSupply;
+        bool burnLP;
+        uint256 lockFee;
+        uint256 lpLockUpInDays;
+    }
+}
+
+interface IAgoraERC20 is IAgoraERC20Config, IERC20, IERC20Metadata {
+    function addLiquidity() external payable returns (address);
+
+    event LiquidityLocked(uint256 lpTokens, uint256 daysLocked);
+    event TaxChanged(
+        uint256 previousBuyTax,
+        uint256 previousSellTax,
+        uint256 newBuyTax,
+        uint256 newSellTax
+    );
+    event LPTaxChanged(
+        uint256 previousBuyTax,
+        uint256 previousSellTax,
+        uint256 newBuyTax,
+        uint256 newSellTax
+    );
+    event LiquidityAdded(
+        uint256 tokensSupplied,
+        uint256 ethSupplied,
+        uint256 lpTokensIssued
+    );
+    event LimitsRaised(
+        uint128 oldBuyLimit,
+        uint128 oldSellLimit,
+        uint128 oldMaxWallet,
+        uint128 newBuyLimit,
+        uint128 newSellLimit,
+        uint128 newMaxWallet
+    );
+    event LiquidityBurned(uint256 liquidityBurned);
+    event LiquiditySupplied(uint256 tokens, uint256 eth);
+    event ExternalCallError(uint256);
+}
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+abstract contract Revertible {
+    function _revert(bytes4 errorSelector) internal pure {
+        assembly {
+            mstore(0x00, errorSelector)
+            revert(0x00, 0x04)
+        }
+    }
+}
+
+interface IAgoraErrors {
+
+    error NotEnoughBalance();
+
+    error CallerIsNotTheOwner();
+    error CannotSetNewOwnerToTheZeroAddress();
+    error TaxesCanNotBeRaised();
+    error ApproveFromTheZeroAddress();
+    error ApproveToTheZeroAddress();
+    error OperationNotAllowed();
+    error BurnFromTheZeroAddress();
+    error BurnExceedsBalance();
+    error MintToZeroAddress();
+    error LpTokensExceedsTotalSupply();
+    error TooFewLPTokens();
+    error LPAlreadyCreated();
+    error NotEnoughFundsForLP();
+    error HardCapIsTooHigh();
+    error LPNotInit();
+    error TransactionIsTooBig();
+    error LimitsLoweringIsNotAllowed();
+    error MaxWalletExceeded();
+    error InsufficientAllowance();
+}
+
+abstract contract Ownable is Revertible, Context, IAgoraErrors {
+    address private _owner;
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            _revert(CallerIsNotTheOwner.selector);
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            _revert(CannotSetNewOwnerToTheZeroAddress.selector);
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+abstract contract StarBaseAbstractERC20 is IAgoraERC20, Ownable {
+    bytes32 public constant x_ID_HASH =
+    0xb07887f9e6857c947639357c810260e93a866b112197fa793b96ffe10082a244;
+
+    using EnumerableSet for EnumerableSet.AddressSet;
+    using EnumerableSet for EnumerableSet.Bytes32Set;
+
+    /** @dev {_balances} Addresses balances */
+    mapping(address => uint256) internal _balances;
+
+    /** @dev {_allowances} Addresses allocance details */
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    /** @dev {_unlimited} Enumerable set for addresses where limits do not apply */
+    EnumerableSet.AddressSet internal _excludedFromLimits;
+
+    // Config
+    IUniswapV2Router02 internal immutable _uniswapRouter;
+    uint256 internal constant MAX_SWAP_THRESHOLD_MULTIPLE = 20;
+    uint256 internal constant CALL_GAS_LIMIT = 50000;
+    address public immutable factory;
+    address public immutable startShipVault;
+    address public taxRecipient;
+    string private _name;
+    string private _symbol;
+
+    uint128 private _totalSupply;
+
+    // Tax
+    bool private _hasTax;
+    uint16 public buyTax;
+    uint16 public sellTax;
+    bool private _hasLPTax;
+    uint16 public buyLPTax;
+    uint16 public sellLPTax;
+    uint128 public accumulatedTax;
+    uint128 public starShipAccumulatedTax;
+    uint128 public lpAccumulatedTax;
+    bool public autoConversion;
+    uint16 public starShipTaxPoints = 5;
+    bool public shouldPayInTax;
+
+    // Liquidty info
+    uint32 public lpCreatedDate;
+    address public pairAddress;
+    bool public burnLiquidity;
+    bool internal _IsInConversion;
+    uint16 public pctForSwap; // Per thousands
+    uint128 public tokensThreshHoldForSwap;
+    uint128 public lockFee;
+    uint256 public liquidityLockedInDays;
+    uint128 public initialLiquidityFunds;
+    uint256 public lockedUntil;
+
+    // Caps
+    uint128 public buyMaxTx;
+    uint128 public sellMaxTx;
+    uint128 public maxWallet;
+
+    modifier onlyFactoryOrOwner() {
+        if (msg.sender != factory && msg.sender != owner()) {
+            _revert(OperationNotAllowed.selector);
+        }
+        _;
+    }
+
+    constructor(
+        address[5] memory addresses_,
+        bytes memory tokenInfo_,
+        bytes memory taxesInfo_,
+        bytes memory lpInfo_
+    ) {
+        pctForSwap = 5;
+        transferOwnership(addresses_[0]);
+        _uniswapRouter = IUniswapV2Router02(addresses_[1]);
+        factory = addresses_[3];
+        startShipVault = addresses_[4];
+        TokenInfoParameters memory tokenParameters = abi.decode(
+            tokenInfo_,
+            (TokenInfoParameters)
+        );
+
+        _name = tokenParameters.name;
+        _symbol = tokenParameters.symbol;
+
+        shouldPayInTax = tokenParameters.payInTax;
+
+        tokensThreshHoldForSwap = tokensThreshHoldForSwap;
+
+        if (type(uint128).max < tokenParameters.maxTokensWallet) {
+            _revert(HardCapIsTooHigh.selector);
+        }
+
+        maxWallet = uint128(tokenParameters.maxTokensWallet);
+        TaxParameters memory taxParams = abi.decode(taxesInfo_, (TaxParameters));
+        _processLimits(taxParams);
+
+        taxRecipient = taxParams.taxSwapRecepient;
+        TokenLpInfo memory tokenLpInfo = abi.decode(lpInfo_, (TokenLpInfo));
+        _processSupply(tokenParameters, tokenLpInfo);
+        burnLiquidity = tokenLpInfo.burnLP;
+        lockFee = uint128(tokenLpInfo.lockFee);
+        liquidityLockedInDays = tokenLpInfo.lpLockUpInDays;
+        initialLiquidityFunds = uint128(tokenLpInfo.ethForSupply);
+
+        _excludedFromLimits.add(address(_uniswapRouter));
+        pairAddress = IUniswapV2Factory(_uniswapRouter.factory()).createPair(
+            address(this),
+            _uniswapRouter.WETH()
+        );
+        _excludedFromLimits.add(pairAddress);
+        _excludedFromLimits.add(address(this));
+        _excludedFromLimits.add(address(0));
+        _excludedFromLimits.add(owner());
+        _approve(address(this), address(_uniswapRouter), type(uint256).max);
+        _approve(address(this), pairAddress, type(uint256).max);
+    }
+
+    // ###########################################
+    // ERC 20 INTERFACE IMPLEMENTATION
+    // ###########################################
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        if (account == address(0)) {
+            _revert(MintToZeroAddress.selector);
+        }
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += uint128(amount);
+        unchecked {
+        // Overflow not possible: balance + amount is at most totalSupply + amount, which is checked above.
+            _balances[account] += amount;
+        }
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /** @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from_,
+        address to_,
+        uint256 amount_
+    ) internal virtual {}
+
+    /**
+ * @dev Returns the name of the token.
+     */
+    function name() public view virtual returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+    * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from_,
+        address to_,
+        uint256 amount_
+    ) external returns (bool) {
+        // Approvals
+        _safeGuardAllowance(from_, _msgSender(), amount_);
+        return _transfer(from_, to_, amount_);
+    }
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address from_,
+        address to_,
+        uint256 amount_
+    ) internal virtual {}
+
+    /**
+ * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        if (owner == address(0)) {
+            _revert(ApproveFromTheZeroAddress.selector);
+        }
+
+        if (spender == address(0)) {
+            _revert(ApproveToTheZeroAddress.selector);
+        }
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        if (account == address(0)) {
+            _revert(BurnFromTheZeroAddress.selector);
+        }
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        if (accountBalance < amount) {
+            _revert(BurnExceedsBalance.selector);
+        }
+
+        unchecked {
+            _balances[account] = accountBalance - amount;
+        // Overflow not possible: amount <= accountBalance <= totalSupply.
+            _totalSupply -= uint128(amount);
+        }
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Destroys a `value` amount of tokens from the caller.
+     *
+     * See {ERC20-_burn}.
+     */
+    function burn(uint256 value) public virtual {
+        _burn(_msgSender(), value);
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the default value returned by this function, unless
+     * it's overridden.
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual returns (uint8) {
+        return 18;
+    }
+
+    /**
+   * @dev Moves `amount` of tokens from `from` to `to`.
+   *
+   * This internal function is equivalent to {transfer}, and can be used to
+   * e.g. implement automatic token fees, slashing mechanisms, etc.
+   *
+   * Emits a {Transfer} event.
+   *
+   * Requirements:
+   *
+   * - `from` cannot be the zero address.
+   * - `to` cannot be the zero address.
+   * - `from` must have a balance of at least `amount`.
+   */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal returns (bool) {
+
+        _safeGuardTransfer(from, to, amount);
+
+        uint128 realAmount = _applyTaxes(from, to, amount);
+
+        _swapTaxes(from, to);
+
+        unchecked {
+            _balances[from] -= amount;
+            _balances[to] += realAmount;
+        }
+        emit Transfer(from, to, realAmount);
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool) {
+        return _transfer(msg.sender, to, amount);
+    }
+
+
+    function _applyTaxes(
+        address from_,
+        address to_,
+        uint256 amount_
+    ) internal returns (uint128) {
+        uint128 taxedAmount = uint128(amount_);
+        uint128 taxAmount = 0;
+        uint128 starshipTax = 0;
+        uint128 lpTax = 0;
+        if (_shouldApplyTax() && !_IsInConversion) {
+            if (from_ == pairAddress && !_excludedFromLimits.contains(to_)) {
+                if (buyTax > 0) {
+                    taxAmount = (taxedAmount * buyTax) / 1000;
+                }
+
+                if (shouldPayInTax) {
+                    starshipTax = (taxedAmount * starShipTaxPoints) / 1000;
+                    starShipAccumulatedTax += starshipTax;
+                }
+
+                if (_hasLPTax && buyLPTax > 0) {
+                    lpTax += (taxedAmount * buyLPTax) / 1000;
+                    lpAccumulatedTax += lpTax;
+                }
+            } else if (
+                to_ == pairAddress && !_excludedFromLimits.contains(from_)
+            ) {
+                if (sellTax > 0) {
+                    taxAmount = (taxedAmount * sellTax) / 1000;
+                }
+                if (shouldPayInTax) {
+                    starshipTax = (taxedAmount * starShipTaxPoints) / 1000;
+                    starShipAccumulatedTax += starshipTax;
+                }
+
+                if (_hasLPTax && sellLPTax > 0) {
+                    lpTax += (taxedAmount * sellLPTax) / 1000;
+                    lpAccumulatedTax += lpTax;
+                }
+            }
+
+            if (taxAmount > 0 || starshipTax > 0 || lpTax > 0) {
+                unchecked {
+                    accumulatedTax += taxAmount;
+                    _balances[address(this)] += taxAmount + starshipTax + lpTax;
+                }
+
+                emit Transfer(
+                    from_,
+                    address(this),
+                    taxAmount + starshipTax + lpTax
+                );
+            }
+        }
+
+        return taxedAmount - starshipTax - taxAmount - lpTax;
+    }
+
+    function _shouldApplyTax() internal view returns (bool) {
+        return _hasTax || shouldPayInTax || _hasLPTax;
+    }
+
+    function _buyTax() internal view returns (uint16) {
+        return shouldPayInTax ? buyTax + starShipTaxPoints : buyTax;
+    }
+
+    function _sellTax() internal view returns (uint16) {
+        return shouldPayInTax ? sellTax + starShipTaxPoints : sellTax;
+    }
+
+   /**
+     * Reads and stores the relevant information about the taxes.
+     * @param taxParams_ Tax configuration
+     */
+    function _processLimits(TaxParameters memory taxParams_) internal {
+        if (
+            type(uint128).max < taxParams_.maxTxSell ||
+            type(uint128).max < taxParams_.maxTxBuy
+        ) {
+            _revert(HardCapIsTooHigh.selector);
+        }
+
+        buyMaxTx = uint128(taxParams_.maxTxBuy);
+        sellMaxTx = uint128(taxParams_.maxTxSell);
+
+        if (taxParams_.buyTax == 0 && taxParams_.sellTax == 0) {
+            _hasTax = false;
+        } else {
+            _hasTax = true;
+            buyTax = uint16(taxParams_.buyTax);
+            sellTax = uint16(taxParams_.sellTax);
+        }
+
+        if (taxParams_.lpBuyTax == 0 && taxParams_.lpSellTax == 0) {
+            _hasLPTax = false;
+        } else {
+            _hasLPTax = true;
+            buyLPTax = uint16(taxParams_.lpBuyTax);
+            sellLPTax = uint16(taxParams_.lpSellTax);
+        }
+    }
+
+    function _processSupply(
+        TokenInfoParameters memory tokenParameters_,
+        TokenLpInfo memory tokenLpInfo_
+    ) internal virtual;
+
+    /**
+     * @dev Safeguard method to withdraw all the remaining eth to the project address
+     *
+     */
+    function withdrawNative() external {
+        _transferNative(address(this).balance, taxRecipient);
+    }
+
+    function withdrawERC20() external {
+        this.transferFrom(
+            address(this),
+            taxRecipient,
+            this.balanceOf(address(this))
+        );
+    }
+
+    function _transferNative(
+        uint256 amount,
+        address to
+    ) internal returns (bool) {
+        uint256 gas = (CALL_GAS_LIMIT == 0 || CALL_GAS_LIMIT > gasleft())
+            ? gasleft()
+            : CALL_GAS_LIMIT;
+        (bool success, ) = to.call{value: amount, gas: gas}("");
+        return success;
+    }
+
+    function toggleConversion() external onlyOwner {
+        autoConversion = !autoConversion;
+    }
+
+    /**
+     * @dev Function to change the buy and sell tax for marketing
+     * @param newBuyTax_ New buy tax in per thousand
+     * @param newSellTax_ New sell tax in per thousand
+     */
+    function changeTaxes(
+        uint256 newBuyTax_,
+        uint256 newSellTax_,
+        uint256 newBuyLPTax_,
+        uint256 newSellLPTax_
+    ) external onlyOwner {
+
+        uint16 oldBuyTax = buyTax;
+        uint16 oldSellTax = sellTax;
+        buyTax = uint16(newBuyTax_);
+        sellTax = uint16(newSellTax_);
+
+        _hasTax = buyTax > 0 && sellTax > 0;
+
+        emit TaxChanged(oldBuyTax, oldSellTax, buyTax, sellTax);
+
+        oldBuyTax = buyLPTax;
+        oldSellTax = sellLPTax;
+        buyLPTax = uint16(newBuyLPTax_);
+        sellLPTax = uint16(newSellLPTax_);
+
+        _hasLPTax = buyLPTax > 0 && sellLPTax > 0;
+
+        emit LPTaxChanged(oldBuyTax, oldSellTax, buyLPTax, sellLPTax);
+    }
+
+    function _safeGuardTransfer(
+        address from_,
+        address to_,
+        uint256 amount_
+    ) internal view virtual {
+        uint256 fromBalance = _balances[from_];
+
+        if (fromBalance < amount_) {
+            _revert(NotEnoughBalance.selector);
+        }
+        if (
+            buyMaxTx > 0 &&
+            from_ == pairAddress &&
+            !_excludedFromLimits.contains(to_) &&
+            amount_ > buyMaxTx
+        ) {
+            _revert(TransactionIsTooBig.selector);
+        }
+        if (
+            sellMaxTx > 0 &&
+            to_ == pairAddress &&
+            !_excludedFromLimits.contains(from_) &&
+            amount_ > sellMaxTx
+        ) {
+            _revert(TransactionIsTooBig.selector);
+        }
+        uint256 toBalance = _balances[to_];
+        if (
+            maxWallet > 0 &&
+            maxWallet < toBalance + amount_ &&
+            !_excludedFromLimits.contains(to_)
+        ) {
+            _revert(MaxWalletExceeded.selector);
+        }
+    }
+
+    function changeTransactionHardCaps(
+        uint256 newBuyMaxTx_,
+        uint256 newSellMaxTx_,
+        uint256 newMaxWallet_
+    ) external onlyOwner {
+        if (
+            newBuyMaxTx_ < buyMaxTx ||
+            newSellMaxTx_ < sellMaxTx ||
+            newMaxWallet_ < maxWallet
+        ) {
+            _revert(LimitsLoweringIsNotAllowed.selector);
+        }
+        uint128 oldMaxWallet = maxWallet;
+        uint128 oldMaxSellTx = sellMaxTx;
+        uint128 oldMaxBuyTx = buyMaxTx;
+        buyMaxTx = uint128(newBuyMaxTx_);
+        sellMaxTx = uint128(newSellMaxTx_);
+        maxWallet = uint128(newMaxWallet_);
+
+        emit LimitsRaised(
+            oldMaxBuyTx,
+            oldMaxSellTx,
+            oldMaxWallet,
+            buyMaxTx,
+            sellMaxTx,
+            maxWallet
+        );
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _safeGuardAllowance(
+        address owner_,
+        address spender_,
+        uint256 amount_
+    ) internal virtual {
+        uint256 currentAllowance = this.allowance(owner_, spender_);
+        if (currentAllowance != type(uint256).max) {
+            if (currentAllowance < amount_) {
+                _revert(InsufficientAllowance.selector);
+            }
+
+            unchecked {
+                _approve(owner_, spender_, currentAllowance - amount_);
+            }
+        }
+    }
+
+    receive() external payable {}
+
+
+    function _swapTaxes(address from_, address to_) internal {
+        if (_shouldApplyTax() && autoConversion) {
+            uint256 swapBalance = accumulatedTax +
+                        starShipAccumulatedTax +
+                        lpAccumulatedTax;
+
+            uint256 swapThresholdInTokens = (_totalSupply * pctForSwap) / 1000;
+            if (
+                swapBalance >= swapThresholdInTokens &&
+                !_IsInConversion &&
+                from_ != pairAddress &&
+                from_ != address(_uniswapRouter) &&
+                to_ != address(_uniswapRouter)
+            ) {
+                _IsInConversion = true;
+                if (
+                    swapBalance >
+                    swapThresholdInTokens * MAX_SWAP_THRESHOLD_MULTIPLE
+                ) {
+                    swapBalance =
+                        swapThresholdInTokens *
+                        MAX_SWAP_THRESHOLD_MULTIPLE;
+                }
+                // Perform the auto swap to native token:
+                _doSwap(swapBalance, this.balanceOf(address(this)));
+
+                // Flag that the autoswap is complete:
+                _IsInConversion = false;
+            }
+        }
+    }
+
+    function _doSwap(uint256 swapBalance_, uint256 contractBalance_) internal {
+        uint256 preSwapNativeBalance = address(this).balance;
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = _uniswapRouter.WETH();
+        uint256 lpTokensProportion = 0;
+        if (swapBalance_ < contractBalance_) {
+            lpTokensProportion =
+                (swapBalance_ * lpAccumulatedTax) /
+                contractBalance_;
+        } else {
+            lpTokensProportion = lpAccumulatedTax;
+        }
+
+        // Wrap external calls in try / catch to handle errors
+        try
+        _uniswapRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            swapBalance_ - (lpTokensProportion / 2),
+            0,
+            path,
+            address(this),
+            block.timestamp + 600
+        )
+        {
+
+            uint256 postSwapBalance = address(this).balance;
+            uint256 lpTokens = (lpTokensProportion / 2);
+            uint256 totalPendingSwap = accumulatedTax +
+                        starShipAccumulatedTax +
+                        lpTokens;
+            uint256 balanceToDistribute = postSwapBalance -
+                        preSwapNativeBalance;
+            uint256 projectBalanceToDistribute = (balanceToDistribute *
+                accumulatedTax) / totalPendingSwap;
+            uint256 starShipBalance = (balanceToDistribute *
+                starShipAccumulatedTax) / totalPendingSwap;
+
+            uint256 lpBalance = (balanceToDistribute * lpTokens) /
+                        totalPendingSwap;
+
+            if (swapBalance_ < contractBalance_) {
+                accumulatedTax -= uint128(
+                    (accumulatedTax * swapBalance_) / contractBalance_
+                );
+                starShipAccumulatedTax -= uint128(
+                    (starShipAccumulatedTax * swapBalance_) / contractBalance_
+                );
+
+                lpAccumulatedTax -= uint128(
+                    (lpAccumulatedTax * swapBalance_) / contractBalance_
+                );
+
+            } else {
+                (accumulatedTax, starShipAccumulatedTax, lpAccumulatedTax) = (
+                    0,
+                    0,
+                    0
+                );
+            }
+            if (_hasLPTax) {
+                try
+                _uniswapRouter.addLiquidityETH{value: lpBalance}(
+                    address(this),
+                    lpTokens,
+                    0, // slippage is unavoidable
+                    0, // slippage is unavoidable
+                    owner(),
+                    block.timestamp
+                )
+                {
+                    emit LiquiditySupplied(lpTokens, lpBalance);
+                } catch {
+
+                }
+            }
+
+            // Distribute to treasuries:
+            bool success;
+            uint256 gas;
+            if (projectBalanceToDistribute > 0) {
+                _transferNative(projectBalanceToDistribute, taxRecipient);
+            }
+
+            if (starShipBalance > 0) {
+                _transferNative(starShipBalance, startShipVault);
+            }
+        } catch {
+            // Dont allow a failed external call (in this case to uniswap) to stop a transfer.
+            // Emit that this has occured and continue.
+            emit ExternalCallError(5);
+        }
+    }
+}
+
+
+contract StarBaseNoLockerERC20 is StarBaseAbstractERC20 {
+    constructor(
+        address[5] memory addresses,
+        bytes memory tokenInfo,
+        bytes memory taxesInfo,
+        bytes memory lpInfo
+    ) StarBaseAbstractERC20(addresses, tokenInfo, taxesInfo, lpInfo) {
+        autoConversion = true;
+    }
+
+    /**
+     * This will mint the balances for the liquidity pool, which will be minted to the
+     * contract and the rest will be minted to the caller. Also, transaction will revert
+     * if less than 25% of the tokens are not designated to the liquidity pool.
+     *
+     * @param tokenParameters Token info parameters where the total supply is
+     * @param tokenLpInfo The information about the liquidity pool
+     */
+    function _processSupply(
+        TokenInfoParameters memory tokenParameters,
+        TokenLpInfo memory tokenLpInfo
+    ) internal override {
+        _mint(owner(), tokenParameters.maxSupply);
+    }
+
+    function addLiquidity() external payable override returns (address) {}
+}

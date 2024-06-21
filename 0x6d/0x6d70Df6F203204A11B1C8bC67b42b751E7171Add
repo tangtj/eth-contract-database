@@ -1,0 +1,1118 @@
+
+// File: src/core/SafeDeployer.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {ReentrancyGuard} from "openzeppelin-contracts/security/ReentrancyGuard.sol";
+import {AddressProviderService} from "../core/AddressProviderService.sol";
+import {WalletRegistry} from "../core/registries/WalletRegistry.sol";
+import {PolicyRegistry} from "../core/registries/PolicyRegistry.sol";
+import {ISafeProxyFactory} from "../../interfaces/external/ISafeProxyFactory.sol";
+import {ISafeWallet} from "../../interfaces/external/ISafeWallet.sol";
+import {Types, SafeHelper} from "../libraries/SafeHelper.sol";
+import {ISafeMultiSend} from "../../interfaces/external/ISafeMultiSend.sol";
+
+/**
+ * @title SafeDeployer
+ * @author Brahma.fi
+ * @notice Deploys new brahma console accounts and sub accounts
+ */
+contract SafeDeployer is AddressProviderService, ReentrancyGuard {
+    /// @notice version of safe deployer
+    string public constant VERSION = "1";
+
+    /**
+     * @notice hash of safe create2 failure reason
+     * @dev keccak256("Create2 call failed");
+     */
+    bytes32 internal constant _SAFE_CREATION_FAILURE_REASON =
+        0xd7c71a0bdd2eb2834ad042153c811dd478e4ee2324e3003b9522e03e7b3735dc;
+
+    event SafeProxyCreationFailure(address indexed singleton, uint256 indexed nonce, bytes initializer);
+    event ConsoleAccountDeployed(address indexed consoleAddress);
+    event SubAccountDeployed(address indexed subAccountAddress, address indexed consoleAddress);
+    event PreComputeAccount(address[] indexed owners, uint256 indexed threshold);
+
+    error InvalidCommitment();
+    error NotWallet();
+    error PreComputedAccount(address addr);
+    error SafeProxyCreationFailed();
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /// @notice owners nonce
+    mapping(bytes32 ownersHash => uint256 count) public ownerSafeCount;
+
+    /**
+     * @notice Deploys a new console account with or without policy commit and registers it
+     * @dev _owners list should contain addresses in the same order to generate same console address on all chains
+     * @param _owners list of safe owners
+     * @param _threshold safe threshold
+     * @param _policyCommit commitment
+     * @param _salt salt to be used during creation of safe
+     * @return _safe deployed console account address
+     */
+    function deployConsoleAccount(address[] calldata _owners, uint256 _threshold, bytes32 _policyCommit, bytes32 _salt)
+        external
+        nonReentrant
+        returns (address _safe)
+    {
+        bool _policyHashValid = _policyCommit != bytes32(0);
+
+        _safe = _createSafe(_owners, _setupConsoleAccount(_owners, _threshold, _policyHashValid), _salt);
+
+        if (_policyHashValid) {
+            PolicyRegistry(policyRegistry).updatePolicy(_safe, _policyCommit);
+        }
+        emit ConsoleAccountDeployed(_safe);
+    }
+
+    /**
+     * @notice Deploys a new sub-account with policy commit and registers it
+     * @dev ConsoleAccount is enabled as module
+     * @param _owners list of safe owners
+     * @param _threshold safe threshold
+     * @param _policyCommit commitment
+     * @param _salt salt to be used during creation of safe, to generate nonce
+     * @return _subAcc deployed sub-account address
+     */
+    function deploySubAccount(address[] calldata _owners, uint256 _threshold, bytes32 _policyCommit, bytes32 _salt)
+        external
+        nonReentrant
+        returns (address _subAcc)
+    {
+        // Policy commit is required for sub account
+        if (_policyCommit == bytes32(0)) revert InvalidCommitment();
+
+        // Check if msg.sender is a registered wallet
+        if (!WalletRegistry(walletRegistry).isWallet(msg.sender)) revert NotWallet();
+
+        // Deploy sub account
+        _subAcc = _createSafe(_owners, _setupSubAccount(_owners, _threshold), _salt);
+
+        // Register sub account to wallet
+        WalletRegistry(walletRegistry).registerSubAccount(msg.sender, _subAcc);
+
+        // Update policy commit for sub account
+        PolicyRegistry(policyRegistry).updatePolicy(_subAcc, _policyCommit);
+        emit SubAccountDeployed(_subAcc, msg.sender);
+    }
+
+    /**
+     * @notice Private helper function to setup Console account with setUp transactions
+     * @param _owners list of owners addresses
+     * @param _threshold safe threshold
+     */
+    function _setupConsoleAccount(address[] memory _owners, uint256 _threshold, bool _policyHashValid)
+        private
+        view
+        returns (bytes memory)
+    {
+        address fallbackHandler;
+        Types.Executable[] memory txns;
+
+        if (_policyHashValid) {
+            txns = new Types.Executable[](2);
+            fallbackHandler = AddressProviderService._getAuthorizedAddress(_CONSOLE_FALLBACK_HANDLER_HASH);
+
+            // Enable guard on console account
+            txns[1] = Types.Executable({
+                callType: Types.CallType.DELEGATECALL,
+                target: AddressProviderService._getAuthorizedAddress(_SAFE_ENABLER_HASH),
+                value: 0,
+                data: abi.encodeCall(
+                    ISafeWallet.setGuard, (AddressProviderService._getAuthorizedAddress(_SAFE_MODERATOR_OVERRIDABLE_HASH))
+                    )
+            });
+        } else {
+            txns = new Types.Executable[](1);
+            fallbackHandler = AddressProviderService._getAuthorizedAddress(_SAFE_FALLBACK_HANDLER_HASH);
+        }
+
+        // Register Wallet
+        /// @dev This function is being packed as a part of multisend transaction as, safe internally performs
+        // a delegatecall during initializer to the target contract, so direct call doesnt work. Multisend is
+        // supposed to be delegatecall
+        txns[0] = Types.Executable({
+            callType: Types.CallType.CALL,
+            target: walletRegistry,
+            value: 0,
+            data: abi.encodeCall(WalletRegistry.registerWallet, ())
+        });
+
+        return abi.encodeCall(
+            ISafeWallet.setup,
+            (
+                _owners,
+                _threshold,
+                AddressProviderService._getAuthorizedAddress(_SAFE_MULTI_SEND_HASH),
+                abi.encodeCall(ISafeMultiSend.multiSend, (SafeHelper._packMultisendTxns(txns))),
+                fallbackHandler,
+                address(0),
+                0,
+                address(0)
+            )
+        );
+    }
+
+    /**
+     * @notice Private helper function to setup subAccount safe with setUp transactions
+     * @param _owners list of owners addresses
+     * @param _threshold safe threshold
+     */
+    function _setupSubAccount(address[] memory _owners, uint256 _threshold) private view returns (bytes memory) {
+        address safeEnabler = AddressProviderService._getAuthorizedAddress(_SAFE_ENABLER_HASH);
+        Types.Executable[] memory txns = new Types.Executable[](2);
+
+        // Enable Brhma Console account as module on sub Account
+        txns[0] = Types.Executable({
+            callType: Types.CallType.DELEGATECALL,
+            target: safeEnabler,
+            value: 0,
+            data: abi.encodeCall(ISafeWallet.enableModule, (msg.sender))
+        });
+
+        // Enable guard on subAccount
+        txns[1] = Types.Executable({
+            callType: Types.CallType.DELEGATECALL,
+            target: safeEnabler,
+            value: 0,
+            data: abi.encodeCall(ISafeWallet.setGuard, (AddressProviderService._getAuthorizedAddress(_SAFE_MODERATOR_HASH)))
+        });
+
+        return abi.encodeCall(
+            ISafeWallet.setup,
+            (
+                _owners,
+                _threshold,
+                AddressProviderService._getAuthorizedAddress(_SAFE_MULTI_SEND_HASH),
+                abi.encodeCall(ISafeMultiSend.multiSend, (SafeHelper._packMultisendTxns(txns))),
+                AddressProviderService._getAuthorizedAddress(_CONSOLE_FALLBACK_HANDLER_HASH),
+                address(0),
+                0,
+                address(0)
+            )
+        );
+    }
+
+    /**
+     * @notice Internal function to create a new Safe Wallet.
+     * @dev SafeDeployer calls createProxyWithNonce to deploy a new Safe Wallet. This also contains initializer bytes
+     *  which are used during creation to setup the safe with owners and threshold. An actor can precompute the salt
+     *  for a given set of owners and deploy the safe. We choose to not consider that safe as a valid safe and deploy a new
+     *  safe. In case the actor chooses to deploy multiple precomputed safes with bumped nonces, the transaction will run out
+     *  of gas and user can retry with a new random salt
+     *  To generate deterministic addresses for a given set of owners, the order of owner addresses and threshold should be same
+     * @param _owners list of owners addresses
+     * @param _salt salt to be used during creation of safe, to generate nonce
+     * @return _safe The address of the created Safe Wallet.
+     */
+    function _createSafe(address[] calldata _owners, bytes memory _initializer, bytes32 _salt)
+        private
+        returns (address _safe)
+    {
+        address safeProxyFactory = AddressProviderService._getAuthorizedAddress(_SAFE_PROXY_FACTORY_HASH);
+        address safeSingleton = AddressProviderService._getAuthorizedAddress(_SAFE_SINGLETON_HASH);
+        bytes32 ownersHash = keccak256(abi.encode(_owners));
+
+        // Generate nonce based on owners and user provided salt
+        do {
+            uint256 nonce = _genNonce(ownersHash, _salt);
+            try ISafeProxyFactory(safeProxyFactory).createProxyWithNonce(safeSingleton, _initializer, nonce) returns (
+                address _deployedSafe
+            ) {
+                _safe = _deployedSafe;
+            } catch Error(string memory reason) {
+                // KEK
+                if (keccak256(bytes(reason)) != _SAFE_CREATION_FAILURE_REASON) {
+                    // Revert if the error is not due to create2 call failure
+                    revert SafeProxyCreationFailed();
+                }
+                // A safe is already deployed with the same salt, retry with bumped nonce
+                emit SafeProxyCreationFailure(safeSingleton, nonce, _initializer);
+            } catch {
+                revert SafeProxyCreationFailed();
+            }
+        } while (_safe == address(0));
+    }
+
+    /**
+     * @notice Internal function to get the nonce of a user's safe deployment
+     * @param _ownersHash address of owner of the safe.
+     * @param _salt salt to be used in nonce generation
+     * @return The nonce of the user's safe deployment.
+     */
+    function _genNonce(bytes32 _ownersHash, bytes32 _salt) private returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(_ownersHash, ownerSafeCount[_ownersHash]++, _salt, VERSION)));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: src/core/AddressProviderService.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {IAddressProviderService} from "../../interfaces/IAddressProviderService.sol";
+import {AddressProvider} from "../core/AddressProvider.sol";
+import {Constants} from "./Constants.sol";
+
+/**
+ * @title AddressProviderService
+ * @author Brahma.fi
+ * @notice Provides a base contract for services to resolve other services through AddressProvider
+ * @dev This contract is designed to be inheritable by other contracts
+ *  Provides quick and easy access to all contracts in Console Ecosystem
+ */
+abstract contract AddressProviderService is IAddressProviderService, Constants {
+    error InvalidAddressProvider();
+    error NotGovernance(address);
+    error InvalidAddress();
+
+    /// @notice address of addressProvider
+    // solhint-disable-next-line immutable-vars-naming
+    AddressProvider public immutable addressProvider;
+    address public immutable walletRegistry;
+    address public immutable policyRegistry;
+    address public immutable executorRegistry;
+
+    constructor(address _addressProvider) {
+        if (_addressProvider == address(0)) revert InvalidAddressProvider();
+        addressProvider = AddressProvider(_addressProvider);
+
+        walletRegistry = addressProvider.getRegistry(_WALLET_REGISTRY_HASH);
+        policyRegistry = addressProvider.getRegistry(_POLICY_REGISTRY_HASH);
+        executorRegistry = addressProvider.getRegistry(_EXECUTOR_REGISTRY_HASH);
+
+        _notNull(walletRegistry);
+        _notNull(policyRegistry);
+        _notNull(executorRegistry);
+    }
+
+    /**
+     * @inheritdoc IAddressProviderService
+     */
+    function addressProviderTarget() external view override returns (address) {
+        return address(addressProvider);
+    }
+
+    /**
+     * @notice Helper to get authorized address from address provider
+     * @param _key keccak256 key corresponding to authorized address
+     * @return authorizedAddress
+     */
+    function _getAuthorizedAddress(bytes32 _key) internal view returns (address authorizedAddress) {
+        authorizedAddress = addressProvider.getAuthorizedAddress(_key);
+        _notNull(authorizedAddress);
+    }
+
+    /**
+     * @notice Helper to revert if address is null
+     * @param _addr address to check
+     */
+    function _notNull(address _addr) internal pure {
+        if (_addr == address(0)) revert InvalidAddress();
+    }
+}
+
+
+// File: src/core/registries/WalletRegistry.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {AddressProviderService} from "../AddressProviderService.sol";
+
+/**
+ * @title WalletRegistry
+ * @author Brahma.fi
+ * @notice Registry for wallet and sub account addresses
+ */
+contract WalletRegistry is AddressProviderService {
+    error AlreadyRegistered();
+    error InvalidSender();
+    error IsSubAccount();
+
+    event RegisterWallet(address indexed wallet);
+    event RegisterSubAccount(address indexed wallet, address indexed subAccount);
+
+    /// @notice subAccount addresses mapped to owner wallet
+    mapping(address subAccount => address wallet) public subAccountToWallet;
+    /// @notice wallet addresses mapped to list of subAccounts
+    mapping(address wallet => address[] subAccountList) public walletToSubAccountList;
+    /// @notice address of wallet mapped to boolean indicating if it's a wallet
+    mapping(address => bool) public isWallet;
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice Registers a wallet
+     * @dev Can only be called by wallet to register itself
+     */
+    function registerWallet() external {
+        if (isWallet[msg.sender]) revert AlreadyRegistered();
+        if (subAccountToWallet[msg.sender] != address(0)) revert IsSubAccount();
+        isWallet[msg.sender] = true;
+        emit RegisterWallet(msg.sender);
+    }
+
+    /**
+     * @notice Registers a sub account for a Safe
+     * @param _wallet Console account address, owner of sub account
+     * @param _subAccount Sub account address to register
+     * @dev Can only be called by safe deployer
+     */
+
+    function registerSubAccount(address _wallet, address _subAccount) external {
+        if (msg.sender != AddressProviderService._getAuthorizedAddress(_SAFE_DEPLOYER_HASH)) revert InvalidSender();
+
+        if (subAccountToWallet[_subAccount] != address(0) || isWallet[_subAccount]) revert AlreadyRegistered();
+
+        subAccountToWallet[_subAccount] = _wallet;
+        walletToSubAccountList[_wallet].push(_subAccount);
+        emit RegisterSubAccount(_wallet, _subAccount);
+    }
+
+    /**
+     * @notice sub account list getter
+     * @dev returns sub account list associated with _wallet
+     * @param _wallet safe address
+     * @return list of subAccounts for wallet
+     */
+    function getSubAccountsForWallet(address _wallet) external view returns (address[] memory) {
+        return walletToSubAccountList[_wallet];
+    }
+}
+
+
+// File: src/core/registries/PolicyRegistry.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {AddressProviderService} from "src/core/AddressProviderService.sol";
+import {WalletRegistry} from "src/core/registries/WalletRegistry.sol";
+
+/**
+ * @title PolicyRegistry
+ * @author Brahma.fi
+ * @notice Registry for policy commits for wallets and sub accounts
+ */
+contract PolicyRegistry is AddressProviderService {
+    error PolicyCommitInvalid();
+    error UnauthorizedPolicyUpdate();
+
+    event UpdatedPolicyCommit(address indexed account, bytes32 policyCommit, bytes32 oldPolicyCommit);
+
+    /// @notice account addresses mapped to their policy commits
+    mapping(address account => bytes32 policyCommit) public commitments;
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice Enables setting policy commits for accounts
+     * @param account address of account to set policy commit for
+     * @param policyCommit policy commit hash to set
+     * @dev policyCommit for an account can be set by:
+     *  1. by safe deployer, if the account is uninitialized
+     *  2. by the registered wallet, if the account is a subAccount
+     *  3. by the account itself, if account is a registered wallet
+     */
+    function updatePolicy(address account, bytes32 policyCommit) external {
+        if (policyCommit == bytes32(0)) {
+            revert PolicyCommitInvalid();
+        }
+
+        bytes32 currentCommit = commitments[account];
+
+        // solhint-disable no-empty-blocks
+        if (
+            currentCommit == bytes32(0)
+                && msg.sender == AddressProviderService._getAuthorizedAddress(_SAFE_DEPLOYER_HASH)
+        ) {
+            // In case invoker is safe  deployer
+        } else {
+            if (WalletRegistry(walletRegistry).subAccountToWallet(account) == msg.sender) {
+                //In case invoker is updating on behalf of sub account
+            } else if (msg.sender == account && WalletRegistry(walletRegistry).isWallet(msg.sender)) {
+                // In case invoker is a registered wallet
+            } else {
+                revert UnauthorizedPolicyUpdate();
+            }
+        }
+        // solhint-enable no-empty-blocks
+        _updatePolicy(account, policyCommit, currentCommit);
+    }
+
+    /**
+     * @notice Internal function to update policy commit for an account
+     * @param account address of account to set policy commit for
+     * @param policyCommit policy commit hash to set
+     */
+    function _updatePolicy(address account, bytes32 policyCommit, bytes32 oldPolicyCommit) internal {
+        emit UpdatedPolicyCommit(account, policyCommit, oldPolicyCommit);
+        commitments[account] = policyCommit;
+    }
+}
+
+
+// File: interfaces/external/ISafeProxyFactory.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+interface ISafeProxyFactory {
+    event ProxyCreation(address proxy, address singleton);
+
+    function calculateCreateProxyWithNonceAddress(address _singleton, bytes memory initializer, uint256 saltNonce)
+        external
+        returns (address proxy);
+
+    function createProxy(address singleton, bytes memory data) external returns (address proxy);
+
+    function createProxyWithCallback(address _singleton, bytes memory initializer, uint256 saltNonce, address callback)
+        external
+        returns (address proxy);
+
+    function createProxyWithNonce(address _singleton, bytes memory initializer, uint256 saltNonce)
+        external
+        returns (address proxy);
+
+    function proxyCreationCode() external pure returns (bytes memory);
+
+    function proxyRuntimeCode() external pure returns (bytes memory);
+}
+
+
+// File: interfaces/external/ISafeWallet.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity 0.8.19;
+
+import {IERC165} from "openzeppelin-contracts/utils/introspection/IERC165.sol";
+
+/// @title Enum - Collection of enums
+/// @author Richard Meissner - <richard@gnosis.pm>
+contract Enum {
+    enum Operation {
+        Call,
+        DelegateCall
+    }
+}
+
+interface ISafeWallet {
+    /// @dev Allows a Module to execute a Safe transaction without any further confirmations.
+    /// @param to Destination address of module transaction.
+    /// @param value Ether value of module transaction.
+    /// @param data Data payload of module transaction.
+    /// @param operation Operation type of module transaction.
+    function execTransactionFromModule(address to, uint256 value, bytes calldata data, Enum.Operation operation)
+        external
+        returns (bool success);
+
+    /// @dev Allows a Module to execute a Safe transaction without any further confirmations and return data
+    /// @param to Destination address of module transaction.
+    /// @param value Ether value of module transaction.
+    /// @param data Data payload of module transaction.
+    /// @param operation Operation type of module transaction.
+    function execTransactionFromModuleReturnData(address to, uint256 value, bytes memory data, Enum.Operation operation)
+        external
+        returns (bool success, bytes memory returnData);
+    function getStorageAt(uint256 offset, uint256 length) external view returns (bytes memory);
+    function isOwner(address owner) external view returns (bool);
+    function nonce() external view returns (uint256);
+    function getThreshold() external view returns (uint256);
+    function isModuleEnabled(address module) external view returns (bool);
+    function enableModule(address module) external;
+    function disableModule(address prevModule, address module) external;
+    function removeOwner(address prevOwner, address owner, uint256 _threshold) external;
+    function swapOwner(address prevOwner, address oldOwner, address newOwner) external;
+    function getOwners() external view returns (address[] memory);
+    function approveHash(bytes32 hashToApprove) external;
+    function signedMessages(bytes32 _dataHash) external returns (uint256 _signatures);
+    function execTransaction(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory signatures
+    ) external payable returns (bool);
+
+    function setup(
+        address[] memory _owners,
+        uint256 _threshold,
+        address to,
+        bytes memory data,
+        address fallbackHandler,
+        address paymentToken,
+        uint256 payment,
+        address paymentReceiver
+    ) external;
+
+    function addOwnerWithThreshold(address owner, uint256 _threshold) external;
+    function domainSeparator() external view returns (bytes32);
+    function setFallbackHandler(address _fallbackHandler) external;
+    function setGuard(address guard) external;
+    function encodeTransactionData(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address refundReceiver,
+        uint256 _nonce
+    ) external view returns (bytes memory);
+}
+
+interface Guard is IERC165 {
+    function checkTransaction(
+        address to,
+        uint256 value,
+        bytes memory data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory signatures,
+        address msgSender
+    ) external;
+
+    function checkAfterExecution(bytes32 txHash, bool success) external;
+}
+
+
+// File: src/libraries/SafeHelper.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {Enum, ISafeWallet} from "interfaces/external/ISafeWallet.sol";
+import {Types} from "interfaces/Types.sol";
+
+/**
+ * @title SafeHelper
+ * @author Brahma.fi
+ * @notice Helper library containing functions to interact with safe wallet
+ */
+library SafeHelper {
+    error InvalidMultiSendInput();
+    error UnableToParseOperation();
+
+    /// @notice uint256(keccak256("guard_manager.guard.address"))
+    /// @dev This refers to the storage slot where guard is stored in Safe's layout: https://github.com/safe-global/safe-contracts/blob/ff4c6761fbfae8ab8a94f36fd26bcfb2b5414eb1/contracts/base/GuardManager.sol#L77
+    uint256 internal constant _GUARD_STORAGE_SLOT =
+        33528237782592280163068556224972516439282563014722366175641814928123294921928;
+    /// @notice uint256(keccak256("fallback_manager.handler.address"))
+    /// @dev This refers to the storage slot where fallback handler is stored in Safe's layout: https://github.com/safe-global/safe-contracts/blob/ff4c6761fbfae8ab8a94f36fd26bcfb2b5414eb1/contracts/base/FallbackManager.sol#L14
+    uint256 internal constant _FALLBACK_HANDLER_STORAGE_SLOT =
+        49122629484629529244014240937346711770925847994644146912111677022347558721749;
+
+    /**
+     * @notice Contains hash for expected overridable guard removal calldata
+     * @dev This is the hash of the calldata for the following function call
+     *
+     * abi.encodeCall(ISafeWallet.setGuard, (address(0))) = 0xe19a9dd90000000000000000000000000000000000000000000000000000000000000000
+     * keccak256(abi.encodeCall(ISafeWallet.setGuard, (address(0)))) = 0xc0e2c16ecb99419a40dd8b9c0b339b27acebd27c481a28cd606927aeb86f5079
+     */
+    bytes32 internal constant _GUARD_REMOVAL_CALLDATA_HASH =
+        0xc0e2c16ecb99419a40dd8b9c0b339b27acebd27c481a28cd606927aeb86f5079;
+
+    /**
+     * @notice Contains hash for expected overridable fallback handler removal calldata
+     * @dev This is the hash of the calldata for the following function call
+     *
+     * abi.encodeCall(ISafeWallet.setFallbackHandler, (address(0))) = 0xf08a03230000000000000000000000000000000000000000000000000000000000000000
+     * keccak256(abi.encodeCall(ISafeWallet.setFallbackHandler, (address(0)))) = 0x5bdf8c44c012c1347b2b15694dc5cc39b899eb99e32614676b7661001be925b7
+     */
+    bytes32 internal constant _FALLBACK_REMOVAL_CALLDATA_HASH =
+        0x5bdf8c44c012c1347b2b15694dc5cc39b899eb99e32614676b7661001be925b7;
+
+    /**
+     * @notice Packs multiple executables into a single bytes array compatible with Safe's MultiSend contract which can be used as argument for multicall method
+     * @dev Reference contract at https://github.com/safe-global/safe-contracts/blob/main/contracts/libraries/MultiSend.sol
+     * @param _txns Array of executables to pack
+     * @return packedTxns bytes array containing packed transactions
+     */
+    function _packMultisendTxns(Types.Executable[] memory _txns) internal pure returns (bytes memory packedTxns) {
+        uint256 len = _txns.length;
+        if (len == 0) revert InvalidMultiSendInput();
+
+        uint256 i = 0;
+        do {
+            uint8 call = uint8(_parseOperationEnum(_txns[i].callType));
+
+            uint256 calldataLength = _txns[i].data.length;
+
+            bytes memory encodedTxn = abi.encodePacked(
+                bytes1(call), bytes20(_txns[i].target), bytes32(_txns[i].value), bytes32(calldataLength), _txns[i].data
+            );
+
+            if (i != 0) {
+                // If not first transaction, append to packedTxns
+                packedTxns = abi.encodePacked(packedTxns, encodedTxn);
+            } else {
+                // If first transaction, set packedTxns to encodedTxn
+                packedTxns = encodedTxn;
+            }
+
+            unchecked {
+                ++i;
+            }
+        } while (i < len);
+    }
+
+    /**
+     * @notice Gets the guard for a safe
+     * @param safe address of safe
+     * @return address of guard, address(0) if no guard exists
+     */
+    function _getGuard(address safe) internal view returns (address) {
+        bytes memory guardAddress = ISafeWallet(safe).getStorageAt(_GUARD_STORAGE_SLOT, 1);
+        return address(uint160(uint256(bytes32(guardAddress))));
+    }
+
+    /**
+     * @notice Gets the fallback handler for a safe
+     * @param safe address of safe
+     * @return address of fallback handler, address(0) if no fallback handler exists
+     */
+    function _getFallbackHandler(address safe) internal view returns (address) {
+        bytes memory fallbackHandlerAddress = ISafeWallet(safe).getStorageAt(_FALLBACK_HANDLER_STORAGE_SLOT, 1);
+        return address(uint160(uint256(bytes32(fallbackHandlerAddress))));
+    }
+
+    /**
+     * @notice Converts a CallType enum to an Operation enum.
+     * @dev Reverts with UnableToParseOperation error if the CallType is not supported.
+     * @param callType The CallType enum to be converted.
+     * @return operation The converted Operation enum.
+     */
+    function _parseOperationEnum(Types.CallType callType) internal pure returns (Enum.Operation operation) {
+        if (callType == Types.CallType.DELEGATECALL) {
+            operation = Enum.Operation.DelegateCall;
+        } else if (callType == Types.CallType.CALL) {
+            operation = Enum.Operation.Call;
+        } else {
+            revert UnableToParseOperation();
+        }
+    }
+}
+
+
+// File: interfaces/external/ISafeMultiSend.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity >=0.7.0 <0.9.0;
+
+interface ISafeMultiSend {
+    function multiSend(bytes memory transactions) external payable;
+}
+
+
+// File: interfaces/IAddressProviderService.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+interface IAddressProviderService {
+    /// @notice Returns the address of the AddressProvider
+    function addressProviderTarget() external view returns (address);
+}
+
+
+// File: src/core/AddressProvider.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {IAddressProviderService} from "interfaces/IAddressProviderService.sol";
+import {Constants} from "src/core/Constants.sol";
+
+/**
+ * @title AddressProvider
+ * @author Brahma.fi
+ * @notice Single source of truth for resolving addresses of core components and external contracts
+ */
+contract AddressProvider is Constants {
+    error RegistryAlreadyExists();
+    error AddressProviderUnsupported();
+    error NotGovernance(address);
+    error NotPendingGovernance(address);
+    error NullAddress();
+
+    event RegistryInitialised(address indexed registry, bytes32 indexed key);
+    event AuthorizedAddressInitialised(address indexed authorizedAddress, bytes32 indexed key);
+    event GovernanceTransferRequested(address indexed previousGovernance, address indexed newGovernance);
+    event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
+
+    /// @notice address of governance
+    address public governance;
+    /// @notice address of pending governance before accepting
+    address public pendingGovernance;
+
+    /**
+     * @notice keccak256 hash of authorizedAddress keys mapped to their addresses
+     * @dev Core & Roles are used as keys for this mapping. These addresses are mutable
+     * @dev authorizedAddresses are updatable by governance
+     */
+    mapping(bytes32 => address) internal authorizedAddresses;
+
+    /**
+     * @notice keccak256 hash of registry keys mapped to their addresses
+     * @dev registries are only set once by governance and immutable
+     */
+    mapping(bytes32 => address) internal registries;
+
+    constructor(address _governance, address walletRegistry, address policyRegistry, address executorRegistry) {
+        _notNull(_governance);
+        governance = _governance;
+
+        _notNull(walletRegistry);
+        _notNull(policyRegistry);
+        _notNull(executorRegistry);
+        registries[_WALLET_REGISTRY_HASH] = walletRegistry;
+        registries[_POLICY_REGISTRY_HASH] = policyRegistry;
+        registries[_EXECUTOR_REGISTRY_HASH] = executorRegistry;
+    }
+
+    /**
+     * @notice Governance setter
+     * @param _newGovernance address of new governance
+     */
+    function setGovernance(address _newGovernance) external {
+        _notNull(_newGovernance);
+        _onlyGov();
+        emit GovernanceTransferRequested(governance, _newGovernance);
+        pendingGovernance = _newGovernance;
+    }
+
+    /**
+     * @notice Governance accepter
+     */
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) {
+            revert NotPendingGovernance(msg.sender);
+        }
+        emit GovernanceTransferred(governance, msg.sender);
+        governance = msg.sender;
+        delete pendingGovernance;
+    }
+
+    /**
+     * @notice Authorized address setter
+     * @param _key key of authorizedAddress
+     * @param _authorizedAddress address to set
+     * @param _overrideCheck overrides check for supported address provider
+     */
+    function setAuthorizedAddress(bytes32 _key, address _authorizedAddress, bool _overrideCheck) external {
+        _onlyGov();
+        _notNull(_authorizedAddress);
+
+        /// @dev skips checks for supported `addressProvider()` if `_overrideCheck` is true
+        if (!_overrideCheck) {
+            /// @dev skips checks for supported `addressProvider()` if `_authorizedAddress` is an EOA
+            if (_authorizedAddress.code.length != 0) _ensureAddressProvider(_authorizedAddress);
+        }
+
+        authorizedAddresses[_key] = _authorizedAddress;
+
+        emit AuthorizedAddressInitialised(_authorizedAddress, _key);
+    }
+
+    /**
+     * @notice Registry address setter
+     * @param _key key of registry address
+     * @param _registry address to set
+     */
+    function setRegistry(bytes32 _key, address _registry) external {
+        _onlyGov();
+        _ensureAddressProvider(_registry);
+
+        if (registries[_key] != address(0)) revert RegistryAlreadyExists();
+        registries[_key] = _registry;
+
+        emit RegistryInitialised(_registry, _key);
+    }
+
+    /**
+     * @notice Authorized address getter
+     * @param _key key of authorized address
+     * @return address of authorized address
+     */
+    function getAuthorizedAddress(bytes32 _key) external view returns (address) {
+        return authorizedAddresses[_key];
+    }
+
+    /**
+     * @notice Registry address getter
+     * @param _key key of registry address
+     * @return address of registry address
+     */
+    function getRegistry(bytes32 _key) external view returns (address) {
+        return registries[_key];
+    }
+
+    /**
+     * @notice Ensures that the new address supports the AddressProviderService interface
+     * and is pointing to this AddressProvider
+     * @param _newAddress address to check
+     */
+    function _ensureAddressProvider(address _newAddress) internal view {
+        if (IAddressProviderService(_newAddress).addressProviderTarget() != address(this)) {
+            revert AddressProviderUnsupported();
+        }
+    }
+
+    /**
+     * @notice Checks if msg.sender is governance
+     */
+    function _onlyGov() internal view {
+        if (msg.sender != governance) revert NotGovernance(msg.sender);
+    }
+
+    /**
+     * @notice Checks and reverts if address is null
+     * @param addr address to check if null
+     */
+    function _notNull(address addr) internal pure {
+        if (addr == address(0)) revert NullAddress();
+    }
+}
+
+
+// File: src/core/Constants.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+/**
+ * @title Constants
+ * @author Brahma.fi
+ * @notice Contains constants used by multiple contracts
+ * @dev Inflates bytecode size by approximately 560 bytes on deployment, but saves gas on runtime
+ */
+abstract contract Constants {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        REGISTRIES                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /// @notice Key to map address of ExecutorRegistry
+    bytes32 internal constant _EXECUTOR_REGISTRY_HASH = bytes32(uint256(keccak256("console.core.ExecutorRegistry")) - 1);
+
+    /// @notice Key to map address of WalletRegistry
+    bytes32 internal constant _WALLET_REGISTRY_HASH = bytes32(uint256(keccak256("console.core.WalletRegistry")) - 1);
+
+    /// @notice Key to map address of PolicyRegistry
+    bytes32 internal constant _POLICY_REGISTRY_HASH = bytes32(uint256(keccak256("console.core.PolicyRegistry")) - 1);
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          CORE                              */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /// @notice Key to map address of ExecutorPlugin
+    bytes32 internal constant _EXECUTOR_PLUGIN_HASH = bytes32(uint256(keccak256("console.core.ExecutorPlugin")) - 1);
+
+    /// @notice Key to map address of ConsoleFallbackHandler
+    bytes32 internal constant _CONSOLE_FALLBACK_HANDLER_HASH =
+        bytes32(uint256(keccak256("console.core.FallbackHandler")) - 1);
+
+    /// @notice Key to map address of Safe FallbackHandler
+    bytes32 internal constant _SAFE_FALLBACK_HANDLER_HASH = bytes32(uint256(keccak256("safe.FallbackHandler")) - 1);
+
+    /// @notice Key to map address of Safe MultiSend
+    bytes32 internal constant _SAFE_MULTI_SEND_HASH = bytes32(uint256(keccak256("safe.MultiSend")) - 1);
+
+    /// @notice Key to map address of SafeProxyFactory
+    bytes32 internal constant _SAFE_PROXY_FACTORY_HASH = bytes32(uint256(keccak256("safe.ProxyFactory")) - 1);
+
+    /// @notice Key to map address of SafeSingleton
+    bytes32 internal constant _SAFE_SINGLETON_HASH = bytes32(uint256(keccak256("safe.Singleton")) - 1);
+
+    /// @notice Key to map address of PolicyValidator
+    bytes32 internal constant _POLICY_VALIDATOR_HASH = bytes32(uint256(keccak256("console.core.PolicyValidator")) - 1);
+
+    /// @notice Key to map address of SafeDeployer
+    bytes32 internal constant _SAFE_DEPLOYER_HASH = bytes32(uint256(keccak256("console.core.SafeDeployer")) - 1);
+
+    /// @notice Key to map address of SafeEnabler
+    bytes32 internal constant _SAFE_ENABLER_HASH = bytes32(uint256(keccak256("console.core.SafeEnabler")) - 1);
+
+    /// @notice Key to map address of SafeModerator
+    bytes32 internal constant _SAFE_MODERATOR_HASH = bytes32(uint256(keccak256("console.core.SafeModerator")) - 1);
+
+    /// @notice Key to map address of SafeModeratorOverridable
+    bytes32 internal constant _SAFE_MODERATOR_OVERRIDABLE_HASH =
+        bytes32(uint256(keccak256("console.core.SafeModeratorOverridable")) - 1);
+
+    /// @notice Key to map address of TransactionValidator
+    bytes32 internal constant _TRANSACTION_VALIDATOR_HASH =
+        bytes32(uint256(keccak256("console.core.TransactionValidator")) - 1);
+
+    /// @notice Key to map address of ConsoleOpBuilder
+    bytes32 internal constant _CONSOLE_OP_BUILDER_HASH =
+        bytes32(uint256(keccak256("console.core.ConsoleOpBuilder")) - 1);
+
+    /// @notice Key to map address of ExecutionBlocker
+    bytes32 internal constant _EXECUTION_BLOCKER_HASH = bytes32(uint256(keccak256("console.core.ExecutionBlocker")) - 1);
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          ROLES                             */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @notice Key to map address of Role PolicyAuthenticator
+    bytes32 internal constant _POLICY_AUTHENTICATOR_HASH =
+        bytes32(uint256(keccak256("console.roles.PolicyAuthenticator")) - 1);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: interfaces/Types.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+interface Types {
+    enum CallType {
+        CALL,
+        DELEGATECALL,
+        STATICCALL
+    }
+
+    struct Executable {
+        CallType callType;
+        address target;
+        uint256 value;
+        bytes data;
+    }
+
+    struct TokenRequest {
+        address token;
+        uint256 amount;
+    }
+}
+

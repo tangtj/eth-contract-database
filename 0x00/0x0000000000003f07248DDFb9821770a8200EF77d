@@ -1,0 +1,2988 @@
+
+// File: src/SuperPunkWorld/SuperPunkWorld.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.23;
+
+import {OrderType} from "../helpers/OrderEnums.sol";
+import {Order} from "../helpers/OrderStructs.sol";
+import {IStash} from "../interfaces/IStash.sol";
+import {IAuction} from "../interfaces/IAuction.sol";
+import {IStashFactory} from "../interfaces/IStashFactory.sol";
+import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
+import {IRegistry} from "../interfaces/IRegistry.sol";
+import {ICreatorToken} from "../interfaces/ICreatorToken.sol";
+import {ITransferValidator} from "../interfaces/ITransferValidator.sol";
+import {SingleUseVRFConsumer} from "../helpers/SingleUseVRFConsumer.sol";
+import {ERC2981} from "solady/tokens/ERC2981.sol";
+import {Ownable} from "solady/auth/Ownable.sol";
+import {IERC721} from "forge-std/interfaces/IERC721.sol";
+import {IERC165} from "forge-std/interfaces/IERC165.sol";
+import "ERC721A/extensions/ERC721AQueryable.sol";
+
+error NotEnoughEther();
+error ExceedMaxSupply();
+error BidForZeroUnits();
+error AuctionFinalized();
+error FailedToWithdraw();
+error AuctionInProgress();
+error CallerNotEligible();
+error CannotCloseAuction();
+error ArrayLengthMismatch();
+error AuctionNotConfigured();
+error IncreasingPriceDisallowed();
+error CannotTransferDuringAuction();
+error ProvenanceMustBeSetBeforeFinalization();
+
+/**
+ * @title SuperPunkWorld
+ * @notice Nina Chanel X Yuga Labs
+ */
+contract SuperPunkWorld is ERC721AQueryable, SingleUseVRFConsumer, ERC2981, Ownable, IAuction, ICreatorToken {
+    event NewBid(uint256 bidAmount, uint256 numberOfUnits);
+
+    struct AuctionInfo {
+        uint24 dropInterval;
+        uint32 startTime;
+        uint32 endTime;
+        uint32 priceCurveLength;
+        uint64 endPrice;
+        uint72 startPrice;
+    }
+
+    uint256 public constant MAX_SUPPLY = 500;
+    address private constant _PAYMENT_TOKEN = address(0);
+    OrderType private constant _ORDER_TYPE = OrderType.SUBSEQUENT_BIDS_OVERWRITE_PRICE_AND_ADD_UNITS;
+    address private immutable _SPLITTER;
+    address private immutable _CHAINALYSIS;
+    address private constant _STASH_FACTORY = 0x000000000000A6fA31F5fC51c1640aAc76866750;
+
+    AuctionInfo public auctionInfo;
+    uint80 public finalPrice;
+    bool public finalized;
+    bytes32 public provenanceHash;
+    string private _baseUri;
+    ITransferValidator private _transferValidator;
+
+    constructor(
+        uint32 _startTime,
+        uint32 _endTime,
+        uint32 _priceCurveInSeconds,
+        uint24 _dropIntervalInSeconds,
+        address _chainalysis,
+        address _splitterContract,
+        address _link,
+        address _vrfWrapper,
+        address __transferValidator
+    ) ERC721A("Super Punk World", "SPW") SingleUseVRFConsumer(_link, _vrfWrapper) {
+        address _owner = tx.origin;
+        _initializeOwner(_owner);
+
+        auctionInfo = AuctionInfo(
+            _dropIntervalInSeconds,
+            _startTime,
+            _endTime,
+            _priceCurveInSeconds,
+            0,
+            0 // end price and start price to be set closer to auction start
+        );
+
+        _CHAINALYSIS = _chainalysis;
+        _SPLITTER = _splitterContract;
+        _transferValidator = ITransferValidator(__transferValidator);
+
+        _setDefaultRoyalty(_splitterContract, 500);
+    }
+
+    // Allows the contract to receive Ether
+    receive() external payable {}
+
+    /**
+     * @notice Performs checks and creates a bid in the stash of `msg.sender` on this auction. Supports
+     * direct ownership, or ownership through warm or delegate cash
+     * @param numberOfUnits The number of units to bid on
+     * @dev Total amount bid is calculated as pricePerUnit * numberOfUnits
+     * @dev If a user does not yet have a stash, one will be deployed for them as a part of this transaction.
+     * @dev Total amount to bid must be fulfillable with a combination of `msg.value` and the balance of the user's stash.
+     */
+    function bid(uint16 numberOfUnits) external payable {
+        if (!_canBid(msg.sender)) revert CallerNotEligible();
+        if (_totalMinted() + numberOfUnits > MAX_SUPPLY) revert ExceedMaxSupply();
+        if (numberOfUnits == 0) revert BidForZeroUnits();
+        if (!open()) revert AuctionNotOpen();
+        if (auctionInfo.endPrice == 0) revert AuctionNotConfigured();
+
+        uint80 pricePerUnit = currentPrice();
+
+        uint256 totalCost = pricePerUnit * numberOfUnits; // max 4300 eth
+
+        address stashAddress = IStashFactory(_STASH_FACTORY).stashAddressFor(msg.sender);
+
+        uint256 size;
+        assembly {
+            size := extcodesize(stashAddress)
+        }
+
+        if (size == 0) {
+            IStashFactory(_STASH_FACTORY).deployStash(msg.sender);
+        }
+
+        IStash stash = IStash(stashAddress);
+
+        uint256 stashBalance = stash.availableLiquidity(address(0));
+
+        Order memory existingOrder;
+
+        try stash.getOrder(address(this)) returns (Order memory order) {
+            existingOrder = order;
+        } catch {}
+
+        uint256 liquidityToUnlock;
+
+        if (existingOrder.numberOfUnits > 0) {
+            // In a decreasing price auction, earlier bids get adjusted downwards to the new price upon re-bidding
+            liquidityToUnlock = (existingOrder.pricePerUnit - pricePerUnit) * existingOrder.numberOfUnits;
+        }
+
+        if (stashBalance + liquidityToUnlock + msg.value < totalCost) {
+            revert NotEnoughEther();
+        }
+
+        stash.placeOrder{value: msg.value}(pricePerUnit, numberOfUnits);
+
+        _mint(msg.sender, numberOfUnits);
+
+        if (_totalMinted() == MAX_SUPPLY) finalPrice = pricePerUnit;
+
+        emit NewBid(pricePerUnit, numberOfUnits);
+    }
+
+    /**
+     * @notice Claims units for a list of recipients. Used by Yuga prior to finalization to process claims for
+     * bidders that have not done so.
+     */
+    function processOrders(address[] calldata _recipients, uint16[] calldata _unitCounts) external onlyOwner {
+        if (open()) revert AuctionInProgress();
+        if (finalized) revert AuctionFinalized();
+        if (_recipients.length != _unitCounts.length) revert ArrayLengthMismatch();
+
+        for (uint256 i = 0; i < _recipients.length;) {
+            _processOrderFor(_recipients[i], _unitCounts[i]);
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Finalizes the auction. This can only be done after the auction is closed.
+     * @dev Once called, all bids will be released and bidders will be free to withdraw their funds.
+     * @dev Ensure all bids have been claimed prior to calling this function.
+     */
+    function finalizeAuction() external onlyOwner {
+        if (open()) revert CannotFinalizeOpenAuction();
+        if (provenanceHash == 0) revert ProvenanceMustBeSetBeforeFinalization();
+        finalized = true;
+    }
+
+    /**
+     * @notice withdraws contract balance to `owner`
+     */
+    function withdraw() external onlyOwner {
+        (bool success,) = payable(_SPLITTER).call{value: address(this).balance}("");
+        if (!success) revert FailedToWithdraw();
+    }
+
+    /**
+     * @notice Sets the auction start and end price.
+     */
+    function setPrice(uint72 _startPriceWei, uint64 _endPriceWei) external onlyOwner {
+        if (_endPriceWei > _startPriceWei) revert IncreasingPriceDisallowed();
+        auctionInfo.startPrice = _startPriceWei;
+        auctionInfo.endPrice = _endPriceWei;
+    }
+
+    /**
+     * @notice Sets the auction start, end, drop interval and price curve.
+     */
+    function setTime(uint32 _startTime, uint32 _endTime, uint32 _priceCurveInSeconds, uint24 _dropIntervalInSeconds)
+        external
+        onlyOwner
+    {
+        auctionInfo.startTime = _startTime;
+        auctionInfo.endTime = _endTime;
+        auctionInfo.priceCurveLength = _priceCurveInSeconds;
+        auctionInfo.dropInterval = _dropIntervalInSeconds;
+    }
+
+    /**
+     * @notice Sets the base URI for the collection. TokenURIs are the concatenation of baseURI + tokenId
+     */
+    function setBaseUri(string calldata baseUri) external onlyOwner {
+        _baseUri = baseUri;
+    }
+
+    /**
+     * @notice Sets the provenance hash for the collection.
+     * @param hash The hash of the provenance information.
+     * @dev This hash is used to verify the authenticity of the collection. It uses unshuffled metadata, concatenated in order
+     * and hashed using keccak256. Once the auction is finalized, the metadata will be offset by a random number, to be determined
+     * using chainlink VRF. Those seeking to verify the authenticity of the collection will need to apply the same offset when doing
+     * so. It is publicly accessible by reading the `offset` on this contract.
+     */
+    function setProvenanceHash(bytes32 hash) external onlyOwner {
+        if (finalized) revert ProvenanceMustBeSetBeforeFinalization();
+        provenanceHash = hash;
+    }
+
+    /**
+     * @notice Sets the VRF offset for the collection.
+     * @dev This is used to offset the provenance hash by a random number, to be determined using chainlink VRF.
+     * @dev Though this function can be called more than once, the `fullfillRandomWords` callback will revert if
+     * the offset has already been set.
+     */
+    function setVrfOffset() external onlyOwner {
+        vrfRequestId = requestRandomness(100000, 3, 1);
+    }
+
+    /**
+     * @dev Sets the royalty information for the token collection.
+     * @param receiver The address of the royalty recipient.
+     * @param feeNumerator The royalty fee numerator.
+     */
+    function setRoyaltyInfo(address receiver, uint96 feeNumerator) external onlyOwner {
+        _setDefaultRoyalty(receiver, feeNumerator);
+    }
+
+    /**
+     * @notice Sets the transfer validator for the collection.
+     */
+    function setTransferValidator(address transferValidator_) external onlyOwner {
+        address oldValue = address(_transferValidator);
+        _transferValidator = ITransferValidator(transferValidator_);
+        emit TransferValidatorUpdated(oldValue, transferValidator_);
+    }
+
+    function getTransferValidationFunction() external pure returns (bytes4 functionSignature, bool isViewFunction) {
+        functionSignature = 0x7c1e14b4;
+        isViewFunction = true;
+    }
+
+    function getTransferValidator() external view returns (address validator) {
+        validator = address(_transferValidator);
+    }
+
+    /**
+     * @notice Used to retrieve bid type and payment token for this auction
+     */
+    function bidConfig() external pure override returns (address, OrderType) {
+        return (_PAYMENT_TOKEN, _ORDER_TYPE);
+    }
+
+    /**
+     * @notice Returns the current price of the auction, which will decrease over time until a final price is hit
+     */
+    function currentPrice() public view returns (uint80) {
+        if (finalPrice > 0) return finalPrice;
+
+        AuctionInfo memory info = auctionInfo;
+        if (block.timestamp < info.startTime) {
+            return info.startPrice;
+        }
+        if (block.timestamp - info.startTime >= info.priceCurveLength) {
+            return info.endPrice;
+        } else {
+            uint256 steps = (block.timestamp - info.startTime) / info.dropInterval;
+            uint256 auctionDropPerStep = (info.startPrice - info.endPrice) / (info.priceCurveLength / info.dropInterval);
+            return info.startPrice - (uint80(steps * auctionDropPerStep));
+        }
+    }
+
+    /**
+     * @notice Returns whether the auction is currently accepting new bids
+     */
+    function open() public view returns (bool) {
+        if (_totalMinted() == MAX_SUPPLY) return false;
+
+        // If there are available units, the auction is open if the current time is between the start and end time
+        return block.timestamp >= auctionInfo.startTime && block.timestamp < auctionInfo.endTime;
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721A, IERC721A, IERC165, ERC2981)
+        returns (bool)
+    {
+        return interfaceId == type(IAuction).interfaceId || ERC721A.supportsInterface(interfaceId)
+            || ERC2981.supportsInterface(interfaceId);
+    }
+
+    // override _approve, transferFrom, setApprovalForAll to prevent transfers while auction is ongoing
+    function setApprovalForAll(address operator, bool approved) public override(ERC721A, IERC721A) {
+        if (open()) revert CannotTransferDuringAuction();
+        _transferValidator.validateTransfer(operator, msg.sender, operator);
+
+        super.setApprovalForAll(operator, approved);
+    }
+
+    function transferFrom(address from, address to, uint256 tokenId) public payable override(ERC721A, IERC721A) {
+        if (open()) revert CannotTransferDuringAuction();
+        _transferValidator.validateTransfer(msg.sender, from, to, tokenId);
+
+        super.transferFrom(from, to, tokenId);
+    }
+
+    function approve(address to, uint256 tokenId) public payable override(ERC721A, IERC721A) {
+        if (open()) revert CannotTransferDuringAuction();
+        _transferValidator.validateTransfer(to, msg.sender, to, tokenId);
+
+        super.approve(to, tokenId);
+    }
+
+    /**
+     * @notice Mints units to caller, transfers funds and modifies or removes the bid from their stash.
+     * @dev This call will revert is the user does not have a bid of at least `currentPrice()` per unit and for at least `numberOfUnits`
+     */
+    function _processOrderFor(address user, uint16 numberOfUnits) internal {
+        address stash = IStashFactory(_STASH_FACTORY).stashAddressFor(user);
+        IStash(stash).processOrder(currentPrice(), numberOfUnits);
+    }
+
+    /**
+     * @notice Supports ownership through the underlying asset contracts, warm wallets, and delegatexyz
+     * @param bidder The address of the bidder
+     * @dev the stash parameter should be address(0) if not bidding through delegatexyz.
+     */
+    function _canBid(address bidder) internal view virtual returns (bool) {
+        return !ISanctionsList(_CHAINALYSIS).isSanctioned(bidder);
+    }
+
+    function _baseURI() internal view override returns (string memory) {
+        return _baseUri;
+    }
+
+    function _maxOffsetValue() internal pure override returns (uint256) {
+        return MAX_SUPPLY;
+    }
+}
+
+
+// File: src/helpers/OrderEnums.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+enum OrderType
+{
+    // 0: Can replace previous bid. Alters bid price and adds `numberOfUnits`
+    SUBSEQUENT_BIDS_OVERWRITE_PRICE_AND_ADD_UNITS,
+    // 1: Can replace previous bid if new bid has higher `pricePerUnit`
+    SUBSEQUENT_BIDS_REPLACE_EXISTING_PRICE_INCREASE_REQUIRED,
+    // 2: Cannot replace previous bid under any circumstance
+    UNREPLACEABLE
+}
+
+
+// File: src/helpers/OrderStructs.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+struct Order {
+    uint16 numberOfUnits;
+    uint80 pricePerUnit;
+    address auction;
+}
+
+struct PunkBid {
+    Order order;
+    uint256 accountNonce;
+    uint256 bidNonce;
+    uint256 expiration;
+    bytes32 root;
+}
+
+
+// File: src/interfaces/IStash.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+import {OrderType} from "../helpers/OrderEnums.sol";
+import {Order} from "../helpers/OrderStructs.sol";
+
+interface IStash {
+    function placeOrder(uint80 pricePerUnit, uint16 numberOfUnits) external payable;
+    function processOrder(uint80 pricePerUnit, uint16 numberOfUnits) external;
+    function availableLiquidity(address tokenAddress) external view returns (uint256);
+    function wrapPunk(uint256 punkIndex) external;
+    function getOrder(address auction) external view returns (Order memory);
+    function withdraw(address tokenAddress, uint256 amount) external;
+    function owner() external view returns (address);
+    function version() external view returns (uint256);
+}
+
+
+// File: src/interfaces/IAuction.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC721/IERC721.sol)
+
+pragma solidity ^0.8.0;
+
+import "forge-std/interfaces/IERC165.sol";
+import {OrderType} from "../helpers/OrderEnums.sol";
+
+/**
+ * @dev Required interface of an ERC721 compliant contract.
+ */
+interface IAuction is IERC165 {
+    error AuctionNotOpen();
+    error BidTooLow();
+    error CannotFinalizeOpenAuction();
+
+    function bidConfig() external view returns (address, OrderType);
+
+    function open() external view returns (bool);
+
+    function finalized() external view returns (bool);
+
+    function withdraw() external;
+
+    function currentPrice() external view returns (uint80);
+}
+
+
+// File: src/interfaces/IStashFactory.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+interface IStashFactory {
+    function isStash(address stash) external view returns (bool);
+    function deployStash(address owner) external returns (address);
+    function isAuction(address auction) external view returns (bool);
+    function stashAddressFor(address owner) external view returns (address);
+}
+
+
+// File: src/interfaces/ISanctionsList.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+interface ISanctionsList {
+    function isSanctioned(address addr) external view returns (bool);
+}
+
+
+// File: src/interfaces/IRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.9;
+
+/**
+ * @dev Required interface of an Registry compliant contract.
+ */
+interface IRegistry {
+    /**
+     * @dev Emitted when address trying to transfer is not allowed on the registry
+     */
+    error NotAllowed();
+
+    /**
+     * @dev Checks whether `operator` is valid on the registry; let the registry
+     * decide across both allow and blocklists.
+     * @param operator - Address of operator
+     * @return Bool whether operator is valid against registry
+     */
+    function isAllowedOperator(address operator) external view returns (bool);
+
+    /**
+     * @dev Checks whether `operator` is allowed on the registry
+     * @param operator - Address of operator
+     * @return Bool whether operator is allowed
+     */
+    function isAllowed(address operator) external view returns (bool);
+
+    /**
+     * @dev Checks whether `operator` is blocked on the registry
+     * @param operator - Address of operator
+     * @return Bool whether operator is blocked
+     */
+    function isBlocked(address operator) external view returns (bool);
+}
+
+// File: src/interfaces/ICreatorToken.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface ICreatorToken {
+    event TransferValidatorUpdated(address oldValidator, address newValidator);
+
+    function getTransferValidationFunction() external view returns (bytes4 functionSignature, bool isViewFunction);
+    function getTransferValidator() external view returns (address validator);
+    function setTransferValidator(address validator) external;
+}
+
+// File: src/interfaces/ITransferValidator.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface ITransferValidator {
+    function validateTransfer(address caller, address from, address to) external view;
+    function validateTransfer(address caller, address from, address to, uint256 tokenId) external view;
+    function validateTransfer(address caller, address from, address to, uint256 tokenId, uint256 amount) external;
+}
+
+
+// File: src/helpers/SingleUseVRFConsumer.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+import {VRFV2WrapperConsumerBase} from "chainlink/vrf/VRFV2WrapperConsumerBase.sol";
+
+abstract contract SingleUseVRFConsumer is VRFV2WrapperConsumerBase {
+    uint256 public offset;
+    uint256 internal vrfRequestId;
+
+    error OffsetAlreadySet();
+
+    constructor(address linkAddress, address wrapperAddress)
+        VRFV2WrapperConsumerBase(linkAddress, wrapperAddress)
+    {}
+
+    function fulfillRandomWords(uint256 _requestId, uint256[] memory _randomWords) internal override {
+        if (_requestId != vrfRequestId) revert();
+        if (offset > 0) revert OffsetAlreadySet();
+
+        uint256 randomNumber = _randomWords[0];
+
+        offset = randomNumber % _maxOffsetValue();
+    }
+
+    /**
+     * @dev Returns the maximum value that the offset can be. Setting to 0 will revert during fulfillRandomWords.
+     */
+    function _maxOffsetValue() internal view virtual returns (uint256);
+}
+
+// File: lib/solady/src/tokens/ERC2981.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple ERC2981 NFT Royalty Standard implementation.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/tokens/ERC2981.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/common/ERC2981.sol)
+abstract contract ERC2981 {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The royalty fee numerator exceeds the fee denominator.
+    error RoyaltyOverflow();
+
+    /// @dev The royalty receiver cannot be the zero address.
+    error RoyaltyReceiverIsZeroAddress();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The default royalty info is given by:
+    /// ```
+    ///     let packed := sload(_ERC2981_MASTER_SLOT_SEED)
+    ///     let receiver := shr(96, packed)
+    ///     let royaltyFraction := xor(packed, shl(96, receiver))
+    /// ```
+    ///
+    /// The per token royalty info is given by.
+    /// ```
+    ///     mstore(0x00, tokenId)
+    ///     mstore(0x20, _ERC2981_MASTER_SLOT_SEED)
+    ///     let packed := sload(keccak256(0x00, 0x40))
+    ///     let receiver := shr(96, packed)
+    ///     let royaltyFraction := xor(packed, shl(96, receiver))
+    /// ```
+    uint256 private constant _ERC2981_MASTER_SLOT_SEED = 0xaa4ec00224afccfdb7;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          ERC2981                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Checks that `_feeDenominator` is non-zero.
+    constructor() {
+        require(_feeDenominator() != 0, "Fee denominator cannot be zero.");
+    }
+
+    /// @dev Returns the denominator for the royalty amount.
+    /// Defaults to 10000, which represents fees in basis points.
+    /// Override this function to return a custom amount if needed.
+    function _feeDenominator() internal pure virtual returns (uint96) {
+        return 10000;
+    }
+
+    /// @dev Returns true if this contract implements the interface defined by `interfaceId`.
+    /// See: https://eips.ethereum.org/EIPS/eip-165
+    /// This function call must use less than 30000 gas.
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let s := shr(224, interfaceId)
+            // ERC165: 0x01ffc9a7, ERC2981: 0x2a55205a.
+            result := or(eq(s, 0x01ffc9a7), eq(s, 0x2a55205a))
+        }
+    }
+
+    /// @dev Returns the `receiver` and `royaltyAmount` for `tokenId` sold at `salePrice`.
+    function royaltyInfo(uint256 tokenId, uint256 salePrice)
+        public
+        view
+        virtual
+        returns (address receiver, uint256 royaltyAmount)
+    {
+        uint256 feeDenominator = _feeDenominator();
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, tokenId)
+            mstore(0x20, _ERC2981_MASTER_SLOT_SEED)
+            let packed := sload(keccak256(0x00, 0x40))
+            receiver := shr(96, packed)
+            if iszero(receiver) {
+                packed := sload(mload(0x20))
+                receiver := shr(96, packed)
+            }
+            let x := salePrice
+            let y := xor(packed, shl(96, receiver)) // `feeNumerator`.
+            // Overflow check, equivalent to `require(y == 0 || x <= type(uint256).max / y)`.
+            // Out-of-gas revert. Should not be triggered in practice, but included for safety.
+            returndatacopy(returndatasize(), returndatasize(), mul(y, gt(x, div(not(0), y))))
+            royaltyAmount := div(mul(x, y), feeDenominator)
+        }
+    }
+
+    /// @dev Sets the default royalty `receiver` and `feeNumerator`.
+    ///
+    /// Requirements:
+    /// - `receiver` must not be the zero address.
+    /// - `feeNumerator` must not be greater than the fee denominator.
+    function _setDefaultRoyalty(address receiver, uint96 feeNumerator) internal virtual {
+        uint256 feeDenominator = _feeDenominator();
+        /// @solidity memory-safe-assembly
+        assembly {
+            feeNumerator := shr(160, shl(160, feeNumerator))
+            if gt(feeNumerator, feeDenominator) {
+                mstore(0x00, 0x350a88b3) // `RoyaltyOverflow()`.
+                revert(0x1c, 0x04)
+            }
+            let packed := shl(96, receiver)
+            if iszero(packed) {
+                mstore(0x00, 0xb4457eaa) // `RoyaltyReceiverIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+            sstore(_ERC2981_MASTER_SLOT_SEED, or(packed, feeNumerator))
+        }
+    }
+
+    /// @dev Sets the default royalty `receiver` and `feeNumerator` to zero.
+    function _deleteDefaultRoyalty() internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            sstore(_ERC2981_MASTER_SLOT_SEED, 0)
+        }
+    }
+
+    /// @dev Sets the royalty `receiver` and `feeNumerator` for `tokenId`.
+    ///
+    /// Requirements:
+    /// - `receiver` must not be the zero address.
+    /// - `feeNumerator` must not be greater than the fee denominator.
+    function _setTokenRoyalty(uint256 tokenId, address receiver, uint96 feeNumerator)
+        internal
+        virtual
+    {
+        uint256 feeDenominator = _feeDenominator();
+        /// @solidity memory-safe-assembly
+        assembly {
+            feeNumerator := shr(160, shl(160, feeNumerator))
+            if gt(feeNumerator, feeDenominator) {
+                mstore(0x00, 0x350a88b3) // `RoyaltyOverflow()`.
+                revert(0x1c, 0x04)
+            }
+            let packed := shl(96, receiver)
+            if iszero(packed) {
+                mstore(0x00, 0xb4457eaa) // `RoyaltyReceiverIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x00, tokenId)
+            mstore(0x20, _ERC2981_MASTER_SLOT_SEED)
+            sstore(keccak256(0x00, 0x40), or(packed, feeNumerator))
+        }
+    }
+
+    /// @dev Sets the royalty `receiver` and `feeNumerator` for `tokenId` to zero.
+    function _resetTokenRoyalty(uint256 tokenId) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, tokenId)
+            mstore(0x20, _ERC2981_MASTER_SLOT_SEED)
+            sstore(keccak256(0x00, 0x40), 0)
+        }
+    }
+}
+
+
+// File: lib/solady/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+///
+/// @dev Note:
+/// This implementation does NOT auto-initialize the owner to `msg.sender`.
+/// You MUST call the `_initializeOwner` in the constructor / initializer.
+///
+/// While the ownable portion follows
+/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,
+/// the nomenclature for the 2-step ownership handover may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /// @dev Cannot double-initialize.
+    error AlreadyInitialized();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by:
+    /// `bytes32(~uint256(uint32(bytes4(keccak256("_OWNER_SLOT_NOT")))))`.
+    /// It is intentionally chosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    bytes32 internal constant _OWNER_SLOT =
+        0xffffffffffffffffffffffffffffffffffffffffffffffffffffffff74873927;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Override to return true to make `_initializeOwner` prevent double-initialization.
+    function _guardInitializeOwner() internal pure virtual returns (bool guard) {}
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        if (_guardInitializeOwner()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                if sload(ownerSlot) {
+                    mstore(0x00, 0x0dc149f0) // `AlreadyInitialized()`.
+                    revert(0x1c, 0x04)
+                }
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Store the new value.
+                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+            }
+        } else {
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Store the new value.
+                sstore(_OWNER_SLOT, newOwner)
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+            }
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        if (_guardInitializeOwner()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+                // Store the new value.
+                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))
+            }
+        } else {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+                // Store the new value.
+                sstore(ownerSlot, newOwner)
+            }
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(_OWNER_SLOT))) {
+                mstore(0x00, 0x82b42900) // `Unauthorized()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    /// Override to return a different value if needed.
+    /// Made internal to conserve bytecode. Wrap it in a public function if needed.
+    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + _ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(_OWNER_SLOT)
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+
+
+// File: lib/forge-std/src/interfaces/IERC721.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2;
+
+import "./IERC165.sol";
+
+/// @title ERC-721 Non-Fungible Token Standard
+/// @dev See https://eips.ethereum.org/EIPS/eip-721
+/// Note: the ERC-165 identifier for this interface is 0x80ac58cd.
+interface IERC721 is IERC165 {
+    /// @dev This emits when ownership of any NFT changes by any mechanism.
+    /// This event emits when NFTs are created (`from` == 0) and destroyed
+    /// (`to` == 0). Exception: during contract creation, any number of NFTs
+    /// may be created and assigned without emitting Transfer. At the time of
+    /// any transfer, the approved address for that NFT (if any) is reset to none.
+    event Transfer(address indexed _from, address indexed _to, uint256 indexed _tokenId);
+
+    /// @dev This emits when the approved address for an NFT is changed or
+    /// reaffirmed. The zero address indicates there is no approved address.
+    /// When a Transfer event emits, this also indicates that the approved
+    /// address for that NFT (if any) is reset to none.
+    event Approval(address indexed _owner, address indexed _approved, uint256 indexed _tokenId);
+
+    /// @dev This emits when an operator is enabled or disabled for an owner.
+    /// The operator can manage all NFTs of the owner.
+    event ApprovalForAll(address indexed _owner, address indexed _operator, bool _approved);
+
+    /// @notice Count all NFTs assigned to an owner
+    /// @dev NFTs assigned to the zero address are considered invalid, and this
+    /// function throws for queries about the zero address.
+    /// @param _owner An address for whom to query the balance
+    /// @return The number of NFTs owned by `_owner`, possibly zero
+    function balanceOf(address _owner) external view returns (uint256);
+
+    /// @notice Find the owner of an NFT
+    /// @dev NFTs assigned to zero address are considered invalid, and queries
+    /// about them do throw.
+    /// @param _tokenId The identifier for an NFT
+    /// @return The address of the owner of the NFT
+    function ownerOf(uint256 _tokenId) external view returns (address);
+
+    /// @notice Transfers the ownership of an NFT from one address to another address
+    /// @dev Throws unless `msg.sender` is the current owner, an authorized
+    /// operator, or the approved address for this NFT. Throws if `_from` is
+    /// not the current owner. Throws if `_to` is the zero address. Throws if
+    /// `_tokenId` is not a valid NFT. When transfer is complete, this function
+    /// checks if `_to` is a smart contract (code size > 0). If so, it calls
+    /// `onERC721Received` on `_to` and throws if the return value is not
+    /// `bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`.
+    /// @param _from The current owner of the NFT
+    /// @param _to The new owner
+    /// @param _tokenId The NFT to transfer
+    /// @param data Additional data with no specified format, sent in call to `_to`
+    function safeTransferFrom(address _from, address _to, uint256 _tokenId, bytes calldata data) external payable;
+
+    /// @notice Transfers the ownership of an NFT from one address to another address
+    /// @dev This works identically to the other function with an extra data parameter,
+    /// except this function just sets data to "".
+    /// @param _from The current owner of the NFT
+    /// @param _to The new owner
+    /// @param _tokenId The NFT to transfer
+    function safeTransferFrom(address _from, address _to, uint256 _tokenId) external payable;
+
+    /// @notice Transfer ownership of an NFT -- THE CALLER IS RESPONSIBLE
+    /// TO CONFIRM THAT `_to` IS CAPABLE OF RECEIVING NFTS OR ELSE
+    /// THEY MAY BE PERMANENTLY LOST
+    /// @dev Throws unless `msg.sender` is the current owner, an authorized
+    /// operator, or the approved address for this NFT. Throws if `_from` is
+    /// not the current owner. Throws if `_to` is the zero address. Throws if
+    /// `_tokenId` is not a valid NFT.
+    /// @param _from The current owner of the NFT
+    /// @param _to The new owner
+    /// @param _tokenId The NFT to transfer
+    function transferFrom(address _from, address _to, uint256 _tokenId) external payable;
+
+    /// @notice Change or reaffirm the approved address for an NFT
+    /// @dev The zero address indicates there is no approved address.
+    /// Throws unless `msg.sender` is the current NFT owner, or an authorized
+    /// operator of the current owner.
+    /// @param _approved The new approved NFT controller
+    /// @param _tokenId The NFT to approve
+    function approve(address _approved, uint256 _tokenId) external payable;
+
+    /// @notice Enable or disable approval for a third party ("operator") to manage
+    /// all of `msg.sender`'s assets
+    /// @dev Emits the ApprovalForAll event. The contract MUST allow
+    /// multiple operators per owner.
+    /// @param _operator Address to add to the set of authorized operators
+    /// @param _approved True if the operator is approved, false to revoke approval
+    function setApprovalForAll(address _operator, bool _approved) external;
+
+    /// @notice Get the approved address for a single NFT
+    /// @dev Throws if `_tokenId` is not a valid NFT.
+    /// @param _tokenId The NFT to find the approved address for
+    /// @return The approved address for this NFT, or the zero address if there is none
+    function getApproved(uint256 _tokenId) external view returns (address);
+
+    /// @notice Query if an address is an authorized operator for another address
+    /// @param _owner The address that owns the NFTs
+    /// @param _operator The address that acts on behalf of the owner
+    /// @return True if `_operator` is an approved operator for `_owner`, false otherwise
+    function isApprovedForAll(address _owner, address _operator) external view returns (bool);
+}
+
+/// @dev Note: the ERC-165 identifier for this interface is 0x150b7a02.
+interface IERC721TokenReceiver {
+    /// @notice Handle the receipt of an NFT
+    /// @dev The ERC721 smart contract calls this function on the recipient
+    /// after a `transfer`. This function MAY throw to revert and reject the
+    /// transfer. Return of other than the magic value MUST result in the
+    /// transaction being reverted.
+    /// Note: the contract address is always the message sender.
+    /// @param _operator The address which called `safeTransferFrom` function
+    /// @param _from The address which previously owned the token
+    /// @param _tokenId The NFT identifier which is being transferred
+    /// @param _data Additional data with no specified format
+    /// @return `bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`
+    ///  unless throwing
+    function onERC721Received(address _operator, address _from, uint256 _tokenId, bytes calldata _data)
+        external
+        returns (bytes4);
+}
+
+/// @title ERC-721 Non-Fungible Token Standard, optional metadata extension
+/// @dev See https://eips.ethereum.org/EIPS/eip-721
+/// Note: the ERC-165 identifier for this interface is 0x5b5e139f.
+interface IERC721Metadata is IERC721 {
+    /// @notice A descriptive name for a collection of NFTs in this contract
+    function name() external view returns (string memory _name);
+
+    /// @notice An abbreviated name for NFTs in this contract
+    function symbol() external view returns (string memory _symbol);
+
+    /// @notice A distinct Uniform Resource Identifier (URI) for a given asset.
+    /// @dev Throws if `_tokenId` is not a valid NFT. URIs are defined in RFC
+    /// 3986. The URI may point to a JSON file that conforms to the "ERC721
+    /// Metadata JSON Schema".
+    function tokenURI(uint256 _tokenId) external view returns (string memory);
+}
+
+/// @title ERC-721 Non-Fungible Token Standard, optional enumeration extension
+/// @dev See https://eips.ethereum.org/EIPS/eip-721
+/// Note: the ERC-165 identifier for this interface is 0x780e9d63.
+interface IERC721Enumerable is IERC721 {
+    /// @notice Count NFTs tracked by this contract
+    /// @return A count of valid NFTs tracked by this contract, where each one of
+    /// them has an assigned and queryable owner not equal to the zero address
+    function totalSupply() external view returns (uint256);
+
+    /// @notice Enumerate valid NFTs
+    /// @dev Throws if `_index` >= `totalSupply()`.
+    /// @param _index A counter less than `totalSupply()`
+    /// @return The token identifier for the `_index`th NFT,
+    /// (sort order not specified)
+    function tokenByIndex(uint256 _index) external view returns (uint256);
+
+    /// @notice Enumerate NFTs assigned to an owner
+    /// @dev Throws if `_index` >= `balanceOf(_owner)` or if
+    /// `_owner` is the zero address, representing invalid NFTs.
+    /// @param _owner An address where we are interested in NFTs owned by them
+    /// @param _index A counter less than `balanceOf(_owner)`
+    /// @return The token identifier for the `_index`th NFT assigned to `_owner`,
+    /// (sort order not specified)
+    function tokenOfOwnerByIndex(address _owner, uint256 _index) external view returns (uint256);
+}
+
+
+// File: lib/forge-std/src/interfaces/IERC165.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2;
+
+interface IERC165 {
+    /// @notice Query if a contract implements an interface
+    /// @param interfaceID The interface identifier, as specified in ERC-165
+    /// @dev Interface identification is specified in ERC-165. This function
+    /// uses less than 30,000 gas.
+    /// @return `true` if the contract implements `interfaceID` and
+    /// `interfaceID` is not 0xffffffff, `false` otherwise
+    function supportsInterface(bytes4 interfaceID) external view returns (bool);
+}
+
+
+// File: lib/ERC721A/contracts/extensions/ERC721AQueryable.sol
+// SPDX-License-Identifier: MIT
+// ERC721A Contracts v4.2.3
+// Creator: Chiru Labs
+
+pragma solidity ^0.8.4;
+
+import './IERC721AQueryable.sol';
+import '../ERC721A.sol';
+
+/**
+ * @title ERC721AQueryable.
+ *
+ * @dev ERC721A subclass with convenience query functions.
+ */
+abstract contract ERC721AQueryable is ERC721A, IERC721AQueryable {
+    /**
+     * @dev Returns the `TokenOwnership` struct at `tokenId` without reverting.
+     *
+     * If the `tokenId` is out of bounds:
+     *
+     * - `addr = address(0)`
+     * - `startTimestamp = 0`
+     * - `burned = false`
+     * - `extraData = 0`
+     *
+     * If the `tokenId` is burned:
+     *
+     * - `addr = <Address of owner before token was burned>`
+     * - `startTimestamp = <Timestamp when token was burned>`
+     * - `burned = true`
+     * - `extraData = <Extra data when token was burned>`
+     *
+     * Otherwise:
+     *
+     * - `addr = <Address of owner>`
+     * - `startTimestamp = <Timestamp of start of ownership>`
+     * - `burned = false`
+     * - `extraData = <Extra data at start of ownership>`
+     */
+    function explicitOwnershipOf(uint256 tokenId) public view virtual override returns (TokenOwnership memory) {
+        TokenOwnership memory ownership;
+        if (tokenId < _startTokenId() || tokenId >= _nextTokenId()) {
+            return ownership;
+        }
+        ownership = _ownershipAt(tokenId);
+        if (ownership.burned) {
+            return ownership;
+        }
+        return _ownershipOf(tokenId);
+    }
+
+    /**
+     * @dev Returns an array of `TokenOwnership` structs at `tokenIds` in order.
+     * See {ERC721AQueryable-explicitOwnershipOf}
+     */
+    function explicitOwnershipsOf(uint256[] calldata tokenIds)
+        external
+        view
+        virtual
+        override
+        returns (TokenOwnership[] memory)
+    {
+        unchecked {
+            uint256 tokenIdsLength = tokenIds.length;
+            TokenOwnership[] memory ownerships = new TokenOwnership[](tokenIdsLength);
+            for (uint256 i; i != tokenIdsLength; ++i) {
+                ownerships[i] = explicitOwnershipOf(tokenIds[i]);
+            }
+            return ownerships;
+        }
+    }
+
+    /**
+     * @dev Returns an array of token IDs owned by `owner`,
+     * in the range [`start`, `stop`)
+     * (i.e. `start <= tokenId < stop`).
+     *
+     * This function allows for tokens to be queried if the collection
+     * grows too big for a single call of {ERC721AQueryable-tokensOfOwner}.
+     *
+     * Requirements:
+     *
+     * - `start < stop`
+     */
+    function tokensOfOwnerIn(
+        address owner,
+        uint256 start,
+        uint256 stop
+    ) external view virtual override returns (uint256[] memory) {
+        unchecked {
+            if (start >= stop) revert InvalidQueryRange();
+            uint256 tokenIdsIdx;
+            uint256 stopLimit = _nextTokenId();
+            // Set `start = max(start, _startTokenId())`.
+            if (start < _startTokenId()) {
+                start = _startTokenId();
+            }
+            // Set `stop = min(stop, stopLimit)`.
+            if (stop > stopLimit) {
+                stop = stopLimit;
+            }
+            uint256 tokenIdsMaxLength = balanceOf(owner);
+            // Set `tokenIdsMaxLength = min(balanceOf(owner), stop - start)`,
+            // to cater for cases where `balanceOf(owner)` is too big.
+            if (start < stop) {
+                uint256 rangeLength = stop - start;
+                if (rangeLength < tokenIdsMaxLength) {
+                    tokenIdsMaxLength = rangeLength;
+                }
+            } else {
+                tokenIdsMaxLength = 0;
+            }
+            uint256[] memory tokenIds = new uint256[](tokenIdsMaxLength);
+            if (tokenIdsMaxLength == 0) {
+                return tokenIds;
+            }
+            // We need to call `explicitOwnershipOf(start)`,
+            // because the slot at `start` may not be initialized.
+            TokenOwnership memory ownership = explicitOwnershipOf(start);
+            address currOwnershipAddr;
+            // If the starting slot exists (i.e. not burned), initialize `currOwnershipAddr`.
+            // `ownership.address` will not be zero, as `start` is clamped to the valid token ID range.
+            if (!ownership.burned) {
+                currOwnershipAddr = ownership.addr;
+            }
+            for (uint256 i = start; i != stop && tokenIdsIdx != tokenIdsMaxLength; ++i) {
+                ownership = _ownershipAt(i);
+                if (ownership.burned) {
+                    continue;
+                }
+                if (ownership.addr != address(0)) {
+                    currOwnershipAddr = ownership.addr;
+                }
+                if (currOwnershipAddr == owner) {
+                    tokenIds[tokenIdsIdx++] = i;
+                }
+            }
+            // Downsize the array to fit.
+            assembly {
+                mstore(tokenIds, tokenIdsIdx)
+            }
+            return tokenIds;
+        }
+    }
+
+    /**
+     * @dev Returns an array of token IDs owned by `owner`.
+     *
+     * This function scans the ownership mapping and is O(`totalSupply`) in complexity.
+     * It is meant to be called off-chain.
+     *
+     * See {ERC721AQueryable-tokensOfOwnerIn} for splitting the scan into
+     * multiple smaller scans if the collection is large enough to cause
+     * an out-of-gas error (10K collections should be fine).
+     */
+    function tokensOfOwner(address owner) external view virtual override returns (uint256[] memory) {
+        unchecked {
+            uint256 tokenIdsIdx;
+            address currOwnershipAddr;
+            uint256 tokenIdsLength = balanceOf(owner);
+            uint256[] memory tokenIds = new uint256[](tokenIdsLength);
+            TokenOwnership memory ownership;
+            for (uint256 i = _startTokenId(); tokenIdsIdx != tokenIdsLength; ++i) {
+                ownership = _ownershipAt(i);
+                if (ownership.burned) {
+                    continue;
+                }
+                if (ownership.addr != address(0)) {
+                    currOwnershipAddr = ownership.addr;
+                }
+                if (currOwnershipAddr == owner) {
+                    tokenIds[tokenIdsIdx++] = i;
+                }
+            }
+            return tokenIds;
+        }
+    }
+}
+
+
+// File: lib/chainlink/contracts/src/v0.8/vrf/VRFV2WrapperConsumerBase.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {LinkTokenInterface} from "../shared/interfaces/LinkTokenInterface.sol";
+import {VRFV2WrapperInterface} from "./interfaces/VRFV2WrapperInterface.sol";
+
+/** *******************************************************************************
+ * @notice Interface for contracts using VRF randomness through the VRF V2 wrapper
+ * ********************************************************************************
+ * @dev PURPOSE
+ *
+ * @dev Create VRF V2 requests without the need for subscription management. Rather than creating
+ * @dev and funding a VRF V2 subscription, a user can use this wrapper to create one off requests,
+ * @dev paying up front rather than at fulfillment.
+ *
+ * @dev Since the price is determined using the gas price of the request transaction rather than
+ * @dev the fulfillment transaction, the wrapper charges an additional premium on callback gas
+ * @dev usage, in addition to some extra overhead costs associated with the VRFV2Wrapper contract.
+ * *****************************************************************************
+ * @dev USAGE
+ *
+ * @dev Calling contracts must inherit from VRFV2WrapperConsumerBase. The consumer must be funded
+ * @dev with enough LINK to make the request, otherwise requests will revert. To request randomness,
+ * @dev call the 'requestRandomness' function with the desired VRF parameters. This function handles
+ * @dev paying for the request based on the current pricing.
+ *
+ * @dev Consumers must implement the fullfillRandomWords function, which will be called during
+ * @dev fulfillment with the randomness result.
+ */
+abstract contract VRFV2WrapperConsumerBase {
+  // solhint-disable-next-line chainlink-solidity/prefix-immutable-variables-with-i
+  LinkTokenInterface internal immutable LINK;
+  // solhint-disable-next-line chainlink-solidity/prefix-immutable-variables-with-i
+  VRFV2WrapperInterface internal immutable VRF_V2_WRAPPER;
+
+  /**
+   * @param _link is the address of LinkToken
+   * @param _vrfV2Wrapper is the address of the VRFV2Wrapper contract
+   */
+  constructor(address _link, address _vrfV2Wrapper) {
+    LINK = LinkTokenInterface(_link);
+    VRF_V2_WRAPPER = VRFV2WrapperInterface(_vrfV2Wrapper);
+  }
+
+  /**
+   * @dev Requests randomness from the VRF V2 wrapper.
+   *
+   * @param _callbackGasLimit is the gas limit that should be used when calling the consumer's
+   *        fulfillRandomWords function.
+   * @param _requestConfirmations is the number of confirmations to wait before fulfilling the
+   *        request. A higher number of confirmations increases security by reducing the likelihood
+   *        that a chain re-org changes a published randomness outcome.
+   * @param _numWords is the number of random words to request.
+   *
+   * @return requestId is the VRF V2 request ID of the newly created randomness request.
+   */
+  // solhint-disable-next-line chainlink-solidity/prefix-internal-functions-with-underscore
+  function requestRandomness(
+    uint32 _callbackGasLimit,
+    uint16 _requestConfirmations,
+    uint32 _numWords
+  ) internal returns (uint256 requestId) {
+    LINK.transferAndCall(
+      address(VRF_V2_WRAPPER),
+      VRF_V2_WRAPPER.calculateRequestPrice(_callbackGasLimit),
+      abi.encode(_callbackGasLimit, _requestConfirmations, _numWords)
+    );
+    return VRF_V2_WRAPPER.lastRequestId();
+  }
+
+  /**
+   * @notice fulfillRandomWords handles the VRF V2 wrapper response. The consuming contract must
+   * @notice implement it.
+   *
+   * @param _requestId is the VRF V2 request ID.
+   * @param _randomWords is the randomness result.
+   */
+  // solhint-disable-next-line chainlink-solidity/prefix-internal-functions-with-underscore
+  function fulfillRandomWords(uint256 _requestId, uint256[] memory _randomWords) internal virtual;
+
+  function rawFulfillRandomWords(uint256 _requestId, uint256[] memory _randomWords) external {
+    // solhint-disable-next-line gas-custom-errors
+    require(msg.sender == address(VRF_V2_WRAPPER), "only VRF V2 wrapper can fulfill");
+    fulfillRandomWords(_requestId, _randomWords);
+  }
+}
+
+
+// File: lib/ERC721A/contracts/extensions/IERC721AQueryable.sol
+// SPDX-License-Identifier: MIT
+// ERC721A Contracts v4.2.3
+// Creator: Chiru Labs
+
+pragma solidity ^0.8.4;
+
+import '../IERC721A.sol';
+
+/**
+ * @dev Interface of ERC721AQueryable.
+ */
+interface IERC721AQueryable is IERC721A {
+    /**
+     * Invalid query range (`start` >= `stop`).
+     */
+    error InvalidQueryRange();
+
+    /**
+     * @dev Returns the `TokenOwnership` struct at `tokenId` without reverting.
+     *
+     * If the `tokenId` is out of bounds:
+     *
+     * - `addr = address(0)`
+     * - `startTimestamp = 0`
+     * - `burned = false`
+     * - `extraData = 0`
+     *
+     * If the `tokenId` is burned:
+     *
+     * - `addr = <Address of owner before token was burned>`
+     * - `startTimestamp = <Timestamp when token was burned>`
+     * - `burned = true`
+     * - `extraData = <Extra data when token was burned>`
+     *
+     * Otherwise:
+     *
+     * - `addr = <Address of owner>`
+     * - `startTimestamp = <Timestamp of start of ownership>`
+     * - `burned = false`
+     * - `extraData = <Extra data at start of ownership>`
+     */
+    function explicitOwnershipOf(uint256 tokenId) external view returns (TokenOwnership memory);
+
+    /**
+     * @dev Returns an array of `TokenOwnership` structs at `tokenIds` in order.
+     * See {ERC721AQueryable-explicitOwnershipOf}
+     */
+    function explicitOwnershipsOf(uint256[] memory tokenIds) external view returns (TokenOwnership[] memory);
+
+    /**
+     * @dev Returns an array of token IDs owned by `owner`,
+     * in the range [`start`, `stop`)
+     * (i.e. `start <= tokenId < stop`).
+     *
+     * This function allows for tokens to be queried if the collection
+     * grows too big for a single call of {ERC721AQueryable-tokensOfOwner}.
+     *
+     * Requirements:
+     *
+     * - `start < stop`
+     */
+    function tokensOfOwnerIn(
+        address owner,
+        uint256 start,
+        uint256 stop
+    ) external view returns (uint256[] memory);
+
+    /**
+     * @dev Returns an array of token IDs owned by `owner`.
+     *
+     * This function scans the ownership mapping and is O(`totalSupply`) in complexity.
+     * It is meant to be called off-chain.
+     *
+     * See {ERC721AQueryable-tokensOfOwnerIn} for splitting the scan into
+     * multiple smaller scans if the collection is large enough to cause
+     * an out-of-gas error (10K collections should be fine).
+     */
+    function tokensOfOwner(address owner) external view returns (uint256[] memory);
+}
+
+
+// File: lib/ERC721A/contracts/ERC721A.sol
+// SPDX-License-Identifier: MIT
+// ERC721A Contracts v4.2.3
+// Creator: Chiru Labs
+
+pragma solidity ^0.8.4;
+
+import './IERC721A.sol';
+
+/**
+ * @dev Interface of ERC721 token receiver.
+ */
+interface ERC721A__IERC721Receiver {
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external returns (bytes4);
+}
+
+/**
+ * @title ERC721A
+ *
+ * @dev Implementation of the [ERC721](https://eips.ethereum.org/EIPS/eip-721)
+ * Non-Fungible Token Standard, including the Metadata extension.
+ * Optimized for lower gas during batch mints.
+ *
+ * Token IDs are minted in sequential order (e.g. 0, 1, 2, 3, ...)
+ * starting from `_startTokenId()`.
+ *
+ * Assumptions:
+ *
+ * - An owner cannot have more than 2**64 - 1 (max value of uint64) of supply.
+ * - The maximum token ID cannot exceed 2**256 - 1 (max value of uint256).
+ */
+contract ERC721A is IERC721A {
+    // Bypass for a `--via-ir` bug (https://github.com/chiru-labs/ERC721A/pull/364).
+    struct TokenApprovalRef {
+        address value;
+    }
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    // Mask of an entry in packed address data.
+    uint256 private constant _BITMASK_ADDRESS_DATA_ENTRY = (1 << 64) - 1;
+
+    // The bit position of `numberMinted` in packed address data.
+    uint256 private constant _BITPOS_NUMBER_MINTED = 64;
+
+    // The bit position of `numberBurned` in packed address data.
+    uint256 private constant _BITPOS_NUMBER_BURNED = 128;
+
+    // The bit position of `aux` in packed address data.
+    uint256 private constant _BITPOS_AUX = 192;
+
+    // Mask of all 256 bits in packed address data except the 64 bits for `aux`.
+    uint256 private constant _BITMASK_AUX_COMPLEMENT = (1 << 192) - 1;
+
+    // The bit position of `startTimestamp` in packed ownership.
+    uint256 private constant _BITPOS_START_TIMESTAMP = 160;
+
+    // The bit mask of the `burned` bit in packed ownership.
+    uint256 private constant _BITMASK_BURNED = 1 << 224;
+
+    // The bit position of the `nextInitialized` bit in packed ownership.
+    uint256 private constant _BITPOS_NEXT_INITIALIZED = 225;
+
+    // The bit mask of the `nextInitialized` bit in packed ownership.
+    uint256 private constant _BITMASK_NEXT_INITIALIZED = 1 << 225;
+
+    // The bit position of `extraData` in packed ownership.
+    uint256 private constant _BITPOS_EXTRA_DATA = 232;
+
+    // Mask of all 256 bits in a packed ownership except the 24 bits for `extraData`.
+    uint256 private constant _BITMASK_EXTRA_DATA_COMPLEMENT = (1 << 232) - 1;
+
+    // The mask of the lower 160 bits for addresses.
+    uint256 private constant _BITMASK_ADDRESS = (1 << 160) - 1;
+
+    // The maximum `quantity` that can be minted with {_mintERC2309}.
+    // This limit is to prevent overflows on the address data entries.
+    // For a limit of 5000, a total of 3.689e15 calls to {_mintERC2309}
+    // is required to cause an overflow, which is unrealistic.
+    uint256 private constant _MAX_MINT_ERC2309_QUANTITY_LIMIT = 5000;
+
+    // The `Transfer` event signature is given by:
+    // `keccak256(bytes("Transfer(address,address,uint256)"))`.
+    bytes32 private constant _TRANSFER_EVENT_SIGNATURE =
+        0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    // The next token ID to be minted.
+    uint256 private _currentIndex;
+
+    // The number of tokens burned.
+    uint256 private _burnCounter;
+
+    // Token name
+    string private _name;
+
+    // Token symbol
+    string private _symbol;
+
+    // Mapping from token ID to ownership details
+    // An empty struct value does not necessarily mean the token is unowned.
+    // See {_packedOwnershipOf} implementation for details.
+    //
+    // Bits Layout:
+    // - [0..159]   `addr`
+    // - [160..223] `startTimestamp`
+    // - [224]      `burned`
+    // - [225]      `nextInitialized`
+    // - [232..255] `extraData`
+    mapping(uint256 => uint256) private _packedOwnerships;
+
+    // Mapping owner address to address data.
+    //
+    // Bits Layout:
+    // - [0..63]    `balance`
+    // - [64..127]  `numberMinted`
+    // - [128..191] `numberBurned`
+    // - [192..255] `aux`
+    mapping(address => uint256) private _packedAddressData;
+
+    // Mapping from token ID to approved address.
+    mapping(uint256 => TokenApprovalRef) private _tokenApprovals;
+
+    // Mapping from owner to operator approvals
+    mapping(address => mapping(address => bool)) private _operatorApprovals;
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+        _currentIndex = _startTokenId();
+    }
+
+    // =============================================================
+    //                   TOKEN COUNTING OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Returns the starting token ID.
+     * To change the starting token ID, please override this function.
+     */
+    function _startTokenId() internal view virtual returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @dev Returns the next token ID to be minted.
+     */
+    function _nextTokenId() internal view virtual returns (uint256) {
+        return _currentIndex;
+    }
+
+    /**
+     * @dev Returns the total number of tokens in existence.
+     * Burned tokens will reduce the count.
+     * To get the total number of tokens minted, please see {_totalMinted}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        // Counter underflow is impossible as _burnCounter cannot be incremented
+        // more than `_currentIndex - _startTokenId()` times.
+        unchecked {
+            return _currentIndex - _burnCounter - _startTokenId();
+        }
+    }
+
+    /**
+     * @dev Returns the total amount of tokens minted in the contract.
+     */
+    function _totalMinted() internal view virtual returns (uint256) {
+        // Counter underflow is impossible as `_currentIndex` does not decrement,
+        // and it is initialized to `_startTokenId()`.
+        unchecked {
+            return _currentIndex - _startTokenId();
+        }
+    }
+
+    /**
+     * @dev Returns the total number of tokens burned.
+     */
+    function _totalBurned() internal view virtual returns (uint256) {
+        return _burnCounter;
+    }
+
+    // =============================================================
+    //                    ADDRESS DATA OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Returns the number of tokens in `owner`'s account.
+     */
+    function balanceOf(address owner) public view virtual override returns (uint256) {
+        if (owner == address(0)) revert BalanceQueryForZeroAddress();
+        return _packedAddressData[owner] & _BITMASK_ADDRESS_DATA_ENTRY;
+    }
+
+    /**
+     * Returns the number of tokens minted by `owner`.
+     */
+    function _numberMinted(address owner) internal view returns (uint256) {
+        return (_packedAddressData[owner] >> _BITPOS_NUMBER_MINTED) & _BITMASK_ADDRESS_DATA_ENTRY;
+    }
+
+    /**
+     * Returns the number of tokens burned by or on behalf of `owner`.
+     */
+    function _numberBurned(address owner) internal view returns (uint256) {
+        return (_packedAddressData[owner] >> _BITPOS_NUMBER_BURNED) & _BITMASK_ADDRESS_DATA_ENTRY;
+    }
+
+    /**
+     * Returns the auxiliary data for `owner`. (e.g. number of whitelist mint slots used).
+     */
+    function _getAux(address owner) internal view returns (uint64) {
+        return uint64(_packedAddressData[owner] >> _BITPOS_AUX);
+    }
+
+    /**
+     * Sets the auxiliary data for `owner`. (e.g. number of whitelist mint slots used).
+     * If there are multiple variables, please pack them into a uint64.
+     */
+    function _setAux(address owner, uint64 aux) internal virtual {
+        uint256 packed = _packedAddressData[owner];
+        uint256 auxCasted;
+        // Cast `aux` with assembly to avoid redundant masking.
+        assembly {
+            auxCasted := aux
+        }
+        packed = (packed & _BITMASK_AUX_COMPLEMENT) | (auxCasted << _BITPOS_AUX);
+        _packedAddressData[owner] = packed;
+    }
+
+    // =============================================================
+    //                            IERC165
+    // =============================================================
+
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * [EIP section](https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified)
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        // The interface IDs are constants representing the first 4 bytes
+        // of the XOR of all function selectors in the interface.
+        // See: [ERC165](https://eips.ethereum.org/EIPS/eip-165)
+        // (e.g. `bytes4(i.functionA.selector ^ i.functionB.selector ^ ...)`)
+        return
+            interfaceId == 0x01ffc9a7 || // ERC165 interface ID for ERC165.
+            interfaceId == 0x80ac58cd || // ERC165 interface ID for ERC721.
+            interfaceId == 0x5b5e139f; // ERC165 interface ID for ERC721Metadata.
+    }
+
+    // =============================================================
+    //                        IERC721Metadata
+    // =============================================================
+
+    /**
+     * @dev Returns the token collection name.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the token collection symbol.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the Uniform Resource Identifier (URI) for `tokenId` token.
+     */
+    function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
+        if (!_exists(tokenId)) revert URIQueryForNonexistentToken();
+
+        string memory baseURI = _baseURI();
+        return bytes(baseURI).length != 0 ? string(abi.encodePacked(baseURI, _toString(tokenId))) : '';
+    }
+
+    /**
+     * @dev Base URI for computing {tokenURI}. If set, the resulting URI for each
+     * token will be the concatenation of the `baseURI` and the `tokenId`. Empty
+     * by default, it can be overridden in child contracts.
+     */
+    function _baseURI() internal view virtual returns (string memory) {
+        return '';
+    }
+
+    // =============================================================
+    //                     OWNERSHIPS OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) public view virtual override returns (address) {
+        return address(uint160(_packedOwnershipOf(tokenId)));
+    }
+
+    /**
+     * @dev Gas spent here starts off proportional to the maximum mint batch size.
+     * It gradually moves to O(1) as tokens get transferred around over time.
+     */
+    function _ownershipOf(uint256 tokenId) internal view virtual returns (TokenOwnership memory) {
+        return _unpackedOwnership(_packedOwnershipOf(tokenId));
+    }
+
+    /**
+     * @dev Returns the unpacked `TokenOwnership` struct at `index`.
+     */
+    function _ownershipAt(uint256 index) internal view virtual returns (TokenOwnership memory) {
+        return _unpackedOwnership(_packedOwnerships[index]);
+    }
+
+    /**
+     * @dev Initializes the ownership slot minted at `index` for efficiency purposes.
+     */
+    function _initializeOwnershipAt(uint256 index) internal virtual {
+        if (_packedOwnerships[index] == 0) {
+            _packedOwnerships[index] = _packedOwnershipOf(index);
+        }
+    }
+
+    /**
+     * Returns the packed ownership data of `tokenId`.
+     */
+    function _packedOwnershipOf(uint256 tokenId) private view returns (uint256) {
+        uint256 curr = tokenId;
+
+        unchecked {
+            if (_startTokenId() <= curr)
+                if (curr < _currentIndex) {
+                    uint256 packed = _packedOwnerships[curr];
+                    // If not burned.
+                    if (packed & _BITMASK_BURNED == 0) {
+                        // Invariant:
+                        // There will always be an initialized ownership slot
+                        // (i.e. `ownership.addr != address(0) && ownership.burned == false`)
+                        // before an unintialized ownership slot
+                        // (i.e. `ownership.addr == address(0) && ownership.burned == false`)
+                        // Hence, `curr` will not underflow.
+                        //
+                        // We can directly compare the packed value.
+                        // If the address is zero, packed will be zero.
+                        while (packed == 0) {
+                            packed = _packedOwnerships[--curr];
+                        }
+                        return packed;
+                    }
+                }
+        }
+        revert OwnerQueryForNonexistentToken();
+    }
+
+    /**
+     * @dev Returns the unpacked `TokenOwnership` struct from `packed`.
+     */
+    function _unpackedOwnership(uint256 packed) private pure returns (TokenOwnership memory ownership) {
+        ownership.addr = address(uint160(packed));
+        ownership.startTimestamp = uint64(packed >> _BITPOS_START_TIMESTAMP);
+        ownership.burned = packed & _BITMASK_BURNED != 0;
+        ownership.extraData = uint24(packed >> _BITPOS_EXTRA_DATA);
+    }
+
+    /**
+     * @dev Packs ownership data into a single uint256.
+     */
+    function _packOwnershipData(address owner, uint256 flags) private view returns (uint256 result) {
+        assembly {
+            // Mask `owner` to the lower 160 bits, in case the upper bits somehow aren't clean.
+            owner := and(owner, _BITMASK_ADDRESS)
+            // `owner | (block.timestamp << _BITPOS_START_TIMESTAMP) | flags`.
+            result := or(owner, or(shl(_BITPOS_START_TIMESTAMP, timestamp()), flags))
+        }
+    }
+
+    /**
+     * @dev Returns the `nextInitialized` flag set if `quantity` equals 1.
+     */
+    function _nextInitializedFlag(uint256 quantity) private pure returns (uint256 result) {
+        // For branchless setting of the `nextInitialized` flag.
+        assembly {
+            // `(quantity == 1) << _BITPOS_NEXT_INITIALIZED`.
+            result := shl(_BITPOS_NEXT_INITIALIZED, eq(quantity, 1))
+        }
+    }
+
+    // =============================================================
+    //                      APPROVAL OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the
+     * zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) public payable virtual override {
+        address owner = ownerOf(tokenId);
+
+        if (_msgSenderERC721A() != owner)
+            if (!isApprovedForAll(owner, _msgSenderERC721A())) {
+                revert ApprovalCallerNotOwnerNorApproved();
+            }
+
+        _tokenApprovals[tokenId].value = to;
+        emit Approval(owner, to, tokenId);
+    }
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) public view virtual override returns (address) {
+        if (!_exists(tokenId)) revert ApprovalQueryForNonexistentToken();
+
+        return _tokenApprovals[tokenId].value;
+    }
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom}
+     * for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the caller.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool approved) public virtual override {
+        _operatorApprovals[_msgSenderERC721A()][operator] = approved;
+        emit ApprovalForAll(_msgSenderERC721A(), operator, approved);
+    }
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}.
+     */
+    function isApprovedForAll(address owner, address operator) public view virtual override returns (bool) {
+        return _operatorApprovals[owner][operator];
+    }
+
+    /**
+     * @dev Returns whether `tokenId` exists.
+     *
+     * Tokens can be managed by their owner or approved accounts via {approve} or {setApprovalForAll}.
+     *
+     * Tokens start existing when they are minted. See {_mint}.
+     */
+    function _exists(uint256 tokenId) internal view virtual returns (bool) {
+        return
+            _startTokenId() <= tokenId &&
+            tokenId < _currentIndex && // If within bounds,
+            _packedOwnerships[tokenId] & _BITMASK_BURNED == 0; // and not burned.
+    }
+
+    /**
+     * @dev Returns whether `msgSender` is equal to `approvedAddress` or `owner`.
+     */
+    function _isSenderApprovedOrOwner(
+        address approvedAddress,
+        address owner,
+        address msgSender
+    ) private pure returns (bool result) {
+        assembly {
+            // Mask `owner` to the lower 160 bits, in case the upper bits somehow aren't clean.
+            owner := and(owner, _BITMASK_ADDRESS)
+            // Mask `msgSender` to the lower 160 bits, in case the upper bits somehow aren't clean.
+            msgSender := and(msgSender, _BITMASK_ADDRESS)
+            // `msgSender == owner || msgSender == approvedAddress`.
+            result := or(eq(msgSender, owner), eq(msgSender, approvedAddress))
+        }
+    }
+
+    /**
+     * @dev Returns the storage slot and value for the approved address of `tokenId`.
+     */
+    function _getApprovedSlotAndAddress(uint256 tokenId)
+        private
+        view
+        returns (uint256 approvedAddressSlot, address approvedAddress)
+    {
+        TokenApprovalRef storage tokenApproval = _tokenApprovals[tokenId];
+        // The following is equivalent to `approvedAddress = _tokenApprovals[tokenId].value`.
+        assembly {
+            approvedAddressSlot := tokenApproval.slot
+            approvedAddress := sload(approvedAddressSlot)
+        }
+    }
+
+    // =============================================================
+    //                      TRANSFER OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Transfers `tokenId` from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token
+     * by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public payable virtual override {
+        uint256 prevOwnershipPacked = _packedOwnershipOf(tokenId);
+
+        if (address(uint160(prevOwnershipPacked)) != from) revert TransferFromIncorrectOwner();
+
+        (uint256 approvedAddressSlot, address approvedAddress) = _getApprovedSlotAndAddress(tokenId);
+
+        // The nested ifs save around 20+ gas over a compound boolean condition.
+        if (!_isSenderApprovedOrOwner(approvedAddress, from, _msgSenderERC721A()))
+            if (!isApprovedForAll(from, _msgSenderERC721A())) revert TransferCallerNotOwnerNorApproved();
+
+        if (to == address(0)) revert TransferToZeroAddress();
+
+        _beforeTokenTransfers(from, to, tokenId, 1);
+
+        // Clear approvals from the previous owner.
+        assembly {
+            if approvedAddress {
+                // This is equivalent to `delete _tokenApprovals[tokenId]`.
+                sstore(approvedAddressSlot, 0)
+            }
+        }
+
+        // Underflow of the sender's balance is impossible because we check for
+        // ownership above and the recipient's balance can't realistically overflow.
+        // Counter overflow is incredibly unrealistic as `tokenId` would have to be 2**256.
+        unchecked {
+            // We can directly increment and decrement the balances.
+            --_packedAddressData[from]; // Updates: `balance -= 1`.
+            ++_packedAddressData[to]; // Updates: `balance += 1`.
+
+            // Updates:
+            // - `address` to the next owner.
+            // - `startTimestamp` to the timestamp of transfering.
+            // - `burned` to `false`.
+            // - `nextInitialized` to `true`.
+            _packedOwnerships[tokenId] = _packOwnershipData(
+                to,
+                _BITMASK_NEXT_INITIALIZED | _nextExtraData(from, to, prevOwnershipPacked)
+            );
+
+            // If the next slot may not have been initialized (i.e. `nextInitialized == false`) .
+            if (prevOwnershipPacked & _BITMASK_NEXT_INITIALIZED == 0) {
+                uint256 nextTokenId = tokenId + 1;
+                // If the next slot's address is zero and not burned (i.e. packed value is zero).
+                if (_packedOwnerships[nextTokenId] == 0) {
+                    // If the next slot is within bounds.
+                    if (nextTokenId != _currentIndex) {
+                        // Initialize the next slot to maintain correctness for `ownerOf(tokenId + 1)`.
+                        _packedOwnerships[nextTokenId] = prevOwnershipPacked;
+                    }
+                }
+            }
+        }
+
+        emit Transfer(from, to, tokenId);
+        _afterTokenTransfers(from, to, tokenId, 1);
+    }
+
+    /**
+     * @dev Equivalent to `safeTransferFrom(from, to, tokenId, '')`.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public payable virtual override {
+        safeTransferFrom(from, to, tokenId, '');
+    }
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token
+     * by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement
+     * {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) public payable virtual override {
+        transferFrom(from, to, tokenId);
+        if (to.code.length != 0)
+            if (!_checkContractOnERC721Received(from, to, tokenId, _data)) {
+                revert TransferToNonERC721ReceiverImplementer();
+            }
+    }
+
+    /**
+     * @dev Hook that is called before a set of serially-ordered token IDs
+     * are about to be transferred. This includes minting.
+     * And also called before burning one token.
+     *
+     * `startTokenId` - the first token ID to be transferred.
+     * `quantity` - the amount to be transferred.
+     *
+     * Calling conditions:
+     *
+     * - When `from` and `to` are both non-zero, `from`'s `tokenId` will be
+     * transferred to `to`.
+     * - When `from` is zero, `tokenId` will be minted for `to`.
+     * - When `to` is zero, `tokenId` will be burned by `from`.
+     * - `from` and `to` are never both zero.
+     */
+    function _beforeTokenTransfers(
+        address from,
+        address to,
+        uint256 startTokenId,
+        uint256 quantity
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after a set of serially-ordered token IDs
+     * have been transferred. This includes minting.
+     * And also called after one token has been burned.
+     *
+     * `startTokenId` - the first token ID to be transferred.
+     * `quantity` - the amount to be transferred.
+     *
+     * Calling conditions:
+     *
+     * - When `from` and `to` are both non-zero, `from`'s `tokenId` has been
+     * transferred to `to`.
+     * - When `from` is zero, `tokenId` has been minted for `to`.
+     * - When `to` is zero, `tokenId` has been burned by `from`.
+     * - `from` and `to` are never both zero.
+     */
+    function _afterTokenTransfers(
+        address from,
+        address to,
+        uint256 startTokenId,
+        uint256 quantity
+    ) internal virtual {}
+
+    /**
+     * @dev Private function to invoke {IERC721Receiver-onERC721Received} on a target contract.
+     *
+     * `from` - Previous owner of the given token ID.
+     * `to` - Target address that will receive the token.
+     * `tokenId` - Token ID to be transferred.
+     * `_data` - Optional data to send along with the call.
+     *
+     * Returns whether the call correctly returned the expected magic value.
+     */
+    function _checkContractOnERC721Received(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) private returns (bool) {
+        try ERC721A__IERC721Receiver(to).onERC721Received(_msgSenderERC721A(), from, tokenId, _data) returns (
+            bytes4 retval
+        ) {
+            return retval == ERC721A__IERC721Receiver(to).onERC721Received.selector;
+        } catch (bytes memory reason) {
+            if (reason.length == 0) {
+                revert TransferToNonERC721ReceiverImplementer();
+            } else {
+                assembly {
+                    revert(add(32, reason), mload(reason))
+                }
+            }
+        }
+    }
+
+    // =============================================================
+    //                        MINT OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Mints `quantity` tokens and transfers them to `to`.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `quantity` must be greater than 0.
+     *
+     * Emits a {Transfer} event for each mint.
+     */
+    function _mint(address to, uint256 quantity) internal virtual {
+        uint256 startTokenId = _currentIndex;
+        if (quantity == 0) revert MintZeroQuantity();
+
+        _beforeTokenTransfers(address(0), to, startTokenId, quantity);
+
+        // Overflows are incredibly unrealistic.
+        // `balance` and `numberMinted` have a maximum limit of 2**64.
+        // `tokenId` has a maximum limit of 2**256.
+        unchecked {
+            // Updates:
+            // - `balance += quantity`.
+            // - `numberMinted += quantity`.
+            //
+            // We can directly add to the `balance` and `numberMinted`.
+            _packedAddressData[to] += quantity * ((1 << _BITPOS_NUMBER_MINTED) | 1);
+
+            // Updates:
+            // - `address` to the owner.
+            // - `startTimestamp` to the timestamp of minting.
+            // - `burned` to `false`.
+            // - `nextInitialized` to `quantity == 1`.
+            _packedOwnerships[startTokenId] = _packOwnershipData(
+                to,
+                _nextInitializedFlag(quantity) | _nextExtraData(address(0), to, 0)
+            );
+
+            uint256 toMasked;
+            uint256 end = startTokenId + quantity;
+
+            // Use assembly to loop and emit the `Transfer` event for gas savings.
+            // The duplicated `log4` removes an extra check and reduces stack juggling.
+            // The assembly, together with the surrounding Solidity code, have been
+            // delicately arranged to nudge the compiler into producing optimized opcodes.
+            assembly {
+                // Mask `to` to the lower 160 bits, in case the upper bits somehow aren't clean.
+                toMasked := and(to, _BITMASK_ADDRESS)
+                // Emit the `Transfer` event.
+                log4(
+                    0, // Start of data (0, since no data).
+                    0, // End of data (0, since no data).
+                    _TRANSFER_EVENT_SIGNATURE, // Signature.
+                    0, // `address(0)`.
+                    toMasked, // `to`.
+                    startTokenId // `tokenId`.
+                )
+
+                // The `iszero(eq(,))` check ensures that large values of `quantity`
+                // that overflows uint256 will make the loop run out of gas.
+                // The compiler will optimize the `iszero` away for performance.
+                for {
+                    let tokenId := add(startTokenId, 1)
+                } iszero(eq(tokenId, end)) {
+                    tokenId := add(tokenId, 1)
+                } {
+                    // Emit the `Transfer` event. Similar to above.
+                    log4(0, 0, _TRANSFER_EVENT_SIGNATURE, 0, toMasked, tokenId)
+                }
+            }
+            if (toMasked == 0) revert MintToZeroAddress();
+
+            _currentIndex = end;
+        }
+        _afterTokenTransfers(address(0), to, startTokenId, quantity);
+    }
+
+    /**
+     * @dev Mints `quantity` tokens and transfers them to `to`.
+     *
+     * This function is intended for efficient minting only during contract creation.
+     *
+     * It emits only one {ConsecutiveTransfer} as defined in
+     * [ERC2309](https://eips.ethereum.org/EIPS/eip-2309),
+     * instead of a sequence of {Transfer} event(s).
+     *
+     * Calling this function outside of contract creation WILL make your contract
+     * non-compliant with the ERC721 standard.
+     * For full ERC721 compliance, substituting ERC721 {Transfer} event(s) with the ERC2309
+     * {ConsecutiveTransfer} event is only permissible during contract creation.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `quantity` must be greater than 0.
+     *
+     * Emits a {ConsecutiveTransfer} event.
+     */
+    function _mintERC2309(address to, uint256 quantity) internal virtual {
+        uint256 startTokenId = _currentIndex;
+        if (to == address(0)) revert MintToZeroAddress();
+        if (quantity == 0) revert MintZeroQuantity();
+        if (quantity > _MAX_MINT_ERC2309_QUANTITY_LIMIT) revert MintERC2309QuantityExceedsLimit();
+
+        _beforeTokenTransfers(address(0), to, startTokenId, quantity);
+
+        // Overflows are unrealistic due to the above check for `quantity` to be below the limit.
+        unchecked {
+            // Updates:
+            // - `balance += quantity`.
+            // - `numberMinted += quantity`.
+            //
+            // We can directly add to the `balance` and `numberMinted`.
+            _packedAddressData[to] += quantity * ((1 << _BITPOS_NUMBER_MINTED) | 1);
+
+            // Updates:
+            // - `address` to the owner.
+            // - `startTimestamp` to the timestamp of minting.
+            // - `burned` to `false`.
+            // - `nextInitialized` to `quantity == 1`.
+            _packedOwnerships[startTokenId] = _packOwnershipData(
+                to,
+                _nextInitializedFlag(quantity) | _nextExtraData(address(0), to, 0)
+            );
+
+            emit ConsecutiveTransfer(startTokenId, startTokenId + quantity - 1, address(0), to);
+
+            _currentIndex = startTokenId + quantity;
+        }
+        _afterTokenTransfers(address(0), to, startTokenId, quantity);
+    }
+
+    /**
+     * @dev Safely mints `quantity` tokens and transfers them to `to`.
+     *
+     * Requirements:
+     *
+     * - If `to` refers to a smart contract, it must implement
+     * {IERC721Receiver-onERC721Received}, which is called for each safe transfer.
+     * - `quantity` must be greater than 0.
+     *
+     * See {_mint}.
+     *
+     * Emits a {Transfer} event for each mint.
+     */
+    function _safeMint(
+        address to,
+        uint256 quantity,
+        bytes memory _data
+    ) internal virtual {
+        _mint(to, quantity);
+
+        unchecked {
+            if (to.code.length != 0) {
+                uint256 end = _currentIndex;
+                uint256 index = end - quantity;
+                do {
+                    if (!_checkContractOnERC721Received(address(0), to, index++, _data)) {
+                        revert TransferToNonERC721ReceiverImplementer();
+                    }
+                } while (index < end);
+                // Reentrancy protection.
+                if (_currentIndex != end) revert();
+            }
+        }
+    }
+
+    /**
+     * @dev Equivalent to `_safeMint(to, quantity, '')`.
+     */
+    function _safeMint(address to, uint256 quantity) internal virtual {
+        _safeMint(to, quantity, '');
+    }
+
+    // =============================================================
+    //                        BURN OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Equivalent to `_burn(tokenId, false)`.
+     */
+    function _burn(uint256 tokenId) internal virtual {
+        _burn(tokenId, false);
+    }
+
+    /**
+     * @dev Destroys `tokenId`.
+     * The approval is cleared when the token is burned.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _burn(uint256 tokenId, bool approvalCheck) internal virtual {
+        uint256 prevOwnershipPacked = _packedOwnershipOf(tokenId);
+
+        address from = address(uint160(prevOwnershipPacked));
+
+        (uint256 approvedAddressSlot, address approvedAddress) = _getApprovedSlotAndAddress(tokenId);
+
+        if (approvalCheck) {
+            // The nested ifs save around 20+ gas over a compound boolean condition.
+            if (!_isSenderApprovedOrOwner(approvedAddress, from, _msgSenderERC721A()))
+                if (!isApprovedForAll(from, _msgSenderERC721A())) revert TransferCallerNotOwnerNorApproved();
+        }
+
+        _beforeTokenTransfers(from, address(0), tokenId, 1);
+
+        // Clear approvals from the previous owner.
+        assembly {
+            if approvedAddress {
+                // This is equivalent to `delete _tokenApprovals[tokenId]`.
+                sstore(approvedAddressSlot, 0)
+            }
+        }
+
+        // Underflow of the sender's balance is impossible because we check for
+        // ownership above and the recipient's balance can't realistically overflow.
+        // Counter overflow is incredibly unrealistic as `tokenId` would have to be 2**256.
+        unchecked {
+            // Updates:
+            // - `balance -= 1`.
+            // - `numberBurned += 1`.
+            //
+            // We can directly decrement the balance, and increment the number burned.
+            // This is equivalent to `packed -= 1; packed += 1 << _BITPOS_NUMBER_BURNED;`.
+            _packedAddressData[from] += (1 << _BITPOS_NUMBER_BURNED) - 1;
+
+            // Updates:
+            // - `address` to the last owner.
+            // - `startTimestamp` to the timestamp of burning.
+            // - `burned` to `true`.
+            // - `nextInitialized` to `true`.
+            _packedOwnerships[tokenId] = _packOwnershipData(
+                from,
+                (_BITMASK_BURNED | _BITMASK_NEXT_INITIALIZED) | _nextExtraData(from, address(0), prevOwnershipPacked)
+            );
+
+            // If the next slot may not have been initialized (i.e. `nextInitialized == false`) .
+            if (prevOwnershipPacked & _BITMASK_NEXT_INITIALIZED == 0) {
+                uint256 nextTokenId = tokenId + 1;
+                // If the next slot's address is zero and not burned (i.e. packed value is zero).
+                if (_packedOwnerships[nextTokenId] == 0) {
+                    // If the next slot is within bounds.
+                    if (nextTokenId != _currentIndex) {
+                        // Initialize the next slot to maintain correctness for `ownerOf(tokenId + 1)`.
+                        _packedOwnerships[nextTokenId] = prevOwnershipPacked;
+                    }
+                }
+            }
+        }
+
+        emit Transfer(from, address(0), tokenId);
+        _afterTokenTransfers(from, address(0), tokenId, 1);
+
+        // Overflow not possible, as _burnCounter cannot be exceed _currentIndex times.
+        unchecked {
+            _burnCounter++;
+        }
+    }
+
+    // =============================================================
+    //                     EXTRA DATA OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Directly sets the extra data for the ownership data `index`.
+     */
+    function _setExtraDataAt(uint256 index, uint24 extraData) internal virtual {
+        uint256 packed = _packedOwnerships[index];
+        if (packed == 0) revert OwnershipNotInitializedForExtraData();
+        uint256 extraDataCasted;
+        // Cast `extraData` with assembly to avoid redundant masking.
+        assembly {
+            extraDataCasted := extraData
+        }
+        packed = (packed & _BITMASK_EXTRA_DATA_COMPLEMENT) | (extraDataCasted << _BITPOS_EXTRA_DATA);
+        _packedOwnerships[index] = packed;
+    }
+
+    /**
+     * @dev Called during each token transfer to set the 24bit `extraData` field.
+     * Intended to be overridden by the cosumer contract.
+     *
+     * `previousExtraData` - the value of `extraData` before transfer.
+     *
+     * Calling conditions:
+     *
+     * - When `from` and `to` are both non-zero, `from`'s `tokenId` will be
+     * transferred to `to`.
+     * - When `from` is zero, `tokenId` will be minted for `to`.
+     * - When `to` is zero, `tokenId` will be burned by `from`.
+     * - `from` and `to` are never both zero.
+     */
+    function _extraData(
+        address from,
+        address to,
+        uint24 previousExtraData
+    ) internal view virtual returns (uint24) {}
+
+    /**
+     * @dev Returns the next extra data for the packed ownership data.
+     * The returned result is shifted into position.
+     */
+    function _nextExtraData(
+        address from,
+        address to,
+        uint256 prevOwnershipPacked
+    ) private view returns (uint256) {
+        uint24 extraData = uint24(prevOwnershipPacked >> _BITPOS_EXTRA_DATA);
+        return uint256(_extraData(from, to, extraData)) << _BITPOS_EXTRA_DATA;
+    }
+
+    // =============================================================
+    //                       OTHER OPERATIONS
+    // =============================================================
+
+    /**
+     * @dev Returns the message sender (defaults to `msg.sender`).
+     *
+     * If you are writing GSN compatible contracts, you need to override this function.
+     */
+    function _msgSenderERC721A() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    /**
+     * @dev Converts a uint256 to its ASCII string decimal representation.
+     */
+    function _toString(uint256 value) internal pure virtual returns (string memory str) {
+        assembly {
+            // The maximum value of a uint256 contains 78 digits (1 byte per digit), but
+            // we allocate 0xa0 bytes to keep the free memory pointer 32-byte word aligned.
+            // We will need 1 word for the trailing zeros padding, 1 word for the length,
+            // and 3 words for a maximum of 78 digits. Total: 5 * 0x20 = 0xa0.
+            let m := add(mload(0x40), 0xa0)
+            // Update the free memory pointer to allocate.
+            mstore(0x40, m)
+            // Assign the `str` to the end.
+            str := sub(m, 0x20)
+            // Zeroize the slot after the string.
+            mstore(str, 0)
+
+            // Cache the end of the memory to calculate the length later.
+            let end := str
+
+            // We write the string from rightmost digit to leftmost digit.
+            // The following is essentially a do-while loop that also handles the zero case.
+            // prettier-ignore
+            for { let temp := value } 1 {} {
+                str := sub(str, 1)
+                // Write the character to the pointer.
+                // The ASCII index of the '0' character is 48.
+                mstore8(str, add(48, mod(temp, 10)))
+                // Keep dividing `temp` until zero.
+                temp := div(temp, 10)
+                // prettier-ignore
+                if iszero(temp) { break }
+            }
+
+            let length := sub(end, str)
+            // Move the pointer 32 bytes leftwards to make room for the length.
+            str := sub(str, 0x20)
+            // Store the length.
+            mstore(str, length)
+        }
+    }
+}
+
+
+// File: lib/chainlink/contracts/src/v0.8/shared/interfaces/LinkTokenInterface.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface LinkTokenInterface {
+  function allowance(address owner, address spender) external view returns (uint256 remaining);
+
+  function approve(address spender, uint256 value) external returns (bool success);
+
+  function balanceOf(address owner) external view returns (uint256 balance);
+
+  function decimals() external view returns (uint8 decimalPlaces);
+
+  function decreaseApproval(address spender, uint256 addedValue) external returns (bool success);
+
+  function increaseApproval(address spender, uint256 subtractedValue) external;
+
+  function name() external view returns (string memory tokenName);
+
+  function symbol() external view returns (string memory tokenSymbol);
+
+  function totalSupply() external view returns (uint256 totalTokensIssued);
+
+  function transfer(address to, uint256 value) external returns (bool success);
+
+  function transferAndCall(address to, uint256 value, bytes calldata data) external returns (bool success);
+
+  function transferFrom(address from, address to, uint256 value) external returns (bool success);
+}
+
+
+// File: lib/chainlink/contracts/src/v0.8/vrf/interfaces/VRFV2WrapperInterface.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface VRFV2WrapperInterface {
+  /**
+   * @return the request ID of the most recent VRF V2 request made by this wrapper. This should only
+   * be relied option within the same transaction that the request was made.
+   */
+  function lastRequestId() external view returns (uint256);
+
+  /**
+   * @notice Calculates the price of a VRF request with the given callbackGasLimit at the current
+   * @notice block.
+   *
+   * @dev This function relies on the transaction gas price which is not automatically set during
+   * @dev simulation. To estimate the price at a specific gas price, use the estimatePrice function.
+   *
+   * @param _callbackGasLimit is the gas limit used to estimate the price.
+   */
+  function calculateRequestPrice(uint32 _callbackGasLimit) external view returns (uint256);
+
+  /**
+   * @notice Estimates the price of a VRF request with a specific gas limit and gas price.
+   *
+   * @dev This is a convenience function that can be called in simulation to better understand
+   * @dev pricing.
+   *
+   * @param _callbackGasLimit is the gas limit used to estimate the price.
+   * @param _requestGasPriceWei is the gas price in wei used for the estimation.
+   */
+  function estimateRequestPrice(uint32 _callbackGasLimit, uint256 _requestGasPriceWei) external view returns (uint256);
+}
+
+
+// File: lib/ERC721A/contracts/IERC721A.sol
+// SPDX-License-Identifier: MIT
+// ERC721A Contracts v4.2.3
+// Creator: Chiru Labs
+
+pragma solidity ^0.8.4;
+
+/**
+ * @dev Interface of ERC721A.
+ */
+interface IERC721A {
+    /**
+     * The caller must own the token or be an approved operator.
+     */
+    error ApprovalCallerNotOwnerNorApproved();
+
+    /**
+     * The token does not exist.
+     */
+    error ApprovalQueryForNonexistentToken();
+
+    /**
+     * Cannot query the balance for the zero address.
+     */
+    error BalanceQueryForZeroAddress();
+
+    /**
+     * Cannot mint to the zero address.
+     */
+    error MintToZeroAddress();
+
+    /**
+     * The quantity of tokens minted must be more than zero.
+     */
+    error MintZeroQuantity();
+
+    /**
+     * The token does not exist.
+     */
+    error OwnerQueryForNonexistentToken();
+
+    /**
+     * The caller must own the token or be an approved operator.
+     */
+    error TransferCallerNotOwnerNorApproved();
+
+    /**
+     * The token must be owned by `from`.
+     */
+    error TransferFromIncorrectOwner();
+
+    /**
+     * Cannot safely transfer to a contract that does not implement the
+     * ERC721Receiver interface.
+     */
+    error TransferToNonERC721ReceiverImplementer();
+
+    /**
+     * Cannot transfer to the zero address.
+     */
+    error TransferToZeroAddress();
+
+    /**
+     * The token does not exist.
+     */
+    error URIQueryForNonexistentToken();
+
+    /**
+     * The `quantity` minted with ERC2309 exceeds the safety limit.
+     */
+    error MintERC2309QuantityExceedsLimit();
+
+    /**
+     * The `extraData` cannot be set on an unintialized ownership slot.
+     */
+    error OwnershipNotInitializedForExtraData();
+
+    // =============================================================
+    //                            STRUCTS
+    // =============================================================
+
+    struct TokenOwnership {
+        // The address of the owner.
+        address addr;
+        // Stores the start time of ownership with minimal overhead for tokenomics.
+        uint64 startTimestamp;
+        // Whether the token has been burned.
+        bool burned;
+        // Arbitrary data similar to `startTimestamp` that can be set via {_extraData}.
+        uint24 extraData;
+    }
+
+    // =============================================================
+    //                         TOKEN COUNTERS
+    // =============================================================
+
+    /**
+     * @dev Returns the total number of tokens in existence.
+     * Burned tokens will reduce the count.
+     * To get the total number of tokens minted, please see {_totalMinted}.
+     */
+    function totalSupply() external view returns (uint256);
+
+    // =============================================================
+    //                            IERC165
+    // =============================================================
+
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * [EIP section](https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified)
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+
+    // =============================================================
+    //                            IERC721
+    // =============================================================
+
+    /**
+     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.
+     */
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables or disables
+     * (`approved`) `operator` to manage all of its assets.
+     */
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /**
+     * @dev Returns the number of tokens in `owner`'s account.
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`,
+     * checking first that contract recipients are aware of the ERC721 protocol
+     * to prevent tokens from being forever locked.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be have been allowed to move
+     * this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement
+     * {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata data
+    ) external payable;
+
+    /**
+     * @dev Equivalent to `safeTransferFrom(from, to, tokenId, '')`.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external payable;
+
+    /**
+     * @dev Transfers `tokenId` from `from` to `to`.
+     *
+     * WARNING: Usage of this method is discouraged, use {safeTransferFrom}
+     * whenever possible.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token
+     * by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external payable;
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the
+     * zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) external payable;
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom}
+     * for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the caller.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool _approved) external;
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) external view returns (address operator);
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}.
+     */
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+
+    // =============================================================
+    //                        IERC721Metadata
+    // =============================================================
+
+    /**
+     * @dev Returns the token collection name.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the token collection symbol.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the Uniform Resource Identifier (URI) for `tokenId` token.
+     */
+    function tokenURI(uint256 tokenId) external view returns (string memory);
+
+    // =============================================================
+    //                           IERC2309
+    // =============================================================
+
+    /**
+     * @dev Emitted when tokens in `fromTokenId` to `toTokenId`
+     * (inclusive) is transferred from `from` to `to`, as defined in the
+     * [ERC2309](https://eips.ethereum.org/EIPS/eip-2309) standard.
+     *
+     * See {_mintERC2309} for more details.
+     */
+    event ConsecutiveTransfer(uint256 indexed fromTokenId, uint256 toTokenId, address indexed from, address indexed to);
+}
+

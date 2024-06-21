@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract MyToken {
+    string public name = "Renaissance of Meme";
+    string public symbol = "ROE";
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    address public owner;
+    uint256 public buyFee = 5;
+    uint256 public sellFee = 20;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event FeesUpdated(uint256 newBuyFee, uint256 newSellFee);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Ownable: caller is not the owner");
+        _;
+    }
+
+    constructor(uint256 _initialSupply) {
+        owner = msg.sender;
+        totalSupply = _initialSupply * (10 ** uint256(decimals));
+        balanceOf[msg.sender] = totalSupply;
+        emit Transfer(address(0), msg.sender, totalSupply);
+    }
+
+    function transfer(address _to, uint256 _value) public returns (bool success) {
+        require(balanceOf[msg.sender] >= _value, "ERC20: transfer amount exceeds balance");
+        balanceOf[msg.sender] -= _value;
+        uint256 transferAmount = _value;
+
+        if (_to == address(0)) {
+            // This is a sell transaction
+            uint256 fee = (_value * sellFee) / 10000;
+            transferAmount -= fee;
+            balanceOf[owner] += fee;
+            emit Transfer(msg.sender, owner, fee);
+        } else if (msg.sender == address(0)) {
+            // This is a buy transaction
+            uint256 fee = (_value * buyFee) / 10000;
+            transferAmount -= fee;
+            balanceOf[owner] += fee;
+            emit Transfer(_to, owner, fee);
+        }
+
+        balanceOf[_to] += transferAmount;
+        emit Transfer(msg.sender, _to, transferAmount);
+        return true;
+    }
+
+    function approve(address _spender, uint256 _value) public returns (bool success) {
+        allowance[msg.sender][_spender] = _value;
+        emit Approval(msg.sender, _spender, _value);
+        return true;
+    }
+
+    function transferFrom(address _from, address _to, uint256 _value) public returns (bool success) {
+        require(_value <= balanceOf[_from], "ERC20: transfer amount exceeds balance");
+        require(_value <= allowance[_from][msg.sender], "ERC20: transfer amount exceeds allowance");
+        balanceOf[_from] -= _value;
+        allowance[_from][msg.sender] -= _value;
+        uint256 transferAmount = _value;
+
+        if (_to == address(0)) {
+            // This is a sell transaction
+            uint256 fee = (_value * sellFee) / 10000;
+            transferAmount -= fee;
+            balanceOf[owner] += fee;
+            emit Transfer(_from, owner, fee);
+        } else if (_from == address(0)) {
+            // This is a buy transaction
+            uint256 fee = (_value * buyFee) / 10000;
+            transferAmount -= fee;
+            balanceOf[owner] += fee;
+            emit Transfer(_to, owner, fee);
+        }
+
+        balanceOf[_to] += transferAmount;
+        emit Transfer(_from, _to, transferAmount);
+        return true;
+    }
+
+    function updateFees(uint256 _buyFee, uint256 _sellFee) public onlyOwner {
+        require(_buyFee <= 1000 && _sellFee <= 1000, "Fees cannot exceed 10%");
+        buyFee = _buyFee;
+        sellFee = _sellFee;
+        emit FeesUpdated(_buyFee, _sellFee);
+    }
+
+    function renounceOwnership() public onlyOwner {
+        emit OwnershipTransferred(owner, address(0));
+        owner = address(0);
+    }
+}

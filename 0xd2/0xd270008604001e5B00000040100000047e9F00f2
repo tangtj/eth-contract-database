@@ -1,0 +1,1316 @@
+
+// File: src/KekotronRouterV2.sol
+/**
+ * Kekotron Router V2
+ * 
+ * Website: kekotron.io
+ * Docs: docs.kekotron.io
+ * twitter.com/Kekotron_
+ * twitter.com/Nchart_
+ */
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import {Owned} from "solmate/auth/Owned.sol";
+import {KekotronSwapV2} from "./KekotronSwapV2.sol";
+import {KekotronSwapTraderJoeV2_1} from "./KekotronSwapTraderJoeV2_1.sol";
+import {KekotronSwapV3} from "./KekotronSwapV3.sol";
+import {OnlyOwner, TooLittleReceived, InvalidVersion, TokenInCannotBeSameAsTokenOut, InvalidInputAmount} from "./KekotronErrors.sol";
+import {Swap, ProtocolData} from "./DataTypes.sol";
+import {INITIALIZER, POOL_FEE_MASK} from "./Constants.sol";
+import {IERC20} from "./interfaces/IERC20.sol";
+import {KekotronLib} from "./KekotronLib.sol";
+
+/**
+ * ........            
+ *        ..::::::::::::.  .       
+ *      .:::::::::::::::.  =+-.    
+ *    --::::::::::::::::.  =+++-   
+ *    ##*+::::::::::::::.  =+++++
+ *   #####:  .::::::::::.  =++++++
+ * -######:     .:::::::.  =++++++-
+ *  ######:  :.    .::::.  =+++++++
+ * #######:  -=-:.    .:.  =+++++++
+ * +######:  -=====:.      =++++++=
+ * :######:  -========-.   =++++++:
+ *  +#####:  -===========-.-+++++= 
+ *   =####:  -==============-==+-  
+ *    :*##:  -================-.   
+ *      :+:  -==============-.     
+ *           :==========-:.        
+ *              ......
+ */
+
+contract KekotronRouterV2 is Owned, KekotronSwapV2, KekotronSwapTraderJoeV2_1, KekotronSwapV3 {
+    event FeeUpdated(uint8 fee);
+    event FeeReceiverUpdated(address feeReceiver);
+    event ProtocolDataUpdated(uint8 protocol, ProtocolData data);
+    event AllowedV2CallbackUpdated(bytes4 selector, bool allowed);
+    event AllowedV3CallbackUpdated(bytes4 selector, bool allowed);
+
+    address private immutable WRAPPED_NATIVE;
+    bytes4 private constant V2_CALLBACK1 = 0x10d1e85c;
+    bytes4 private constant V2_CALLBACK2 = 0x84800812;
+    bytes4 private constant V2_CALLBACK3 = 0xee22dd87;
+
+    bytes4 private constant V3_CALLBACK1 = 0xfa461e33;
+    bytes4 private constant V3_CALLBACK2 = 0x23a69e75;
+    bytes4 private constant V3_CALLBACK3 = 0x2c8958f6;
+
+    uint8 public fee = 0; // 100 = 1% - max = 255 = 2.55%
+    address public feeReceiver;
+
+    /// @dev Fallback selectors for callbacks, allowing for adding additional protocols in the future
+    mapping(bytes4 => bool) public allowedV2Callbacks;
+    mapping(bytes4 => bool) public allowedV3Callbacks;
+
+    constructor(address owner_) Owned(owner_) KekotronSwapV2() KekotronSwapTraderJoeV2_1() KekotronSwapV3() {
+        (address receiver, address wrappedNative_,) = INITIALIZER.getSetupData();
+
+        WRAPPED_NATIVE = wrappedNative_;
+        feeReceiver = receiver;
+    }
+
+    modifier onlyOwner() virtual override {
+        _requireIsOwner();
+        _;
+    }
+
+    function updateFee(uint8 newFee) external onlyOwner {
+        fee = newFee;
+
+        emit FeeUpdated(newFee);
+    }
+
+    function updateFeeReceiver(address newFeeReceiver) external onlyOwner {
+        feeReceiver = newFeeReceiver;
+
+        emit FeeReceiverUpdated(newFeeReceiver);
+    }
+
+    function withdrawNative() external onlyOwner {
+        KekotronLib.safeTransferNative(owner, address(this).balance);
+    }
+
+    function withdrawToken(address token) external onlyOwner {
+        KekotronLib.safeTransfer(token, owner, IERC20(token).balanceOf(address(this)));
+    }
+
+    function updateAllowedV2Callbacks(bytes4 selector, bool allowed) external onlyOwner {
+        allowedV2Callbacks[selector] = allowed;
+
+        emit AllowedV2CallbackUpdated(selector, allowed);
+    }
+
+    function updatedAllowedV3Callbacks(bytes4 selector, bool allowed) external onlyOwner {
+        allowedV3Callbacks[selector] = allowed;
+
+        emit AllowedV3CallbackUpdated(selector, allowed);
+    }
+
+    function updateProtocolData(uint8 protocol, ProtocolData memory data) external onlyOwner {
+        _updateProtocolData(protocol, data);
+
+        emit ProtocolDataUpdated(protocol, data);
+    }
+
+    /**
+     * @dev The fallback function is used to handle both callbacks from the pools and swap initiators
+     * @dev For swaps, a prefix is added to the calldata to indicate the type of call and certain parameters
+     * @dev The prefix is 5 bytes long and is structured as follows:
+     * @dev   0: version (1 byte)
+     * @dev   1: feeOn (1 byte)
+     * @dev   2: protocol (1 byte)
+     * @dev   3: poolFee (2 bytes)
+     *
+     * @dev For callbacks, the selector is checked against the allowed callbacks and the call is forwarded
+     * @dev to a callback handler. The callback handler is responsible for decoding the calldata and
+     * @dev performing the appropriate actions. For v3 callbacks the msg.sender MUST be a pool launched
+     * @dev by the cannonical factory of the protocol.
+     *
+     * @dev To support new V3 protocols, the owner MUST call updateProtocolData with the new protocol details
+     * @dev there can be overlap of protocol selectors between different protocols, so numeric identifiers are
+     * @dev used in the calldata prefix to differentiate between them.
+     */
+    fallback() external payable {
+        bytes4 selector = bytes4(msg.data[:4]);
+
+        // First check immutable callbacks
+        if (_isV2Callback(selector)) {
+            return;
+        }
+
+        if (_isV3Callback(selector)) {
+            (int256 amount0Delta, int256 amount1Delta, bytes memory data) =
+                abi.decode(msg.data[4:], (int256, int256, bytes));
+            return _callbackV3(amount0Delta, amount1Delta, data);
+        }
+
+        uint8 version;
+        uint8 feeOn;
+        uint8 protocol;
+        uint16 poolFee;
+
+        assembly {
+            let data := calldataload(0)
+            version := byte(0, data)
+            feeOn := byte(1, data)
+            protocol := byte(2, data)
+            poolFee := shr(216, and(data, POOL_FEE_MASK))
+        }
+
+        Swap memory swapData;
+
+        // TOOD: M-03 - Add support for deadline in calldata
+        assembly {
+            let offset := 0x05
+            calldatacopy(add(swapData, 0x0c), offset, 0x14) // pool
+            calldatacopy(add(swapData, 0x2c), add(offset, 0x14), 0x14) // tokenIn
+            calldatacopy(add(swapData, 0x4c), add(offset, 0x28), 0x14) // tokenOut
+            calldatacopy(add(swapData, 0x70), add(offset, 0x3c), 0x10) // amountIn
+            calldatacopy(add(swapData, 0x90), add(offset, 0x4c), 0x20) // amountOut
+        }
+
+        if (swapData.tokenIn == swapData.tokenOut) {
+            revert TokenInCannotBeSameAsTokenOut();
+        }
+
+        if (swapData.tokenIn == address(0)) {
+            if (msg.value != swapData.amountIn) {
+                revert InvalidInputAmount();
+            }
+        }
+
+        if (version == 0) {
+            // v2
+            return _swapExactInputV2(swapData, feeReceiver, fee, feeOn, poolFee);
+        }
+
+        if (version == 1) {
+            // v3
+            return _swapExactInputV3(swapData, feeReceiver, fee, feeOn, poolFee, protocol);
+        }
+
+        if (version == 2) {
+            // Trader Joe v2.1
+            return _swapExactInputV2_1(swapData, feeReceiver, fee, feeOn);
+        }
+
+        // Fallback to mutable callbacks if no version and no immutable match
+        if (allowedV2Callbacks[selector]) {
+            return;
+        }
+
+        if (allowedV3Callbacks[selector]) {
+            (int256 amount0Delta, int256 amount1Delta, bytes memory data) =
+                abi.decode(msg.data[4:], (int256, int256, bytes));
+            return _callbackV3(amount0Delta, amount1Delta, data);
+        }
+
+        revert InvalidVersion();
+    }
+
+    function _requireIsOwner() internal view {
+        if (msg.sender != owner) {
+            revert OnlyOwner();
+        }
+    }
+
+    function _isV2Callback(bytes4 selector) internal pure returns (bool isCallback) {
+        if (selector == V2_CALLBACK1) {
+            isCallback = true;
+        } else if (selector == V2_CALLBACK2) {
+            isCallback = true;
+        } else if (selector == V2_CALLBACK3) {
+            isCallback = true;
+        }
+    }
+
+    function _isV3Callback(bytes4 selector) internal pure returns (bool isCallback) {
+        if (selector == V3_CALLBACK1) {
+            isCallback = true;
+        } else if (selector == V3_CALLBACK2) {
+            isCallback = true;
+        } else if (selector == V3_CALLBACK3) {
+            isCallback = true;
+        }
+    }
+
+    function _wrappedNative()
+        internal
+        view
+        override(KekotronSwapTraderJoeV2_1, KekotronSwapV2, KekotronSwapV3)
+        returns (address)
+    {
+        return WRAPPED_NATIVE;
+    }
+
+    receive() external payable {}
+}
+
+
+// File: lib/solmate/src/auth/Owned.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/auth/Owned.sol)
+abstract contract Owned {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event OwnershipTransferred(address indexed user, address indexed newOwner);
+
+    /*//////////////////////////////////////////////////////////////
+                            OWNERSHIP STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    address public owner;
+
+    modifier onlyOwner() virtual {
+        require(msg.sender == owner, "UNAUTHORIZED");
+
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(address _owner) {
+        owner = _owner;
+
+        emit OwnershipTransferred(address(0), _owner);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             OWNERSHIP LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        owner = newOwner;
+
+        emit OwnershipTransferred(msg.sender, newOwner);
+    }
+}
+
+
+// File: src/KekotronSwapV2.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import "./interfaces/IPoolV2.sol";
+import "./KekotronRouterInitializer.sol";
+import "./KekotronLib.sol";
+import "./KekotronErrors.sol";
+import {Swap} from "./DataTypes.sol";
+import {INITIALIZER, MAX_BPS} from "./Constants.sol";
+
+abstract contract KekotronSwapV2 {
+    constructor() {}
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint16 poolFee)
+        private
+        pure
+        returns (uint256)
+    {
+        if (amountIn == 0) {
+            revert InsufficientInputAmount();
+        }
+        if (reserveIn == 0 || reserveOut == 0) {
+            revert InsufficientLiquidity();
+        }
+
+        uint256 amountInWithFee = amountIn * (100000 - poolFee) / 100;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = reserveIn * 1000 + amountInWithFee;
+
+        return numerator / denominator;
+    }
+
+    function _swapV2(Swap memory param, address to, uint16 poolFee) private returns (uint256) {
+        bool zeroForOne = param.tokenIn < param.tokenOut;
+
+        uint256 amountOut;
+        {
+            (uint256 reserve0, uint256 reserve1,) = IPoolV2(param.pool).getReserves();
+            (uint256 reserveInput, uint256 reserveOutput) = zeroForOne ? (reserve0, reserve1) : (reserve1, reserve0);
+
+            amountOut = _getAmountOut(
+                IERC20(param.tokenIn).balanceOf(param.pool) - reserveInput, reserveInput, reserveOutput, poolFee
+            );
+        }
+
+        (uint256 amount0Out, uint256 amount1Out) = zeroForOne ? (uint256(0), amountOut) : (amountOut, uint256(0));
+
+        uint256 balanceBefore = IERC20(param.tokenOut).balanceOf(to);
+        IPoolV2(param.pool).swap(amount0Out, amount1Out, to, new bytes(0));
+        uint256 balanceAfter = IERC20(param.tokenOut).balanceOf(to);
+
+        return balanceAfter - balanceBefore;
+    }
+
+    function _swapExactNativeForTokensV2(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn, uint16 poolFee)
+        private
+    {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferNative(feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.depositWrappedNative(_wrappedNative(), param.amountIn);
+        KekotronLib.safeTransfer(_wrappedNative(), param.pool, param.amountIn);
+
+        uint256 amountOut = _swapV2(param, feeOut ? address(this) : msg.sender, poolFee);
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        if (feeOut) {
+            KekotronLib.safeTransfer(param.tokenOut, msg.sender, amountOut);
+        }
+    }
+
+    function _swapExactTokensForNativeV2(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn, uint16 poolFee)
+        private
+    {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, param.pool, param.amountIn);
+
+        uint256 amountOut = _swapV2(param, address(this), poolFee);
+
+        KekotronLib.withdrawWrappedNative(_wrappedNative(), amountOut);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransferNative(feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        KekotronLib.safeTransferNative(msg.sender, amountOut);
+    }
+
+    function _swapExactTokensForTokensV2(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn, uint16 poolFee)
+        private
+    {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, param.pool, param.amountIn);
+
+        uint256 amountOut = _swapV2(param, feeOut ? address(this) : msg.sender, poolFee);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        if (feeOut) {
+            KekotronLib.safeTransfer(param.tokenOut, msg.sender, amountOut);
+        }
+    }
+
+    function _swapExactInputV2(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn, uint16 poolFee)
+        internal
+    {
+        if (param.tokenIn == address(0)) {
+            param.tokenIn = _wrappedNative();
+            return _swapExactNativeForTokensV2(param, feeReceiver, fee, feeOn, poolFee);
+        }
+
+        if (param.tokenOut == address(0)) {
+            param.tokenOut = _wrappedNative();
+            return _swapExactTokensForNativeV2(param, feeReceiver, fee, feeOn, poolFee);
+        }
+
+        return _swapExactTokensForTokensV2(param, feeReceiver, fee, feeOn, poolFee);
+    }
+
+    /// @dev overwritten in top level contract
+    function _wrappedNative() internal view virtual returns (address);
+}
+
+
+// File: src/KekotronSwapTraderJoeV2_1.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import "./interfaces/IPoolTraderJoeV2_1.sol";
+import "./KekotronRouterInitializer.sol";
+import "./KekotronLib.sol";
+import {TooLittleReceived, TokenInCannotBeSameAsTokenOut} from "./KekotronErrors.sol";
+import {Swap} from "./DataTypes.sol";
+import {INITIALIZER, MAX_BPS} from "./Constants.sol";
+
+abstract contract KekotronSwapTraderJoeV2_1 {
+    constructor() {}
+
+    function _swapV2_1(Swap memory param, address to) private returns (uint256) {
+        bool zeroForOne = param.tokenIn < param.tokenOut;
+
+        uint256 balanceBefore = IERC20(param.tokenOut).balanceOf(to);
+        IPoolTraderJoeV2_1(param.pool).swap(zeroForOne, to);
+
+        return IERC20(param.tokenOut).balanceOf(to) - balanceBefore;
+    }
+
+    function _swapExactNativeForTokensV2_1(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn) private {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferNative(feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.depositWrappedNative(_wrappedNative(), param.amountIn);
+        KekotronLib.safeTransfer(_wrappedNative(), param.pool, param.amountIn);
+
+        uint256 amountOut = _swapV2_1(param, feeOut ? address(this) : msg.sender);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        if (feeOut) {
+            KekotronLib.safeTransfer(param.tokenOut, msg.sender, amountOut);
+        }
+    }
+
+    function _swapExactTokensForNativeV2_1(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn) private {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, param.pool, param.amountIn);
+
+        uint256 amountOut = _swapV2_1(param, address(this));
+
+        KekotronLib.withdrawWrappedNative(_wrappedNative(), amountOut);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransferNative(feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        KekotronLib.safeTransferNative(msg.sender, amountOut);
+    }
+
+    function _swapExactTokensForTokensV2_1(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn) private {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, param.pool, param.amountIn);
+
+        uint256 amountOut = _swapV2_1(param, feeOut ? address(this) : msg.sender);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        if (feeOut) {
+            KekotronLib.safeTransfer(param.tokenOut, msg.sender, amountOut);
+        }
+    }
+
+    function _swapExactInputV2_1(Swap memory param, address feeReceiver, uint8 fee, uint8 feeOn) internal {
+        if (param.tokenIn == address(0)) {
+            param.tokenIn = _wrappedNative();
+            return _swapExactNativeForTokensV2_1(param, feeReceiver, fee, feeOn);
+        }
+
+        if (param.tokenOut == address(0)) {
+            param.tokenOut = _wrappedNative();
+            return _swapExactTokensForNativeV2_1(param, feeReceiver, fee, feeOn);
+        }
+
+        return _swapExactTokensForTokensV2_1(param, feeReceiver, fee, feeOn);
+    }
+
+    function _wrappedNative() internal view virtual returns (address);
+}
+
+
+// File: src/KekotronSwapV3.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import "./interfaces/IAlgebraFactory.sol";
+import "./interfaces/IPoolV3.sol";
+import "./KekotronRouterInitializer.sol";
+import "./KekotronLib.sol";
+import {
+    TooLittleReceived,
+    InvalidCallbackPool,
+    InsufficientLiquidity,
+    ProtocolDataAlreadySet,
+    ProtocolNotFound
+} from "./KekotronErrors.sol";
+import {Swap} from "./DataTypes.sol";
+import {INITIALIZER, MAX_BPS, MIN_SQRT_RATIO, MAX_SQRT_RATIO} from "./Constants.sol";
+
+abstract contract KekotronSwapV3 {
+    mapping(uint8 => ProtocolData) private _factories;
+
+    constructor() {
+        ProtocolData[] memory protocoldata = INITIALIZER.getProtocolData();
+
+        for (uint8 i = 0; i < protocoldata.length;) {
+            _factories[i] = protocoldata[i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Returns the factory ID for a given factory address or returns 0 if the factory is not supported
+     * @dev    Do not use this on chain, as this function is gas intensive
+     */
+    function getProtocolNumber(address factory) external view returns (uint8 protocol) {
+        bool found;
+        for (uint8 i = 0; i < type(uint8).max;) {
+            if (factory == _factories[i].factory) {
+                protocol = uint8(i);
+                found = true;
+                break;
+            }
+            unchecked {
+                ++i;
+            }
+        }
+        if (!found) {
+            revert ProtocolNotFound();
+        }
+    }
+
+    /**
+     * @notice Allows the owner to update the protocol data for a given protocol
+     *
+     * @dev    This function is intended to be overridden by the inheriting contract - do not leave unguarded
+     *
+     * @param  protocol The protocol ID to update
+     * @param  data     The new protocol data
+     */
+    function _updateProtocolData(uint8 protocol, ProtocolData memory data) internal {
+        if (_factories[protocol].factory != address(0)) {
+            revert ProtocolDataAlreadySet();
+        }
+
+        _factories[protocol] = data;
+    }
+
+    function _computePool(address tokenIn, address tokenOut, uint24 fee, uint8 protocol)
+        private
+        view
+        returns (address pool)
+    {
+        address tokenA;
+        address tokenB;
+
+        if (tokenIn < tokenOut) {
+            tokenA = tokenIn;
+            tokenB = tokenOut;
+        } else {
+            tokenA = tokenOut;
+            tokenB = tokenIn;
+        }
+
+        ProtocolData memory protocolData = _factories[protocol];
+
+        bytes memory typeData;
+        if (protocolData.feeInHash) {
+            typeData = abi.encode(tokenA, tokenB, fee);
+        } else {
+            typeData = abi.encode(tokenA, tokenB);
+        }
+
+        pool = address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(
+                            hex"ff",
+                            protocolData.externalDeployer
+                                ? IAlgebraFactory(protocolData.factory).poolDeployer()
+                                : protocolData.factory,
+                            keccak256(typeData),
+                            protocolData.initHash
+                        )
+                    )
+                )
+            )
+        );
+    }
+
+    function _deriveData(Swap memory param, address payer, uint16 poolFee, uint8 protocol)
+        private
+        pure
+        returns (bool, int256, uint160, bytes memory)
+    {
+        bool zeroForOne = param.tokenIn < param.tokenOut;
+        // We shift the fee to save some calldata space in the original call
+        uint24 shiftedFee = uint24(poolFee) * 10;
+
+        int256 amountSpecified = int256(param.amountIn);
+        uint160 sqrtPriceLimitX96 = (zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1);
+        bytes memory data = abi.encode(param.tokenIn, param.tokenOut, shiftedFee, param.amountOut, payer, protocol);
+
+        return (zeroForOne, amountSpecified, sqrtPriceLimitX96, data);
+    }
+
+    function _swapV3(Swap memory param, address to, address payer, uint16 poolFee, uint8 protocol)
+        private
+        returns (uint256)
+    {
+        (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes memory data) =
+            _deriveData(param, payer, poolFee, protocol);
+
+        (int256 amount0, int256 amount1) =
+            IPoolV3(param.pool).swap(to, zeroForOne, amountSpecified, sqrtPriceLimitX96, data);
+        uint256 amountOut = uint256(-(zeroForOne ? amount1 : amount0));
+
+        return amountOut;
+    }
+
+    function _swapExactNativeForTokensV3(
+        Swap memory param,
+        address feeReceiver,
+        uint8 fee,
+        uint8 feeOn,
+        uint16 poolFee,
+        uint8 protocol
+    ) private {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferNative(feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        KekotronLib.depositWrappedNative(_wrappedNative(), param.amountIn);
+
+        uint256 amountOut = _swapV3(param, feeOut ? address(this) : msg.sender, address(this), poolFee, protocol);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        if (feeOut) {
+            KekotronLib.safeTransfer(param.tokenOut, msg.sender, amountOut);
+        }
+    }
+
+    function _swapExactTokensForNativeV3(
+        Swap memory param,
+        address feeReceiver,
+        uint8 fee,
+        uint8 feeOn,
+        uint16 poolFee,
+        uint8 protocol
+    ) private {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        uint256 amountOut = _swapV3(param, address(this), msg.sender, poolFee, protocol);
+
+        KekotronLib.withdrawWrappedNative(_wrappedNative(), amountOut);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        KekotronLib.safeTransferNative(msg.sender, amountOut);
+    }
+
+    function _swapExactTokensForTokensV3(
+        Swap memory param,
+        address feeReceiver,
+        uint8 fee,
+        uint8 feeOn,
+        uint16 poolFee,
+        uint8 protocol
+    ) private {
+        (bool feeIn, bool feeOut) = fee > 0 ? (feeOn < 1, feeOn > 0) : (false, false);
+        uint256 amountFee;
+
+        if (feeIn) {
+            amountFee = param.amountIn * fee / MAX_BPS;
+            KekotronLib.safeTransferFrom(param.tokenIn, msg.sender, feeReceiver, amountFee);
+            param.amountIn -= amountFee;
+        }
+
+        uint256 amountOut = _swapV3(param, feeOut ? address(this) : msg.sender, msg.sender, poolFee, protocol);
+
+        if (feeOut) {
+            amountFee = amountOut * fee / MAX_BPS;
+            amountOut = amountOut - amountFee;
+            if (amountFee > 0) {
+                KekotronLib.safeTransfer(param.tokenOut, feeReceiver, amountFee);
+            }
+        }
+
+        if (amountOut < param.amountOut) {
+            revert TooLittleReceived();
+        }
+
+        if (feeOut) {
+            KekotronLib.safeTransfer(param.tokenOut, msg.sender, amountOut);
+        }
+    }
+
+    function _swapExactInputV3(
+        Swap memory param,
+        address feeReceiver,
+        uint8 fee,
+        uint8 feeOn,
+        uint16 poolFee,
+        uint8 protocol
+    ) internal {
+        if (param.tokenIn == address(0)) {
+            param.tokenIn = _wrappedNative();
+            return _swapExactNativeForTokensV3(param, feeReceiver, fee, feeOn, poolFee, protocol);
+        }
+
+        if (param.tokenOut == address(0)) {
+            param.tokenOut = _wrappedNative();
+            return _swapExactTokensForNativeV3(param, feeReceiver, fee, feeOn, poolFee, protocol);
+        }
+
+        return _swapExactTokensForTokensV3(param, feeReceiver, fee, feeOn, poolFee, protocol);
+    }
+
+    function _callbackV3(int256 amount0Delta, int256 amount1Delta, bytes memory data) internal {
+        if (amount0Delta == 0 && amount1Delta == 0) {
+            revert InsufficientLiquidity();
+        }
+
+        (address tokenIn, address tokenOut, uint24 fee, uint256 limit, address payer, uint8 protocol) =
+            abi.decode(data, (address, address, uint24, uint256, address, uint8));
+
+        if (msg.sender != _computePool(tokenIn, tokenOut, fee, protocol)) {
+            revert InvalidCallbackPool();
+        }
+
+        bool zeroForOne = tokenIn < tokenOut;
+
+        if (uint256(-(zeroForOne ? amount1Delta : amount0Delta)) < limit) {
+            revert TooLittleReceived();
+        }
+
+        if (payer == address(this)) {
+            KekotronLib.safeTransfer(tokenIn, msg.sender, uint256(zeroForOne ? amount0Delta : amount1Delta));
+        } else {
+            KekotronLib.safeTransferFrom(tokenIn, payer, msg.sender, uint256(zeroForOne ? amount0Delta : amount1Delta));
+        }
+    }
+
+    function _wrappedNative() internal view virtual returns (address);
+}
+
+
+// File: src/KekotronErrors.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+error OnlyOwner();
+
+error InvalidVersion();
+
+error WrappedNativeCurrencyDeposit();
+error WrappedNativeCurrencyWithdraw();
+error NativeTransfer();
+error TokenTransfer();
+error TokenTransferFrom();
+error TokenMustBeContract();
+error TokenInCannotBeSameAsTokenOut();
+
+error TooLittleReceived();
+error InvalidInputAmount();
+error InsufficientInputAmount();
+error InsufficientLiquidity();
+error InvalidCallbackPool();
+
+error ProtocolNotFound();
+error ProtocolDataAlreadySet();
+error SetupAlreadyComplete();
+
+
+// File: src/DataTypes.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+struct Swap {
+    address pool;
+    address tokenIn;
+    address tokenOut;
+    uint256 amountIn;
+    uint256 amountOut;
+}
+
+struct ProtocolData {
+    bool feeInHash;
+    bool externalDeployer;
+    address factory;
+    bytes32 initHash;
+}
+
+
+// File: src/Constants.sol
+pragma solidity 0.8.19;
+
+import {KekotronRouterInitializer} from "./KekotronRouterInitializer.sol";
+
+KekotronRouterInitializer constant INITIALIZER =
+    KekotronRouterInitializer(address(0x70B973006870a80073CE6d0022a2000000001914));
+
+uint256 constant MAX_BPS = 10_000;
+uint160 constant MIN_SQRT_RATIO = 4295128739;
+uint160 constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+
+uint256 constant PUSH_PAYMENT_GAS_LIMIT = 10_000;
+
+bytes32 constant POOL_FEE_MASK = 0x000000ffff000000000000000000000000000000000000000000000000000000;
+
+
+// File: src/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+
+// File: src/KekotronLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import {IERC20} from "src/interfaces/IERC20.sol";
+import {IWETH} from "src/interfaces/IWETH.sol";
+import {TokenTransfer, TokenTransferFrom, TokenMustBeContract, NativeTransfer, WrappedNativeCurrencyDeposit, WrappedNativeCurrencyWithdraw} from "./KekotronErrors.sol";
+import {PUSH_PAYMENT_GAS_LIMIT} from "./Constants.sol";
+
+library KekotronLib {
+    function safeTransfer(address token, address to, uint256 value) internal {
+        if (token.code.length == 0) {
+            revert TokenMustBeContract();
+        }
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, value));
+        if (!(success && (data.length == 0 || abi.decode(data, (bool))))) {
+            revert TokenTransfer();
+        }
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint256 value) internal {
+        if (token.code.length == 0) {
+            revert TokenMustBeContract();
+        }
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, value));
+        if (!(success && (data.length == 0 || abi.decode(data, (bool))))) {
+            revert TokenTransferFrom();
+        }
+    }
+
+    function safeTransferNative(address to, uint256 value) internal {
+        (bool success,) = to.call{value: value, gas: PUSH_PAYMENT_GAS_LIMIT}(new bytes(0));
+        if (!success) {
+            revert NativeTransfer();
+        }
+    }
+
+    function depositWrappedNative(address wrappedNative, uint256 value) internal {
+        (bool success,) = wrappedNative.call{value: value}(new bytes(0));
+        if (!success) {
+            revert WrappedNativeCurrencyDeposit();
+        }
+    }
+
+    function withdrawWrappedNative(address wrappedNative, uint256 value) internal {
+        (bool success,) = wrappedNative.call(abi.encodeWithSelector(IWETH.withdraw.selector, value));
+        if (!success) {
+            revert WrappedNativeCurrencyWithdraw();
+        }
+    }
+}
+
+
+// File: src/interfaces/IPoolV2.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPoolV2 {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+
+// File: src/KekotronRouterInitializer.sol
+/**
+ * Kekotron Router V2
+ * 
+ * Website: kekotron.io
+ * Docs: docs.kekotron.io
+ * twitter.com/Kekotron_
+ * twitter.com/Nchart_
+ */
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import {Owned} from "solmate/auth/Owned.sol";
+import {ProtocolData} from "./DataTypes.sol";
+import {SetupAlreadyComplete} from "./KekotronErrors.sol";
+
+/**
+ * ........            
+ *        ..::::::::::::.  .       
+ *      .:::::::::::::::.  =+-.    
+ *    --::::::::::::::::.  =+++-   
+ *    ##*+::::::::::::::.  =+++++
+ *   #####:  .::::::::::.  =++++++
+ * -######:     .:::::::.  =++++++-
+ *  ######:  :.    .::::.  =+++++++
+ * #######:  -=-:.    .:.  =+++++++
+ * +######:  -=====:.      =++++++=
+ * :######:  -========-.   =++++++:
+ *  +#####:  -===========-.-+++++= 
+ *   =####:  -==============-==+-  
+ *    :*##:  -================-.   
+ *      :+:  -==============-.     
+ *           :==========-:.        
+ *              ......
+ */
+
+contract KekotronRouterInitializer is Owned {
+    event Setup(
+        address receiver, 
+        address wrappedNative, 
+        ProtocolData[] protocolData
+    );
+
+    address private receiver;
+    address private wrappedNative;
+    ProtocolData[] private protocolData;
+
+    constructor(address owner_) Owned(owner_) {}
+
+    function setup(
+        address receiver_,
+        address wrappedNative_,
+        ProtocolData[] calldata protocolData_
+    ) external onlyOwner {
+        if (protocolData.length > 0) {
+            revert SetupAlreadyComplete();
+        }
+        receiver = receiver_;
+        wrappedNative = wrappedNative_;
+
+        uint256 protocolLen = protocolData_.length;
+
+        for (uint256 i = 0; i < protocolLen;) {
+            protocolData.push(protocolData_[i]);
+            unchecked {
+                ++i;
+            }
+        }
+        
+        emit Setup(receiver_, wrappedNative_, protocolData_);
+    }
+
+    function getWrappedNative() external view returns (address) {
+        return wrappedNative;
+    }
+
+    function getProtocolData() external view returns (ProtocolData[] memory) {
+        return protocolData;
+    }
+
+    function getReceiver() external view returns (address) {
+        return receiver;
+    }
+
+    function getSetupData() external view returns (address, address, ProtocolData[] memory) {
+        return (receiver, wrappedNative, protocolData);
+    }
+}
+
+
+// File: src/interfaces/IPoolTraderJoeV2_1.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPoolTraderJoeV2_1 {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1);
+    function swap(bool zeroForOne, address to) external;
+}
+
+
+// File: src/interfaces/IAlgebraFactory.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.5.0;
+
+/**
+ * @title The interface for the Algebra Factory
+ * @dev Credit to Uniswap Labs under GPL-2.0-or-later license:
+ * https://github.com/Uniswap/v3-core/tree/main/contracts/interfaces
+ */
+interface IAlgebraFactory {
+    /**
+     *  @notice Emitted when the owner of the factory is changed
+     *  @param newOwner The owner after the owner was changed
+     */
+    event Owner(address indexed newOwner);
+
+    /**
+     *  @notice Emitted when the vault address is changed
+     *  @param newVaultAddress The vault address after the address was changed
+     */
+    event VaultAddress(address indexed newVaultAddress);
+
+    /**
+     *  @notice Emitted when a pool is created
+     *  @param token0 The first token of the pool by address sort order
+     *  @param token1 The second token of the pool by address sort order
+     *  @param pool The address of the created pool
+     */
+    event Pool(address indexed token0, address indexed token1, address pool);
+
+    /**
+     *  @notice Emitted when the farming address is changed
+     *  @param newFarmingAddress The farming address after the address was changed
+     */
+    event FarmingAddress(address indexed newFarmingAddress);
+
+    event FeeConfiguration(
+        uint16 alpha1,
+        uint16 alpha2,
+        uint32 beta1,
+        uint32 beta2,
+        uint16 gamma1,
+        uint16 gamma2,
+        uint32 volumeBeta,
+        uint16 volumeGamma,
+        uint16 baseFee
+    );
+
+    /**
+     *  @notice Returns the current owner of the factory
+     *  @dev Can be changed by the current owner via setOwner
+     *  @return The address of the factory owner
+     */
+    function owner() external view returns (address);
+
+    /**
+     *  @notice Returns the current poolDeployerAddress
+     *  @return The address of the poolDeployer
+     */
+    function poolDeployer() external view returns (address);
+
+    /**
+     * @dev Is retrieved from the pools to restrict calling
+     * certain functions not by a tokenomics contract
+     * @return The tokenomics contract address
+     */
+    function farmingAddress() external view returns (address);
+
+    function vaultAddress() external view returns (address);
+
+    /**
+     *  @notice Returns the pool address for a given pair of tokens and a fee, or address 0 if it does not exist
+     *  @dev tokenA and tokenB may be passed in either token0/token1 or token1/token0 order
+     *  @param tokenA The contract address of either token0 or token1
+     *  @param tokenB The contract address of the other token
+     *  @return pool The pool address
+     */
+    function poolByPair(address tokenA, address tokenB) external view returns (address pool);
+
+    /**
+     *  @notice Creates a pool for the given two tokens and fee
+     *  @param tokenA One of the two tokens in the desired pool
+     *  @param tokenB The other of the two tokens in the desired pool
+     *  @dev tokenA and tokenB may be passed in either order: token0/token1 or token1/token0. tickSpacing is retrieved
+     *  from the fee. The call will revert if the pool already exists, the fee is invalid, or the token arguments
+     *  are invalid.
+     *  @return pool The address of the newly created pool
+     */
+    function createPool(address tokenA, address tokenB) external returns (address pool);
+
+    /**
+     *  @notice Updates the owner of the factory
+     *  @dev Must be called by the current owner
+     *  @param _owner The new owner of the factory
+     */
+    function setOwner(address _owner) external;
+
+    /**
+     * @dev updates tokenomics address on the factory
+     * @param _farmingAddress The new tokenomics contract address
+     */
+    function setFarmingAddress(address _farmingAddress) external;
+
+    /**
+     * @dev updates vault address on the factory
+     * @param _vaultAddress The new vault contract address
+     */
+    function setVaultAddress(address _vaultAddress) external;
+
+    /**
+     * @notice Changes initial fee configuration for new pools
+     * @dev changes coefficients for sigmoids: α / (1 + e^( (β-x) / γ))
+     * alpha1 + alpha2 + baseFee (max possible fee) must be <= type(uint16).max
+     * gammas must be > 0
+     * @param alpha1 max value of the first sigmoid
+     * @param alpha2 max value of the second sigmoid
+     * @param beta1 shift along the x-axis for the first sigmoid
+     * @param beta2 shift along the x-axis for the second sigmoid
+     * @param gamma1 horizontal stretch factor for the first sigmoid
+     * @param gamma2 horizontal stretch factor for the second sigmoid
+     * @param volumeBeta shift along the x-axis for the outer volume-sigmoid
+     * @param volumeGamma horizontal stretch factor the outer volume-sigmoid
+     * @param baseFee minimum possible fee
+     */
+    function setBaseFeeConfiguration(
+        uint16 alpha1,
+        uint16 alpha2,
+        uint32 beta1,
+        uint32 beta2,
+        uint16 gamma1,
+        uint16 gamma2,
+        uint32 volumeBeta,
+        uint16 volumeGamma,
+        uint16 baseFee
+    ) external;
+}
+
+
+// File: src/interfaces/IPoolV3.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPoolV3 {
+    function fee() external view returns (uint24);
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+}
+
+
+// File: src/interfaces/IWETH.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+

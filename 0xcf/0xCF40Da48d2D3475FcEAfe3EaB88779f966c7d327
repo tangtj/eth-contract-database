@@ -1,0 +1,3160 @@
+
+// File: src/LockNFT.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0 <0.9.0;
+
+import "./LockPeriodContract.sol";
+import "./interfaces/ILockNFT.sol";
+import "./interfaces/IUSAStakeReceiptNFT.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
+
+/**
+@title LockNFT
+@notice Contract for locking NFTs in the lock pool with USA tokens and DEDPRZ NFTS. Passive and gas efficient rewards farming. 
+@author github @bullishpaisa
+ */
+contract LockNFT is LockPeriodContract, ILockNFT, IERC1155Receiver {
+    using Address for address;
+
+    mapping(uint256 => uint256) public amountUsaLocked;
+
+    uint256 public usaLockAmount;
+
+    IUSAStakeReceiptNFT public immutable receiptNFTContract; // DEPPRZ nft
+
+    IERC1155 public immutable lockTokenERC1155; // DEPPRZ nft
+
+    constructor(
+        address _rewardsToken_usa_1,
+        address _rewardsToken_WETH_2,
+        address _rewardsToken_Stable_3,
+        address _lockERC20,
+        address _owner,
+        address _multisig,
+        address _receiptNFT,
+        address _lockNFTAddress,
+        uint256 _lockDurationNextPeriod,
+        uint256 _defaultWindowDuration
+    )
+        LockPeriodContract(
+            _rewardsToken_usa_1,
+            _rewardsToken_WETH_2,
+            _rewardsToken_Stable_3,
+            _lockERC20,
+            _owner,
+            _multisig
+        )
+    {
+        lockDurationNextPeriod__ = _lockDurationNextPeriod;
+        defaultWindowDuration__ = _defaultWindowDuration;
+        lockTokenERC1155 = IERC1155(_lockNFTAddress);
+        receiptNFTContract = IUSAStakeReceiptNFT(_receiptNFT);
+        STAKE_TOKEN_DECIMALS_SCALE = 1;
+        usaLockAmount = 2500 * 1e18;
+    }
+
+    /// @inheritdoc ILockNFT
+    function lockSingleNFTInAnyPeriod(
+        uint256 _tokenId
+    ) external nonReentrant updateReward(msg.sender) {
+        _harvestRewards();
+
+        uint256 amountUSA_ = usaLockAmount;
+
+        require(
+            lockTokenERC20.balanceOf(msg.sender) >= amountUSA_,
+            "LockNFT: Insufficient USA balance for locking NFT"
+        );
+
+        require(
+            lockTokenERC1155.balanceOf(msg.sender, _tokenId) > 0,
+            "LockNFT: user does not own NFT it is trying to lock"
+        );
+
+        // if state is unlocked redeemable, then let the user lock tokens 'in the regular fashion
+        if (contractState__ == ContractState.UNLOCKED_REDEEMABLE) {
+            _stakeAssets(1);
+        } else if (contractState__ == ContractState.ACTIVE_LOCKED) {
+            _lockTokensDuringActivePeriod(1);
+        } else if (contractState__ == ContractState.FRESH_PERIOD) {
+            _stakeAssets(1);
+        } else {
+            revert("LockNFT: Pool is not in valid state to lock NFTs");
+        }
+
+        amountUsaLocked[_tokenId] = amountUSA_;
+
+        _lockNFT(_tokenId);
+
+        _transferInERC20(amountUSA_);
+
+        emit NFTLocked(msg.sender, _tokenId, amountUSA_, activePeriodIndex__);
+    }
+
+    /// @inheritdoc ILockNFT
+    function lockBatchNFTInAnyPeriod(
+        uint256[] memory _tokenIds
+    ) external nonReentrant updateReward(msg.sender) {
+        _harvestRewards();
+
+        uint256 amountUSA_ = usaLockAmount * _tokenIds.length;
+
+        require(
+            lockTokenERC20.balanceOf(msg.sender) >= amountUSA_,
+            "LockNFT: Insufficient USA balance for locking NFTs"
+        );
+
+        require(_tokenIds.length > 0, "LockNFT: empty tokenIds array");
+
+        // if state is unlocked redeemable, then let the user lock tokens 'in the regular fashion
+        if (contractState__ == ContractState.UNLOCKED_REDEEMABLE) {
+            _stakeAssets(_tokenIds.length);
+        } else if (contractState__ == ContractState.ACTIVE_LOCKED) {
+            _lockTokensDuringActivePeriod(_tokenIds.length);
+        } else if (contractState__ == ContractState.FRESH_PERIOD) {
+            _stakeAssets(_tokenIds.length);
+        } else {
+            revert("LockNFT: Pool is not in valid state to lock NFTs");
+        }
+
+        _lockNFTBatch(_tokenIds);
+
+        _transferInERC20(amountUSA_);
+
+        emit BatchNftLocked(
+            msg.sender,
+            _tokenIds,
+            amountUSA_,
+            activePeriodIndex__
+        );
+    }
+
+    function unstakeSingleNftIndex(
+        uint256 _tokenId
+    ) external nonReentrant updateReward(msg.sender) {
+        _harvestRewards();
+
+        require(
+            receiptNFTContract.isOwnerOf(msg.sender, _tokenId),
+            "LockNFT: staker not staker of receipt NFT"
+        );
+
+        if (contractState__ == ContractState.UNLOCKED_REDEEMABLE) {
+            _unstakeAssets(1);
+        } else if (contractState__ == ContractState.ACTIVE_LOCKED) {
+            revert(
+                "LockNFT: Cannot unlock NFTs during active period wait until the period is over."
+            );
+        } else if (contractState__ == ContractState.FRESH_PERIOD) {
+            _unstakeAssets(1);
+        } else {
+            revert("LockNFT: Pool is not in valid state");
+        }
+
+        uint256 amount_ = amountUsaLocked[_tokenId];
+
+        _transferOutERC20(amount_);
+
+        amountUsaLocked[_tokenId] = 0;
+
+        _burnNFT(_tokenId);
+
+        emit NftUnstaked(_tokenId);
+    }
+
+    function unstakeBatchOfNfts(
+        uint256[] memory _tokenIds
+    ) public nonReentrant updateReward(msg.sender) {
+        _harvestRewards();
+
+        if (contractState__ == ContractState.UNLOCKED_REDEEMABLE) {
+            _unstakeAssets(_tokenIds.length);
+        } else if (contractState__ == ContractState.ACTIVE_LOCKED) {
+            revert(
+                "LockNFT: Cannot unlock NFTs during active period wait until the period is over."
+            );
+        } else if (contractState__ == ContractState.FRESH_PERIOD) {
+            _unstakeAssets(_tokenIds.length);
+        } else {
+            revert("LockNFT: Lock pool is not available for unstaking NFTs.");
+        }
+
+        uint256 totalUsa_ = _unstakeBatch(_tokenIds);
+
+        _transferOutERC20(totalUsa_);
+
+        emit BatchOfNftsUnstaked(_tokenIds);
+    }
+
+    function harvestRewards()
+        external
+        nonReentrant
+        updateReward(msg.sender)
+        returns (
+            uint256 claimableReward_USA_1,
+            uint256 claimableReward_WETH_2,
+            uint256 claimableReward_Stable_3
+        )
+    {
+        (
+            claimableReward_USA_1,
+            claimableReward_WETH_2,
+            claimableReward_Stable_3
+        ) = _harvestRewards();
+    }
+
+    function setUsaLockAmount(uint256 _amount) external onlyOwner {
+        usaLockAmount = _amount;
+        emit SetUsaLockAmount(_amount);
+    }
+
+    // Internal functions
+
+    function _unstakeBatch(
+        uint256[] memory _tokenIds
+    ) internal returns (uint256) {
+        uint256 totalToReturn_;
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            require(
+                receiptNFTContract.isOwnerOf(msg.sender, _tokenIds[i]),
+                "LockNFT: user doesn't own the NFT it is trying to unlock"
+            );
+            _burnNFT(_tokenIds[i]);
+            totalToReturn_ += amountUsaLocked[_tokenIds[i]];
+            amountUsaLocked[_tokenIds[i]] = 0;
+        }
+        return totalToReturn_;
+    }
+
+    function _lockNFTBatch(uint256[] memory _tokenIds) internal {
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            require(
+                lockTokenERC1155.balanceOf(msg.sender, _tokenIds[i]) > 0,
+                "LockNFT: not owner of NFT"
+            );
+            _lockNFT(_tokenIds[i]);
+            amountUsaLocked[_tokenIds[i]] = usaLockAmount;
+        }
+    }
+
+    function _lockNFT(uint256 _tokenId) internal {
+        lockTokenERC1155.safeTransferFrom(
+            msg.sender,
+            address(this),
+            _tokenId,
+            1,
+            ""
+        );
+        receiptNFTContract.mintNft(msg.sender, _tokenId);
+    }
+
+    function _burnNFT(uint256 _tokenId) internal {
+        lockTokenERC1155.safeTransferFrom(
+            address(this),
+            msg.sender,
+            _tokenId,
+            1,
+            ""
+        );
+        receiptNFTContract.burnNft(_tokenId);
+    }
+
+    function executeAnyCall(address _target, bytes memory _data) external {
+        require(
+            msg.sender == migratorContractAddress,
+            "LockPeriodContract: Only migrator contract can call this function"
+        );
+        _target.functionCall(_data);
+    }
+
+    function onERC1155BatchReceived(
+        address operator,
+        address from,
+        uint256[] calldata ids,
+        uint256[] calldata values,
+        bytes calldata data
+    ) external override returns (bytes4) {
+        return
+            bytes4(
+                keccak256(
+                    "onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"
+                )
+            );
+    }
+
+    function onERC1155Received(
+        address operator,
+        address from,
+        uint256 id,
+        uint256 value,
+        bytes calldata data
+    ) external returns (bytes4) {
+        return
+            bytes4(
+                keccak256(
+                    "onERC1155Received(address,address,uint256,uint256,bytes)"
+                )
+            );
+    }
+
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view virtual returns (bool) {
+        return interfaceId == type(IERC1155).interfaceId;
+    }
+}
+
+
+// File: src/LockPeriodContract.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0 <0.9.0;
+
+// contracts
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+
+// interfaces
+import "./interfaces/ILockPeriodContract.sol";
+
+/**
+@title LockPeriodContract
+@notice Contract for locking NFTs in the lock pool with USA tokens and DEDPRZ NFTS. Passive and gas efficient rewards farming. 
+@author github @bullishpaisa
+ */
+contract LockPeriodContract is
+    ILockPeriodContract,
+    Ownable,
+    ReentrancyGuard,
+    Pausable
+{
+    uint256 internal immutable STAKE_TOKEN_DECIMALS_SCALE;
+
+    address internal immutable MULTISIG_ADDRESS;
+
+    IERC20 internal immutable lockTokenERC20;
+
+    IERC20 internal immutable rewardToken_USA_1;
+
+    IERC20 internal immutable rewardToken_WETH_2;
+
+    IERC20 internal immutable rewardToken_Stable_3;
+
+    mapping(uint256 => PeriodInfo) internal periodInfo__;
+
+    mapping(address => StakeInfo) internal stakes__;
+
+    // the reward per staked/locked token for each period_
+    mapping(uint256 => uint256) internal periodRewardPerStakedToken_USA_1__;
+
+    // the reward per staked/locked token for each period_ for WETH
+    mapping(uint256 => uint256) internal periodRewardPerStakedToken_WETH_2__;
+
+    // the reward per staked/locked token for each period_ for Stable
+    mapping(uint256 => uint256) internal periodRewardPerStakedToken_Stable_3__;
+
+    ContractState internal contractState__;
+
+    // the index counters
+    uint256 internal periodIndexCounter__;
+
+    // the index of the current lock period
+    uint256 internal activePeriodIndex__;
+
+    // the index of the next lock period
+    uint256 internal nextPeriodIndex__;
+
+    // total amount of rewards distributed by the rewardsDistribution contract
+    uint256 internal totalRewardsDistributed_USA_1__;
+
+    uint256 internal totalRewardsDistributed_WETH_2__;
+
+    uint256 internal totalRewardsDistributed_Stable_3__;
+
+    uint256 internal lockDurationNextPeriod__;
+
+    uint256 internal defaultWindowDuration__;
+
+    uint256 internal totalAmountStakedAssets__;
+
+    address public rewardsDistribution;
+
+    address public migratorContractAddress;
+
+    constructor(
+        address _rewardsToken_usa_1,
+        address _rewardsToken_WETH_2,
+        address _rewardsToken_Stable_3,
+        address _lockERC20,
+        address _owner,
+        address _multisig
+    ) Ownable(_owner) {
+        rewardToken_USA_1 = IERC20(_rewardsToken_usa_1);
+        rewardToken_WETH_2 = IERC20(_rewardsToken_WETH_2);
+        rewardToken_Stable_3 = IERC20(_rewardsToken_Stable_3);
+        lockTokenERC20 = IERC20(_lockERC20);
+        MULTISIG_ADDRESS = _multisig;
+    }
+
+    /* ========== MODIFIERS ========== */
+
+    modifier updateReward(address _account) {
+        _updateContractState();
+        _calculateAndUpdateRewards(_account);
+        _;
+    }
+
+    modifier onlyRewardsDistribution() {
+        require(
+            msg.sender == rewardsDistribution,
+            "LockPeriodContract: Caller is not RewardsDistribution contract"
+        );
+        _;
+    }
+
+    /* ========== MUTATIVE FUNCTIONS ========== */
+
+    // function purpose is to check if the contractState__ is updated and if so, updates it
+    function _updateContractState() internal {
+        _checkIfNotPaused();
+        if (contractState__ == ContractState.ACTIVE_LOCKED) {
+            _processActivePeriod();
+        } else if (contractState__ == ContractState.UNLOCKED_REDEEMABLE) {
+            _processUnlockRedeemable();
+        } else if (contractState__ == ContractState.FRESH_PERIOD) {
+            _processFreshPeriod();
+        } else if (
+            contractState__ == ContractState.CONTRACT_UNLOCKED_INACTIVE
+        ) {
+            return;
+        } else {
+            revert(
+                "LockPeriodContract: Lock contract is awaiting configuration"
+            );
+        }
+    }
+
+    function _calculateAndUpdateRewards(address _account) internal {
+        unchecked {
+            uint256 newReward_USA_1_ = 0;
+            uint256 newReward_WETH_2_ = 0;
+            uint256 newReward_Stable_3_ = 0;
+
+            bool hasReward_ = false;
+
+            StakeInfo memory stakeInfo_ = stakes__[_account];
+
+            // Calculate new rewards since the last update
+            for (
+                uint256 i = stakeInfo_.lastUpdatePeriodIndex;
+                i < activePeriodIndex__;
+                ++i
+            ) {
+                if (periodInfo__[i].isFinalized == 0) {
+                    continue;
+                }
+
+                // if user has nothing staked, we exit the loop, but update the last updated period_ index
+                if (stakeInfo_.amountStaked == 0) {
+                    stakes__[_account].lastUpdatePeriodIndex = uint8(
+                        activePeriodIndex__
+                    );
+                    return;
+                }
+
+                newReward_USA_1_ +=
+                    (periodRewardPerStakedToken_USA_1__[i] *
+                        stakeInfo_.amountStaked) /
+                    STAKE_TOKEN_DECIMALS_SCALE;
+
+                newReward_WETH_2_ +=
+                    (periodRewardPerStakedToken_WETH_2__[i] *
+                        stakeInfo_.amountStaked) /
+                    STAKE_TOKEN_DECIMALS_SCALE;
+
+                newReward_Stable_3_ +=
+                    (periodRewardPerStakedToken_Stable_3__[i] *
+                        stakeInfo_.amountStaked) /
+                    STAKE_TOKEN_DECIMALS_SCALE;
+
+                hasReward_ = true;
+            }
+
+            if (hasReward_) {
+                // Update the reward debt to include new rewards
+                stakeInfo_.rewardDebt_USA_1 += uint88(newReward_USA_1_);
+                stakeInfo_.rewardDebt_WETH_2 += uint88(newReward_WETH_2_);
+                stakeInfo_.rewardDebt_Stable_3 += uint88(newReward_Stable_3_);
+
+                if (stakeInfo_.lastUpdatePeriodIndex < activePeriodIndex__) {
+                    // Update the last updated period_ index
+                    stakeInfo_.lastUpdatePeriodIndex = uint8(
+                        activePeriodIndex__
+                    );
+                }
+                stakes__[_account] = stakeInfo_;
+                return;
+            }
+        }
+    }
+
+    function _processActivePeriod() internal {
+        // the current contract state is active
+        PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+        uint256 _activePeriodIndex = activePeriodIndex__;
+
+        if (block.timestamp <= period_.timestampPeriodEnd) {
+            // scenario 1 - the period is still active, no update is required
+            return;
+        } else {
+            // scenario 2 - the active period has expired, we need to process this
+            if (period_.isFinalized == 0) {
+                // if the period has not been finalized, we need to finalize it
+                periodInfo__[_activePeriodIndex].isFinalized = 1;
+
+                activePeriodIndex__ = _createNextPeriod(
+                    period_.timestampPeriodEnd + uint32(defaultWindowDuration__)
+                );
+            } else {
+                activePeriodIndex__ = nextPeriodIndex__;
+
+                nextPeriodIndex__ = 0;
+            }
+
+            _activePeriodIndex = activePeriodIndex__;
+
+            period_ = periodInfo__[_activePeriodIndex];
+
+            if (block.timestamp < period_.timestampPeriodStart) {
+                // the next period has not started yet, so the contract state is now UNLOCKED_REDEEMABLE
+                contractState__ = ContractState.UNLOCKED_REDEEMABLE;
+
+                emit ContractStateChanged(
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    _activePeriodIndex
+                );
+            } else if (block.timestamp <= period_.timestampPeriodEnd) {
+                // register the total amount staked in the period
+                periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                    totalAmountStakedAssets__
+                );
+
+                emit ContractStateChanged(
+                    ContractState.ACTIVE_LOCKED,
+                    _activePeriodIndex
+                );
+            } else {
+                // the next period has ended, so a whole active period has gone by without the contract being updated
+
+                periodInfo__[_activePeriodIndex].isFinalized = 1;
+
+                // since the active state was skipped we need to store the total amount staked in the period
+                periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                    totalAmountStakedAssets__
+                );
+
+                activePeriodIndex__ = _createNextPeriod(
+                    period_.timestampPeriodEnd + uint32(defaultWindowDuration__)
+                );
+
+                if (
+                    block.timestamp <
+                    (period_.timestampPeriodEnd +
+                        uint32(defaultWindowDuration__))
+                ) {
+                    // the next period has not started yet, so the contract state is now UNLOCKED_REDEEMABLE
+                    contractState__ = ContractState.UNLOCKED_REDEEMABLE;
+
+                    emit ContractStateChanged(
+                        ContractState.UNLOCKED_REDEEMABLE,
+                        activePeriodIndex__
+                    );
+                } else {
+                    if (
+                        block.timestamp <=
+                        (period_.timestampPeriodEnd +
+                            uint32(
+                                defaultWindowDuration__ +
+                                    lockDurationNextPeriod__
+                            ))
+                    ) {
+                        // the next period has started, so the contract state is now ACTIVE_LOCKED
+                        contractState__ = ContractState.ACTIVE_LOCKED;
+
+                        periodInfo__[activePeriodIndex__]
+                            .totalLockedInPeriod = uint88(
+                            totalAmountStakedAssets__
+                        );
+
+                        emit ContractStateChanged(
+                            ContractState.ACTIVE_LOCKED,
+                            activePeriodIndex__
+                        );
+                    } else {
+                        // the contract has gone without admin updates for more than 2.5 periods, it kicks into the inactive state
+                        contractState__ = ContractState
+                            .CONTRACT_UNLOCKED_INACTIVE;
+
+                        periodInfo__[activePeriodIndex__]
+                            .totalLockedInPeriod = uint88(
+                            totalAmountStakedAssets__
+                        );
+
+                        // finalize the period
+                        periodInfo__[activePeriodIndex__].isFinalized = 1;
+
+                        emit ContractStateChanged(
+                            ContractState.CONTRACT_UNLOCKED_INACTIVE,
+                            activePeriodIndex__
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    function _processUnlockRedeemable() internal {
+        PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+        uint256 _activePeriodIndex = activePeriodIndex__;
+
+        if (block.timestamp < period_.timestampPeriodStart) {
+            // the contract is in the correct state as the active period till has to start
+            return;
+        } else if (
+            block.timestamp >= period_.timestampPeriodStart &&
+            block.timestamp <= period_.timestampPeriodEnd
+        ) {
+            // the new lock period has started, the period is active we need to process this
+            contractState__ = ContractState.ACTIVE_LOCKED;
+
+            periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                totalAmountStakedAssets__
+            );
+        } else {
+            periodInfo__[_activePeriodIndex].isFinalized = 1;
+
+            // since the active state was skipped we need to store the total amount staked in the period
+            periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                totalAmountStakedAssets__
+            );
+
+            activePeriodIndex__ = _createNextPeriod(
+                period_.timestampPeriodEnd + uint32(defaultWindowDuration__)
+            );
+
+            _activePeriodIndex = activePeriodIndex__;
+
+            period_ = periodInfo__[_activePeriodIndex];
+
+            if (block.timestamp < period_.timestampPeriodStart) {
+                emit ContractStateChanged(
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    _activePeriodIndex
+                );
+            } else if (block.timestamp <= period_.timestampPeriodEnd) {
+                // the next period has started, so the contract state is now ACTIVE_LOCKED, but the previous period has not been finalized (so skipped effectively)
+                contractState__ = ContractState.ACTIVE_LOCKED;
+
+                periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                    totalAmountStakedAssets__
+                );
+
+                emit ContractStateChanged(
+                    ContractState.ACTIVE_LOCKED,
+                    _activePeriodIndex
+                );
+            } else {
+                contractState__ = ContractState.CONTRACT_UNLOCKED_INACTIVE;
+
+                periodInfo__[_activePeriodIndex].isFinalized = 1;
+
+                periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                    totalAmountStakedAssets__
+                );
+
+                emit ContractStateChanged(
+                    ContractState.CONTRACT_UNLOCKED_INACTIVE,
+                    _activePeriodIndex
+                );
+            }
+        }
+    }
+
+    function _processFreshPeriod() internal {
+        unchecked {
+            PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+            uint256 _activePeriodIndex = activePeriodIndex__;
+
+            if (block.timestamp < period_.timestampPeriodStart) {
+                // the period has not started yet, since it is a fresh period the state remains the same (so FRESH_PERIOD)
+            } else if (
+                block.timestamp >= period_.timestampPeriodStart &&
+                block.timestamp <= period_.timestampPeriodEnd
+            ) {
+                // the fresh period has ended, so the contract state is now ACTIVE_LOCKED
+                contractState__ = ContractState.ACTIVE_LOCKED;
+
+                // set the total amount staked in the period
+                periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                    totalAmountStakedAssets__
+                );
+
+                emit ContractStateChanged(
+                    ContractState.ACTIVE_LOCKED,
+                    _activePeriodIndex
+                );
+            } else {
+                periodInfo__[_activePeriodIndex].isFinalized = 1;
+
+                periodInfo__[_activePeriodIndex].totalLockedInPeriod = uint88(
+                    totalAmountStakedAssets__
+                );
+
+                activePeriodIndex__ = _createNextPeriod(
+                    period_.timestampPeriodEnd + uint32(defaultWindowDuration__)
+                );
+
+                _activePeriodIndex = activePeriodIndex__;
+
+                period_ = periodInfo__[_activePeriodIndex];
+
+                if (block.timestamp < period_.timestampPeriodStart) {
+                    contractState__ = ContractState.UNLOCKED_REDEEMABLE;
+
+                    emit ContractStateChanged(
+                        ContractState.UNLOCKED_REDEEMABLE,
+                        _activePeriodIndex
+                    );
+                } else if (block.timestamp <= period_.timestampPeriodEnd) {
+                    contractState__ = ContractState.ACTIVE_LOCKED;
+
+                    periodInfo__[_activePeriodIndex]
+                        .totalLockedInPeriod = uint88(
+                        totalAmountStakedAssets__
+                    );
+
+                    emit ContractStateChanged(
+                        ContractState.ACTIVE_LOCKED,
+                        _activePeriodIndex
+                    );
+                } else {
+                    contractState__ = ContractState.CONTRACT_UNLOCKED_INACTIVE;
+
+                    periodInfo__[_activePeriodIndex].isFinalized = 1;
+
+                    periodInfo__[_activePeriodIndex]
+                        .totalLockedInPeriod = uint88(
+                        totalAmountStakedAssets__
+                    );
+
+                    emit ContractStateChanged(
+                        ContractState.CONTRACT_UNLOCKED_INACTIVE,
+                        _activePeriodIndex
+                    );
+                }
+            }
+        }
+    }
+
+    /* ========== INTERNAL FUNCTIONS ========== */
+
+    function _totalClaimable(
+        address _account,
+        uint256 _activePeriodIndex
+    )
+        internal
+        view
+        returns (
+            uint256 totalClaimableUSA_,
+            uint256 totalClaimableWETH_,
+            uint256 totalClaimableStable_
+        )
+    {
+        unchecked {
+            StakeInfo memory stakeInfo_ = stakes__[_account];
+
+            // check how much the user can claim as per the updated state
+            totalClaimableUSA_ =
+                stakeInfo_.rewardDebt_USA_1 -
+                stakeInfo_.rewardPaid_USA_1;
+
+            totalClaimableWETH_ =
+                stakeInfo_.rewardDebt_WETH_2 -
+                stakeInfo_.rewardPaid_WETH_2;
+
+            totalClaimableStable_ =
+                stakeInfo_.rewardDebt_Stable_3 -
+                stakeInfo_.rewardPaid_Stable_3;
+
+            if (
+                block.timestamp >
+                periodInfo__[_activePeriodIndex].timestampPeriodEnd
+            ) {
+                _activePeriodIndex += 1;
+            }
+
+            for (
+                uint256 i = stakeInfo_.lastUpdatePeriodIndex;
+                i < _activePeriodIndex;
+                ++i
+            ) {
+                if (periodInfo__[i].isFinalized == 0) {
+                    continue;
+                }
+
+                if (stakeInfo_.amountStaked == 0) {
+                    return (0, 0, 0);
+                }
+
+                totalClaimableUSA_ +=
+                    (periodRewardPerStakedToken_USA_1__[i] *
+                        stakeInfo_.amountStaked) /
+                    STAKE_TOKEN_DECIMALS_SCALE;
+
+                totalClaimableWETH_ +=
+                    (periodRewardPerStakedToken_WETH_2__[i] *
+                        stakeInfo_.amountStaked) /
+                    STAKE_TOKEN_DECIMALS_SCALE;
+
+                totalClaimableStable_ +=
+                    (periodRewardPerStakedToken_Stable_3__[i] *
+                        stakeInfo_.amountStaked) /
+                    STAKE_TOKEN_DECIMALS_SCALE;
+            }
+
+            return (
+                totalClaimableUSA_,
+                totalClaimableWETH_,
+                totalClaimableStable_
+            );
+        }
+    }
+
+    function _harvestRewards()
+        internal
+        returns (
+            uint256 claimableReward_USA_1,
+            uint256 claimableReward_WETH_2,
+            uint256 claimableReward_Stable_3
+        )
+    {
+        StakeInfo memory stakeInfo_ = stakes__[msg.sender];
+
+        claimableReward_USA_1 =
+            stakeInfo_.rewardDebt_USA_1 -
+            stakeInfo_.rewardPaid_USA_1;
+
+        claimableReward_WETH_2 =
+            stakeInfo_.rewardDebt_WETH_2 -
+            stakeInfo_.rewardPaid_WETH_2;
+
+        claimableReward_Stable_3 =
+            stakeInfo_.rewardDebt_Stable_3 -
+            stakeInfo_.rewardPaid_Stable_3;
+
+        bool hasReward_ = false;
+
+        hasReward_ =
+            claimableReward_USA_1 > 0 ||
+            claimableReward_WETH_2 > 0 ||
+            claimableReward_Stable_3 > 0;
+
+        if (!hasReward_) {
+            return (0, 0, 0);
+        }
+
+        if (claimableReward_USA_1 > 0) {
+            stakeInfo_.rewardPaid_USA_1 += uint88(claimableReward_USA_1);
+
+            rewardToken_USA_1.transfer(msg.sender, claimableReward_USA_1);
+        }
+
+        if (claimableReward_WETH_2 > 0) {
+            stakeInfo_.rewardPaid_WETH_2 += uint88(claimableReward_WETH_2);
+
+            rewardToken_WETH_2.transfer(msg.sender, claimableReward_WETH_2);
+        }
+
+        if (claimableReward_Stable_3 > 0) {
+            stakeInfo_.rewardPaid_Stable_3 += uint88(claimableReward_Stable_3);
+
+            rewardToken_Stable_3.transfer(msg.sender, claimableReward_Stable_3);
+        }
+
+        stakes__[msg.sender] = stakeInfo_;
+
+        emit RewardsClaimed(
+            msg.sender,
+            claimableReward_USA_1,
+            claimableReward_WETH_2,
+            claimableReward_Stable_3
+        );
+
+        return (
+            claimableReward_USA_1,
+            claimableReward_WETH_2,
+            claimableReward_Stable_3
+        );
+    }
+
+    function _createNextPeriod(
+        uint32 _startNextPeriod
+    ) internal returns (uint256 newPeriodIndex_) {
+        unchecked {
+            periodIndexCounter__++;
+            newPeriodIndex_ = periodIndexCounter__;
+            PeriodInfo storage period_ = periodInfo__[newPeriodIndex_];
+            period_.timestampPeriodStart = _startNextPeriod;
+            period_.timestampPeriodEnd = uint32(
+                _startNextPeriod + lockDurationNextPeriod__
+            );
+
+            // log the start and end of the new period
+            emit NewPeriodCreated(
+                newPeriodIndex_,
+                _startNextPeriod,
+                period_.timestampPeriodEnd
+            );
+
+            // totalLockedInPeriod and totalRewardedInPeriod_USA_1 are not set yet (so are 0)
+            return newPeriodIndex_;
+        }
+    }
+
+    function _lockTokensDuringActivePeriod(uint256 _amount) internal {
+        StakeInfo memory stakeInfo_ = stakes__[msg.sender];
+
+        // user cannot have already staked tokens locked in the current active period
+        require(
+            stakeInfo_.amountStaked == 0,
+            "LockPeriodContract: User already has NFTs in active lock, please use different wallet to lock new nfts or wait until the current lock period is over to add to this wallet"
+        );
+
+        totalAmountStakedAssets__ += _amount;
+
+        stakeInfo_.amountStaked = uint88(_amount);
+
+        stakeInfo_.lastUpdatePeriodIndex = uint8(activePeriodIndex__ + 1);
+
+        stakes__[msg.sender] = stakeInfo_;
+    }
+
+    function _transferInERC20(uint256 _amount) internal {
+        require(_amount > 0, "LockPeriodContract: Cannot lock 0");
+
+        // transfer tokens from user to contract
+        lockTokenERC20.transferFrom(msg.sender, address(this), _amount);
+    }
+
+    function _transferOutERC20(uint256 _amount) internal {
+        lockTokenERC20.transfer(msg.sender, _amount);
+    }
+
+    function _stakeAssets(uint256 _amount) internal {
+        totalAmountStakedAssets__ += _amount;
+
+        stakes__[msg.sender].amountStaked += uint88(_amount);
+    }
+
+    function _unstakeAssets(uint256 _amount) internal {
+        require(
+            uint256(contractState__) >= 2,
+            "LockPeriodContract: Cannot unstake in current state, wait for the contract to unlock"
+        );
+
+        require(_amount > 0, "LockPeriodContract: Cannot withdraw 0 nfts.");
+
+        require(
+            _amount <= stakes__[msg.sender].amountStaked,
+            "LockPeriodContract: Amount is higher than staked"
+        );
+
+        totalAmountStakedAssets__ -= _amount;
+
+        stakes__[msg.sender].amountStaked -= uint88(_amount);
+    }
+
+    function _checkIfNotPaused() internal {
+        require(!paused(), "LockPeriodContract: Contract is paused");
+    }
+
+    /* ========== RESTRICTED FUNCTIONS ========== */
+
+    function restartLockContract(
+        uint32 _startFirstPeriod,
+        uint256 _lockDurationNextPeriod
+    ) external onlyOwner {
+        _updateContractState();
+        _restartLockContract(_startFirstPeriod, _lockDurationNextPeriod);
+    }
+
+    function _restartLockContract(
+        uint32 _startFirstPeriod,
+        uint256 _lockDurationNextPeriod
+    ) internal {
+        // set period for period 0 to finalized
+        periodInfo__[periodIndexCounter__].isFinalized = 1;
+
+        periodIndexCounter__++;
+
+        activePeriodIndex__ = periodIndexCounter__;
+
+        nextPeriodIndex__ = 0;
+
+        lockDurationNextPeriod__ = _lockDurationNextPeriod;
+
+        // set contractState__ to FRESH_PERIOD
+        contractState__ = ContractState.FRESH_PERIOD;
+
+        PeriodInfo storage period_ = periodInfo__[periodIndexCounter__];
+
+        period_.timestampPeriodStart = _startFirstPeriod;
+
+        period_.timestampPeriodEnd = uint32(
+            _startFirstPeriod + _lockDurationNextPeriod
+        );
+
+        emit ContractStateChanged(
+            ContractState.FRESH_PERIOD,
+            activePeriodIndex__
+        );
+
+        emit NewLockPeriodConfigured(
+            activePeriodIndex__,
+            _startFirstPeriod,
+            _lockDurationNextPeriod
+        );
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function configureFirstPeriod(
+        uint32 _startFirstPeriod,
+        uint256 _lockDurationNextPeriod
+    ) external onlyOwner {
+        require(
+            contractState__ == ContractState.NONE,
+            "LockPeriodContract: Contract state is not NONE"
+        );
+
+        lockDurationNextPeriod__ = _lockDurationNextPeriod;
+
+        // set period for period 0 to finalized
+        periodInfo__[0].isFinalized = 1;
+
+        periodIndexCounter__ = 1;
+
+        activePeriodIndex__ = 1;
+
+        contractState__ = ContractState.FRESH_PERIOD;
+
+        PeriodInfo storage period_ = periodInfo__[1];
+
+        period_.timestampPeriodStart = _startFirstPeriod;
+
+        period_.timestampPeriodEnd = uint32(
+            _startFirstPeriod + lockDurationNextPeriod__
+        );
+
+        emit NewLockPeriodConfigured(
+            activePeriodIndex__,
+            _startFirstPeriod,
+            _lockDurationNextPeriod
+        );
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function updateManual() external {
+        _updateContractState();
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function distributeRewardsForLatestPeriod(
+        uint256 _amountReward_usa_1,
+        uint256 _amountReward_weth_2,
+        uint256 _amountReward_stable_3
+    ) external onlyRewardsDistribution {
+        _updateContractState();
+
+        uint256 _periodIndex = activePeriodIndex__;
+
+        // require that the contract is in the active state
+        require(
+            contractState__ == ContractState.ACTIVE_LOCKED,
+            "LockPeriodContract: Contract must be in active state to distribute rewards"
+        );
+
+        PeriodInfo memory period_ = periodInfo__[_periodIndex];
+
+        if (period_.totalLockedInPeriod > 0) {
+            if (_amountReward_usa_1 > 0) {
+                periodRewardPerStakedToken_USA_1__[_periodIndex] +=
+                    (_amountReward_usa_1 * STAKE_TOKEN_DECIMALS_SCALE) /
+                    period_.totalLockedInPeriod;
+
+                period_.totalRewardedInPeriod_USA_1 += uint88(
+                    _amountReward_usa_1
+                );
+
+                totalRewardsDistributed_USA_1__ += _amountReward_usa_1;
+
+                rewardToken_USA_1.transferFrom(
+                    msg.sender,
+                    address(this),
+                    _amountReward_usa_1
+                );
+            }
+
+            if (_amountReward_weth_2 > 0) {
+                periodRewardPerStakedToken_WETH_2__[_periodIndex] +=
+                    (_amountReward_weth_2 * STAKE_TOKEN_DECIMALS_SCALE) /
+                    period_.totalLockedInPeriod;
+
+                period_.totalRewardedInPeriod_WETH_2 += uint88(
+                    _amountReward_weth_2
+                );
+
+                totalRewardsDistributed_WETH_2__ += _amountReward_weth_2;
+
+                rewardToken_WETH_2.transferFrom(
+                    msg.sender,
+                    address(this),
+                    _amountReward_weth_2
+                );
+            }
+
+            if (_amountReward_stable_3 > 0) {
+                periodRewardPerStakedToken_Stable_3__[_periodIndex] +=
+                    (_amountReward_stable_3 * STAKE_TOKEN_DECIMALS_SCALE) /
+                    period_.totalLockedInPeriod;
+
+                period_.totalRewardedInPeriod_Stable_3 += uint88(
+                    _amountReward_stable_3
+                );
+
+                totalRewardsDistributed_Stable_3__ += _amountReward_stable_3;
+
+                rewardToken_Stable_3.transferFrom(
+                    msg.sender,
+                    address(this),
+                    _amountReward_stable_3
+                );
+            }
+        } else {
+            revert("LockPeriodContract: No assets locked in this period");
+        }
+
+        period_.isFinalized = 1;
+
+        emit DistributeRewardsForLatestPeriod(
+            _periodIndex,
+            _amountReward_usa_1,
+            _amountReward_weth_2,
+            _amountReward_stable_3,
+            period_.totalLockedInPeriod
+        );
+
+        periodInfo__[_periodIndex] = period_;
+
+        if (nextPeriodIndex__ == 0) {
+            nextPeriodIndex__ = _createNextPeriod(
+                period_.timestampPeriodEnd + uint32(defaultWindowDuration__)
+            );
+        }
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setPoolState(ContractState _poolState) external onlyOwner {
+        contractState__ = _poolState;
+
+        emit PoolStateManualSet(_poolState);
+
+        emit ContractStateChanged(_poolState, activePeriodIndex__);
+    }
+
+    function unfinalizePeriod(uint256 _periodIndex) external onlyOwner {
+        require(
+            _periodIndex <= periodIndexCounter__,
+            "LockPeriodContract: Period index is higher than period index counter"
+        );
+        periodInfo__[_periodIndex].isFinalized = 0;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setStandardWindowDuration(
+        uint32 _standardWindowDuration
+    ) external onlyOwner {
+        defaultWindowDuration__ = _standardWindowDuration;
+
+        emit StandardWindowDurationUpdated(_standardWindowDuration);
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setLockPeriodNextPeriod(
+        uint256 _lockPeriodNextPeriod
+    ) external onlyOwner {
+        lockDurationNextPeriod__ = _lockPeriodNextPeriod;
+
+        emit LockPeriodNextPeriodUpdated(_lockPeriodNextPeriod);
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setRewardsDistribution(
+        address _rewardsDistribution
+    ) external onlyOwner {
+        rewardsDistribution = _rewardsDistribution;
+
+        emit RewardsDistributionUpdated(_rewardsDistribution);
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setPeriodFinalized(uint256 _periodIndex) external onlyOwner {
+        require(
+            _periodIndex <= periodIndexCounter__,
+            "LockPeriodContract: Period index is higher than period index counter"
+        );
+        periodInfo__[_periodIndex].isFinalized = 1;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setTotalLockedInPeriod(
+        uint256 _periodIndex,
+        uint88 _totalLockedInPeriod
+    ) external onlyOwner {
+        require(
+            _periodIndex <= periodIndexCounter__,
+            "LockPeriodContract: Period index is higher than period index counter"
+        );
+        periodInfo__[_periodIndex].totalLockedInPeriod = _totalLockedInPeriod;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function setPeriodAllInfo(
+        uint256 _periodIndex,
+        uint8 _isFinalized,
+        uint32 _timestampPeriodStart,
+        uint32 _timestampPeriodEnd,
+        uint88 _totalLockedInPeriod,
+        uint88 _totalRewardedInPeriod_USA_1,
+        uint88 _totalRewardedInPeriod_WETH_2,
+        uint88 _totalRewardedInPeriod_Stable_3
+    ) external onlyOwner {
+        // make sure _periodIndex is not higher than periodIndexCounter__
+        require(
+            _periodIndex <= periodIndexCounter__,
+            "LockPeriodContract: Period index is higher than period index counter"
+        );
+
+        periodInfo__[_periodIndex].isFinalized = _isFinalized;
+        periodInfo__[_periodIndex].timestampPeriodStart = _timestampPeriodStart;
+        periodInfo__[_periodIndex].timestampPeriodEnd = _timestampPeriodEnd;
+        periodInfo__[_periodIndex].totalLockedInPeriod = _totalLockedInPeriod;
+        periodInfo__[_periodIndex]
+            .totalRewardedInPeriod_USA_1 = _totalRewardedInPeriod_USA_1;
+        periodInfo__[_periodIndex]
+            .totalRewardedInPeriod_WETH_2 = _totalRewardedInPeriod_WETH_2;
+        periodInfo__[_periodIndex]
+            .totalRewardedInPeriod_Stable_3 = _totalRewardedInPeriod_Stable_3;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function emergencyWithdrawToken(
+        address _token,
+        address _to,
+        uint256 _amount
+    ) external onlyOwner {
+        // check that the token is not the stake token
+        require(
+            _token != address(lockTokenERC20),
+            "LockPeriodContract: Cannot withdraw staking token"
+        );
+        IERC20(_token).transfer(_to, _amount);
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function transferStakedTokensToMultisig(
+        address _to,
+        uint256 _amount
+    ) external {
+        require(
+            msg.sender == MULTISIG_ADDRESS,
+            "LockPeriodContract: Only multisig can call this function"
+        );
+        lockTokenERC20.transfer(_to, _amount);
+    }
+
+    // /// @inheritdoc ILockPeriodContract
+    function setMigratorContract(address _migratorContract) external {
+        require(
+            msg.sender == MULTISIG_ADDRESS,
+            "LockPeriodContract: Only multisig can call this function"
+        );
+        migratorContractAddress = _migratorContract;
+    }
+
+    /* ========== VIEWS ========== */
+
+    function _checkActivePeriod()
+        internal
+        view
+        returns (ContractState state_, uint256 activePeriodIndex_)
+    {
+        PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+
+        if (block.timestamp <= period_.timestampPeriodEnd) {
+            // the contract is up to date, the active period is ongoing, the contract is in the correct state
+            return (ContractState.ACTIVE_LOCKED, activePeriodIndex__);
+        } else {
+            // the period has ended, the contract is in the correct state as the active period has ended
+            uint32 nextPeriodStart_ = period_.timestampPeriodEnd +
+                uint32(defaultWindowDuration__);
+
+            if (block.timestamp < nextPeriodStart_) {
+                return (
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    activePeriodIndex__ + 1
+                );
+            } else if (
+                block.timestamp <=
+                nextPeriodStart_ + uint32(lockDurationNextPeriod__)
+            ) {
+                return (ContractState.ACTIVE_LOCKED, activePeriodIndex__ + 1);
+            } else if (
+                block.timestamp <
+                nextPeriodStart_ +
+                    uint32(lockDurationNextPeriod__) +
+                    uint32(defaultWindowDuration__)
+            ) {
+                return (
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    activePeriodIndex__ + 2
+                );
+            } else {
+                return (ContractState.ACTIVE_LOCKED, activePeriodIndex__ + 2);
+            }
+        }
+    }
+
+    function _checkUnlockRedeemable()
+        internal
+        view
+        returns (ContractState state_, uint256 activePeriodIndex_)
+    {
+        PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+
+        if (block.timestamp < period_.timestampPeriodStart) {
+            // the contract is in the correct state as the active period till has to start
+            return (ContractState.UNLOCKED_REDEEMABLE, activePeriodIndex__);
+        } else if (
+            block.timestamp >= period_.timestampPeriodStart &&
+            block.timestamp <= period_.timestampPeriodEnd
+        ) {
+            return (ContractState.ACTIVE_LOCKED, activePeriodIndex__);
+        } else {
+            uint32 nextPeriodStart_ = period_.timestampPeriodEnd +
+                uint32(defaultWindowDuration__);
+            if (block.timestamp < nextPeriodStart_) {
+                return (
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    activePeriodIndex__ + 1
+                );
+            } else if (
+                block.timestamp <=
+                nextPeriodStart_ + uint32(lockDurationNextPeriod__)
+            ) {
+                return (ContractState.ACTIVE_LOCKED, activePeriodIndex__ + 1);
+            } else {
+                return (
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    activePeriodIndex__ + 2
+                );
+            }
+        }
+    }
+
+    function _checkFreshPeriod()
+        internal
+        view
+        returns (ContractState state_, uint256 activePeriodIndex_)
+    {
+        PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+
+        if (block.timestamp < period_.timestampPeriodStart) {
+            // the contract is in the correct state as the active period till has to start
+            return (ContractState.FRESH_PERIOD, activePeriodIndex__);
+        } else if (
+            block.timestamp >= period_.timestampPeriodStart &&
+            block.timestamp <= period_.timestampPeriodEnd
+        ) {
+            return (ContractState.ACTIVE_LOCKED, activePeriodIndex__);
+        } else {
+            uint32 nextPeriodStart_ = period_.timestampPeriodEnd +
+                uint32(defaultWindowDuration__);
+            if (block.timestamp < nextPeriodStart_) {
+                return (
+                    ContractState.UNLOCKED_REDEEMABLE,
+                    activePeriodIndex__ + 1
+                );
+            } else {
+                return (
+                    ContractState.CONTRACT_UNLOCKED_INACTIVE,
+                    activePeriodIndex__ + 1
+                );
+            }
+        }
+    }
+
+    function returnContractPeriodState()
+        public
+        view
+        returns (ContractState state_, uint256 activePeriodIndex_)
+    {
+        if (contractState__ == ContractState.ACTIVE_LOCKED) {
+            (state_, activePeriodIndex_) = _checkActivePeriod();
+        } else if (contractState__ == ContractState.UNLOCKED_REDEEMABLE) {
+            (state_, activePeriodIndex_) = _checkUnlockRedeemable();
+        } else if (contractState__ == ContractState.FRESH_PERIOD) {
+            (state_, activePeriodIndex_) = _checkFreshPeriod();
+        } else if (
+            contractState__ == ContractState.CONTRACT_UNLOCKED_INACTIVE
+        ) {
+            return (
+                ContractState.CONTRACT_UNLOCKED_INACTIVE,
+                activePeriodIndex__
+            );
+        } else {
+            revert(
+                "LockPeriodContract: Lock contract is awaiting configuration"
+            );
+        }
+    }
+
+    function returnPendingRewards(
+        address _user
+    ) external view returns (uint256, uint256, uint256) {
+        return _totalClaimable(_user, activePeriodIndex__ + 1);
+    }
+
+    function returnPeriodInfoTime()
+        external
+        view
+        returns (
+            uint256 currentPeriodStart_,
+            uint256 currentPeriodEnd_,
+            uint256 nextPeriodStart_,
+            uint256 nextPeriodEnd_
+        )
+    {
+        (, uint256 activePeriodIndex_) = returnContractPeriodState();
+
+        PeriodInfo memory period_ = periodInfo__[activePeriodIndex__];
+
+        if (activePeriodIndex_ == activePeriodIndex__) {
+            currentPeriodStart_ = period_.timestampPeriodStart;
+
+            currentPeriodEnd_ = period_.timestampPeriodEnd;
+
+            nextPeriodStart_ =
+                period_.timestampPeriodEnd +
+                uint32(defaultWindowDuration__);
+
+            nextPeriodEnd_ =
+                nextPeriodStart_ +
+                uint32(lockDurationNextPeriod__);
+
+            return (
+                currentPeriodStart_,
+                currentPeriodEnd_,
+                nextPeriodStart_,
+                nextPeriodEnd_
+            );
+        } else if (activePeriodIndex_ == activePeriodIndex__ + 1) {
+            currentPeriodStart_ =
+                period_.timestampPeriodEnd +
+                uint32(defaultWindowDuration__);
+
+            currentPeriodEnd_ =
+                currentPeriodStart_ +
+                uint32(lockDurationNextPeriod__);
+
+            nextPeriodStart_ =
+                currentPeriodEnd_ +
+                uint32(defaultWindowDuration__);
+
+            nextPeriodEnd_ =
+                nextPeriodStart_ +
+                uint32(lockDurationNextPeriod__);
+        } else {
+            currentPeriodStart_ =
+                period_.timestampPeriodEnd +
+                uint32(defaultWindowDuration__) +
+                uint32(lockDurationNextPeriod__) +
+                uint32(defaultWindowDuration__);
+
+            currentPeriodEnd_ =
+                currentPeriodStart_ +
+                uint32(lockDurationNextPeriod__);
+
+            nextPeriodStart_ =
+                currentPeriodEnd_ +
+                uint32(defaultWindowDuration__);
+
+            nextPeriodEnd_ =
+                nextPeriodStart_ +
+                uint32(lockDurationNextPeriod__);
+        }
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnPeriodInfoStruct(
+        uint256 _periodIndex
+    ) external view returns (PeriodInfo memory) {
+        return periodInfo__[_periodIndex];
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnPeriodIndexCounter() external view returns (uint256) {
+        return periodIndexCounter__;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function isActivePeriodFinalized() external view returns (bool) {
+        return periodInfo__[activePeriodIndex__].isFinalized == 1;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function isPreviousPeriodFinalized() external view returns (bool) {
+        return periodInfo__[activePeriodIndex__ - 1].isFinalized == 1;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnActivePeriodInContract() external view returns (uint256) {
+        return activePeriodIndex__;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnNextPeriod() external view returns (uint256) {
+        return nextPeriodIndex__;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnContractStateInContract()
+        external
+        view
+        returns (ContractState)
+    {
+        return contractState__;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnPeriodRewardPerStakedToken(
+        uint256 _periodIndex
+    ) external view returns (uint256, uint256, uint256) {
+        return (
+            periodRewardPerStakedToken_USA_1__[_periodIndex],
+            periodRewardPerStakedToken_WETH_2__[_periodIndex],
+            periodRewardPerStakedToken_Stable_3__[_periodIndex]
+        );
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnTotalRewardsDistributed()
+        external
+        view
+        returns (
+            uint256 totalRewardsDistributed_USA_1,
+            uint256 totalRewardsDistributed_WETH_2,
+            uint256 totalRewardsDistributed_Stable_3
+        )
+    {
+        return (
+            totalRewardsDistributed_USA_1__,
+            totalRewardsDistributed_WETH_2__,
+            totalRewardsDistributed_Stable_3__
+        );
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnPeriodInfo(
+        uint256 _periodIndex
+    )
+        external
+        view
+        returns (
+            uint8 isFinalized,
+            uint88 totalLockedInPeriod,
+            uint88 totalRewardedInPeriod_USA_1,
+            uint32 timestampPeriodStart,
+            uint88 totalRewardedInPeriod_WETH_2,
+            uint88 totalRewardedInPeriod_Stable_3,
+            uint32 timestampPeriodEnd
+        )
+    {
+        PeriodInfo memory period_ = periodInfo__[_periodIndex];
+
+        return (
+            period_.isFinalized,
+            period_.totalLockedInPeriod,
+            period_.totalRewardedInPeriod_USA_1,
+            period_.timestampPeriodStart,
+            period_.totalRewardedInPeriod_WETH_2,
+            period_.totalRewardedInPeriod_Stable_3,
+            period_.timestampPeriodEnd
+        );
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnUserStakeInfo(
+        address _account
+    )
+        external
+        view
+        returns (
+            uint8 lastUpdatePeriodIndex,
+            uint88 amountStaked,
+            uint88 rewardDebt_USA_1,
+            uint88 rewardPaid_USA_1,
+            uint88 rewardDebt_WETH_2,
+            uint88 rewardPaid_WETH_2,
+            uint88 rewardDebt_Stable_3,
+            uint88 rewardPaid_Stable_3
+        )
+    {
+        StakeInfo memory stakeInfo_ = stakes__[_account];
+        return (
+            stakeInfo_.lastUpdatePeriodIndex,
+            stakeInfo_.amountStaked,
+            stakeInfo_.rewardDebt_USA_1,
+            stakeInfo_.rewardPaid_USA_1,
+            stakeInfo_.rewardDebt_WETH_2,
+            stakeInfo_.rewardPaid_WETH_2,
+            stakeInfo_.rewardDebt_Stable_3,
+            stakeInfo_.rewardPaid_Stable_3
+        );
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function totalTokensLocked() external view returns (uint256) {
+        return totalAmountStakedAssets__;
+    }
+
+    function returnLockPeriod() external view returns (uint256) {
+        return lockDurationNextPeriod__;
+    }
+
+    function returnStandardWindowDuration() external view returns (uint256) {
+        return defaultWindowDuration__;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function amountLocked(address _account) external view returns (uint256) {
+        return stakes__[_account].amountStaked;
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function returnRewardClaimableUser(
+        address _account
+    ) external view returns (uint256, uint256, uint256) {
+        return _totalClaimable(_account, activePeriodIndex__);
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function rewardPerToken_USA_1(
+        uint256 _periodIndex
+    ) external view returns (uint256) {
+        return periodRewardPerStakedToken_USA_1__[_periodIndex];
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function rewardPerToken_WETH_2(
+        uint256 _periodIndex
+    ) external view returns (uint256) {
+        return periodRewardPerStakedToken_WETH_2__[_periodIndex];
+    }
+
+    /// @inheritdoc ILockPeriodContract
+    function rewardPerToken_Stable_3(
+        uint256 _periodIndex
+    ) external view returns (uint256) {
+        return periodRewardPerStakedToken_Stable_3__[_periodIndex];
+    }
+}
+
+
+// File: src/interfaces/ILockNFT.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0 <0.9.0;
+
+interface ILockNFT {
+    function lockBatchNFTInAnyPeriod(uint256[] calldata _tokenIds) external;
+
+    function lockSingleNFTInAnyPeriod(uint256 _tokenId) external;
+
+    event NFTLocked(
+        address staker,
+        uint256 nftIndex,
+        uint256 amountUSA,
+        uint256 activerPeriodIndex
+    );
+
+    event BatchNftLocked(
+        address stakerAddress,
+        uint256[] tokenIds,
+        uint256 totalUSAStaked,
+        uint256 activePeriodIndex
+    );
+
+    event SetUsaLockAmount(uint256 _amount);
+
+    event BatchOfNftsUnstaked(uint256[] _tokenIds);
+
+    event NftUnstaked(uint256 tokenId);
+}
+
+
+// File: src/interfaces/IUSAStakeReceiptNFT.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0 <0.9.0;
+
+import "@openzeppelin/contracts/token/ERC721/extensions/IERC721Enumerable.sol";
+
+interface IUSAStakeReceiptNFT is IERC721Enumerable {
+    function mintNft(address _to, uint256 _tokenId) external;
+
+    function burnNft(uint256 _tokenId) external;
+
+    function mintBatch(address _to, uint256[] memory _tokenIds) external;
+
+    function setStakeContract(address _stakeContract) external;
+
+    function returnArrayWithNfts(
+        address _user
+    ) external view returns (uint256[] memory indexArray_);
+
+    function isOwnerOf(
+        address _user,
+        uint256 _tokenId
+    ) external view returns (bool);
+
+    function burnBatch(uint256[] memory _tokenIds) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC1155/IERC1155.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (token/ERC1155/IERC1155.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC-1155 compliant contract, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-1155[ERC].
+ */
+interface IERC1155 is IERC165 {
+    /**
+     * @dev Emitted when `value` amount of tokens of type `id` are transferred from `from` to `to` by `operator`.
+     */
+    event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
+
+    /**
+     * @dev Equivalent to multiple {TransferSingle} events, where `operator`, `from` and `to` are the same for all
+     * transfers.
+     */
+    event TransferBatch(
+        address indexed operator,
+        address indexed from,
+        address indexed to,
+        uint256[] ids,
+        uint256[] values
+    );
+
+    /**
+     * @dev Emitted when `account` grants or revokes permission to `operator` to transfer their tokens, according to
+     * `approved`.
+     */
+    event ApprovalForAll(address indexed account, address indexed operator, bool approved);
+
+    /**
+     * @dev Emitted when the URI for token type `id` changes to `value`, if it is a non-programmatic URI.
+     *
+     * If an {URI} event was emitted for `id`, the standard
+     * https://eips.ethereum.org/EIPS/eip-1155#metadata-extensions[guarantees] that `value` will equal the value
+     * returned by {IERC1155MetadataURI-uri}.
+     */
+    event URI(string value, uint256 indexed id);
+
+    /**
+     * @dev Returns the value of tokens of token type `id` owned by `account`.
+     */
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {balanceOf}.
+     *
+     * Requirements:
+     *
+     * - `accounts` and `ids` must have the same length.
+     */
+    function balanceOfBatch(
+        address[] calldata accounts,
+        uint256[] calldata ids
+    ) external view returns (uint256[] memory);
+
+    /**
+     * @dev Grants or revokes permission to `operator` to transfer the caller's tokens, according to `approved`,
+     *
+     * Emits an {ApprovalForAll} event.
+     *
+     * Requirements:
+     *
+     * - `operator` cannot be the zero address.
+     */
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /**
+     * @dev Returns true if `operator` is approved to transfer ``account``'s tokens.
+     *
+     * See {setApprovalForAll}.
+     */
+    function isApprovedForAll(address account, address operator) external view returns (bool);
+
+    /**
+     * @dev Transfers a `value` amount of tokens of type `id` from `from` to `to`.
+     *
+     * WARNING: This function can potentially allow a reentrancy attack when transferring tokens
+     * to an untrusted contract, when invoking {onERC1155Received} on the receiver.
+     * Ensure to follow the checks-effects-interactions pattern and consider employing
+     * reentrancy guards when interacting with untrusted contracts.
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - If the caller is not `from`, it must have been approved to spend ``from``'s tokens via {setApprovalForAll}.
+     * - `from` must have a balance of tokens of type `id` of at least `value` amount.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155Received} and return the
+     * acceptance magic value.
+     */
+    function safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes calldata data) external;
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {safeTransferFrom}.
+     *
+     * WARNING: This function can potentially allow a reentrancy attack when transferring tokens
+     * to an untrusted contract, when invoking {onERC1155BatchReceived} on the receiver.
+     * Ensure to follow the checks-effects-interactions pattern and consider employing
+     * reentrancy guards when interacting with untrusted contracts.
+     *
+     * Emits either a {TransferSingle} or a {TransferBatch} event, depending on the length of the array arguments.
+     *
+     * Requirements:
+     *
+     * - `ids` and `values` must have the same length.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155BatchReceived} and return the
+     * acceptance magic value.
+     */
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] calldata ids,
+        uint256[] calldata values,
+        bytes calldata data
+    ) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+import {Errors} from "./Errors.sol";
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert Errors.InsufficientBalance(address(this).balance, amount);
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert Errors.FailedCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {Errors.FailedCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert Errors.InsufficientBalance(address(this).balance, value);
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {Errors.FailedCall}) in case
+     * of an unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {Errors.FailedCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {Errors.FailedCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert Errors.FailedCall();
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC1155/IERC1155Receiver.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC1155/IERC1155Receiver.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Interface that must be implemented by smart contracts in order to receive
+ * ERC-1155 token transfers.
+ */
+interface IERC1155Receiver is IERC165 {
+    /**
+     * @dev Handles the receipt of a single ERC-1155 token type. This function is
+     * called at the end of a `safeTransferFrom` after the balance has been updated.
+     *
+     * NOTE: To accept the transfer, this must return
+     * `bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))`
+     * (i.e. 0xf23a6e61, or its own function selector).
+     *
+     * @param operator The address which initiated the transfer (i.e. msg.sender)
+     * @param from The address which previously owned the token
+     * @param id The ID of the token being transferred
+     * @param value The amount of tokens being transferred
+     * @param data Additional data with no specified format
+     * @return `bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))` if transfer is allowed
+     */
+    function onERC1155Received(
+        address operator,
+        address from,
+        uint256 id,
+        uint256 value,
+        bytes calldata data
+    ) external returns (bytes4);
+
+    /**
+     * @dev Handles the receipt of a multiple ERC-1155 token types. This function
+     * is called at the end of a `safeBatchTransferFrom` after the balances have
+     * been updated.
+     *
+     * NOTE: To accept the transfer(s), this must return
+     * `bytes4(keccak256("onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"))`
+     * (i.e. 0xbc197c81, or its own function selector).
+     *
+     * @param operator The address which initiated the batch transfer (i.e. msg.sender)
+     * @param from The address which previously owned the token
+     * @param ids An array containing ids of each token being transferred (order and length must match values array)
+     * @param values An array containing amounts of each token being transferred (order and length must match ids array)
+     * @param data Additional data with no specified format
+     * @return `bytes4(keccak256("onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"))` if transfer is allowed
+     */
+    function onERC1155BatchReceived(
+        address operator,
+        address from,
+        uint256[] calldata ids,
+        uint256[] calldata values,
+        bytes calldata data
+    ) external returns (bytes4);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC-20 standard as defined in the ERC.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Pausable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    bool private _paused;
+
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    /**
+     * @dev The operation failed because the contract is paused.
+     */
+    error EnforcedPause();
+
+    /**
+     * @dev The operation failed because the contract is not paused.
+     */
+    error ExpectedPause();
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        if (paused()) {
+            revert EnforcedPause();
+        }
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        if (!paused()) {
+            revert ExpectedPause();
+        }
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: src/interfaces/ILockPeriodContract.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0 <0.9.0;
+
+interface ILockPeriodContract {
+    /**
+     * @param isFinalized 0 = not finalized, 1 = finalized
+     * @param periodDuration the duration of the period_ in seconds
+     * @param timestampPeriodEnd the timestamp of the end of the period_
+     * @param totalLockedInPeriod the total amount of tokens locked in the period_
+     * @param totalRewardedInPeriod_USA_1 the total amount of WETH rewarded in the period_
+     * @param totalRewardedInPeriod_WETH_2 the total amount of WETH rewarded in the period_
+     * @param totalRewardedInPeriod_Stable_3 the total amount of WETH rewarded in the period_
+     * @param timestampPeriodStart the timestamp of the start of the period_
+     */
+    struct PeriodInfo {
+        uint8 isFinalized; // 0 = not finalized, 1 = finalized
+        uint88 totalLockedInPeriod;
+        uint88 totalRewardedInPeriod_USA_1;
+        uint32 timestampPeriodStart;
+        uint88 totalRewardedInPeriod_WETH_2;
+        uint88 totalRewardedInPeriod_Stable_3;
+        uint32 timestampPeriodEnd;
+    }
+
+    /**
+     * @param amountStaked the amount of tokens staked
+     * @param rewardDebt_USA_1 the amount of rewards(WETH) that have been distributed but not yet claimed
+     * @param rewardPaid the amount of rewards(WETH) that have been claimed
+     * @param lastUpdatePeriodIndex the index of the last period_ that the user has updated their rewards for
+     */
+    struct StakeInfo {
+        uint8 lastUpdatePeriodIndex;
+        uint88 amountStaked;
+        uint88 rewardDebt_USA_1;
+        uint88 rewardPaid_USA_1;
+        uint88 rewardDebt_WETH_2;
+        uint88 rewardPaid_WETH_2;
+        uint88 rewardDebt_Stable_3;
+        uint88 rewardPaid_Stable_3;
+    }
+
+    enum ContractState {
+        NONE, // 0
+        ACTIVE_LOCKED, // 1
+        UNLOCKED_REDEEMABLE, // 2
+        FRESH_PERIOD, // 3
+        CONTRACT_UNLOCKED_INACTIVE // 4
+    }
+
+    /* ========== VIEW FUNCTIONS ========== */
+
+    function returnPeriodIndexCounter() external view returns (uint256);
+
+    function isActivePeriodFinalized() external view returns (bool);
+
+    function isPreviousPeriodFinalized() external view returns (bool);
+
+    function returnContractStateInContract()
+        external
+        view
+        returns (ContractState);
+
+    function returnActivePeriodInContract() external view returns (uint256);
+
+    function returnLockPeriod() external view returns (uint256);
+
+    function returnStandardWindowDuration() external view returns (uint256);
+
+    function returnNextPeriod() external view returns (uint256);
+
+    function returnPeriodRewardPerStakedToken(
+        uint256 _periodIndex
+    ) external view returns (uint256, uint256, uint256);
+
+    function totalTokensLocked() external view returns (uint256);
+
+    function returnTotalRewardsDistributed()
+        external
+        view
+        returns (
+            uint256 totalRewardsDistributed_USA_1,
+            uint256 totalRewardsDistributed_WETH_2,
+            uint256 totalRewardsDistributed_Stable_3
+        );
+
+    /**
+     * @notice Calculates the amount of reward USA token each locked token is entitled to for a given period
+     * @param _periodIndex The index of the period for which to calculate the reward per token
+     * @return The calculated reward amount per token as a fixed point number with 18 decimals
+     */
+    function rewardPerToken_USA_1(
+        uint256 _periodIndex
+    ) external view returns (uint256);
+
+    /**
+     * @notice Calculates the amount of reward WETH token each locked token is entitled to for a given period
+     * @param _periodIndex The index of the period for which to calculate the reward per token
+     * @return The calculated reward amount per token as a fixed point number with 18 decimals
+     */
+    function rewardPerToken_WETH_2(
+        uint256 _periodIndex
+    ) external view returns (uint256);
+
+    /**
+     * @notice Calculates the amount of reward Stable token each locked token is entitled to for a given period
+     * @param _periodIndex The index of the period for which to calculate the reward per token
+     * @return The calculated reward amount per token as a fixed point number with 18 decimals
+     */
+    function rewardPerToken_Stable_3(
+        uint256 _periodIndex
+    ) external view returns (uint256);
+
+    /**
+     * @notice Returns the amount of tokens staked by a specific user and how much historically user has been issued and claimed
+     * @param _user The address of the user for whom to return the stake information
+     * @return lastUpdatePeriodIndex The index of the last period that the user has updated their rewards for
+     * @return amountStaked The amount of tokens staked by the user
+     * @return rewardDebt_USA_1 The amount of USA the user has earned historically (up only value, accumulated)
+     * @return rewardPaid_USA_1 The amount of USA the user has claimed historically (up only value, accumulated)
+     * @return rewardDebt_WETH_2 The amount of WETH the user has earned historically (up only value, accumulated)
+     * @return rewardPaid_WETH_2 The amount of WETH the user has claimed historically (up only value, accumulated)
+     * @return rewardDebt_Stable_3 The amount of Stable the user has earned historically (up only value, accumulated)
+     * @return rewardPaid_Stable_3 The amount of Stable the user has claimed historically (up only value, accumulated)
+     */
+    function returnUserStakeInfo(
+        address _user
+    )
+        external
+        view
+        returns (
+            uint8 lastUpdatePeriodIndex,
+            uint88 amountStaked,
+            uint88 rewardDebt_USA_1,
+            uint88 rewardPaid_USA_1,
+            uint88 rewardDebt_WETH_2,
+            uint88 rewardPaid_WETH_2,
+            uint88 rewardDebt_Stable_3,
+            uint88 rewardPaid_Stable_3
+        );
+
+    /**
+     * @notice Returns the claimable reward amount of a specific user
+     * @param _user The address of the user for whom to return the claimable reward
+     * @return The total amount of rewards that the user can claim
+     */
+    function returnRewardClaimableUser(
+        address _user
+    ) external view returns (uint256, uint256, uint256);
+
+    /**
+     * @notice Returns detailed information about a specific period by index.
+     * @dev This function provides granular details about a period, including its finalization status, total tokens locked, rewards distributed across different tokens, and its start and end timestamps. This information is crucial for understanding the state and history of rewards and staking for a given period.
+     * @param _periodIndex The index of the period for which to retrieve information.
+     * @return isFinalized Indicates whether the period has been finalized (1) or not (0).
+     * @return totalLockedInPeriod The total amount of tokens locked during the specified period.
+     * @return totalRewardedInPeriod_USA_1 The total amount of USA_1 token rewards distributed during the specified period.
+     * @return timestampPeriodStart The start timestamp of the period.
+     * @return totalRewardedInPeriod_WETH_2 The total amount of WETH_2 token rewards distributed during the specified period.
+     * @return totalRewardedInPeriod_Stable_3 The total amount of Stable_3 token rewards distributed during the specified period.
+     * @return timestampPeriodEnd The end timestamp of the period.
+     */
+    function returnPeriodInfo(
+        uint256 _periodIndex
+    )
+        external
+        view
+        returns (
+            uint8 isFinalized,
+            uint88 totalLockedInPeriod,
+            uint88 totalRewardedInPeriod_USA_1,
+            uint32 timestampPeriodStart,
+            uint88 totalRewardedInPeriod_WETH_2,
+            uint88 totalRewardedInPeriod_Stable_3,
+            uint32 timestampPeriodEnd
+        );
+
+    function returnPeriodInfoTime()
+        external
+        view
+        returns (
+            uint256 currentPeriodStart_,
+            uint256 currentPeriodEnd_,
+            uint256 nextPeriodStart_,
+            uint256 nextPeriodEnd_
+        );
+
+    /**
+     * @notice Returns a struct containing detailed information about a specific period by index.
+     * @dev This function is an alternative to `returnPeriodInfo` that returns a struct, making it easier to interact with in some scenarios. It provides the same information in a structured format, which can be particularly useful when the caller needs to process multiple pieces of period data at once.
+     * @param _periodIndex The index of the period for which to retrieve information.
+     * @return A `PeriodInfo` struct containing all relevant details about the period, including its finalization status, total tokens locked, rewards distributed across different tokens, and its start and end timestamps.
+     */
+    function returnPeriodInfoStruct(
+        uint256 _periodIndex
+    ) external view returns (PeriodInfo memory);
+
+    /**
+     * @notice Returns the balance of staked tokens for a specific account
+     * @param _account The address of the account for which to return the staked token balance
+     * @return The total amount of tokens staked by the specified account
+     */
+    function amountLocked(address _account) external view returns (uint256);
+
+    /* ========== WRITE FUNCTIONS ========== */
+
+    function distributeRewardsForLatestPeriod(
+        uint256 _amountReward_1,
+        uint256 _amountReward_2,
+        uint256 _amountReward_3
+    ) external;
+
+    function pause() external;
+
+    function unpause() external;
+
+    /**
+     * @notice Sets the duration of the standard window for the staking period
+     * @param _standardWindowDuration The duration in seconds for the standard window
+     */
+    function setStandardWindowDuration(uint32 _standardWindowDuration) external;
+
+    /**
+     * @notice set the rewards distribution contract address that can call notifyRewardAmount()
+     * @param _rewardsDistribution The address of the rewardsDistribution contract
+     */
+    function setRewardsDistribution(address _rewardsDistribution) external;
+
+    /**
+     * @notice Sets the lock period for the next period
+     * This function can be used to set the lock period for the next period
+     * @param _lockPeriodNextPeriod The lock period for the next period
+     */
+    function setLockPeriodNextPeriod(uint256 _lockPeriodNextPeriod) external;
+
+    /**
+     * @notice Updates all information for a specific period
+     * @dev This function allows updating the period information including its start and end timestamps,
+     * the total amount locked during the period, and the total rewards distributed in the period for each token type.
+     * This function can only be called by the contract owner or another authorized entity.
+     * @param _periodIndex The index of the period to update
+     * @param _isFinalized The finalization status of the period (0 = not finalized, 1 = finalized)
+     * @param _timestampPeriodStart The start timestamp of the period
+     * @param _timestampPeriodEnd The end timestamp of the period
+     * @param _totalLockedInPeriod The total amount of tokens locked during the period
+     * @param _totalRewardedInPeriod_USA_1 The total amount of USA token rewards distributed during the period
+     * @param _totalRewardedInPeriod_WETH_2 The total amount of WETH token rewards distributed during the period
+     * @param _totalRewardedInPeriod_Stable_3 The total amount of Stable token rewards distributed during the period
+     */
+    function setPeriodAllInfo(
+        uint256 _periodIndex,
+        uint8 _isFinalized,
+        uint32 _timestampPeriodStart,
+        uint32 _timestampPeriodEnd,
+        uint88 _totalLockedInPeriod,
+        uint88 _totalRewardedInPeriod_USA_1,
+        uint88 _totalRewardedInPeriod_WETH_2,
+        uint88 _totalRewardedInPeriod_Stable_3
+    ) external;
+
+    /**
+     * @notice Updates the total amount of tokens locked for a specific period
+     * @dev This function allows updating the total amount of tokens that have been locked during a specified period.
+     * It can only be called by the contract owner or another authorized entity. This is crucial for accurately tracking
+     * the total locked tokens which can affect reward calculations and period finalizations.
+     * @param _periodIndex The index of the period for which to update the total locked amount
+     * @param _totalLockedInPeriod The new total amount of tokens locked in the specified period
+     */
+    function setTotalLockedInPeriod(
+        uint256 _periodIndex,
+        uint88 _totalLockedInPeriod
+    ) external;
+
+    /**
+     * @notice Marks a specific period as finalized
+     * @dev This function sets the finalization status of a specified period to finalized (1).
+     * It can only be called by the contract owner or another authorized entity. Finalizing a period
+     * is an important step in the rewards distribution process as it prevents any further changes
+     * to the period's data, ensuring the integrity of the rewards calculation.
+     * @param _periodIndex The index of the period to be finalized
+     */
+    function setPeriodFinalized(uint256 _periodIndex) external;
+
+    function unfinalizePeriod(uint256 _periodIndex) external;
+
+    /**
+     * @notice Manually triggers the update of the contract state
+     * @dev This function is designed to manually trigger the internal mechanism that updates the contract's state based on the current time and the state of periods. It is intended to be used in scenarios where the automatic state transition needs to be enforced immediately. This function can only be called by the contract owner or another authorized entity.
+     */
+    function updateManual() external;
+
+    /**
+     * @notice Sets the current state of the pool
+     * @dev This function allows updating the current state of the pool to reflect its operational status accurately.
+     * The state can be one of several predefined states, such as ACTIVE_LOCKED, UNLOCKED_REDEEMABLE, or FRESH_PERIOD,
+     * each representing a different phase in the pool's lifecycle. Changing the pool state is a critical action that
+     * can affect the pool's behavior and how users interact with it. Therefore, this function can only be called by
+     * the contract owner or another authorized entity to ensure that state transitions are controlled and intentional.
+     * @param _poolState The new state to set for the pool
+     */
+    function setPoolState(ContractState _poolState) external;
+
+    /**
+     * @notice Configures the first period of the lock pool
+     * @dev This function sets the start time and lock duration for the first period of the lock pool.
+     * It can only be called by the contract owner or another authorized entity. This is a critical setup step
+     * that initializes the first period, enabling users to start locking tokens. The lock duration determines
+     * how long the tokens will be locked before they can be unlocked or before rewards can be claimed.
+     * @param _startFirstPeriod The start time of the first period
+     * @param _lockDurationNextPeriod The lock duration for the first period
+     */
+    function configureFirstPeriod(
+        uint32 _startFirstPeriod,
+        uint256 _lockDurationNextPeriod
+    ) external;
+
+    /**
+     * @notice Transfers staked tokens to a multisig address
+     * @dev This function is designed for emergency scenarios or contract migrations. It allows the transfer of staked tokens to a multisig address. This function can only be called by the multisig address set in the contract, ensuring that only authorized parties can execute it.
+     * @param _to The address to which the tokens will be transferred.
+     * @param _amount The amount of tokens to be transferred.
+     */
+    function transferStakedTokensToMultisig(
+        address _to,
+        uint256 _amount
+    ) external;
+
+    /**
+     * @notice Allows the emergency withdrawal of tokens
+     * @dev This function is an emergency mechanism to withdraw tokens from the contract. It can be used in scenarios such as contract migration or if there's a need to recover tokens mistakenly sent to the contract. This function can only be called by the contract owner.
+     * @param _token The address of the token to be withdrawn.
+     * @param _to The address to which the tokens will be sent.
+     * @param _amount The amount of tokens to be withdrawn.
+     */
+    function emergencyWithdrawToken(
+        address _token,
+        address _to,
+        uint256 _amount
+    ) external;
+
+    /**
+     * @notice Sets the migrator contract address
+     * @dev This function allows setting the address of the migrator contract, which is authorized to call `migrateLockERC20TokensToNewLockContract`. This is a security measure to ensure that only a trusted migrator can perform migrations. This function can only be called by the multisig address.
+     * @param _migratorContract The address of the migrator contract.
+     */
+    function setMigratorContract(address _migratorContract) external;
+
+    /* ========== EVENTS ========== */
+
+    event TokensStaked(
+        address indexed user,
+        uint256 amount,
+        uint256 periodIndexCounter_
+    );
+
+    event StopNextPeriod(bool stopNextPeriod);
+
+    event RewardDistributed(uint256 indexed periodIndex, uint256 amount);
+
+    event NewPeriodStarted(
+        uint256 indexed periodIndex,
+        uint256 startTime,
+        uint256 endTime
+    );
+
+    event RewardsClaimed(
+        address indexed user,
+        uint256 amountClaimedUSA,
+        uint256 amountClaimedWETH,
+        uint256 amountClaimedStable
+    );
+
+    event RewardsDurationUpdated(uint256 newDuration);
+
+    event LockPeriodNextPeriodUpdated(uint256 lockPeriodNextPeriod);
+
+    event RewardsDistributionUpdated(address newRewardsDistribution);
+
+    event StandardWindowDurationUpdated(uint32 standardWindowDuration);
+
+    event UnstakeTokens(address indexed user, uint256 amount);
+
+    event DistributeRewardsForLatestPeriod(
+        uint256 periodIndex,
+        uint256 amountReward_usa_1,
+        uint256 amountReward_weth_2,
+        uint256 amountReward_stable_3,
+        uint88 totalLockedInPeriod
+    );
+
+    event NewLockPeriodConfigured(
+        uint256 indexed periodIndex,
+        uint32 timestampPeriodStart,
+        uint256 lockDurationNextPeriod
+    );
+
+    event PoolStateManualSet(ContractState _poolState);
+
+    event LockActiveUpdated(bool _isLockActive);
+
+    event ContractStateChanged(
+        ContractState _contractState,
+        uint256 periodIndex
+    );
+
+    event NewPeriodCreated(
+        uint256 indexed periodIndex,
+        uint32 timestampPeriodStart,
+        uint32 timestampPeriodEnd
+    );
+
+    event TimeoutByUnfinalizedPeriods(uint256 activePeriodIndex);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC721/extensions/IERC721Enumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC721/extensions/IERC721Enumerable.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC721} from "../IERC721.sol";
+
+/**
+ * @title ERC-721 Non-Fungible Token Standard, optional enumeration extension
+ * @dev See https://eips.ethereum.org/EIPS/eip-721
+ */
+interface IERC721Enumerable is IERC721 {
+    /**
+     * @dev Returns the total amount of tokens stored by the contract.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns a token ID owned by `owner` at a given `index` of its token list.
+     * Use along with {balanceOf} to enumerate all of ``owner``'s tokens.
+     */
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+
+    /**
+     * @dev Returns a token ID at a given `index` of all the tokens stored by the contract.
+     * Use along with {totalSupply} to enumerate all tokens.
+     */
+    function tokenByIndex(uint256 index) external view returns (uint256);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC-165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[ERC].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[ERC section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Errors.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of common custom errors used in multiple contracts
+ *
+ * IMPORTANT: Backwards compatibility is not guaranteed in future versions of the library.
+ * It is recommended to avoid relying on the error API for critical functionality.
+ */
+library Errors {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error InsufficientBalance(uint256 balance, uint256 needed);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedCall();
+
+    /**
+     * @dev The deployment failed.
+     */
+    error FailedDeployment();
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC721/IERC721.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC-721 compliant contract.
+ */
+interface IERC721 is IERC165 {
+    /**
+     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.
+     */
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.
+     */
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /**
+     * @dev Returns the number of tokens in ``owner``'s account.
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon
+     *   a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC-721 protocol to prevent tokens from being forever locked.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or
+     *   {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon
+     *   a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+
+    /**
+     * @dev Transfers `tokenId` token from `from` to `to`.
+     *
+     * WARNING: Note that the caller is responsible to confirm that the recipient is capable of receiving ERC-721
+     * or else they may be permanently lost. Usage of {safeTransferFrom} prevents loss, though the caller must
+     * understand this adds an external call which potentially creates a reentrancy vulnerability.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 tokenId) external;
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) external;
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the address zero.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) external view returns (address operator);
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}
+     */
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+}
+
