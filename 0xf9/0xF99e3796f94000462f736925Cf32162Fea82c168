@@ -1,0 +1,2618 @@
+
+// File: src/extensions/BulkerGateway.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity ^0.8.17;
+
+import {IWETH} from "src/interfaces/extensions/IWETH.sol";
+import {IWSTETH} from "src/interfaces/extensions/IWSTETH.sol";
+import {IMorpho} from "src/interfaces/IMorpho.sol";
+import {IBulkerGateway} from "src/interfaces/extensions/IBulkerGateway.sol";
+
+import {Types} from "src/libraries/Types.sol";
+import {Math} from "@morpho-utils/math/Math.sol";
+import {SafeTransferLib, ERC20} from "@solmate/utils/SafeTransferLib.sol";
+import {ERC20 as ERC20Permit2, Permit2Lib} from "@permit2/libraries/Permit2Lib.sol";
+
+/// @title BulkerGateway.
+/// @author Morpho Labs.
+/// @custom:contact security@morpho.xyz
+/// @notice Contract allowing to bundle multiple interactions with Morpho together.
+contract BulkerGateway is IBulkerGateway {
+    using SafeTransferLib for ERC20;
+    using Permit2Lib for ERC20Permit2;
+
+    /* CONSTANTS */
+
+    /// @dev The address of the WETH contract.
+    address internal constant _WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    /// @dev The address of the stETH contract.
+    address internal constant _ST_ETH = 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84;
+
+    /// @dev The address of the wstETH contract.
+    address internal constant _WST_ETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
+
+    /* IMMUTABLES */
+
+    IMorpho internal immutable _MORPHO;
+
+    /* CONSTRUCTOR */
+
+    constructor(address morpho) {
+        if (morpho == address(0)) revert AddressIsZero();
+
+        _MORPHO = IMorpho(morpho);
+
+        ERC20(_WETH).safeApprove(morpho, type(uint256).max);
+        ERC20(_ST_ETH).safeApprove(_WST_ETH, type(uint256).max);
+        ERC20(_WST_ETH).safeApprove(morpho, type(uint256).max);
+    }
+
+    /* EXTERNAL */
+
+    /// @notice Returns the address of the WETH contract.
+    function WETH() external pure returns (address) {
+        return _WETH;
+    }
+
+    /// @notice Returns the address of the stETH contract.
+    function stETH() external pure returns (address) {
+        return _ST_ETH;
+    }
+
+    /// @notice Returns the address of the wstETH contract.
+    function wstETH() external pure returns (address) {
+        return _WST_ETH;
+    }
+
+    /// @notice Returns the address of the Morpho protocol.
+    function MORPHO() external view returns (address) {
+        return address(_MORPHO);
+    }
+
+    /// @notice Executes the given batch of actions, with the given input data.
+    ///         Those actions, if not performed in the correct order, with the proper action's configuration
+    ///         and with the proper inclusion of skim final calls, could leave funds in the Bulker contract.
+    /// @param actions The batch of action to execute, one after the other.
+    /// @param data The array of data corresponding to each input action.
+    function execute(ActionType[] calldata actions, bytes[] calldata data) external payable {
+        uint256 nbActions = actions.length;
+        if (nbActions != data.length) {
+            revert InconsistentParameters(nbActions, data.length);
+        }
+
+        for (uint256 i; i < nbActions; ++i) {
+            _performAction(actions[i], data[i]);
+        }
+    }
+
+    /// @dev Only the WETH contract is allowed to transfer ETH to this contract, without any calldata.
+    receive() external payable {
+        if (msg.sender != _WETH) revert OnlyWETH();
+    }
+
+    /* INTERNAL */
+
+    /// @dev Performs the given action, given its associated parameters.
+    /// @param action The type of action to perform on behalf of the caller.
+    /// @param data The data to decode, associated with the action.
+    function _performAction(ActionType action, bytes calldata data) internal {
+        if (action == ActionType.APPROVE2) {
+            _approve2(data);
+        } else if (action == ActionType.TRANSFER_FROM2) {
+            _transferFrom2(data);
+        } else if (action == ActionType.APPROVE_MANAGER) {
+            _approveManager(data);
+        } else if (action == ActionType.SUPPLY) {
+            _supply(data);
+        } else if (action == ActionType.SUPPLY_COLLATERAL) {
+            _supplyCollateral(data);
+        } else if (action == ActionType.BORROW) {
+            _borrow(data);
+        } else if (action == ActionType.REPAY) {
+            _repay(data);
+        } else if (action == ActionType.WITHDRAW) {
+            _withdraw(data);
+        } else if (action == ActionType.WITHDRAW_COLLATERAL) {
+            _withdrawCollateral(data);
+        } else if (action == ActionType.WRAP_ETH) {
+            _wrapEth(data);
+        } else if (action == ActionType.UNWRAP_ETH) {
+            _unwrapEth(data);
+        } else if (action == ActionType.WRAP_ST_ETH) {
+            _wrapStEth(data);
+        } else if (action == ActionType.UNWRAP_ST_ETH) {
+            _unwrapStEth(data);
+        } else if (action == ActionType.SKIM) {
+            _skim(data);
+        } else if (action == ActionType.CLAIM_REWARDS) {
+            _claimRewards(data);
+        } else {
+            revert UnsupportedAction(action);
+        }
+    }
+
+    /* INTERNAL ACTIONS */
+
+    /// @dev Approves the given `amount` of `asset` from sender to be spent by this contract via Permit2 with the given `deadline` & EIP712 `signature`.
+    function _approve2(bytes calldata data) internal {
+        (address asset, uint256 amount, uint256 deadline, Types.Signature memory signature) =
+            abi.decode(data, (address, uint256, uint256, Types.Signature));
+        if (amount == 0) revert AmountIsZero();
+
+        ERC20Permit2(asset).simplePermit2(
+            msg.sender, address(this), amount, deadline, signature.v, signature.r, signature.s
+        );
+    }
+
+    /// @dev Transfers the given `amount` of `asset` from sender to this contract via ERC20 transfer with Permit2 fallback.
+    function _transferFrom2(bytes calldata data) internal {
+        (address asset, uint256 amount) = abi.decode(data, (address, uint256));
+        if (amount == 0) revert AmountIsZero();
+
+        ERC20Permit2(asset).transferFrom2(msg.sender, address(this), amount);
+    }
+
+    /// @dev Approves this contract to manage the position of `msg.sender` via EIP712 `signature`.
+    function _approveManager(bytes calldata data) internal {
+        (bool isAllowed, uint256 nonce, uint256 deadline, Types.Signature memory signature) =
+            abi.decode(data, (bool, uint256, uint256, Types.Signature));
+
+        _MORPHO.approveManagerWithSig(msg.sender, address(this), isAllowed, nonce, deadline, signature);
+    }
+
+    /// @dev Supplies `amount` of `asset` of `onBehalf` using permit2 in a single tx.
+    ///         The supplied amount cannot be used as collateral but is eligible for the peer-to-peer matching.
+    function _supply(bytes calldata data) internal {
+        (address asset, uint256 amount, address onBehalf, uint256 maxIterations) =
+            abi.decode(data, (address, uint256, address, uint256));
+        if (onBehalf == address(this)) revert AddressIsBulker();
+
+        amount = Math.min(amount, ERC20(asset).balanceOf(address(this)));
+
+        _approveMaxToMorpho(asset);
+
+        _MORPHO.supply(asset, amount, onBehalf, maxIterations);
+    }
+
+    /// @dev Supplies `amount` of `asset` collateral to the pool on behalf of `onBehalf`.
+    function _supplyCollateral(bytes calldata data) internal {
+        (address asset, uint256 amount, address onBehalf) = abi.decode(data, (address, uint256, address));
+        if (onBehalf == address(this)) revert AddressIsBulker();
+
+        amount = Math.min(amount, ERC20(asset).balanceOf(address(this)));
+
+        _approveMaxToMorpho(asset);
+
+        _MORPHO.supplyCollateral(asset, amount, onBehalf);
+    }
+
+    /// @dev Borrows `amount` of `asset` on behalf of the sender. Sender must have previously approved the bulker as their manager on Morpho.
+    function _borrow(bytes calldata data) internal {
+        (address asset, uint256 amount, address receiver, uint256 maxIterations) =
+            abi.decode(data, (address, uint256, address, uint256));
+
+        _MORPHO.borrow(asset, amount, msg.sender, receiver, maxIterations);
+    }
+
+    /// @dev Repays `amount` of `asset` on behalf of `onBehalf`.
+    function _repay(bytes calldata data) internal {
+        (address asset, uint256 amount, address onBehalf) = abi.decode(data, (address, uint256, address));
+        if (onBehalf == address(this)) revert AddressIsBulker();
+
+        amount = Math.min(amount, ERC20(asset).balanceOf(address(this)));
+
+        _approveMaxToMorpho(asset);
+
+        _MORPHO.repay(asset, amount, onBehalf);
+    }
+
+    /// @dev Withdraws `amount` of `asset` on behalf of `onBehalf`. Sender must have previously approved the bulker as their manager on Morpho.
+    function _withdraw(bytes calldata data) internal {
+        (address asset, uint256 amount, address receiver, uint256 maxIterations) =
+            abi.decode(data, (address, uint256, address, uint256));
+
+        _MORPHO.withdraw(asset, amount, msg.sender, receiver, maxIterations);
+    }
+
+    /// @dev Withdraws `amount` of `asset` on behalf of sender. Sender must have previously approved the bulker as their manager on Morpho.
+    function _withdrawCollateral(bytes calldata data) internal {
+        (address asset, uint256 amount, address receiver) = abi.decode(data, (address, uint256, address));
+
+        _MORPHO.withdrawCollateral(asset, amount, msg.sender, receiver);
+    }
+
+    /// @dev Wraps the given input of ETH to WETH.
+    function _wrapEth(bytes calldata data) internal {
+        (uint256 amount) = abi.decode(data, (uint256));
+
+        amount = Math.min(amount, address(this).balance);
+        if (amount == 0) revert AmountIsZero();
+
+        IWETH(_WETH).deposit{value: amount}();
+    }
+
+    /// @dev Unwraps the given input of WETH to ETH.
+    function _unwrapEth(bytes calldata data) internal {
+        (uint256 amount, address receiver) = abi.decode(data, (uint256, address));
+        if (receiver == address(this)) revert AddressIsBulker();
+        if (receiver == address(0)) revert AddressIsZero();
+
+        amount = Math.min(amount, ERC20(_WETH).balanceOf(address(this)));
+        if (amount == 0) revert AmountIsZero();
+
+        IWETH(_WETH).withdraw(amount);
+
+        SafeTransferLib.safeTransferETH(receiver, amount);
+    }
+
+    /// @dev Wraps the given input of stETH to wstETH.
+    function _wrapStEth(bytes calldata data) internal {
+        (uint256 amount) = abi.decode(data, (uint256));
+
+        amount = Math.min(amount, ERC20(_ST_ETH).balanceOf(address(this)));
+        if (amount == 0) revert AmountIsZero();
+
+        IWSTETH(_WST_ETH).wrap(amount);
+    }
+
+    /// @dev Unwraps the given input of wstETH to stETH.
+    function _unwrapStEth(bytes calldata data) internal {
+        (uint256 amount, address receiver) = abi.decode(data, (uint256, address));
+        if (receiver == address(this)) revert AddressIsBulker();
+        if (receiver == address(0)) revert AddressIsZero();
+
+        amount = Math.min(amount, ERC20(_WST_ETH).balanceOf(address(this)));
+        if (amount == 0) revert AmountIsZero();
+
+        uint256 unwrapped = IWSTETH(_WST_ETH).unwrap(amount);
+
+        ERC20(_ST_ETH).safeTransfer(receiver, unwrapped);
+    }
+
+    /// @dev Sends any ERC20 in this contract to the receiver.
+    function _skim(bytes calldata data) internal {
+        (address asset, address receiver) = abi.decode(data, (address, address));
+        if (receiver == address(this)) revert AddressIsBulker();
+        if (receiver == address(0)) revert AddressIsZero();
+
+        uint256 balance = ERC20(asset).balanceOf(address(this));
+        ERC20(asset).safeTransfer(receiver, balance);
+    }
+
+    /// @dev Claims rewards for the given assets, on behalf of an address, sending the funds to the given address.
+    function _claimRewards(bytes calldata data) internal {
+        (address[] memory assets, address onBehalf) = abi.decode(data, (address[], address));
+        if (onBehalf == address(this)) revert AddressIsBulker();
+
+        _MORPHO.claimRewards(assets, onBehalf);
+    }
+
+    /* INTERNAL HELPERS */
+
+    /// @dev Gives the max approval to the Morpho contract to spend the given `asset` if not already approved.
+    function _approveMaxToMorpho(address asset) internal {
+        if (ERC20(asset).allowance(address(this), address(_MORPHO)) == 0) {
+            ERC20(asset).safeApprove(address(_MORPHO), type(uint256).max);
+        }
+    }
+}
+
+
+// File: src/interfaces/extensions/IWETH.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.5.0;
+
+interface IWETH {
+    function deposit() external payable;
+
+    function withdraw(uint256 wad) external;
+
+    function approve(address guy, uint256 wad) external returns (bool);
+
+    function transferFrom(address src, address dst, uint256 wad) external returns (bool);
+}
+
+
+// File: src/interfaces/extensions/IWSTETH.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.5.0;
+
+interface IWSTETH {
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function decreaseAllowance(address spender, uint256 subtractedValue) external returns (bool);
+    function getStETHByWstETH(uint256 wstETHAmount) external view returns (uint256);
+    function getWstETHByStETH(uint256 stETHAmount) external view returns (uint256);
+    function increaseAllowance(address spender, uint256 addedValue) external returns (bool);
+    function name() external view returns (string memory);
+    function nonces(address owner) external view returns (uint256);
+    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+        external;
+    function stETH() external view returns (address);
+    function stEthPerToken() external view returns (uint256);
+    function symbol() external view returns (string memory);
+    function tokensPerStEth() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function unwrap(uint256 wstETHAmount) external returns (uint256);
+    function wrap(uint256 stETHAmount) external returns (uint256);
+}
+
+
+// File: src/interfaces/IMorpho.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.5.0;
+
+import {Types} from "../libraries/Types.sol";
+
+interface IMorphoGetters {
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+    function pool() external view returns (address);
+    function addressesProvider() external view returns (address);
+    function eModeCategoryId() external view returns (uint256);
+
+    function market(address underlying) external view returns (Types.Market memory);
+    function marketsCreated() external view returns (address[] memory);
+
+    function scaledCollateralBalance(address underlying, address user) external view returns (uint256);
+    function scaledP2PBorrowBalance(address underlying, address user) external view returns (uint256);
+    function scaledP2PSupplyBalance(address underlying, address user) external view returns (uint256);
+    function scaledPoolBorrowBalance(address underlying, address user) external view returns (uint256);
+    function scaledPoolSupplyBalance(address underlying, address user) external view returns (uint256);
+
+    function supplyBalance(address underlying, address user) external view returns (uint256);
+    function borrowBalance(address underlying, address user) external view returns (uint256);
+    function collateralBalance(address underlying, address user) external view returns (uint256);
+
+    function userCollaterals(address user) external view returns (address[] memory);
+    function userBorrows(address user) external view returns (address[] memory);
+
+    function isManagedBy(address delegator, address manager) external view returns (bool);
+    function userNonce(address user) external view returns (uint256);
+
+    function defaultIterations() external view returns (Types.Iterations memory);
+    function positionsManager() external view returns (address);
+    function rewardsManager() external view returns (address);
+    function treasuryVault() external view returns (address);
+
+    function isClaimRewardsPaused() external view returns (bool);
+
+    function updatedIndexes(address underlying) external view returns (Types.Indexes256 memory);
+    function liquidityData(address user) external view returns (Types.LiquidityData memory);
+    function getNext(address underlying, Types.Position position, address user) external view returns (address);
+    function getBucketsMask(address underlying, Types.Position position) external view returns (uint256);
+}
+
+interface IMorphoSetters {
+    function createMarket(address underlying, uint16 reserveFactor, uint16 p2pIndexCursor) external;
+    function increaseP2PDeltas(address underlying, uint256 amount) external;
+    function claimToTreasury(address[] calldata underlyings, uint256[] calldata amounts) external;
+
+    function setPositionsManager(address positionsManager) external;
+    function setRewardsManager(address rewardsManager) external;
+    function setTreasuryVault(address treasuryVault) external;
+    function setDefaultIterations(Types.Iterations memory defaultIterations) external;
+    function setP2PIndexCursor(address underlying, uint16 p2pIndexCursor) external;
+    function setReserveFactor(address underlying, uint16 newReserveFactor) external;
+
+    function setAssetIsCollateralOnPool(address underlying, bool isCollateral) external;
+    function setAssetIsCollateral(address underlying, bool isCollateral) external;
+    function setIsClaimRewardsPaused(bool isPaused) external;
+    function setIsPaused(address underlying, bool isPaused) external;
+    function setIsPausedForAllMarkets(bool isPaused) external;
+    function setIsSupplyPaused(address underlying, bool isPaused) external;
+    function setIsSupplyCollateralPaused(address underlying, bool isPaused) external;
+    function setIsBorrowPaused(address underlying, bool isPaused) external;
+    function setIsRepayPaused(address underlying, bool isPaused) external;
+    function setIsWithdrawPaused(address underlying, bool isPaused) external;
+    function setIsWithdrawCollateralPaused(address underlying, bool isPaused) external;
+    function setIsLiquidateBorrowPaused(address underlying, bool isPaused) external;
+    function setIsLiquidateCollateralPaused(address underlying, bool isPaused) external;
+    function setIsP2PDisabled(address underlying, bool isP2PDisabled) external;
+    function setIsDeprecated(address underlying, bool isDeprecated) external;
+}
+
+interface IMorpho is IMorphoGetters, IMorphoSetters {
+    function initialize(
+        address addressesProvider,
+        uint8 eModeCategoryId,
+        address newPositionsManager,
+        Types.Iterations memory newDefaultIterations
+    ) external;
+
+    function supply(address underlying, uint256 amount, address onBehalf, uint256 maxIterations)
+        external
+        returns (uint256 supplied);
+    function supplyWithPermit(
+        address underlying,
+        uint256 amount,
+        address onBehalf,
+        uint256 maxIterations,
+        uint256 deadline,
+        Types.Signature calldata signature
+    ) external returns (uint256 supplied);
+    function supplyCollateral(address underlying, uint256 amount, address onBehalf)
+        external
+        returns (uint256 supplied);
+    function supplyCollateralWithPermit(
+        address underlying,
+        uint256 amount,
+        address onBehalf,
+        uint256 deadline,
+        Types.Signature calldata signature
+    ) external returns (uint256 supplied);
+
+    function borrow(address underlying, uint256 amount, address onBehalf, address receiver, uint256 maxIterations)
+        external
+        returns (uint256 borrowed);
+
+    function repay(address underlying, uint256 amount, address onBehalf) external returns (uint256 repaid);
+    function repayWithPermit(
+        address underlying,
+        uint256 amount,
+        address onBehalf,
+        uint256 deadline,
+        Types.Signature calldata signature
+    ) external returns (uint256 repaid);
+
+    function withdraw(address underlying, uint256 amount, address onBehalf, address receiver, uint256 maxIterations)
+        external
+        returns (uint256 withdrawn);
+    function withdrawCollateral(address underlying, uint256 amount, address onBehalf, address receiver)
+        external
+        returns (uint256 withdrawn);
+
+    function approveManager(address manager, bool isAllowed) external;
+    function approveManagerWithSig(
+        address delegator,
+        address manager,
+        bool isAllowed,
+        uint256 nonce,
+        uint256 deadline,
+        Types.Signature calldata signature
+    ) external;
+
+    function liquidate(address underlyingBorrowed, address underlyingCollateral, address user, uint256 amount)
+        external
+        returns (uint256 repaid, uint256 seized);
+
+    function claimRewards(address[] calldata assets, address onBehalf)
+        external
+        returns (address[] memory rewardTokens, uint256[] memory claimedAmounts);
+}
+
+
+// File: src/interfaces/extensions/IBulkerGateway.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.5.0;
+
+interface IBulkerGateway {
+    /* ERRORS */
+
+    /// @notice Thrown when execution parameters don't have the same length.
+    /// @param nbActions The number of input actions.
+    /// @param nbData The number of data inputs.
+    error InconsistentParameters(uint256 nbActions, uint256 nbData);
+
+    /// @notice Thrown when another address than WETH sends ETH to the contract.
+    error OnlyWETH();
+
+    /// @notice Thrown when an address used as parameter is the zero address.
+    error AddressIsZero();
+
+    /// @notice Thrown when an address parameter is the bulker's address.
+    error AddressIsBulker();
+
+    /// @notice Thrown when an amount used as parameter is zero.
+    error AmountIsZero();
+
+    /// @notice Thrown when the action is unsupported.
+    error UnsupportedAction(ActionType action);
+
+    /* ENUMS */
+
+    enum ActionType {
+        APPROVE2,
+        TRANSFER_FROM2,
+        APPROVE_MANAGER,
+        SUPPLY,
+        SUPPLY_COLLATERAL,
+        BORROW,
+        REPAY,
+        WITHDRAW,
+        WITHDRAW_COLLATERAL,
+        WRAP_ETH,
+        UNWRAP_ETH,
+        WRAP_ST_ETH,
+        UNWRAP_ST_ETH,
+        SKIM,
+        CLAIM_REWARDS
+    }
+
+    /* FUNCTIONS */
+
+    function WETH() external pure returns (address);
+    function stETH() external pure returns (address);
+    function wstETH() external pure returns (address);
+
+    function MORPHO() external view returns (address);
+
+    function execute(ActionType[] calldata actions, bytes[] calldata data) external payable;
+}
+
+
+// File: src/libraries/Types.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity ^0.8.17;
+
+import {IAaveOracle} from "@aave-v3-core/interfaces/IAaveOracle.sol";
+
+import {DataTypes} from "@aave-v3-core/protocol/libraries/types/DataTypes.sol";
+
+import {LogarithmicBuckets} from "@morpho-data-structures/LogarithmicBuckets.sol";
+
+/// @title Types
+/// @author Morpho Labs
+/// @custom:contact security@morpho.xyz
+/// @notice Library exposing all Types used in Morpho.
+library Types {
+    /* ENUMS */
+
+    /// @notice Enumeration of the different position types in the protocol.
+    enum Position {
+        POOL_SUPPLIER,
+        P2P_SUPPLIER,
+        POOL_BORROWER,
+        P2P_BORROWER
+    }
+
+    /* NESTED STRUCTS */
+
+    /// @notice Contains the market side delta data.
+    struct MarketSideDelta {
+        uint256 scaledDelta; // The delta amount in pool unit.
+        uint256 scaledP2PTotal; // The total peer-to-peer amount in peer-to-peer unit.
+    }
+
+    /// @notice Contains the delta data for both `supply` and `borrow`.
+    struct Deltas {
+        MarketSideDelta supply; // The `MarketSideDelta` related to the supply side.
+        MarketSideDelta borrow; // The `MarketSideDelta` related to the borrow side.
+    }
+
+    /// @notice Contains the market side indexes.
+    struct MarketSideIndexes {
+        uint128 poolIndex; // The pool index (in ray).
+        uint128 p2pIndex; // The peer-to-peer index (in ray).
+    }
+
+    /// @notice Contains the indexes for both `supply` and `borrow`.
+    struct Indexes {
+        MarketSideIndexes supply; // The `MarketSideIndexes` related to the supply side.
+        MarketSideIndexes borrow; // The `MarketSideIndexes` related to the borrow side.
+    }
+
+    /// @notice Contains the different pauses statuses possible in Morpho.
+    struct PauseStatuses {
+        bool isP2PDisabled;
+        bool isSupplyPaused;
+        bool isSupplyCollateralPaused;
+        bool isBorrowPaused;
+        bool isWithdrawPaused;
+        bool isWithdrawCollateralPaused;
+        bool isRepayPaused;
+        bool isLiquidateCollateralPaused;
+        bool isLiquidateBorrowPaused;
+        bool isDeprecated;
+    }
+
+    /* STORAGE STRUCTS */
+
+    /// @notice Contains the market data that is stored in storage.
+    /// @dev This market struct is able to be passed into memory.
+    struct Market {
+        // SLOT 0-1
+        Indexes indexes;
+        // SLOT 2-5
+        Deltas deltas; // 1024 bits
+        // SLOT 6
+        address underlying; // 160 bits
+        PauseStatuses pauseStatuses; // 80 bits
+        bool isCollateral; // 8 bits
+        // SLOT 7
+        address variableDebtToken; // 160 bits
+        uint32 lastUpdateTimestamp; // 32 bits
+        uint16 reserveFactor; // 16 bits
+        uint16 p2pIndexCursor; // 16 bits
+        // SLOT 8
+        address aToken; // 160 bits
+        // SLOT 9
+        address stableDebtToken; // 160 bits
+        // SLOT 10
+        uint256 idleSupply; // 256 bits
+    }
+
+    /// @notice Contains storage-only dynamic arrays and mappings.
+    struct MarketBalances {
+        LogarithmicBuckets.Buckets poolSuppliers; // In pool unit.
+        LogarithmicBuckets.Buckets p2pSuppliers; // In peer-to-peer unit.
+        LogarithmicBuckets.Buckets poolBorrowers; // In pool unit.
+        LogarithmicBuckets.Buckets p2pBorrowers; // In peer-to-peer unit.
+        mapping(address => uint256) collateral; // In pool unit.
+    }
+
+    /// @notice Contains the minimum number of iterations for a `repay` or a `withdraw`.
+    struct Iterations {
+        uint128 repay;
+        uint128 withdraw;
+    }
+
+    /* STACK AND RETURN STRUCTS */
+
+    /// @notice Contains the data related to the liquidity of a user.
+    struct LiquidityData {
+        uint256 borrowable; // The maximum debt value allowed to borrow (in base currency).
+        uint256 maxDebt; // The maximum debt value allowed before being liquidatable (in base currency).
+        uint256 debt; // The debt value (in base currency).
+    }
+
+    /// @notice The paramaters used to compute the new peer-to-peer indexes.
+    struct IndexesParams {
+        MarketSideIndexes256 lastSupplyIndexes; // The last supply indexes stored (in ray).
+        MarketSideIndexes256 lastBorrowIndexes; // The last borrow indexes stored (in ray).
+        uint256 poolSupplyIndex; // The current pool supply index (in ray).
+        uint256 poolBorrowIndex; // The current pool borrow index (in ray).
+        uint256 reserveFactor; // The reserve factor percentage (10 000 = 100%).
+        uint256 p2pIndexCursor; // The peer-to-peer index cursor (10 000 = 100%).
+        Deltas deltas; // The deltas and peer-to-peer amounts.
+        uint256 proportionIdle; // The amount of proportion idle (in underlying).
+    }
+
+    /// @notice Contains the data related to growth factors as part of the peer-to-peer indexes computation.
+    struct GrowthFactors {
+        uint256 poolSupplyGrowthFactor; // The pool's supply index growth factor (in ray).
+        uint256 p2pSupplyGrowthFactor; // Peer-to-peer supply index growth factor (in ray).
+        uint256 poolBorrowGrowthFactor; // The pool's borrow index growth factor (in ray).
+        uint256 p2pBorrowGrowthFactor; // Peer-to-peer borrow index growth factor (in ray).
+    }
+
+    /// @notice Contains the market side indexes as uint256 instead of uint128.
+    struct MarketSideIndexes256 {
+        uint256 poolIndex; // The pool index (in ray).
+        uint256 p2pIndex; // The peer-to-peer index (in ray).
+    }
+
+    /// @notice Contains the indexes as uint256 instead of uint128.
+    struct Indexes256 {
+        MarketSideIndexes256 supply; // The `MarketSideIndexes` related to the supply as uint256.
+        MarketSideIndexes256 borrow; // The `MarketSideIndexes` related to the borrow as uint256.
+    }
+
+    /// @notice Contains the `v`, `r` and `s` parameters of an ECDSA signature.
+    struct Signature {
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    /// @notice Variables used in the matching engine.
+    struct MatchingEngineVars {
+        address underlying; // The underlying asset address.
+        MarketSideIndexes256 indexes; // The indexes of the market side.
+        uint256 amount; // The amount to promote or demote (in underlying).
+        uint256 maxIterations; // The maximum number of iterations allowed.
+        bool borrow; // Whether the process happens on the borrow side or not.
+        function (address, address, uint256, uint256, bool) returns (uint256, uint256) updateDS; // This function will be used to update the data-structure.
+        bool demoting; // True for demote, False for promote.
+        function(uint256, uint256, MarketSideIndexes256 memory, uint256)
+            pure returns (uint256, uint256, uint256) step; // This function will be used to decide whether to use the algorithm for promoting or for demoting.
+    }
+
+    /// @notice Variables used in the liquidity computation process of a `user`.
+    /// @dev Used to avoid stack too deep.
+    struct LiquidityVars {
+        address user; // The user address.
+        IAaveOracle oracle; // The oracle used by Aave.
+        DataTypes.EModeCategory eModeCategory; // The data related to the eMode category (could be empty if not in any e-mode).
+    }
+
+    /// @notice Variables used during a borrow or withdraw.
+    /// @dev Used to avoid stack too deep.
+    struct BorrowWithdrawVars {
+        uint256 onPool; // The working scaled balance on pool of the user.
+        uint256 inP2P; // The working scaled balance in peer-to-peer of the user.
+        uint256 toWithdraw; // The amount to withdraw from the pool (in underlying).
+        uint256 toBorrow; // The amount to borrow on the pool (in underlying).
+    }
+
+    /// @notice Variables used during a supply or repay.
+    /// @dev Used to avoid stack too deep.
+    struct SupplyRepayVars {
+        uint256 onPool; // The working scaled balance on pool of the user.
+        uint256 inP2P; // The working scaled balance in peer-to-peer of the user.
+        uint256 toSupply; // The amount to supply on the pool (in underlying).
+        uint256 toRepay; // The amount to repay on the pool (in underlying).
+    }
+
+    /// @notice Variables used during a liquidate.
+    /// @dev Used to avoid stack too deep.
+    struct LiquidateVars {
+        uint256 closeFactor; // The close factor used during the liquidation process.
+        uint256 seized; // The amount of collateral to be seized (in underlying).
+    }
+
+    /// @notice Variables used to compute the amount to seize during a liquidation.
+    /// @dev Used to avoid stack too deep.
+    struct AmountToSeizeVars {
+        uint256 liquidationBonus; // The liquidation bonus used during the liquidation process.
+        uint256 borrowedTokenUnit; // The borrowed token unit.
+        uint256 collateralTokenUnit; // The collateral token unit.
+        uint256 borrowedPrice; // The borrowed token price (in base currency).
+        uint256 collateralPrice; // The collateral token price (in base currency).
+    }
+}
+
+
+// File: lib/morpho-utils/src/math/Math.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity ^0.8.0;
+
+/// @title Math Library.
+/// @author Morpho Labs.
+/// @custom:contact security@morpho.xyz
+/// @dev Library to perform simple math manipulations.
+library Math {
+    function abs(int256 x) internal pure returns (int256 y) {
+        if (x == type(int256).min) return type(int256).max;
+
+        assembly {
+            let mask := sar(255, x)
+            y := xor(add(x, mask), mask)
+        }
+    }
+
+    function safeAbs(int256 x) internal pure returns (int256 y) {
+        require(x != type(int256).min);
+
+        assembly {
+            let mask := sar(255, x)
+            y := xor(add(x, mask), mask)
+        }
+    }
+
+    function min(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        assembly {
+            z := xor(x, mul(xor(x, y), lt(y, x)))
+        }
+    }
+
+    function max(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        assembly {
+            z := xor(x, mul(xor(x, y), gt(y, x)))
+        }
+    }
+
+    /// @dev Returns max(x - y, 0).
+    function zeroFloorSub(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        assembly {
+            z := mul(gt(x, y), sub(x, y))
+        }
+    }
+
+    /// @dev Returns x / y rounded up (x / y + boolAsInt(x % y > 0)).
+    function divUp(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        // Division by 0 if
+        //    y = 0
+        assembly {
+            if iszero(y) { revert(0, 0) }
+
+            z := add(gt(mod(x, y), 0), div(x, y))
+        }
+    }
+
+    /// @dev Returns the floor of log2(x) and returns 0 when x = 0.
+    /// @dev Uses a method by dichotomy to find the highest bit set of x.
+    function log2(uint256 x) internal pure returns (uint256 y) {
+        assembly {
+            // Finds if x has a 1 on the first 128 bits. If not then do nothing.
+            // If that is the case then the result is more than 128.
+            let z := shl(7, gt(x, 0xffffffffffffffffffffffffffffffff))
+            y := z
+            x := shr(z, x)
+
+            // Using y as an accumulator, we can now focus on the last 128 bits of x.
+            // Repeat this process to divide the number of bits to handle by 2 every time.
+            z := shl(6, gt(x, 0xffffffffffffffff))
+            y := add(y, z)
+            x := shr(z, x)
+
+            z := shl(5, gt(x, 0xffffffff))
+            y := add(y, z)
+            x := shr(z, x)
+
+            z := shl(4, gt(x, 0xffff))
+            y := add(y, z)
+            x := shr(z, x)
+
+            z := shl(3, gt(x, 0xff))
+            y := add(y, z)
+            x := shr(z, x)
+
+            z := shl(2, gt(x, 0xf))
+            y := add(y, z)
+            x := shr(z, x)
+
+            z := shl(1, gt(x, 3))
+            y := add(add(y, z), gt(shr(z, x), 1))
+        }
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @author Modified from Gnosis (https://github.com/gnosis/gp-v2-contracts/blob/main/src/contracts/libraries/GPv2SafeERC20.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+library SafeTransferLib {
+    /*///////////////////////////////////////////////////////////////
+                            ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool callStatus;
+
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            callStatus := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(callStatus, "ETH_TRANSFER_FAILED");
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                           ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool callStatus;
+
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata to memory piece by piece:
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000) // Begin with the function selector.
+            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Mask and append the "from" argument.
+            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Mask and append the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Finally append the "amount" argument. No mask as it's a full 32 byte value.
+
+            // Call the token and store if it succeeded or not.
+            // We use 100 because the calldata length is 4 + 32 * 3.
+            callStatus := call(gas(), token, 0, freeMemoryPointer, 100, 0, 0)
+        }
+
+        require(didLastOptionalReturnCallSucceed(callStatus), "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool callStatus;
+
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata to memory piece by piece:
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000) // Begin with the function selector.
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Mask and append the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Finally append the "amount" argument. No mask as it's a full 32 byte value.
+
+            // Call the token and store if it succeeded or not.
+            // We use 68 because the calldata length is 4 + 32 * 2.
+            callStatus := call(gas(), token, 0, freeMemoryPointer, 68, 0, 0)
+        }
+
+        require(didLastOptionalReturnCallSucceed(callStatus), "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool callStatus;
+
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata to memory piece by piece:
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000) // Begin with the function selector.
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Mask and append the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Finally append the "amount" argument. No mask as it's a full 32 byte value.
+
+            // Call the token and store if it succeeded or not.
+            // We use 68 because the calldata length is 4 + 32 * 2.
+            callStatus := call(gas(), token, 0, freeMemoryPointer, 68, 0, 0)
+        }
+
+        require(didLastOptionalReturnCallSucceed(callStatus), "APPROVE_FAILED");
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                         INTERNAL HELPER LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function didLastOptionalReturnCallSucceed(bool callStatus) private pure returns (bool success) {
+        assembly {
+            // Get how many bytes the call returned.
+            let returnDataSize := returndatasize()
+
+            // If the call reverted:
+            if iszero(callStatus) {
+                // Copy the revert message into memory.
+                returndatacopy(0, 0, returnDataSize)
+
+                // Revert with the same message.
+                revert(0, returnDataSize)
+            }
+
+            switch returnDataSize
+            case 32 {
+                // Copy the return data into memory.
+                returndatacopy(0, 0, returnDataSize)
+
+                // Set success to whether it returned true.
+                success := iszero(iszero(mload(0)))
+            }
+            case 0 {
+                // There was no return data.
+                success := 1
+            }
+            default {
+                // It returned some malformed input.
+                success := 0
+            }
+        }
+    }
+}
+
+
+// File: lib/permit2/src/libraries/Permit2Lib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import {ERC20} from "solmate/src/tokens/ERC20.sol";
+
+import {IDAIPermit} from "../interfaces/IDAIPermit.sol";
+import {IAllowanceTransfer} from "../interfaces/IAllowanceTransfer.sol";
+import {SafeCast160} from "./SafeCast160.sol";
+
+/// @title Permit2Lib
+/// @notice Enables efficient transfers and EIP-2612/DAI
+/// permits for any token by falling back to Permit2.
+library Permit2Lib {
+    using SafeCast160 for uint256;
+    /*//////////////////////////////////////////////////////////////
+                                CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev The unique EIP-712 domain domain separator for the DAI token contract.
+    bytes32 internal constant DAI_DOMAIN_SEPARATOR = 0xdbb8cf42e1ecb028be3f3dbc922e1d878b963f411dc388ced501601c60f7c6f7;
+
+    /// @dev The address for the WETH9 contract on Ethereum mainnet, encoded as a bytes32.
+    bytes32 internal constant WETH9_ADDRESS = 0x000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2;
+
+    /// @dev The address of the Permit2 contract the library will use.
+    IAllowanceTransfer internal constant PERMIT2 =
+        IAllowanceTransfer(address(0x000000000022D473030F116dDEE9F6B43aC78BA3));
+
+    /// @notice Transfer a given amount of tokens from one user to another.
+    /// @param token The token to transfer.
+    /// @param from The user to transfer from.
+    /// @param to The user to transfer to.
+    /// @param amount The amount to transfer.
+    function transferFrom2(ERC20 token, address from, address to, uint256 amount) internal {
+        // Generate calldata for a standard transferFrom call.
+        bytes memory inputData = abi.encodeCall(ERC20.transferFrom, (from, to, amount));
+
+        bool success; // Call the token contract as normal, capturing whether it succeeded.
+        assembly {
+            success :=
+                and(
+                    // Set success to whether the call reverted, if not we check it either
+                    // returned exactly 1 (can't just be non-zero data), or had no return data.
+                    or(eq(mload(0), 1), iszero(returndatasize())),
+                    // Counterintuitively, this call() must be positioned after the or() in the
+                    // surrounding and() because and() evaluates its arguments from right to left.
+                    // We use 0 and 32 to copy up to 32 bytes of return data into the first slot of scratch space.
+                    call(gas(), token, 0, add(inputData, 32), mload(inputData), 0, 32)
+                )
+        }
+
+        // We'll fall back to using Permit2 if calling transferFrom on the token directly reverted.
+        if (!success) PERMIT2.transferFrom(from, to, amount.toUint160(), address(token));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              PERMIT LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Permit a user to spend a given amount of
+    /// another user's tokens via native EIP-2612 permit if possible, falling
+    /// back to Permit2 if native permit fails or is not implemented on the token.
+    /// @param token The token to permit spending.
+    /// @param owner The user to permit spending from.
+    /// @param spender The user to permit spending to.
+    /// @param amount The amount to permit spending.
+    /// @param deadline  The timestamp after which the signature is no longer valid.
+    /// @param v Must produce valid secp256k1 signature from the owner along with r and s.
+    /// @param r Must produce valid secp256k1 signature from the owner along with v and s.
+    /// @param s Must produce valid secp256k1 signature from the owner along with r and v.
+    function permit2(
+        ERC20 token,
+        address owner,
+        address spender,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        // Generate calldata for a call to DOMAIN_SEPARATOR on the token.
+        bytes memory inputData = abi.encodeWithSelector(ERC20.DOMAIN_SEPARATOR.selector);
+
+        bool success; // Call the token contract as normal, capturing whether it succeeded.
+        bytes32 domainSeparator; // If the call succeeded, we'll capture the return value here.
+
+        assembly {
+            // If the token is WETH9, we know it doesn't have a DOMAIN_SEPARATOR, and we'll skip this step.
+            // We make sure to mask the token address as its higher order bits aren't guaranteed to be clean.
+            if iszero(eq(and(token, 0xffffffffffffffffffffffffffffffffffffffff), WETH9_ADDRESS)) {
+                success :=
+                    and(
+                        // Should resolve false if its not 32 bytes or its first word is 0.
+                        and(iszero(iszero(mload(0))), eq(returndatasize(), 32)),
+                        // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                        // Counterintuitively, this call must be positioned second to the and() call in the
+                        // surrounding and() call or else returndatasize() will be zero during the computation.
+                        // We send a maximum of 5000 gas to prevent tokens with fallbacks from using a ton of gas.
+                        // which should be plenty to allow tokens to fetch their DOMAIN_SEPARATOR from storage, etc.
+                        staticcall(5000, token, add(inputData, 32), mload(inputData), 0, 32)
+                    )
+
+                domainSeparator := mload(0) // Copy the return value into the domainSeparator variable.
+            }
+        }
+
+        // If the call to DOMAIN_SEPARATOR succeeded, try using permit on the token.
+        if (success) {
+            // We'll use DAI's special permit if it's DOMAIN_SEPARATOR matches,
+            // otherwise we'll just encode a call to the standard permit function.
+            inputData = domainSeparator == DAI_DOMAIN_SEPARATOR
+                ? abi.encodeCall(IDAIPermit.permit, (owner, spender, token.nonces(owner), deadline, true, v, r, s))
+                : abi.encodeCall(ERC20.permit, (owner, spender, amount, deadline, v, r, s));
+
+            assembly {
+                success := call(gas(), token, 0, add(inputData, 32), mload(inputData), 0, 0)
+            }
+        }
+
+        if (!success) {
+            // If the initial DOMAIN_SEPARATOR call on the token failed or a
+            // subsequent call to permit failed, fall back to using Permit2.
+            simplePermit2(token, owner, spender, amount, deadline, v, r, s);
+        }
+    }
+
+    /// @notice Simple unlimited permit on the Permit2 contract.
+    /// @param token The token to permit spending.
+    /// @param owner The user to permit spending from.
+    /// @param spender The user to permit spending to.
+    /// @param amount The amount to permit spending.
+    /// @param deadline  The timestamp after which the signature is no longer valid.
+    /// @param v Must produce valid secp256k1 signature from the owner along with r and s.
+    /// @param r Must produce valid secp256k1 signature from the owner along with v and s.
+    /// @param s Must produce valid secp256k1 signature from the owner along with r and v.
+    function simplePermit2(
+        ERC20 token,
+        address owner,
+        address spender,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        (,, uint48 nonce) = PERMIT2.allowance(owner, address(token), spender);
+
+        PERMIT2.permit(
+            owner,
+            IAllowanceTransfer.PermitSingle({
+                details: IAllowanceTransfer.PermitDetails({
+                    token: address(token),
+                    amount: amount.toUint160(),
+                    // Use an unlimited expiration because it most
+                    // closely mimics how a standard approval works.
+                    expiration: type(uint48).max,
+                    nonce: nonce
+                }),
+                spender: spender,
+                sigDeadline: deadline
+            }),
+            bytes.concat(r, s, bytes1(v))
+        );
+    }
+}
+
+
+// File: lib/aave-v3-core/contracts/interfaces/IAaveOracle.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.0;
+
+import {IPriceOracleGetter} from './IPriceOracleGetter.sol';
+import {IPoolAddressesProvider} from './IPoolAddressesProvider.sol';
+
+/**
+ * @title IAaveOracle
+ * @author Aave
+ * @notice Defines the basic interface for the Aave Oracle
+ */
+interface IAaveOracle is IPriceOracleGetter {
+  /**
+   * @dev Emitted after the base currency is set
+   * @param baseCurrency The base currency of used for price quotes
+   * @param baseCurrencyUnit The unit of the base currency
+   */
+  event BaseCurrencySet(address indexed baseCurrency, uint256 baseCurrencyUnit);
+
+  /**
+   * @dev Emitted after the price source of an asset is updated
+   * @param asset The address of the asset
+   * @param source The price source of the asset
+   */
+  event AssetSourceUpdated(address indexed asset, address indexed source);
+
+  /**
+   * @dev Emitted after the address of fallback oracle is updated
+   * @param fallbackOracle The address of the fallback oracle
+   */
+  event FallbackOracleUpdated(address indexed fallbackOracle);
+
+  /**
+   * @notice Returns the PoolAddressesProvider
+   * @return The address of the PoolAddressesProvider contract
+   */
+  function ADDRESSES_PROVIDER() external view returns (IPoolAddressesProvider);
+
+  /**
+   * @notice Sets or replaces price sources of assets
+   * @param assets The addresses of the assets
+   * @param sources The addresses of the price sources
+   */
+  function setAssetSources(address[] calldata assets, address[] calldata sources) external;
+
+  /**
+   * @notice Sets the fallback oracle
+   * @param fallbackOracle The address of the fallback oracle
+   */
+  function setFallbackOracle(address fallbackOracle) external;
+
+  /**
+   * @notice Returns a list of prices from a list of assets addresses
+   * @param assets The list of assets addresses
+   * @return The prices of the given assets
+   */
+  function getAssetsPrices(address[] calldata assets) external view returns (uint256[] memory);
+
+  /**
+   * @notice Returns the address of the source for an asset address
+   * @param asset The address of the asset
+   * @return The address of the source
+   */
+  function getSourceOfAsset(address asset) external view returns (address);
+
+  /**
+   * @notice Returns the address of the fallback oracle
+   * @return The address of the fallback oracle
+   */
+  function getFallbackOracle() external view returns (address);
+}
+
+
+// File: lib/aave-v3-core/contracts/protocol/libraries/types/DataTypes.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.0;
+
+library DataTypes {
+  struct ReserveData {
+    //stores the reserve configuration
+    ReserveConfigurationMap configuration;
+    //the liquidity index. Expressed in ray
+    uint128 liquidityIndex;
+    //the current supply rate. Expressed in ray
+    uint128 currentLiquidityRate;
+    //variable borrow index. Expressed in ray
+    uint128 variableBorrowIndex;
+    //the current variable borrow rate. Expressed in ray
+    uint128 currentVariableBorrowRate;
+    //the current stable borrow rate. Expressed in ray
+    uint128 currentStableBorrowRate;
+    //timestamp of last update
+    uint40 lastUpdateTimestamp;
+    //the id of the reserve. Represents the position in the list of the active reserves
+    uint16 id;
+    //aToken address
+    address aTokenAddress;
+    //stableDebtToken address
+    address stableDebtTokenAddress;
+    //variableDebtToken address
+    address variableDebtTokenAddress;
+    //address of the interest rate strategy
+    address interestRateStrategyAddress;
+    //the current treasury balance, scaled
+    uint128 accruedToTreasury;
+    //the outstanding unbacked aTokens minted through the bridging feature
+    uint128 unbacked;
+    //the outstanding debt borrowed against this asset in isolation mode
+    uint128 isolationModeTotalDebt;
+  }
+
+  struct ReserveConfigurationMap {
+    //bit 0-15: LTV
+    //bit 16-31: Liq. threshold
+    //bit 32-47: Liq. bonus
+    //bit 48-55: Decimals
+    //bit 56: reserve is active
+    //bit 57: reserve is frozen
+    //bit 58: borrowing is enabled
+    //bit 59: stable rate borrowing enabled
+    //bit 60: asset is paused
+    //bit 61: borrowing in isolation mode is enabled
+    //bit 62-63: reserved
+    //bit 64-79: reserve factor
+    //bit 80-115 borrow cap in whole tokens, borrowCap == 0 => no cap
+    //bit 116-151 supply cap in whole tokens, supplyCap == 0 => no cap
+    //bit 152-167 liquidation protocol fee
+    //bit 168-175 eMode category
+    //bit 176-211 unbacked mint cap in whole tokens, unbackedMintCap == 0 => minting disabled
+    //bit 212-251 debt ceiling for isolation mode with (ReserveConfiguration::DEBT_CEILING_DECIMALS) decimals
+    //bit 252-255 unused
+
+    uint256 data;
+  }
+
+  struct UserConfigurationMap {
+    /**
+     * @dev Bitmap of the users collaterals and borrows. It is divided in pairs of bits, one pair per asset.
+     * The first bit indicates if an asset is used as collateral by the user, the second whether an
+     * asset is borrowed by the user.
+     */
+    uint256 data;
+  }
+
+  struct EModeCategory {
+    // each eMode category has a custom ltv and liquidation threshold
+    uint16 ltv;
+    uint16 liquidationThreshold;
+    uint16 liquidationBonus;
+    // each eMode category may or may not have a custom oracle to override the individual assets price oracles
+    address priceSource;
+    string label;
+  }
+
+  enum InterestRateMode {
+    NONE,
+    STABLE,
+    VARIABLE
+  }
+
+  struct ReserveCache {
+    uint256 currScaledVariableDebt;
+    uint256 nextScaledVariableDebt;
+    uint256 currPrincipalStableDebt;
+    uint256 currAvgStableBorrowRate;
+    uint256 currTotalStableDebt;
+    uint256 nextAvgStableBorrowRate;
+    uint256 nextTotalStableDebt;
+    uint256 currLiquidityIndex;
+    uint256 nextLiquidityIndex;
+    uint256 currVariableBorrowIndex;
+    uint256 nextVariableBorrowIndex;
+    uint256 currLiquidityRate;
+    uint256 currVariableBorrowRate;
+    uint256 reserveFactor;
+    ReserveConfigurationMap reserveConfiguration;
+    address aTokenAddress;
+    address stableDebtTokenAddress;
+    address variableDebtTokenAddress;
+    uint40 reserveLastUpdateTimestamp;
+    uint40 stableDebtLastUpdateTimestamp;
+  }
+
+  struct ExecuteLiquidationCallParams {
+    uint256 reservesCount;
+    uint256 debtToCover;
+    address collateralAsset;
+    address debtAsset;
+    address user;
+    bool receiveAToken;
+    address priceOracle;
+    uint8 userEModeCategory;
+    address priceOracleSentinel;
+  }
+
+  struct ExecuteSupplyParams {
+    address asset;
+    uint256 amount;
+    address onBehalfOf;
+    uint16 referralCode;
+  }
+
+  struct ExecuteBorrowParams {
+    address asset;
+    address user;
+    address onBehalfOf;
+    uint256 amount;
+    InterestRateMode interestRateMode;
+    uint16 referralCode;
+    bool releaseUnderlying;
+    uint256 maxStableRateBorrowSizePercent;
+    uint256 reservesCount;
+    address oracle;
+    uint8 userEModeCategory;
+    address priceOracleSentinel;
+  }
+
+  struct ExecuteRepayParams {
+    address asset;
+    uint256 amount;
+    InterestRateMode interestRateMode;
+    address onBehalfOf;
+    bool useATokens;
+  }
+
+  struct ExecuteWithdrawParams {
+    address asset;
+    uint256 amount;
+    address to;
+    uint256 reservesCount;
+    address oracle;
+    uint8 userEModeCategory;
+  }
+
+  struct ExecuteSetUserEModeParams {
+    uint256 reservesCount;
+    address oracle;
+    uint8 categoryId;
+  }
+
+  struct FinalizeTransferParams {
+    address asset;
+    address from;
+    address to;
+    uint256 amount;
+    uint256 balanceFromBefore;
+    uint256 balanceToBefore;
+    uint256 reservesCount;
+    address oracle;
+    uint8 fromEModeCategory;
+  }
+
+  struct FlashloanParams {
+    address receiverAddress;
+    address[] assets;
+    uint256[] amounts;
+    uint256[] interestRateModes;
+    address onBehalfOf;
+    bytes params;
+    uint16 referralCode;
+    uint256 flashLoanPremiumToProtocol;
+    uint256 flashLoanPremiumTotal;
+    uint256 maxStableRateBorrowSizePercent;
+    uint256 reservesCount;
+    address addressesProvider;
+    uint8 userEModeCategory;
+    bool isAuthorizedFlashBorrower;
+  }
+
+  struct FlashloanSimpleParams {
+    address receiverAddress;
+    address asset;
+    uint256 amount;
+    bytes params;
+    uint16 referralCode;
+    uint256 flashLoanPremiumToProtocol;
+    uint256 flashLoanPremiumTotal;
+  }
+
+  struct FlashLoanRepaymentParams {
+    uint256 amount;
+    uint256 totalPremium;
+    uint256 flashLoanPremiumToProtocol;
+    address asset;
+    address receiverAddress;
+    uint16 referralCode;
+  }
+
+  struct CalculateUserAccountDataParams {
+    UserConfigurationMap userConfig;
+    uint256 reservesCount;
+    address user;
+    address oracle;
+    uint8 userEModeCategory;
+  }
+
+  struct ValidateBorrowParams {
+    ReserveCache reserveCache;
+    UserConfigurationMap userConfig;
+    address asset;
+    address userAddress;
+    uint256 amount;
+    InterestRateMode interestRateMode;
+    uint256 maxStableLoanPercent;
+    uint256 reservesCount;
+    address oracle;
+    uint8 userEModeCategory;
+    address priceOracleSentinel;
+    bool isolationModeActive;
+    address isolationModeCollateralAddress;
+    uint256 isolationModeDebtCeiling;
+  }
+
+  struct ValidateLiquidationCallParams {
+    ReserveCache debtReserveCache;
+    uint256 totalDebt;
+    uint256 healthFactor;
+    address priceOracleSentinel;
+  }
+
+  struct CalculateInterestRatesParams {
+    uint256 unbacked;
+    uint256 liquidityAdded;
+    uint256 liquidityTaken;
+    uint256 totalStableDebt;
+    uint256 totalVariableDebt;
+    uint256 averageStableBorrowRate;
+    uint256 reserveFactor;
+    address reserve;
+    address aToken;
+  }
+
+  struct InitReserveParams {
+    address asset;
+    address aTokenAddress;
+    address stableDebtAddress;
+    address variableDebtAddress;
+    address interestRateStrategyAddress;
+    uint16 reservesCount;
+    uint16 maxNumberReserves;
+  }
+}
+
+
+// File: lib/morpho-data-structures/src/LogarithmicBuckets.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity ^0.8.0;
+
+import "./BucketDLL.sol";
+
+/// @title LogarithmicBuckets
+/// @author Morpho Labs
+/// @custom:contact security@morpho.xyz
+/// @notice The logarithmic buckets data-structure.
+library LogarithmicBuckets {
+    using BucketDLL for BucketDLL.List;
+
+    struct Buckets {
+        mapping(uint256 => BucketDLL.List) buckets;
+        mapping(address => uint256) valueOf;
+        uint256 bucketsMask;
+    }
+
+    /* ERRORS */
+
+    /// @notice Thrown when the address is zero at insertion.
+    error ZeroAddress();
+
+    /// @notice Thrown when 0 value is inserted.
+    error ZeroValue();
+
+    /* INTERNAL */
+
+    /// @notice Updates an account in the `buckets`.
+    /// @param buckets The buckets to update.
+    /// @param id The address of the account.
+    /// @param newValue The new value of the account.
+    /// @param head Indicates whether to insert the new values at the head or at the tail of the buckets list.
+    function update(
+        Buckets storage buckets,
+        address id,
+        uint256 newValue,
+        bool head
+    ) internal {
+        if (id == address(0)) revert ZeroAddress();
+        uint256 value = buckets.valueOf[id];
+        buckets.valueOf[id] = newValue;
+
+        if (value == 0) {
+            if (newValue == 0) revert ZeroValue();
+            // `highestSetBit` is used to compute the bucket associated with `newValue`.
+            _insert(buckets, id, highestSetBit(newValue), head);
+            return;
+        }
+
+        // `highestSetBit` is used to compute the bucket associated with `value`.
+        uint256 currentBucket = highestSetBit(value);
+        if (newValue == 0) {
+            _remove(buckets, id, currentBucket);
+            return;
+        }
+
+        // `highestSetBit` is used to compute the bucket associated with `newValue`.
+        uint256 newBucket = highestSetBit(newValue);
+        if (newBucket != currentBucket) {
+            _remove(buckets, id, currentBucket);
+            _insert(buckets, id, newBucket, head);
+        }
+    }
+
+    /// @notice Returns the address in `buckets` that is a candidate for matching the value `value`.
+    /// @param buckets The buckets to get the head.
+    /// @param value The value to match.
+    /// @return The address of the head.
+    function getMatch(Buckets storage buckets, uint256 value) internal view returns (address) {
+        uint256 bucketsMask = buckets.bucketsMask;
+        if (bucketsMask == 0) return address(0);
+
+        uint256 next = nextBucket(value, bucketsMask);
+        if (next != 0) return buckets.buckets[next].getNext(address(0));
+
+        // `highestSetBit` is used to compute the highest non-empty bucket.
+        // Knowing that `next` == 0, it is also the highest previous non-empty bucket.
+        uint256 prev = highestSetBit(bucketsMask);
+        return buckets.buckets[prev].getNext(address(0));
+    }
+
+    /* PRIVATE */
+
+    /// @notice Removes an account in the `buckets`.
+    /// @dev Does not update the value.
+    /// @param buckets The buckets to modify.
+    /// @param id The address of the account to remove.
+    /// @param bucket The mask of the bucket where to remove.
+    function _remove(
+        Buckets storage buckets,
+        address id,
+        uint256 bucket
+    ) private {
+        if (buckets.buckets[bucket].remove(id)) buckets.bucketsMask &= ~bucket;
+    }
+
+    /// @notice Inserts an account in the `buckets`.
+    /// @dev Expects that `id` != 0.
+    /// @dev Does not update the value.
+    /// @param buckets The buckets to modify.
+    /// @param id The address of the account to update.
+    /// @param bucket The mask of the bucket where to insert.
+    /// @param head Whether to insert at the head or at the tail of the list.
+    function _insert(
+        Buckets storage buckets,
+        address id,
+        uint256 bucket,
+        bool head
+    ) private {
+        if (buckets.buckets[bucket].insert(id, head)) buckets.bucketsMask |= bucket;
+    }
+
+    /* PURE HELPERS */
+
+    /// @notice Returns the highest set bit.
+    /// @dev Used to compute the bucket associated to a given `value`.
+    /// @dev Used to compute the highest non empty bucket given the `bucketsMask`.
+    function highestSetBit(uint256 value) internal pure returns (uint256) {
+        uint256 lowerMask = setLowerBits(value);
+        return lowerMask ^ (lowerMask >> 1);
+    }
+
+    /// @notice Sets all the bits lower than (or equal to) the highest bit in the input.
+    /// @dev This is the same as rounding the input the nearest upper value of the form `2 ** n - 1`.
+    function setLowerBits(uint256 x) internal pure returns (uint256 y) {
+        assembly {
+            x := or(x, shr(1, x))
+            x := or(x, shr(2, x))
+            x := or(x, shr(4, x))
+            x := or(x, shr(8, x))
+            x := or(x, shr(16, x))
+            x := or(x, shr(32, x))
+            x := or(x, shr(64, x))
+            y := or(x, shr(128, x))
+        }
+    }
+
+    /// @notice Returns the lowest non-empty bucket containing larger values.
+    /// @dev The bucket returned is the lowest that is in `bucketsMask` and not in `lowerMask`.
+    function nextBucket(uint256 value, uint256 bucketsMask) internal pure returns (uint256 bucket) {
+        uint256 lowerMask = setLowerBits(value);
+        assembly {
+            let higherBucketsMask := and(not(lowerMask), bucketsMask)
+            bucket := and(higherBucketsMask, add(not(higherBucketsMask), 1))
+        }
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/Rari-Capital/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*///////////////////////////////////////////////////////////////
+                                  EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*///////////////////////////////////////////////////////////////
+                             METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*///////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*///////////////////////////////////////////////////////////////
+                             EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    bytes32 public constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*///////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                              ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                              EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            bytes32 digest = keccak256(
+                abi.encodePacked(
+                    "\x19\x01",
+                    DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline))
+                )
+            );
+
+            address recoveredAddress = ecrecover(digest, v, r, s);
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                       INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/permit2/lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/permit2/src/interfaces/IDAIPermit.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IDAIPermit {
+    /// @param holder The address of the token owner.
+    /// @param spender The address of the token spender.
+    /// @param nonce The owner's nonce, increases at each call to permit.
+    /// @param expiry The timestamp at which the permit is no longer valid.
+    /// @param allowed Boolean that sets approval amount, true for type(uint256).max and false for 0.
+    /// @param v Must produce valid secp256k1 signature from the owner along with r and s.
+    /// @param r Must produce valid secp256k1 signature from the owner along with v and s.
+    /// @param s Must produce valid secp256k1 signature from the owner along with r and v.
+    function permit(
+        address holder,
+        address spender,
+        uint256 nonce,
+        uint256 expiry,
+        bool allowed,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
+
+// File: lib/permit2/src/interfaces/IAllowanceTransfer.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+/// @title AllowanceTransfer
+/// @notice Handles ERC20 token permissions through signature based allowance setting and ERC20 token transfers by checking allowed amounts
+/// @dev Requires user's token approval on the Permit2 contract
+interface IAllowanceTransfer {
+    /// @notice Thrown when an allowance on a token has expired.
+    /// @param deadline The timestamp at which the allowed amount is no longer valid
+    error AllowanceExpired(uint256 deadline);
+
+    /// @notice Thrown when an allowance on a token has been depleted.
+    /// @param amount The maximum amount allowed
+    error InsufficientAllowance(uint256 amount);
+
+    /// @notice Thrown when too many nonces are invalidated.
+    error ExcessiveInvalidation();
+
+    /// @notice Emits an event when the owner successfully invalidates an ordered nonce.
+    event NonceInvalidation(
+        address indexed owner, address indexed token, address indexed spender, uint48 newNonce, uint48 oldNonce
+    );
+
+    /// @notice Emits an event when the owner successfully sets permissions on a token for the spender.
+    event Approval(
+        address indexed owner, address indexed token, address indexed spender, uint160 amount, uint48 expiration
+    );
+
+    /// @notice Emits an event when the owner successfully sets permissions using a permit signature on a token for the spender.
+    event Permit(
+        address indexed owner,
+        address indexed token,
+        address indexed spender,
+        uint160 amount,
+        uint48 expiration,
+        uint48 nonce
+    );
+
+    /// @notice Emits an event when the owner sets the allowance back to 0 with the lockdown function.
+    event Lockdown(address indexed owner, address token, address spender);
+
+    /// @notice The permit data for a token
+    struct PermitDetails {
+        // ERC20 token address
+        address token;
+        // the maximum amount allowed to spend
+        uint160 amount;
+        // timestamp at which a spender's token allowances become invalid
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+
+    /// @notice The permit message signed for a single token allownce
+    struct PermitSingle {
+        // the permit data for a single token alownce
+        PermitDetails details;
+        // address permissioned on the allowed tokens
+        address spender;
+        // deadline on the permit signature
+        uint256 sigDeadline;
+    }
+
+    /// @notice The permit message signed for multiple token allowances
+    struct PermitBatch {
+        // the permit data for multiple token allowances
+        PermitDetails[] details;
+        // address permissioned on the allowed tokens
+        address spender;
+        // deadline on the permit signature
+        uint256 sigDeadline;
+    }
+
+    /// @notice The saved permissions
+    /// @dev This info is saved per owner, per token, per spender and all signed over in the permit message
+    /// @dev Setting amount to type(uint160).max sets an unlimited approval
+    struct PackedAllowance {
+        // amount allowed
+        uint160 amount;
+        // permission expiry
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+
+    /// @notice A token spender pair.
+    struct TokenSpenderPair {
+        // the token the spender is approved
+        address token;
+        // the spender address
+        address spender;
+    }
+
+    /// @notice Details for a token transfer.
+    struct AllowanceTransferDetails {
+        // the owner of the token
+        address from;
+        // the recipient of the token
+        address to;
+        // the amount of the token
+        uint160 amount;
+        // the token to be transferred
+        address token;
+    }
+
+    /// @notice A mapping from owner address to token address to spender address to PackedAllowance struct, which contains details and conditions of the approval.
+    /// @notice The mapping is indexed in the above order see: allowance[ownerAddress][tokenAddress][spenderAddress]
+    /// @dev The packed slot holds the allowed amount, expiration at which the allowed amount is no longer valid, and current nonce thats updated on any signature based approvals.
+    function allowance(address, address, address) external view returns (uint160, uint48, uint48);
+
+    /// @notice Approves the spender to use up to amount of the specified token up until the expiration
+    /// @param token The token to approve
+    /// @param spender The spender address to approve
+    /// @param amount The approved amount of the token
+    /// @param expiration The timestamp at which the approval is no longer valid
+    /// @dev The packed allowance also holds a nonce, which will stay unchanged in approve
+    /// @dev Setting amount to type(uint160).max sets an unlimited approval
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+
+    /// @notice Permit a spender to a given amount of the owners token via the owner's EIP-712 signature
+    /// @dev May fail if the owner's nonce was invalidated in-flight by invalidateNonce
+    /// @param owner The owner of the tokens being approved
+    /// @param permitSingle Data signed over by the owner specifying the terms of approval
+    /// @param signature The owner's signature over the permit data
+    function permit(address owner, PermitSingle memory permitSingle, bytes calldata signature) external;
+
+    /// @notice Permit a spender to the signed amounts of the owners tokens via the owner's EIP-712 signature
+    /// @dev May fail if the owner's nonce was invalidated in-flight by invalidateNonce
+    /// @param owner The owner of the tokens being approved
+    /// @param permitBatch Data signed over by the owner specifying the terms of approval
+    /// @param signature The owner's signature over the permit data
+    function permit(address owner, PermitBatch memory permitBatch, bytes calldata signature) external;
+
+    /// @notice Transfer approved tokens from one address to another
+    /// @param from The address to transfer from
+    /// @param to The address of the recipient
+    /// @param amount The amount of the token to transfer
+    /// @param token The token address to transfer
+    /// @dev Requires the from address to have approved at least the desired amount
+    /// of tokens to msg.sender.
+    function transferFrom(address from, address to, uint160 amount, address token) external;
+
+    /// @notice Transfer approved tokens in a batch
+    /// @param transferDetails Array of owners, recipients, amounts, and tokens for the transfers
+    /// @dev Requires the from addresses to have approved at least the desired amount
+    /// of tokens to msg.sender.
+    function transferFrom(AllowanceTransferDetails[] calldata transferDetails) external;
+
+    /// @notice Enables performing a "lockdown" of the sender's Permit2 identity
+    /// by batch revoking approvals
+    /// @param approvals Array of approvals to revoke.
+    function lockdown(TokenSpenderPair[] calldata approvals) external;
+
+    /// @notice Invalidate nonces for a given (token, spender) pair
+    /// @param token The token to invalidate nonces for
+    /// @param spender The spender to invalidate nonces for
+    /// @param newNonce The new nonce to set. Invalidates all nonces less than it.
+    /// @dev Can't invalidate more than 2**16 nonces per transaction.
+    function invalidateNonces(address token, address spender, uint48 newNonce) external;
+}
+
+
+// File: lib/permit2/src/libraries/SafeCast160.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+library SafeCast160 {
+    /// @notice Thrown when a valude greater than type(uint160).max is cast to uint160
+    error UnsafeCast();
+
+    /// @notice Safely casts uint256 to uint160
+    /// @param value The uint256 to be cast
+    function toUint160(uint256 value) internal pure returns (uint160) {
+        if (value > type(uint160).max) revert UnsafeCast();
+        return uint160(value);
+    }
+}
+
+
+// File: lib/aave-v3-core/contracts/interfaces/IPriceOracleGetter.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.0;
+
+/**
+ * @title IPriceOracleGetter
+ * @author Aave
+ * @notice Interface for the Aave price oracle.
+ */
+interface IPriceOracleGetter {
+  /**
+   * @notice Returns the base currency address
+   * @dev Address 0x0 is reserved for USD as base currency.
+   * @return Returns the base currency address.
+   */
+  function BASE_CURRENCY() external view returns (address);
+
+  /**
+   * @notice Returns the base currency unit
+   * @dev 1 ether for ETH, 1e8 for USD.
+   * @return Returns the base currency unit.
+   */
+  function BASE_CURRENCY_UNIT() external view returns (uint256);
+
+  /**
+   * @notice Returns the asset price in the base currency
+   * @param asset The address of the asset
+   * @return The price of the asset
+   */
+  function getAssetPrice(address asset) external view returns (uint256);
+}
+
+
+// File: lib/aave-v3-core/contracts/interfaces/IPoolAddressesProvider.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.0;
+
+/**
+ * @title IPoolAddressesProvider
+ * @author Aave
+ * @notice Defines the basic interface for a Pool Addresses Provider.
+ */
+interface IPoolAddressesProvider {
+  /**
+   * @dev Emitted when the market identifier is updated.
+   * @param oldMarketId The old id of the market
+   * @param newMarketId The new id of the market
+   */
+  event MarketIdSet(string indexed oldMarketId, string indexed newMarketId);
+
+  /**
+   * @dev Emitted when the pool is updated.
+   * @param oldAddress The old address of the Pool
+   * @param newAddress The new address of the Pool
+   */
+  event PoolUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the pool configurator is updated.
+   * @param oldAddress The old address of the PoolConfigurator
+   * @param newAddress The new address of the PoolConfigurator
+   */
+  event PoolConfiguratorUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the price oracle is updated.
+   * @param oldAddress The old address of the PriceOracle
+   * @param newAddress The new address of the PriceOracle
+   */
+  event PriceOracleUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the ACL manager is updated.
+   * @param oldAddress The old address of the ACLManager
+   * @param newAddress The new address of the ACLManager
+   */
+  event ACLManagerUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the ACL admin is updated.
+   * @param oldAddress The old address of the ACLAdmin
+   * @param newAddress The new address of the ACLAdmin
+   */
+  event ACLAdminUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the price oracle sentinel is updated.
+   * @param oldAddress The old address of the PriceOracleSentinel
+   * @param newAddress The new address of the PriceOracleSentinel
+   */
+  event PriceOracleSentinelUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the pool data provider is updated.
+   * @param oldAddress The old address of the PoolDataProvider
+   * @param newAddress The new address of the PoolDataProvider
+   */
+  event PoolDataProviderUpdated(address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when a new proxy is created.
+   * @param id The identifier of the proxy
+   * @param proxyAddress The address of the created proxy contract
+   * @param implementationAddress The address of the implementation contract
+   */
+  event ProxyCreated(
+    bytes32 indexed id,
+    address indexed proxyAddress,
+    address indexed implementationAddress
+  );
+
+  /**
+   * @dev Emitted when a new non-proxied contract address is registered.
+   * @param id The identifier of the contract
+   * @param oldAddress The address of the old contract
+   * @param newAddress The address of the new contract
+   */
+  event AddressSet(bytes32 indexed id, address indexed oldAddress, address indexed newAddress);
+
+  /**
+   * @dev Emitted when the implementation of the proxy registered with id is updated
+   * @param id The identifier of the contract
+   * @param proxyAddress The address of the proxy contract
+   * @param oldImplementationAddress The address of the old implementation contract
+   * @param newImplementationAddress The address of the new implementation contract
+   */
+  event AddressSetAsProxy(
+    bytes32 indexed id,
+    address indexed proxyAddress,
+    address oldImplementationAddress,
+    address indexed newImplementationAddress
+  );
+
+  /**
+   * @notice Returns the id of the Aave market to which this contract points to.
+   * @return The market id
+   */
+  function getMarketId() external view returns (string memory);
+
+  /**
+   * @notice Associates an id with a specific PoolAddressesProvider.
+   * @dev This can be used to create an onchain registry of PoolAddressesProviders to
+   * identify and validate multiple Aave markets.
+   * @param newMarketId The market id
+   */
+  function setMarketId(string calldata newMarketId) external;
+
+  /**
+   * @notice Returns an address by its identifier.
+   * @dev The returned address might be an EOA or a contract, potentially proxied
+   * @dev It returns ZERO if there is no registered address with the given id
+   * @param id The id
+   * @return The address of the registered for the specified id
+   */
+  function getAddress(bytes32 id) external view returns (address);
+
+  /**
+   * @notice General function to update the implementation of a proxy registered with
+   * certain `id`. If there is no proxy registered, it will instantiate one and
+   * set as implementation the `newImplementationAddress`.
+   * @dev IMPORTANT Use this function carefully, only for ids that don't have an explicit
+   * setter function, in order to avoid unexpected consequences
+   * @param id The id
+   * @param newImplementationAddress The address of the new implementation
+   */
+  function setAddressAsProxy(bytes32 id, address newImplementationAddress) external;
+
+  /**
+   * @notice Sets an address for an id replacing the address saved in the addresses map.
+   * @dev IMPORTANT Use this function carefully, as it will do a hard replacement
+   * @param id The id
+   * @param newAddress The address to set
+   */
+  function setAddress(bytes32 id, address newAddress) external;
+
+  /**
+   * @notice Returns the address of the Pool proxy.
+   * @return The Pool proxy address
+   */
+  function getPool() external view returns (address);
+
+  /**
+   * @notice Updates the implementation of the Pool, or creates a proxy
+   * setting the new `pool` implementation when the function is called for the first time.
+   * @param newPoolImpl The new Pool implementation
+   */
+  function setPoolImpl(address newPoolImpl) external;
+
+  /**
+   * @notice Returns the address of the PoolConfigurator proxy.
+   * @return The PoolConfigurator proxy address
+   */
+  function getPoolConfigurator() external view returns (address);
+
+  /**
+   * @notice Updates the implementation of the PoolConfigurator, or creates a proxy
+   * setting the new `PoolConfigurator` implementation when the function is called for the first time.
+   * @param newPoolConfiguratorImpl The new PoolConfigurator implementation
+   */
+  function setPoolConfiguratorImpl(address newPoolConfiguratorImpl) external;
+
+  /**
+   * @notice Returns the address of the price oracle.
+   * @return The address of the PriceOracle
+   */
+  function getPriceOracle() external view returns (address);
+
+  /**
+   * @notice Updates the address of the price oracle.
+   * @param newPriceOracle The address of the new PriceOracle
+   */
+  function setPriceOracle(address newPriceOracle) external;
+
+  /**
+   * @notice Returns the address of the ACL manager.
+   * @return The address of the ACLManager
+   */
+  function getACLManager() external view returns (address);
+
+  /**
+   * @notice Updates the address of the ACL manager.
+   * @param newAclManager The address of the new ACLManager
+   */
+  function setACLManager(address newAclManager) external;
+
+  /**
+   * @notice Returns the address of the ACL admin.
+   * @return The address of the ACL admin
+   */
+  function getACLAdmin() external view returns (address);
+
+  /**
+   * @notice Updates the address of the ACL admin.
+   * @param newAclAdmin The address of the new ACL admin
+   */
+  function setACLAdmin(address newAclAdmin) external;
+
+  /**
+   * @notice Returns the address of the price oracle sentinel.
+   * @return The address of the PriceOracleSentinel
+   */
+  function getPriceOracleSentinel() external view returns (address);
+
+  /**
+   * @notice Updates the address of the price oracle sentinel.
+   * @param newPriceOracleSentinel The address of the new PriceOracleSentinel
+   */
+  function setPriceOracleSentinel(address newPriceOracleSentinel) external;
+
+  /**
+   * @notice Returns the address of the data provider.
+   * @return The address of the DataProvider
+   */
+  function getPoolDataProvider() external view returns (address);
+
+  /**
+   * @notice Updates the address of the data provider.
+   * @param newDataProvider The address of the new DataProvider
+   */
+  function setPoolDataProvider(address newDataProvider) external;
+}
+
+
+// File: lib/morpho-data-structures/src/BucketDLL.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity ^0.8.0;
+
+/// @title BucketDLL
+/// @author Morpho Labs
+/// @custom:contact security@morpho.xyz
+/// @notice The doubly linked list used in logarithmic buckets.
+library BucketDLL {
+    /* STRUCTS */
+
+    struct Account {
+        address prev;
+        address next;
+    }
+
+    struct List {
+        mapping(address => Account) accounts;
+    }
+
+    /* INTERNAL */
+
+    /// @notice Returns the next id address from the current `id`.
+    /// @dev Pass the address 0 to get the head of the list.
+    /// @param list The list to search in.
+    /// @param id The address of the current account.
+    /// @return The address of the next account.
+    function getNext(List storage list, address id) internal view returns (address) {
+        return list.accounts[id].next;
+    }
+
+    /// @notice Removes an account of the `list`.
+    /// @dev This function should not be called with `id` equal to address 0.
+    /// @dev This function should not be called with an `_id` that is not in the list.
+    /// @param list The list to search in.
+    /// @param id The address of the account.
+    /// @return Whether the bucket is empty after removal.
+    function remove(List storage list, address id) internal returns (bool) {
+        Account memory account = list.accounts[id];
+        address prev = account.prev;
+        address next = account.next;
+
+        list.accounts[prev].next = next;
+        list.accounts[next].prev = prev;
+
+        delete list.accounts[id];
+
+        return (prev == address(0) && next == address(0));
+    }
+
+    /// @notice Inserts an account in the `list`.
+    /// @dev This function should not be called with `id` equal to address 0.
+    /// @dev This function should not be called with an `id` that is already in the list.
+    /// @param list The list to search in.
+    /// @param id The address of the account.
+    /// @param atHead Tells whether to insert at the head or at the tail of the list.
+    /// @return Whether the bucket was empty before insertion.
+    function insert(
+        List storage list,
+        address id,
+        bool atHead
+    ) internal returns (bool) {
+        if (atHead) {
+            address head = list.accounts[address(0)].next;
+            list.accounts[address(0)].next = id;
+            list.accounts[head].prev = id;
+            list.accounts[id].next = head;
+            return head == address(0);
+        } else {
+            address tail = list.accounts[address(0)].prev;
+            list.accounts[address(0)].prev = id;
+            list.accounts[tail].next = id;
+            list.accounts[id].prev = tail;
+            return tail == address(0);
+        }
+    }
+}
+

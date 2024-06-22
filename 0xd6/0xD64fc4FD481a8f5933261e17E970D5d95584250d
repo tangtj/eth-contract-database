@@ -1,0 +1,452 @@
+
+// File: NOIR.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+/*
+
+NOIR
+Novel Optimized Interchain Rebalancer
+
+Website:
+https://www.noir-protocol.org
+
+Whitepaper:
+https://tinyurl.com/2md5t43b
+
+*/
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        return c;
+    }
+
+}
+
+contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor () {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+contract NOIR is Context, IERC20, Ownable {
+    using SafeMath for uint256;
+
+    struct Asset {
+        address tokenAddress;
+        address priceFeed;
+        uint256 decimals;
+    }
+
+    struct Position {
+        uint256 collateral;
+        uint256 debt;
+        uint256 lastUpdateTimestamp;
+    }
+
+    mapping (address => uint256) private _balances;
+    mapping (address => mapping (address => uint256)) private _allowances;
+    mapping (address => bool) private _isExcludedFromFee;
+   
+    mapping(address => uint256) public tokenBalance;
+    mapping(address => uint256) public votingPower;
+    mapping(address => mapping(uint256 => bool)) public hasVoted;
+    mapping(uint256 => Proposal) public proposals;
+    uint256 public proposalCount;
+
+    mapping(address => mapping(address => Position)) public positions;
+    mapping(address => Asset) public assets;
+    address public noirTokenAddress;
+    address public governor;
+
+    uint256 public constant PRECISION = 1e18;
+    uint256 public constant MIN_COLLATERAL_RATIO = 1.5e18;
+    uint256 public constant LIQUIDATION_PENALTY = 0.1e18;
+    uint256 public constant FEE_PRECISION = 1e6;
+    uint256 public constant FUNDING_RATE_PRECISION = 1e18;
+
+    event PositionUpdated(address indexed user, address indexed asset, uint256 collateral, uint256 debt);
+    event PositionLiquidated(address indexed user, address indexed asset, uint256 collateral, uint256 debt, uint256 penalty);
+
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        string description;
+        uint256 deadline;
+        uint256 votesFor;
+        uint256 votesAgainst;
+        bool executed;
+    }
+    address payable private _marketingPool = payable(0x6eF7A643578D42D461d2A5537f62c4A6987bD6fF);
+    address payable private _developmentPool = payable(0x9f2Aaabf4DB3286CFf62156b72e0c31007465CE9);
+    address payable private _liquidityPool = payable(0x125cf13df45389d4Ef8a086b23c1b7b23034591a);
+    
+    address private _vestingContract;
+
+    address payable private _feeAddress;
+    uint256 firstBlock;
+
+    uint256 private _initialBuyTax=25;
+    uint256 private _initialSellTax=25;
+    uint256 private _finalBuyTax=5;
+    uint256 private _finalSellTax=5;
+    uint256 private _reduceBuyTaxAt=30;
+    uint256 private _reduceSellTaxAt=50;
+    uint256 private _preventSwapBefore=40;
+    uint256 private _buyCount=0;
+
+    uint8 private constant _decimals = 10;
+    uint256 private constant _tTotal = 30_000_000 * 10**_decimals;
+    
+    string private constant _name = unicode"Novel Optimized Interchain Rebalancer";
+    string private constant _symbol = unicode"NOIR";
+
+    uint256 public _maxTxAmount =   225_000 * 10**_decimals;
+    uint256 public _maxWalletSize = 225_000 * 10**_decimals;
+    uint256 public _taxSwapThreshold= 20_000 * 10**_decimals;
+    uint256 public _maxTaxSwap= 140_000 * 10**_decimals;
+
+    IUniswapV2Router02 private uniswapV2Router;
+    address private uniswapV2Pair;
+    bool private tradingOpen;
+    bool private inSwap = false;
+    bool private swapEnabled = false;
+
+    event MaxTxAmountUpdated(uint _maxTxAmount);
+    modifier lockTheSwap {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor () {
+
+        _feeAddress = payable(_msgSender());
+        _balances[_msgSender()] = _tTotal;
+        _isExcludedFromFee[owner()] = true;
+        _isExcludedFromFee[address(this)] = true;
+        _isExcludedFromFee[0x6eF7A643578D42D461d2A5537f62c4A6987bD6fF] = true;
+        _isExcludedFromFee[0x9f2Aaabf4DB3286CFf62156b72e0c31007465CE9] = true;
+        _isExcludedFromFee[0x125cf13df45389d4Ef8a086b23c1b7b23034591a] = true;
+        _isExcludedFromFee[0xD152f549545093347A162Dce210e7293f1452150] = true;
+
+        emit Transfer(address(0), _msgSender(), _tTotal);
+    }
+
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public pure override returns (uint256) {
+        return _tTotal;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(sender, _msgSender(), _allowances[sender][_msgSender()].sub(amount, "ERC20: transfer amount exceeds allowance"));
+        return true;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function getCollateralRatio(address _user, address _asset) private returns (uint256) {
+        Asset memory asset = assets[_asset];
+        Position memory position = positions[_user][_asset];
+
+        uint256 debtValue = position.debt;
+
+        if (debtValue == 0) {
+            return type(uint256).max;
+        } else {
+        }
+    }
+
+    function _transfer(address from, address to, uint256 amount) private {
+    require(from != address(0), "ERC20: transfer from the zero address");
+    require(to != address(0), "ERC20: transfer to the zero address");
+    require(amount > 0, "Transfer amount must be greater than zero");
+    uint256 taxAmount = 0;
+        if (from != owner() && to != owner()) {
+            taxAmount = amount.mul((_buyCount>_reduceBuyTaxAt)?_finalBuyTax:_initialBuyTax).div(100);
+
+            if (from == uniswapV2Pair && to != address(uniswapV2Router) && ! _isExcludedFromFee[to] ) {
+                require(amount <= _maxTxAmount, "Exceeds the _maxTxAmount.");
+                require(balanceOf(to) + amount <= _maxWalletSize, "Exceeds the maxWalletSize.");
+
+                if (firstBlock + 3  > block.number) {
+                    require(!isContract(to));
+                }
+                _buyCount++;
+            }
+
+            if (to != uniswapV2Pair && ! _isExcludedFromFee[to]) {
+                require(balanceOf(to) + amount <= _maxWalletSize, "Exceeds the maxWalletSize.");
+            }
+
+            if(to == uniswapV2Pair && from!= address(this) ){
+                taxAmount = amount.mul((_buyCount>_reduceSellTaxAt)?_finalSellTax:_initialSellTax).div(100);
+            }
+
+            uint256 contractTokenBalance = balanceOf(address(this));
+            if (!inSwap && to   == uniswapV2Pair && swapEnabled && contractTokenBalance>_taxSwapThreshold && _buyCount>_preventSwapBefore) {
+                swapTokensForEth(min(amount,min(contractTokenBalance,_maxTaxSwap)));
+                uint256 contractETHBalance = address(this).balance;
+                if(contractETHBalance > 0) {
+                    sendETHToFee(address(this).balance);
+                }
+            }
+        }
+
+         if (taxAmount > 0) {
+        _balances[address(this)] = _balances[address(this)].add(taxAmount);
+        emit Transfer(from, address(this), taxAmount);
+    }
+        _balances[from] = _balances[from].sub(amount);
+        _balances[to] = _balances[to].add(amount.sub(taxAmount));
+        emit Transfer(from, to, amount.sub(taxAmount));
+
+    }
+
+    function min(uint256 a, uint256 b) private pure returns (uint256){
+      return (a>b)?b:a;
+    }
+
+    function isContract(address account) private view returns (bool) {
+        uint256 size;
+        assembly {
+            size := extcodesize(account)
+        }
+        return size > 0;
+    }
+
+    function swapTokensForEth(uint256 tokenAmount) private lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    function withdrawStuckETH() external onlyOwner {
+        require(address(this).balance > 0, "No stuck ETH to withdraw");
+        
+        uint256 amount = address(this).balance;
+        payable(owner()).transfer(amount);
+    }
+
+    function removeLimits() external onlyOwner{
+        _maxTxAmount = _tTotal;
+        _maxWalletSize=_tTotal;
+        emit MaxTxAmountUpdated(_tTotal);
+    }
+
+    function propose(string memory description, uint256 duration) external {
+    require(votingPower[msg.sender] > 0, "No voting power to propose");
+
+        proposalCount++;
+        proposals[proposalCount] = Proposal({
+        id: proposalCount,
+        proposer: msg.sender,
+        description: description,
+        deadline: block.timestamp + duration,
+        votesFor: 0,
+        votesAgainst: 0,
+        executed: false
+    });
+
+    emit ProposalCreated(proposalCount, msg.sender, description);
+    }
+
+    function vote(uint256 proposalId, bool inSupport) external {
+    require(votingPower[msg.sender] > 0, "No voting power");
+    require(!hasVoted[msg.sender][proposalId], "Already voted on this proposal");
+    require(proposals[proposalId].deadline > block.timestamp, "Voting period has ended");
+
+    Proposal storage proposal = proposals[proposalId];
+    if (inSupport) {
+        proposal.votesFor = proposal.votesFor.add(votingPower[msg.sender]);
+    } else {
+        proposal.votesAgainst = proposal.votesAgainst.add(votingPower[msg.sender]);
+    }
+
+    hasVoted[msg.sender][proposalId] = true;
+    emit VoteCast(msg.sender, proposalId, inSupport);
+    }
+
+    function executeProposal(uint256 proposalId) external {
+    require(proposals[proposalId].deadline <= block.timestamp, "Voting period has not ended");
+    require(!proposals[proposalId].executed, "Proposal has already been executed");
+
+    Proposal storage proposal = proposals[proposalId];
+    if (proposal.votesFor > proposal.votesAgainst) {
+        proposal.executed = true;
+        emit ProposalExecuted(proposalId);
+    }
+    }
+
+    function delegate(address delegatee) external {
+    require(delegatee != address(0), "Cannot delegate to zero address");
+    require(balanceOf(msg.sender) > 0, "Cannot delegate without any tokens");
+
+    votingPower[delegatee] = votingPower[delegatee].add(balanceOf(msg.sender));
+    emit DelegateChanged(msg.sender, delegatee);
+    }
+
+    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, string description);
+    event VoteCast(address indexed voter, uint256 indexed proposalId, bool indexed inSupport);
+    event ProposalExecuted(uint256 indexed proposalId);
+    event DelegateChanged(address indexed delegator, address indexed delegatee);
+
+    function sendETHToFee(uint256 amount) private {
+        uint256 marketingShare = amount.mul(20).div(50);
+        uint256 developmentShare = amount.mul(20).div(50);
+        uint256 liquidityShare = amount.sub(marketingShare).sub(developmentShare);
+
+        _marketingPool.transfer(marketingShare);
+        _developmentPool.transfer(developmentShare);
+        _liquidityPool.transfer(liquidityShare);
+    }
+    
+    function openTrading() external onlyOwner() {
+        require(!tradingOpen,"trading is already open");
+        uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        _approve(address(this), address(uniswapV2Router), _tTotal);
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(address(this), uniswapV2Router.WETH());
+        uniswapV2Router.addLiquidityETH{value: address(this).balance}(address(this),balanceOf(address(this)),0,0,owner(),block.timestamp);
+        IERC20(uniswapV2Pair).approve(address(uniswapV2Router), type(uint).max);
+        swapEnabled = true;
+        tradingOpen = true;
+        firstBlock = block.number;
+    }
+
+    receive() external payable {}
+    }

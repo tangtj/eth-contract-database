@@ -1,0 +1,468 @@
+/***
+
+    ABOUT ‘JIN CHAN’ - THE MONEY FROG
+
+       In 2021 the legendary Money Frog made a splash in the crypto waters and emerged as the pioneering frog-themed crypto project. 
+    
+    This ethereal creation, well rooted in ancient wisdom and folklore tales, was specially crafted for diamond hand investors with a sweet tooth for long-term involvement and unlimited wealth. 
+    
+    Hang on tight as this mesmerizing token is whispering promises of prosperity in the long journey ahead.
+    
+       The Money Frog token will be listed as TMF on the Ethereum Network and, as its legend and fame precede it, this token is charming enough to become one of the top 5 most powerful meme tokens worldwide.
+    
+    No reliance on luck here, there’s a high marketing investment ready to ensure The Money Frog’s safe journey to the ATH heavens.
+
+    Landing on our website is not mere coincidence, rather look at it as a cosmic invitation. You have been chosen to accompany The Money Frog on its exciting journey and draw abundance into your life. 
+
+    ---
+
+    The Money Frog'S MISSION
+
+       Every full moon The Money Frog is rumored to appear near houses blessed to receive good news and great fortune. 
+       
+    Many legends are told about this mythical creature, some tales suggesting she was once a woman, banished to the moon for stealing the elixir of immortality. 
+
+       In our crypto verse The Money Frogs’ mission is as clear as crystal waters: to bring wealth, joy and abundance to everyone ready to trust and invest in its magic.
+       
+    Much like the pile of infinite lucky coins The Money Frog rests upon, we are focused on creating a solid, supporting and continuously growing community focused on contributing to our token’s success.
+
+    ---
+
+    THE MYSTICAL GAME
+
+       Get ready for the most exciting part - enter The Money Frog game: an endless run where you step into the shoes of the main character, representing The Money Frog herself, passing through many challenges and collecting coins as you go.
+       
+    But there is more…get ready for some multiplayer action with up to 4 players! Race your friends (or should I say enemies) to snatch The Money Frog’s tokens and level up your game by purchasing the Money Frog NFT, using them as skins for your in-game persona. 
+
+       Think you’ve been more than blessed with good fortune and excitement? There is more to it than an epic gaming experience. 
+    
+    We are developing the utility of the token in the future, where we’ll be donating 10% of the profit to children's hospitals, thus bringing good news and smiles to children who need treatment and care. 
+    
+    Join us on this exciting journey and let's make a difference together!
+
+    Website: https://themoneyfrogtoken.com
+    Telegram: https://t.me/TheMoneyFrogPortal
+    X: https://x.com/themoneyfrogtkn
+    Email: themoneyfrogtoken@gmail.com
+
+***/
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function allowance(address owner, address spender)
+        external
+        view
+        returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+contract Ownable is Context {
+    address private _owner;
+    address private _previousOwner;
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    constructor() {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) public onlyOwner {
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal {
+        require(
+            newOwner != address(0),
+            "Ownable: new owner is the zero address"
+        );
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+}
+
+library SafeMath {
+
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB)
+        external
+        returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+}
+
+
+contract TMF is Context, IERC20, Ownable {
+    using SafeMath for uint256;
+    
+    string private constant _name = "The Money Frog";
+    string private constant _symbol = "$TMF";
+    uint256 private constant _totalSupply = 333333333 * 10**18;
+    uint256 public MinTaxSwapLimit = 333333100000000000000000; // 0.1% of the total Supply
+    uint256 public maxTxAmount = 3333333100000000000000000; // 1% maxTxAmount
+    uint256 public maxWalletlimit = 3333333100000000000000000; // 1% Maxwalletlimit
+    uint8 private constant _decimals = 18;
+
+    IUniswapV2Router02 immutable uniswapV2Router;
+    address public  uniswapV2Pair;
+    address immutable WETH;
+    address payable public marketingWallet;
+    address payable public devWallet;
+
+    uint256 private marketingBuyTax = 3;
+    uint256 private marketingSellTax = 3;
+    uint256 private devBuyTax = 2;
+    uint256 private devSellTax = 2;
+
+    uint256 public buyTax = marketingBuyTax.add(devBuyTax);
+    uint256 public sellTax = marketingSellTax.add(devSellTax);
+    uint8 private inSwapAndLiquify;
+
+    uint256 countMarketingTax;
+    uint256 countDevTax;
+
+    mapping(address => uint256) private _balance;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => bool) private _isExcludedFromFees;
+    
+    bool public isOpen = false;
+    bool private inSwap;
+    mapping(address => bool) private _whiteList;
+
+    modifier inSwapFlag {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+    modifier open(address from, address to) {
+        require(isOpen || _whiteList[from] || _whiteList[to], "Not Open");
+        _;
+    }
+
+    constructor() {
+        uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        WETH = uniswapV2Router.WETH();
+        
+
+        _whiteList[msg.sender] = true;
+        _whiteList[0x27140A9788aD0855Da526E038C70F10A6376994a] = true;
+        _whiteList[0x2288854107f7E33901efF82b82e293c27946c69D] = true;
+        _whiteList[0xdb053f6127DeAA019F5412BDEc52cEdc28d0D97A] = true;
+        _whiteList[address(this)] = true;
+
+        marketingWallet = payable(0x27140A9788aD0855Da526E038C70F10A6376994a);
+        devWallet = payable(0x2288854107f7E33901efF82b82e293c27946c69D);
+        _balance[0xdb053f6127DeAA019F5412BDEc52cEdc28d0D97A] = _totalSupply;
+        _isExcludedFromFees[marketingWallet] = true;
+        _isExcludedFromFees[devWallet] = true;
+        _isExcludedFromFees[msg.sender] = true;
+        _isExcludedFromFees[address(this)] = true;
+        _isExcludedFromFees[address(uniswapV2Router)] = true;
+        _allowances[address(this)][address(uniswapV2Router)] = type(uint256).max;
+        _allowances[0xdb053f6127DeAA019F5412BDEc52cEdc28d0D97A][address(uniswapV2Router)] = type(uint256).max;
+        _allowances[marketingWallet][address(uniswapV2Router)] = type(uint256).max;
+        _allowances[devWallet][address(uniswapV2Router)] = type(uint256).max;
+
+        emit Transfer(address(0), _msgSender(), _totalSupply);
+    }
+
+    function createPair() external  onlyOwner {
+
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(
+            address(this),
+            WETH
+        );
+
+    }
+
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public pure override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balance[account];
+    }
+
+    function transfer(address recipient, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(
+            sender,
+            _msgSender(),
+            _allowances[sender][_msgSender()] - amount
+        );
+        return true;
+    }
+
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function updateBuyTaxes(uint256 marketing, uint256 dev) external onlyOwner {
+        require(marketing.add(dev) <= 25);
+        marketingBuyTax = marketing;
+        devBuyTax = dev;
+        buyTax = marketingBuyTax.add(devBuyTax);
+    }    
+
+    function updateSellTaxes(uint256 marketing, uint256 dev) external onlyOwner {
+        require(marketing.add(dev) <= 25);
+        marketingSellTax = marketing;
+        devSellTax = dev;
+        sellTax = marketingSellTax.add(devSellTax);
+    }    
+
+    function ExcludeFromFees(address holder, bool exempt) external onlyOwner {
+        _isExcludedFromFees[holder] = exempt;
+    }
+    
+    function ChangeMinTaxSwapLimit(uint256 NewMinTaxSwapLimitAmount) external onlyOwner {
+        MinTaxSwapLimit = NewMinTaxSwapLimitAmount;
+    }
+
+    function ChangeMaxTxAmountLimit(uint256 NewMaxTxAmountLimit) external onlyOwner {
+        maxTxAmount = NewMaxTxAmountLimit;
+    }
+
+    function DisableWalletLimit() external onlyOwner {
+        maxWalletlimit = _totalSupply;
+    }
+    
+    function ChangeMarketingWalletAddress(address newAddress) external onlyOwner() {
+        marketingWallet = payable(newAddress);
+    }
+
+    function ChangeDevWalletAddress(address newAddress) external onlyOwner() {
+        devWallet = payable(newAddress);
+    }
+
+    function EnableTrade() external onlyOwner {
+        isOpen = true;
+    }
+
+    function includeToWhiteList(address[] memory _users) external onlyOwner {
+        for(uint8 i = 0; i < _users.length; i++) {
+            _whiteList[_users[i]] = true;
+        }
+    }
+
+    // Contract Coded by @butiyam on Fiverr and Telegram
+
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) private {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+        require(isOpen || _whiteList[from] || _whiteList[to], "Not Open");
+
+        uint256 _tax;
+        bool isBuying = false;
+        if (_isExcludedFromFees[from] || _isExcludedFromFees[to]) {
+            _tax = 0;
+        } else {
+
+            if (inSwapAndLiquify == 1) {
+                //No tax transfer
+                _balance[from] -= amount;
+                _balance[to] += amount;
+
+                emit Transfer(from, to, amount);
+                return;
+            }
+
+            if (from == uniswapV2Pair) {
+                isBuying = true;
+                _tax = buyTax;
+                require(amount <= maxTxAmount);
+                uint256 contractBalanceRecipient = balanceOf(to);
+                require(contractBalanceRecipient + amount <= maxWalletlimit,"$TMF: maximum token per wallet amount exceed");
+            } else if (to == uniswapV2Pair) {
+                require(from != address(this) && amount <= maxTxAmount);
+                uint256 tokensToSwap = _balance[address(this)];
+                if (tokensToSwap > MinTaxSwapLimit && inSwapAndLiquify == 0) {
+                    inSwapAndLiquify = 1;
+                    internalSwap(countDevTax, devWallet, true);
+                    internalSwap(countMarketingTax, marketingWallet, false);
+
+                    inSwapAndLiquify = 0;
+                }
+                isBuying = false;
+                _tax = sellTax;
+            } else {
+                _tax = 0;
+            }
+        }
+        
+    // Contract Coded by @butiyam on Fiverr and Telegram
+
+        //Is there tax for sender|receiver?
+        if (_tax != 0) {
+            if(isBuying){
+                countMarketingTax += (amount * marketingBuyTax) / 100;
+                countDevTax += (amount * devBuyTax) / 100; 
+            }else {
+                countMarketingTax += (amount * marketingSellTax) / 100;
+                countDevTax += (amount * devSellTax) / 100; 
+            }
+            //Tax transfer
+            uint256 taxTokens = (amount * _tax) / 100;
+            uint256 transferAmount = amount - taxTokens;
+
+            _balance[from] -= amount;
+            _balance[to] += transferAmount;
+            _balance[address(this)] += taxTokens;
+            emit Transfer(from, address(this), taxTokens);
+            emit Transfer(from, to, transferAmount);
+        } else {
+            //No tax transfer
+            _balance[from] -= amount;
+            _balance[to] += amount;
+
+            emit Transfer(from, to, amount);
+        }
+    }
+
+     function internalSwap(uint256 tokenAmount, address walletAddress, bool isDev) internal inSwapFlag {
+        
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = WETH;
+
+        if (_allowances[address(this)][address(uniswapV2Router)] != type(uint256).max) {
+            _allowances[address(this)][address(uniswapV2Router)] = type(uint256).max;
+        }
+
+        try uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+           walletAddress,
+            block.timestamp
+        ) {} catch {
+            return;
+        }
+
+        (isDev)? countDevTax = 0: countMarketingTax = 0;
+
+    }
+
+    receive() external payable {}
+}

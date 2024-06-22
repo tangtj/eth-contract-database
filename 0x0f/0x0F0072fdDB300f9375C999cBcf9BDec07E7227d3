@@ -1,0 +1,1005 @@
+
+// File: src/ChainlinkOvalBase.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+import {BaseController} from "oval/src/controllers/BaseController.sol";
+import {ChainlinkSourceAdapter} from "oval/src/adapters/source-adapters/ChainlinkSourceAdapter.sol";
+import {ChainlinkDestinationAdapter} from "oval/src/adapters/destination-adapters/ChainlinkDestinationAdapter.sol";
+import {IAggregatorV3Source} from "oval/src/interfaces/chainlink/IAggregatorV3Source.sol";
+
+/**
+ * @title OvalOracle instance that has input and output adapters of Chainlink and BaseController.
+ */
+contract ChainlinkOvalBase is BaseController, ChainlinkSourceAdapter, ChainlinkDestinationAdapter {
+    constructor(IAggregatorV3Source source, uint8 decimals)
+        BaseController()
+        ChainlinkSourceAdapter(source)
+        ChainlinkDestinationAdapter(decimals)
+    {}
+}
+
+
+// File: lib/oval-contracts/src/controllers/BaseController.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {OVAL} from "../Oval.sol";
+
+/**
+ * @title BaseController providing the simplest possible controller logic to govern who can unlock the OVAL.
+ * @dev Custom Controllers can be created to provide more granular control over who can unlock the OVAL.
+ */
+
+abstract contract BaseController is Ownable, OVAL {
+    // these don't need to be public since they can be accessed via the accessor functions below.
+    uint256 private lockWindow_ = 60; // The lockWindow in seconds.
+    uint256 private maxTraversal_ = 10; // The maximum number of rounds to traverse when looking for historical data.
+
+    mapping(address => bool) public unlockers;
+
+    /**
+     * @notice Enables the owner to set the unlocker status of an address. Once set, the address can unlock the OVAL
+     * and by calling unlockLatestValue as part of an MEV-share auction.
+     * @param unlocker The address to set the unlocker status of.
+     * @param allowed The unlocker status to set.
+     */
+    function setUnlocker(address unlocker, bool allowed) public onlyOwner {
+        unlockers[unlocker] = allowed;
+
+        emit UnlockerSet(unlocker, allowed);
+    }
+
+    /**
+     * @notice Returns true if the caller is allowed to unlock the OVAL.
+     * @dev This implementation simply checks if the caller is in the unlockers mapping. Custom Controllers can override
+     * this function to provide more granular control over who can unlock the OVAL.
+     * @param caller The address to check.
+     * @param _lastUnlockTime The timestamp of the latest unlock to the OVAL. Might be useful in verification.
+     */
+    function canUnlock(address caller, uint256 _lastUnlockTime) public view override returns (bool) {
+        return unlockers[caller];
+    }
+
+    /**
+     * @notice Enables the owner to set the lockWindow.
+     * @dev If changing the lockWindow would cause OVAL to return different data the permissioned actor must first
+     * call unlockLatestValue through flashbots via eth_sendPrivateTransaction.
+     * @param newLockWindow The lockWindow to set.
+     */
+    function setLockWindow(uint256 newLockWindow) public onlyOwner {
+        (int256 currentAnswer, uint256 currentTimestamp) = internalLatestData();
+
+        lockWindow_ = newLockWindow;
+
+        // Compare OVAL results so that change in lock window does not change returned data.
+        (int256 newAnswer, uint256 newTimestamp) = internalLatestData();
+        require(currentAnswer == newAnswer && currentTimestamp == newTimestamp, "Must unlock first");
+
+        emit LockWindowSet(newLockWindow);
+    }
+
+    /**
+     * @notice Enables the owner to set the maxTraversal.
+     * @param newMaxTraversal The maxTraversal to set.
+     */
+    function setMaxTraversal(uint256 newMaxTraversal) public onlyOwner {
+        maxTraversal_ = newMaxTraversal;
+
+        emit MaxTraversalSet(newMaxTraversal);
+    }
+
+    /**
+     * @notice Time window that bounds how long the permissioned actor has to call the unlockLatestValue function after
+     * a new source update is posted. If the permissioned actor does not call unlockLatestValue within this window of a
+     * new source price, the latest value will be made available to everyone without going through an MEV-Share auction.
+     * @return lockWindow time in seconds.
+     */
+    function lockWindow() public view override returns (uint256) {
+        return lockWindow_;
+    }
+
+    /**
+     * @notice Max number of historical source updates to traverse when looking for a historic value in the past.
+     * @return maxTraversal max number of historical source updates to traverse.
+     */
+    function maxTraversal() public view override returns (uint256) {
+        return maxTraversal_;
+    }
+}
+
+
+// File: lib/oval-contracts/src/adapters/source-adapters/ChainlinkSourceAdapter.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+import {DecimalLib} from "../lib/DecimalLib.sol";
+import {IAggregatorV3Source} from "../../interfaces/chainlink/IAggregatorV3Source.sol";
+import {DiamondRootOVAL} from "../../DiamondRootOval.sol";
+
+/**
+ * @title ChainlinkSourceAdapter contract to read data from Chainlink aggregator and standardize it for OVAL.
+ * @dev Can fetch information from Chainlink source at a desired timestamp for historic lookups.
+ */
+
+abstract contract ChainlinkSourceAdapter is DiamondRootOVAL {
+    IAggregatorV3Source public immutable CHAINLINK_SOURCE;
+    uint8 private immutable SOURCE_DECIMALS;
+
+    // As per Chainlink documentation https://docs.chain.link/data-feeds/historical-data#roundid-in-proxy
+    // roundId on the aggregator proxy is comprised of phaseId (higher 16 bits) and roundId from phase aggregator
+    // (lower 64 bits). PHASE_MASK is used to calculate first roundId of current phase aggregator.
+    uint80 private constant PHASE_MASK = uint80(0xFFFF) << 64;
+
+    event SourceSet(address indexed sourceOracle, uint8 indexed sourceDecimals);
+
+    constructor(IAggregatorV3Source source) {
+        CHAINLINK_SOURCE = source;
+        SOURCE_DECIMALS = source.decimals();
+
+        emit SourceSet(address(source), SOURCE_DECIMALS);
+    }
+
+    /**
+     * @notice Tries getting latest data as of requested timestamp. If this is not possible, returns the earliest data
+     * available past the requested timestamp within provided traversal limitations.
+     * @param timestamp The timestamp to try getting latest data at.
+     * @param maxTraversal The maximum number of rounds to traverse when looking for historical data.
+     * @return answer The answer as of requested timestamp, or earliest available data if not available, in 18 decimals.
+     * @return updatedAt The timestamp of the answer.
+     */
+    function tryLatestDataAt(uint256 timestamp, uint256 maxTraversal)
+        public
+        view
+        virtual
+        override
+        returns (int256, uint256)
+    {
+        (int256 answer, uint256 updatedAt) = _tryLatestRoundDataAt(timestamp, maxTraversal);
+        return (DecimalLib.convertDecimals(answer, SOURCE_DECIMALS, 18), updatedAt);
+    }
+
+    /**
+     * @notice Initiate a snapshot of the source data. This is a no-op for Chainlink.
+     */
+    function snapshotData() public virtual override {}
+
+    /**
+     * @notice Returns the latest data from the source.
+     * @return answer The latest answer in 18 decimals.
+     * @return updatedAt The timestamp of the answer.
+     */
+    function getLatestSourceData() public view virtual override returns (int256, uint256) {
+        (, int256 sourceAnswer,, uint256 updatedAt,) = CHAINLINK_SOURCE.latestRoundData();
+        return (DecimalLib.convertDecimals(sourceAnswer, SOURCE_DECIMALS, 18), updatedAt);
+    }
+
+    // Tries getting latest data as of requested timestamp. If this is not possible, returns the earliest data available
+    // past the requested timestamp considering the maxTraversal limitations.
+    function _tryLatestRoundDataAt(uint256 timestamp, uint256 maxTraversal) internal view returns (int256, uint256) {
+        (uint80 roundId, int256 answer,, uint256 updatedAt,) = CHAINLINK_SOURCE.latestRoundData();
+
+        // In the happy path there have been no source updates since requested time, so we can return the latest data.
+        // We can use updatedAt property as it matches the block timestamp of the latest source transmission.
+        if (updatedAt <= timestamp) return (answer, updatedAt);
+
+        // Attempt traversing historical round data backwards from roundId. This might still be newer or uninitialized.
+        (int256 historicalAnswer, uint256 historicalUpdatedAt) = _searchRoundDataAt(timestamp, roundId, maxTraversal);
+
+        // Validate returned data. If it is uninitialized we fallback to returning the current latest round data.
+        if (historicalUpdatedAt > 0) return (historicalAnswer, historicalUpdatedAt);
+        return (answer, updatedAt);
+    }
+
+    // Tries finding latest historical data (ignoring current roundId) not newer than requested timestamp. Might return
+    // newer data than requested if exceeds traversal or hold uninitialized data that should be handled by the caller.
+    function _searchRoundDataAt(uint256 timestamp, uint80 targetRoundId, uint256 maxTraversal)
+        internal
+        view
+        returns (int256, uint256)
+    {
+        uint80 roundId;
+        int256 answer;
+        uint256 updatedAt;
+        uint80 traversedRounds = 0;
+        uint80 startRoundId = (targetRoundId & PHASE_MASK) + 1; // Phase aggregators are starting at round 1.
+
+        while (traversedRounds < uint80(maxTraversal) && targetRoundId > startRoundId) {
+            targetRoundId--; // We started from latest roundId that should be ignored.
+            // The aggregator proxy does not keep track when its phase aggregators got switched. This means that we can
+            // only traverse rounds of the current phase aggregator. When phase aggregators are switched there is
+            // normally an overlap period when both new and old phase aggregators receive updates. Without knowing exact
+            // time when the aggregator proxy switched them we might end up returning historical data from the new phase
+            // aggregator that was not yet available on the aggregator proxy at the requested timestamp.
+
+            (roundId, answer,, updatedAt,) = CHAINLINK_SOURCE.getRoundData(targetRoundId);
+            if (!(roundId == targetRoundId && updatedAt > 0)) return (0, 0);
+            if (updatedAt <= timestamp) return (answer, updatedAt);
+            traversedRounds++;
+        }
+
+        return (answer, updatedAt); // Did not find requested round. Return earliest round or uninitialized data.
+    }
+}
+
+
+// File: lib/oval-contracts/src/adapters/destination-adapters/ChainlinkDestinationAdapter.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+import {DecimalLib} from "../lib/DecimalLib.sol";
+import {IAggregatorV3} from "../../interfaces/chainlink/IAggregatorV3.sol";
+import {DiamondRootOVAL} from "../../DiamondRootOval.sol";
+
+/**
+ * @title ChainlinkDestinationAdapter contract to expose OVAL data via the standard Chainlink Aggregator interface.
+ */
+
+abstract contract ChainlinkDestinationAdapter is DiamondRootOVAL, IAggregatorV3 {
+    uint8 public immutable override decimals;
+
+    event DecimalsSet(uint8 indexed decimals);
+
+    constructor(uint8 _decimals) {
+        decimals = _decimals;
+
+        emit DecimalsSet(_decimals);
+    }
+
+    /**
+     * @notice Returns the latest data from the source.
+     * @return answer The latest answer in the configured number of decimals.
+     */
+    function latestAnswer() public view override returns (int256) {
+        (int256 answer,) = internalLatestData();
+        return DecimalLib.convertDecimals(answer, 18, decimals);
+    }
+
+    /**
+     * @notice Returns when the latest answer was updated.
+     * @return timestamp The timestamp of the latest answer.
+     */
+    function latestTimestamp() public view override returns (uint256) {
+        (, uint256 timestamp) = internalLatestData();
+        return timestamp;
+    }
+
+    /**
+     * @notice Returns an approximate form of the latest Round data. This does not implement the notion of "roundId" that
+     * the normal chainlink aggregator does and returns hardcoded values for those fields.
+     * @return roundId The roundId of the latest answer, hardcoded to 1.
+     * @return answer The latest answer in the configured number of decimals.
+     * @return startedAt The timestamp when the value was updated.
+     * @return updatedAt The timestamp when the value was updated.
+     * @return answeredInRound The roundId of the round in which the answer was computed, hardcoded to 1.
+     */
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        (int256 answer, uint256 updatedAt) = internalLatestData();
+        return (1, DecimalLib.convertDecimals(answer, 18, decimals), updatedAt, updatedAt, 1);
+    }
+}
+
+
+// File: lib/oval-contracts/src/interfaces/chainlink/IAggregatorV3Source.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+interface IAggregatorV3Source {
+    function decimals() external view returns (uint8);
+
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+
+    function getRoundData(uint80 _roundId)
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
+
+// File: lib/oval-contracts/lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/oval-contracts/src/Oval.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
+import {DiamondRootOVAL} from "./DiamondRootOval.sol";
+
+/**
+ * @title OVAL contract to provide permissioned updating at the execution of an MEV-share auction.
+ * @dev This contract works by conditionally returning a stale value oracle price from the source adapter until a
+ * permissioned actor calls the unlockLatestValue function. The call to unlockLatestValue is submitted via an MEV-share
+ * auction and will be backrun by the winner of the auction. The backrunner has access to the most recent newly unlocked
+ * source price. If someone tries to front-run the call to unlockLatestValue, the caller will receive a stale value. If
+ * the permissioned actor does not call unlockLatestValue within the lockWindow, the latest value that is at least
+ * lockWindow seconds old will be returned. This contract is intended to be used in conjunction with a Controller
+ * contract that governs who can call unlockLatestValue.
+ * @custom:security-contact bugs@umaproject.org
+ */
+
+abstract contract OVAL is DiamondRootOVAL {
+    uint256 public lastUnlockTime; // Timestamp of the latest unlock to the OVAL.
+
+    /**
+     * @notice Function called by permissioned actor to unlock the latest value as part of the MEV-share auction flow.
+     * @dev The call to this function is expected to be sent to flashbots via eth_sendPrivateTransaction. This is the
+     * transaction that is backrun by the winner of the auction. The backrunner has access to the most recent newly
+     * unlocked source price as a result and therefore can extract the MEV associated with the unlock.
+     */
+    function unlockLatestValue() public {
+        require(canUnlock(msg.sender, lastUnlockTime), "Controller blocked: canUnlock");
+
+        snapshotData(); // If the source connected to this OVAL needs to snapshot data, do it here. Else, no op.
+
+        lastUnlockTime = block.timestamp;
+
+        emit LatestValueUnlocked(block.timestamp);
+    }
+
+    /**
+     * @notice Returns latest data from source, governed by lockWindow controlling if returned data is stale.
+     * @return answer The latest answer in 18 decimals.
+     * @return timestamp The timestamp of the answer.
+     */
+    function internalLatestData() public view override returns (int256, uint256) {
+        // Case work:
+        //-> If unlockLatestValue has been called within lockWindow, then return most recent price as of unlockLatestValue call.
+        //-> If unlockLatestValue has not been called in lockWindow, then return most recent value that is at least lockWindow old.
+        return tryLatestDataAt(Math.max(lastUnlockTime, block.timestamp - lockWindow()), maxTraversal());
+    }
+}
+
+
+// File: lib/oval-contracts/src/adapters/lib/DecimalLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
+
+/**
+ * @title DecimalLib library to perform decimal math operations.
+ */
+library DecimalLib {
+    /**
+     * Converts int256 answer scaled at iDecimals to scale at oDecimals.
+     * Source oracle adapters should pass 18 for oDecimals, while destination adapters should pass 18 for iDecimals.
+     * Warning: When downscaling (i.e., when iDecimals > oDecimals), the conversion can lead to a loss of precision.
+     * In the worst case, if the answer is small enough, the conversion can return zero.
+     * Warning: When upscaling (i.e., when iDecimals < oDecimals), if answer * 10^(oDecimals - iDecimals) exceeds
+     * the maximum int256 value, this function will revert. Ensure the provided values will not cause an overflow.
+     */
+    function convertDecimals(int256 answer, uint8 iDecimals, uint8 oDecimals) internal pure returns (int256) {
+        if (iDecimals == oDecimals) return answer;
+        if (iDecimals < oDecimals) return answer * int256(10 ** (oDecimals - iDecimals));
+        return answer / int256(10 ** (iDecimals - oDecimals));
+    }
+
+    /**
+     * Converts uint256 answer scaled at iDecimals to scale at oDecimals.
+     * Source oracle adapters should pass 18 for oDecimals, while destination adapters should pass 18 for iDecimals.
+     * Warning: When downscaling (i.e., when iDecimals > oDecimals), the conversion can lead to a loss of precision.
+     * In the worst case, if the answer is small enough, the conversion can return zero.
+     * Warning: When upscaling (i.e., when iDecimals < oDecimals), if answer * 10^(oDecimals - iDecimals) exceeds
+     * the maximum uint256 value, this function will revert. Ensure the provided values will not cause an overflow.
+     */
+    function convertDecimals(uint256 answer, uint8 iDecimals, uint8 oDecimals) internal pure returns (uint256) {
+        if (iDecimals == oDecimals) return answer;
+        if (iDecimals < oDecimals) return answer * 10 ** (oDecimals - iDecimals);
+        return answer / 10 ** (iDecimals - oDecimals);
+    }
+
+    // Derives token decimals from its scaling factor.
+    function deriveDecimals(uint256 scalingFactor) internal pure returns (uint8) {
+        uint256 decimals = Math.log10(scalingFactor);
+
+        // Verify that the inverse operation yields the expected result.
+        require(10 ** decimals == scalingFactor, "Invalid scalingFactor");
+
+        // Note: decimals must fit within uint8 because:
+        // 2^8 = 256, which is uint8 max.
+        // This would imply an input scaling factor of 1e256. The max value of uint256 is \(2^{256} - 1\), which is approximately
+        // 1.2e77, but not equal to 1e256. Therefore, decimals will always fit within uint8 or the check above will fail.
+        return uint8(decimals);
+    }
+}
+
+
+// File: lib/oval-contracts/src/DiamondRootOval.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+import {IBaseOracleAdapter} from "./interfaces/IBaseOracleAdapter.sol";
+import {IBaseController} from "./interfaces/IBaseController.sol";
+import {IOVAL} from "./interfaces/IOval.sol";
+
+/**
+ * @title DiamondRootOVAL contract to provide base functions that the three components of the OVAL contract system
+ * need. They are exposed here to simplify the inheritance structure of the OVAL contract system and to enable easier
+ * composability and extensibility at the integration layer, enabling arbitrary combinations of sources and destinations.
+ */
+
+abstract contract DiamondRootOVAL is IBaseController, IOVAL, IBaseOracleAdapter {
+    /**
+     * @notice Returns the latest data from the source.
+     * @return answer The latest answer in 18 decimals.
+     * @return updatedAt The timestamp of the answer.
+     */
+    function getLatestSourceData() public view virtual returns (int256, uint256);
+
+    /**
+     * @notice Tries getting latest data as of requested timestamp. If this is not possible, returns the earliest data
+     * available past the requested timestamp within provided traversal limitations.
+     * @param timestamp The timestamp to try getting latest data at.
+     * @param maxTraversal The maximum number of rounds to traverse when looking for historical data.
+     * @return answer The answer as of requested timestamp, or earliest available data if not available, in 18 decimals.
+     * @return updatedAt The timestamp of the answer.
+     */
+    function tryLatestDataAt(uint256 timestamp, uint256 maxTraversal) public view virtual returns (int256, uint256);
+
+    /**
+     * @notice Returns the latest data from the source. Depending on when the OVAL was last unlocked this might
+     * return an slightly stale value to protect the OEV from being stolen by a front runner.
+     * @return answer The latest answer in 18 decimals.
+     * @return updatedAt The timestamp of the answer.
+     */
+    function internalLatestData() public view virtual returns (int256, uint256);
+
+    /**
+     * @notice Snapshot the current source data. Is a no-op if the source does not require snapshotting.
+     */
+    function snapshotData() public virtual;
+
+    /**
+     * @notice Permissioning function to control who can unlock the OVAL.
+     */
+    function canUnlock(address caller, uint256 cachedLatestTimestamp) public view virtual returns (bool);
+
+    /**
+     * @notice Time window that bounds how long the permissioned actor has to call the unlockLatestValue function after
+     * a new source update is posted. If the permissioned actor does not call unlockLatestValue within this window of a
+     * new source price, the latest value will be made available to everyone without going through an MEV-Share auction.
+     * @return lockWindow time in seconds.
+     */
+    function lockWindow() public view virtual returns (uint256);
+
+    /**
+     * @notice Max number of historical source updates to traverse when looking for a historic value in the past.
+     * @return maxTraversal max number of historical source updates to traverse.
+     */
+    function maxTraversal() public view virtual returns (uint256);
+}
+
+
+// File: lib/oval-contracts/src/interfaces/chainlink/IAggregatorV3.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+interface IAggregatorV3 {
+    function latestAnswer() external view returns (int256);
+
+    function latestTimestamp() external view returns (uint256);
+
+    function decimals() external view returns (uint8);
+
+    function latestRoundData()
+        external
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+
+    // Other Chainlink functions we don't need.
+
+    // function latestRound() external view returns (uint256);
+
+    // function getAnswer(uint256 roundId) external view returns (int256);
+
+    // function getTimestamp(uint256 roundId) external view returns (uint256);
+
+    // function description() external view returns (string memory);
+
+    // function version() external view returns (uint256);
+
+    // function getRoundData(uint80 _roundId)
+    //     external
+    //     view
+    //     returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+
+    // event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
+
+    // event NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt);
+}
+
+
+// File: lib/oval-contracts/lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: lib/oval-contracts/lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1, "Math: mulDiv overflow");
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+}
+
+
+// File: lib/oval-contracts/src/interfaces/IBaseOracleAdapter.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+interface IBaseOracleAdapter {
+    function tryLatestDataAt(uint256 _timestamp, uint256 _maxTraversal)
+        external
+        view
+        returns (int256 answer, uint256 timestamp);
+
+    function getLatestSourceData() external view returns (int256 answer, uint256 timestamp);
+}
+
+
+// File: lib/oval-contracts/src/interfaces/IBaseController.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+interface IBaseController {
+    event LockWindowSet(uint256 indexed lockWindow);
+    event MaxTraversalSet(uint256 indexed maxTraversal);
+    event UnlockerSet(address indexed unlocker, bool indexed allowed);
+
+    function canUnlock(address caller, uint256 cachedLatestTimestamp) external view returns (bool);
+}
+
+
+// File: lib/oval-contracts/src/interfaces/IOval.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity 0.8.17;
+
+interface IOVAL {
+    event LatestValueUnlocked(uint256 indexed timestamp);
+
+    function internalLatestData() external view returns (int256 answer, uint256 timestamp);
+}
+

@@ -1,0 +1,1413 @@
+
+// File: src/SpaceLlama.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "v2-periphery/interfaces/IUniswapV2Router02.sol";
+import "v2-core/interfaces/IUniswapV2Factory.sol";
+
+import "./SpaceLlamaFund.sol";
+
+/**
+ * @dev Error to be thrown when the token sender is invalid.
+ * @param sender Address of the sender.
+ */
+error ERC20InvalidSender(address sender);
+
+/**
+ * @dev Error to be thrown when the token receiver is invalid.
+ * @param receiver Address of the receiver.
+ */
+error ERC20InvalidReceiver(address receiver);
+
+/// @title Space Llama
+/// @notice This contract is for the Space Llama token, a reflective ERC20 token that pays in ETH.
+contract SpaceLlama is IERC20, Ownable {
+    // State variables
+    // Basic ERC20 variables
+    string private _name;
+    string private _symbol;
+    uint256 private _totalSupply = 1_000_000_000 * 10 ** decimals();
+    uint256 private _initialTradeBlockNumber;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    // External contracts
+    SpaceLlamaFund public spaceLlamaFund;
+    IUniswapV2Router02 public uniswapV2Router;
+    address public uniswapV2Pair;
+
+    // Space llama fund variables
+    uint256 public spaceLlamaFundFee = 200; // 2% in BPS
+    uint256 public swapTokensAtAmount = 100_000 * (10 ** 18);
+    uint256 public lastSwapTime;
+    bool private _isSwapping;
+
+    // Event to be emitted when tokens are sent to the Space Llama Fund
+    event SendToSpaceLlamaFund(uint256 tokensSwapped, uint256 amount);
+
+    // Variables for limiting wallet balance and punishing bots
+    bool private _isLimitOn = true; // false on renounce
+    bool private _isSetup = true; // false on trade enable
+    uint256 maxWalletBps = 100; // 1% max wallet, no limits after renounce
+    uint256 blocksToPunishBots = 10; // high initial tax value to punish bots
+    mapping(address => bool) public isAmmPair;
+    mapping(address => bool) private _isExemptMaxWallet;
+    mapping(address => bool) private _isExemptFromFee;
+    mapping(address => bool) private _isAllowedDuringSetup;
+
+    // Events to be emitted when exemptions are updated
+    event UpdateExemptMaxWallet(address indexed account, bool value);
+    event UpdateExemptFromFee(address indexed account, bool value);
+    event UpdateAllowDuringSetup(address indexed account, bool value);
+    event UpdateAmmPair(address indexed pair, bool value);
+
+    // Errors to be thrown in specific situations
+    error NotAllowedDuringSetup();
+    error MaxWalletExceeded();
+
+    // Constructor
+    /**
+     * @dev Constructor for the SpaceLlama contract. Transfers ownership to _contractOwner at the end.
+     * @param __name The name of the token.
+     * @param __symbol The symbol of the token.
+     * @param _uniswapV2Router02 The address of the Uniswap V2 Router.
+     * @param _contractOwner The address of the contract owner and initial token recipient.
+     */
+    constructor(string memory __name, string memory __symbol, address _uniswapV2Router02, address _contractOwner)
+        Ownable(_msgSender())
+    {
+        _name = __name;
+        _symbol = __symbol;
+        uniswapV2Router = IUniswapV2Router02(_uniswapV2Router02);
+        spaceLlamaFund = new SpaceLlamaFund(address(this), _uniswapV2Router02);
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(address(this), uniswapV2Router.WETH());
+
+        _setAutomatedMarketMakerPair(uniswapV2Pair, true);
+
+        // Excluding certain addresses from the Space Llama Fund
+        spaceLlamaFund.excludeFromSLF(_contractOwner, true);
+        spaceLlamaFund.excludeFromSLF(address(this), true);
+        spaceLlamaFund.excludeFromSLF(address(spaceLlamaFund), true);
+        spaceLlamaFund.excludeFromSLF(address(uniswapV2Router), true);
+
+        // Exempting certain addresses from fees
+        exemptFromFee(_contractOwner, true);
+        exemptFromFee(address(this), true);
+        exemptFromFee(address(spaceLlamaFund), true);
+
+        // Exempting certain addresses from max wallet restrictions
+        exemptFromMaxWallet(_contractOwner, true);
+        exemptFromMaxWallet(address(this), true);
+        exemptFromMaxWallet(address(spaceLlamaFund), true);
+
+        // Allowing certain addresses to perform operations during setup phase
+        allowDuringSetupPhase(_contractOwner, true);
+
+        // Initial token distribution
+        _balances[_contractOwner] += _totalSupply;
+        emit Transfer(address(0), _contractOwner, _totalSupply);
+        if (_msgSender() != _contractOwner) {
+            transferOwnership(_contractOwner);
+        }
+    }
+
+    /**
+     * @dev Function to receive Ether. This is a fallback function and it doesn't have a name.
+     * It is executed when the contract receives Ether without any data.
+     */
+    receive() external payable {}
+
+    // External functions for interacting with the contract
+    /**
+     * @dev Approves `spender` to spend `amount` tokens on behalf of the caller.
+     * @param spender The address to be granted spending rights.
+     * @param amount The number of tokens to be approved for spending.
+     * @return A boolean value indicating whether the operation succeeded.
+     */
+    function approve(address spender, uint256 amount) public returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev Transfers `amount` tokens from the caller to `recipient`.
+     * @param recipient The address to receive the transferred tokens.
+     * @param amount The number of tokens to be transferred.
+     * @return A boolean value indicating whether the operation succeeded.
+     */
+    function transfer(address recipient, uint256 amount) public returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    /**
+     * @dev Transfers `amount` tokens from `sender` to `recipient` using the allowance mechanism.
+     * `amount` is then deducted from the caller's allowance.
+     * @param sender The address whose tokens are to be transferred.
+     * @param recipient The address to receive the transferred tokens.
+     * @param amount The number of tokens to be transferred.
+     * @return A boolean value indicating whether the operation succeeded.
+     */
+    function transferFrom(address sender, address recipient, uint256 amount) public returns (bool) {
+        uint256 currentAllowance = _allowances[sender][_msgSender()];
+        require(currentAllowance >= amount, "ERC20: transfer amount exceeds allowance");
+        _transfer(sender, recipient, amount);
+        _approve(sender, _msgSender(), _allowances[sender][_msgSender()] - amount);
+        return true;
+    }
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * @param spender The address to be granted increased spending rights.
+     * @param addedValue The increase in allowance to be granted.
+     * @return A boolean value indicating whether the operation succeeded.
+     */
+
+    function increaseAllowance(address spender, uint256 addedValue) public returns (bool) {
+        _approve(_msgSender(), spender, _allowances[_msgSender()][spender] + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     * @param spender The address to have its spending rights decreased.
+     * @param subtractedValue The decrease in allowance to be applied.
+     * @return A boolean value indicating whether the operation succeeded.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public returns (bool) {
+        uint256 currentAllowance = _allowances[_msgSender()][spender];
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(_msgSender(), spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Exempts `account` from fees, if `value` is true.
+     * @param account The address to be exempted from fees.
+     * @param value A boolean indicating whether the account should be exempted from fees.
+     */
+    function exemptFromFee(address account, bool value) public onlyOwner {
+        require(_isExemptFromFee[account] != value, "Account exemption status is already set to this value");
+        _isExemptFromFee[account] = value;
+        emit UpdateExemptFromFee(account, value);
+    }
+
+    /**
+     * @dev Exempts `account` from max wallet restrictions, if `value` is true.
+     * @param account The address to be exempted from max wallet restrictions.
+     * @param value A boolean indicating whether the account should be exempted from max wallet restrictions.
+     */
+    function exemptFromMaxWallet(address account, bool value) public onlyOwner {
+        require(
+            _isExemptMaxWallet[account] != value,
+            "Account exemption status from max balance is already set to this value"
+        );
+        _isExemptMaxWallet[account] = value;
+        emit UpdateExemptMaxWallet(account, value);
+    }
+
+    /**
+     * @dev Allows `account` to perform operations during setup phase, if `value` is true.
+     * @param account The address to be allowed operations during setup phase.
+     * @param value A boolean indicating whether the account should be allowed operations during setup phase.
+     */
+    function allowDuringSetupPhase(address account, bool value) public onlyOwner {
+        require(
+            _isAllowedDuringSetup[account] != value,
+            "Account exemption status from transfer limit is already set to this value"
+        );
+        _isAllowedDuringSetup[account] = value;
+        emit UpdateAllowDuringSetup(account, value);
+    }
+
+    /**
+     * @dev Sets `pair` as an automated market maker pair, if `value` is true.
+     * @param pair The address to be set as an automated market maker pair.
+     * @param value A boolean indicating whether the address should be set as an automated market maker pair.
+     */
+    function setAutomatedMarketMakerPair(address pair, bool value) public onlyOwner {
+        require(pair != uniswapV2Pair, "DEX pair can not be removed");
+        _setAutomatedMarketMakerPair(pair, value);
+    }
+
+    /**
+     * @dev Excludes or includes `account` from the Space Llama Fund (SLF) based on the `excluded` flag.
+     * Can only be called by the contract owner.
+     * @param account The address to be excluded or included in the SLF.
+     * @param excluded A boolean indicating whether the account should be excluded from the SLF.
+     */
+    function excludeFromSLF(address account, bool excluded) public onlyOwner {
+        spaceLlamaFund.excludeFromSLF(account, excluded);
+    }
+
+    /**
+     * @dev Finishes the setup phase.
+     */
+    function finishSetup() public onlyOwner {
+        _isSetup = false;
+        _initialTradeBlockNumber = block.number;
+    }
+
+    /**
+     * @dev Removes all limits and renounces ownership of the contract.
+     * Can only be called by the current owner.
+     */
+    function removeLimitsAndRenounce() public onlyOwner {
+        _isLimitOn = false;
+        renounceOwnership();
+    }
+
+    /**
+     * @dev Allows the caller to claim their tokens.
+     */
+    function claim() public {
+        spaceLlamaFund.processAccount(payable(_msgSender()));
+    }
+    //////////////////////////////////// external read
+
+    /**
+     * @dev Returns the name of the token.
+     * @return The name of the token.
+     */
+    function name() public view returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token.
+     * @return The symbol of the token.
+     */
+    function symbol() public view returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals the token uses.
+     * @return The number of decimals the token uses.
+     */
+    function decimals() public pure returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev Returns the total supply of the token.
+     * @return The total supply of the token.
+     */
+    function totalSupply() public view returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev Returns the balance of `account`.
+     * @param account The address whose balance is to be returned.
+     * @return The balance of `account`.
+     */
+    function balanceOf(address account) public view returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev Returns the allowance of `spender` from `owner`.
+     * @param owner The address whose allowance is to be returned.
+     * @param spender The address whose allowance is to be returned.
+     * @return The allowance of `spender` from `owner`.
+     */
+    function allowance(address owner, address spender) public view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev Returns the last claim time of `account`.
+     * @param account The address whose last claim time is to be returned.
+     * @return The last claim time of `account`.
+     */
+    function getLastClaimTime(address account) public view returns (uint256) {
+        return spaceLlamaFund.getLastClaimTime(account);
+    }
+
+    /**
+     * @dev Returns whether `account` is excluded from SLF.
+     * @param account The address to be checked for exclusion from SLF.
+     * @return A boolean indicating whether `account` is excluded from SLF.
+     */
+    function isExcludedFromSLF(address account) public view returns (bool) {
+        return spaceLlamaFund.isExcludedFromSLF(account);
+    }
+
+    /**
+     * @dev Returns the withdrawable Ether of `account`.
+     * @param account The address whose withdrawable Ether is to be returned.
+     * @return The withdrawable Ether of `account`.
+     */
+    function withdrawableEtherOf(address account) public view returns (uint256) {
+        return spaceLlamaFund.withdrawableEtherOf(account);
+    }
+
+    /**
+     * @dev Returns the withdrawn Ether of `account`.
+     * @param account The address whose withdrawn Ether is to be returned.
+     * @return The withdrawn Ether of `account`.
+     */
+    function withdrawnEtherOf(address account) public view returns (uint256) {
+        return spaceLlamaFund.withdrawnEtherOf(account);
+    }
+
+    /**
+     * @dev Returns the accumulative SLF of `account`.
+     * @param account The address whose accumulative SLF is to be returned.
+     * @return The accumulative SLF of `account`.
+     */
+    function accumulativeSLFOf(address account) public view returns (uint256) {
+        return spaceLlamaFund.accumulativeSLFOf(account);
+    }
+
+    /**
+     * @dev Returns the account info of `account`.
+     * @param account The address whose account info is to be returned.
+     * @return The account info of `account`.
+     */
+    function getAccountInfo(address account) public view returns (address, uint256, uint256, uint256, uint256) {
+        return spaceLlamaFund.getAccountInfo(account);
+    }
+
+    /**
+     * @dev This function calculates and returns the fee for the Space Llama Fund. The fee calculation is based on the current block number.
+     * The purpose of this dynamic fee structure is to discourage bots and to ensure fair trading.
+     * During the setup phase or when the current block number
+     * is greater than or equal to the steady state block, the fee is set to the default Space Llama Fund fee.
+     * This is to ensure a stable fee during normal operations.
+     * However, if the current block number is less than the steady state block (indicating a high trading activity period), the fee is increased.
+     * It is set to the default fee plus an additional amount which is 50 times the difference between the steady state block and the current block number.
+     * This additional fee acts as a deterrent for bots and high frequency trading during periods of high trading activity in the first few blocks.
+     * @return The calculated fee for the Space Llama Fund.
+     */
+    function getFee() public view returns (uint256) {
+        // add early branching for renounced state
+        if (!_isLimitOn) {
+            return spaceLlamaFundFee;
+        }
+        // The initialTradeBlockNumber is only defined if _isSetup is true, hence it's safe to use here.
+        uint256 steadyStateBlock = _initialTradeBlockNumber + blocksToPunishBots;
+        if (_isSetup || block.number >= steadyStateBlock) {
+            return spaceLlamaFundFee;
+        } else {
+            // tax is 4900 (49%) on first block -> reduced to 2% on 10th block onwards
+            return spaceLlamaFundFee + 470 * (steadyStateBlock - block.number);
+        }
+    }
+
+    //////////////////////////////////// internal write
+
+    /**
+     * @dev Transfers `amount` tokens from `sender` to `recipient`.
+     * @param sender The address whose tokens are to be transferred.
+     * @param recipient The address to receive the transferred tokens.
+     * @param amount The number of tokens to be transferred.
+     */
+    function _transfer(address sender, address recipient, uint256 amount) internal virtual {
+        if (_isSetup) {
+            if (
+                sender != owner() && recipient != owner() && !_isAllowedDuringSetup[sender]
+                    && !_isAllowedDuringSetup[recipient]
+            ) {
+                revert NotAllowedDuringSetup();
+            }
+        }
+        // if (_isLimitOn && _isSetup) {
+        //     if (_isAllowedDuringSetup[sender] || _isAllowedDuringSetup[recipient]) {
+        //         // go ahead
+        //     } else {
+        //         revert NotAllowedDuringSetup();
+        //     }
+        // }
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+
+        if (_isLimitOn && sender != owner() && recipient != address(this) && recipient != uniswapV2Pair) {
+            uint256 maxWallet = (totalSupply() * maxWalletBps) / 10000;
+            uint256 currentBalance = balanceOf(recipient);
+            if (_isExemptMaxWallet[recipient] || (currentBalance + amount <= maxWallet)) {
+                // go ahead
+            } else {
+                revert MaxWalletExceeded();
+            }
+        }
+
+        uint256 contractTokenBalance = balanceOf(address(this));
+        uint256 contractNativeBalance = address(this).balance;
+
+        bool shouldSwap = contractTokenBalance >= swapTokensAtAmount;
+
+        if (
+            shouldSwap && !_isSwapping && !isAmmPair[sender] // no swap on remove liquidity step 1 or DEX buy
+                && sender != address(uniswapV2Router) // no swap on remove liquidity step 2
+                && sender != owner() && recipient != owner()
+        ) {
+            _isSwapping = true;
+
+            _rawSwap(contractTokenBalance, contractNativeBalance);
+
+            lastSwapTime = block.timestamp;
+            _isSwapping = false;
+        }
+
+        bool takeFee;
+
+        if (sender == address(uniswapV2Pair) || recipient == address(uniswapV2Pair)) {
+            takeFee = true;
+        }
+
+        if (_isExemptFromFee[sender] || _isExemptFromFee[recipient]) {
+            takeFee = false;
+        }
+
+        if (_isSwapping) {
+            takeFee = false;
+        }
+
+        if (takeFee) {
+            uint256 fees = (amount * getFee()) / 10000;
+            amount -= fees;
+            _rawTransfer(sender, address(this), fees);
+        }
+        _rawTransfer(sender, recipient, amount);
+
+        spaceLlamaFund.setBalance(payable(sender), balanceOf(sender));
+        spaceLlamaFund.setBalance(payable(recipient), balanceOf(recipient));
+    }
+
+    /**
+     * @dev Transfers `amount` tokens from `sender` to `recipient` without any checks or events.
+     * @param sender The address whose tokens are to be transferred.
+     * @param recipient The address to receive the transferred tokens.
+     * @param amount The number of tokens to be transferred.
+     */
+    function _rawTransfer(address sender, address recipient, uint256 amount) private {
+        if (sender == address(0)) {
+            revert ERC20InvalidSender(address(0));
+        }
+        if (recipient == address(0)) {
+            revert ERC20InvalidReceiver(address(0));
+        }
+        _balances[sender] -= amount;
+        _balances[recipient] += amount;
+        emit Transfer(sender, recipient, amount);
+    }
+
+    /**
+     * @dev Swaps `tokens` for native currency and adds `native` to the swap.
+     * @param tokens The number of tokens to be swapped.
+     * @param native The amount of native currency to be added to the swap.
+     */
+    function _rawSwap(uint256 tokens, uint256 native) private {
+        if (tokens <= 0) {
+            return;
+        }
+
+        uint256 tokensToSwap;
+        if (spaceLlamaFund.totalSupply() > 0) {
+            tokensToSwap = (tokens);
+        }
+
+        uint256 initNativeBal = address(this).balance;
+        _swapTokensForNative(tokensToSwap);
+
+        uint256 nativeSwapped = (address(this).balance - initNativeBal) + native;
+
+        if (nativeSwapped > 0) {
+            (bool success,) = address(spaceLlamaFund).call{value: nativeSwapped}("");
+            if (success) {
+                emit SendToSpaceLlamaFund(tokensToSwap, nativeSwapped);
+            }
+        }
+    }
+
+    /**
+     * @dev Swaps the specified amount of tokens for native currency.
+     * @param tokens The amount of tokens to be swapped.
+     */
+    function _swapTokensForNative(uint256 tokens) private {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokens);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokens,
+            0, // accept any amount of native
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    /**
+     * @dev Approves `spender` to spend `amount` tokens on behalf of `owner`.
+     * @param owner The address whose tokens are to be approved for spending.
+     * @param spender The address to be approved for spending.
+     * @param amount The number of tokens to be approved for spending.
+     */
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Configures the status of `pair` as an automated market maker pair based on the `value` provided.
+     * If `value` is true, the `pair` is set as an automated market maker pair and is excluded from Space Llama Fund (SLF).
+     * An event is emitted to log the update.
+     * @param pair The address that is to be configured as an automated market maker pair.
+     * @param value The boolean value indicating whether the address should be set as an automated market maker pair.
+     *
+     */
+    function _setAutomatedMarketMakerPair(address pair, bool value) private {
+        require(isAmmPair[pair] != value, "Automated market maker pair is already set to that value");
+        isAmmPair[pair] = value;
+        if (value) {
+            spaceLlamaFund.excludeFromSLF(pair, true);
+        }
+        emit UpdateAmmPair(pair, value);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../token/ERC20/IERC20.sol";
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol
+pragma solidity >=0.6.2;
+
+import "./IUniswapV2Router01.sol";
+
+interface IUniswapV2Router02 is IUniswapV2Router01 {
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountETH);
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountETH);
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+
+// File: lib/v2-core/contracts/interfaces/IUniswapV2Factory.sol
+pragma solidity >=0.5.0;
+
+interface IUniswapV2Factory {
+    event PairCreated(address indexed token0, address indexed token1, address pair, uint256);
+
+    function feeTo() external view returns (address);
+    function feeToSetter() external view returns (address);
+
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+    function allPairs(uint256) external view returns (address pair);
+    function allPairsLength() external view returns (uint256);
+
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+
+    function setFeeTo(address) external;
+    function setFeeToSetter(address) external;
+}
+
+
+// File: src/SpaceLlamaFund.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.24;
+
+// Importing required interfaces and contracts
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "v2-periphery/interfaces/IUniswapV2Router02.sol";
+
+/**
+ * @title SpaceLlamaFund
+ * @dev This contract manages the Space Llama Fund, a fund for the Space Llama project.
+ */
+contract SpaceLlamaFund is Ownable, IERC20 {
+    // Uniswap router for token swaps
+    IUniswapV2Router02 uniswapV2Router;
+
+    // Name and symbol for the fund token
+    string private _name = "Space Llama Fund";
+    string private _symbol = "LLAMAF";
+
+    // Index to keep track of the last processed account
+    uint256 public lastProcessedIndex;
+
+    // Total supply of the fund token
+    uint256 private _totalSupply;
+    // Mapping to store the balance of each account
+    mapping(address => uint256) private _balances;
+
+    // Constant to magnify the Ether per share to avoid rounding errors
+    uint256 private constant magnitude = 2 ** 128;
+    // Minimum token balance required to be eligible for SLF
+    uint256 public immutable minTokenBalanceForSLF;
+    // Magnified Ether per share
+    uint256 private magnifiedEtherPerShare;
+    // Total Ether distributed and withdrawn
+    uint256 public totalEtherDistributed;
+    uint256 public totalEtherWithdrawn;
+
+    // Address of the token
+    address public tokenAddress;
+
+    // Mappings to store the state of each account
+    mapping(address => bool) public excludedFromSLF;
+    mapping(address => int256) private magnifiedEtherCorrections;
+    mapping(address => uint256) private withdrawnEther;
+    mapping(address => uint256) private lastClaimTimes;
+
+    // Events to log various actions
+    event EtherDistributed(address indexed from, uint256 weiAmount);
+    event EtherWithdrawn(address indexed to, uint256 weiAmount);
+    event ExcludeFromSLF(address indexed account, bool excluded);
+    event Claim(address indexed account, uint256 amount);
+
+    /**
+     * @dev Struct to store account information.
+     */
+    struct AccountInfo {
+        address account;
+        uint256 withdrawableEther;
+        uint256 totalSLF;
+        uint256 lastClaimTime;
+    }
+
+    /**
+     * @dev Constructor for the SpaceLlamaFund contract.
+     * @param _tokenAddress The address of the token.
+     * @param _uniswapRouter The address of the Uniswap router.
+     */
+    constructor(address _tokenAddress, address _uniswapRouter) Ownable(_tokenAddress) {
+        // Set the minimum token balance for SLF
+        minTokenBalanceForSLF = 1 * (10 ** 18);
+        // Set the token and Uniswap router addresses
+        tokenAddress = _tokenAddress;
+        uniswapV2Router = IUniswapV2Router02(_uniswapRouter);
+    }
+
+    /**
+     * @dev Fallback function to distribute SLF when Ether is sent to the contract.
+     */
+    receive() external payable {
+        distributeSLF();
+    }
+
+    /**
+     * @dev Function to distribute SLF.
+     */
+    function distributeSLF() public payable {
+        // Ensure that the total supply is greater than 0
+        require(_totalSupply > 0, "Total supply should be greater than 0");
+        // If Ether is sent, distribute it among the token holders
+        if (msg.value > 0) {
+            magnifiedEtherPerShare = magnifiedEtherPerShare + ((msg.value * magnitude) / _totalSupply);
+            emit EtherDistributed(msg.sender, msg.value);
+            totalEtherDistributed += msg.value;
+        }
+    }
+
+    /**
+     * @dev Function to set the balance of an account.
+     * @param account The address of the account.
+     * @param newBalance The new balance of the account.
+     */
+    function setBalance(address payable account, uint256 newBalance) external onlyOwner {
+        // If the account is excluded from SLF, do nothing
+        if (excludedFromSLF[account]) {
+            return;
+        }
+        // If the new balance is greater than or equal to the minimum token balance for SLF, set the balance
+        if (newBalance >= minTokenBalanceForSLF) {
+            _setBalance(account, newBalance);
+        } else {
+            // Otherwise, set the balance to 0
+            _setBalance(account, 0);
+        }
+    }
+
+    /**
+     * @dev Function to exclude an account from SLF.
+     * @param account The address of the account.
+     * @param excluded The boolean value indicating whether the account should be excluded.
+     */
+    function excludeFromSLF(address account, bool excluded) external onlyOwner {
+        // Ensure that the account is not already in the requested state
+        require(excludedFromSLF[account] != excluded, "SLF: account already set to requested state");
+        // Set the state of the account
+        excludedFromSLF[account] = excluded;
+        // If the account is excluded, set its balance to 0
+        if (excluded) {
+            _setBalance(account, 0);
+        } else {
+            // Otherwise, set its balance to its token balance if it is greater than or equal to the minimum token balance for SLF
+            uint256 newBalance = IERC20(tokenAddress).balanceOf(account);
+            if (newBalance >= minTokenBalanceForSLF) {
+                _setBalance(account, newBalance);
+            } else {
+                _setBalance(account, 0);
+            }
+        }
+        // Emit an event to log the exclusion
+        emit ExcludeFromSLF(account, excluded);
+    }
+
+    /**
+     * @dev Function to check if an account is excluded from SLF.
+     * @param account The address of the account.
+     * @return A boolean value indicating whether the account is excluded.
+     */
+    function isExcludedFromSLF(address account) public view returns (bool) {
+        // Return the state of the account
+        return excludedFromSLF[account];
+    }
+
+    /**
+     * @dev Internal function to set the balance of an account.
+     * @param account The address of the account.
+     * @param newBalance The new balance of the account.
+     */
+    function _setBalance(address account, uint256 newBalance) internal {
+        // Get the current balance of the account
+        uint256 currentBalance = _balances[account];
+        // If the new balance is greater than the current balance, mint tokens
+        if (newBalance > currentBalance) {
+            uint256 addAmount = newBalance - currentBalance;
+            _mint(account, addAmount);
+        } else if (newBalance < currentBalance) {
+            // If the new balance is less than the current balance, burn tokens
+            uint256 subAmount = currentBalance - newBalance;
+            _burn(account, subAmount);
+        }
+    }
+
+    /**
+     * @dev Internal function to mint tokens.
+     * @param account The address of the account.
+     * @param amount The amount of tokens to mint.
+     */
+    function _mint(address account, uint256 amount) private {
+        // Ensure that the account is not the zero address
+        require(account != address(0), "SLF: mint to the zero address");
+        // Increase the total supply and the balance of the account
+        _totalSupply += amount;
+        _balances[account] += amount;
+        // Emit a transfer event from the zero address to the account
+        emit Transfer(address(0), account, amount);
+        // Adjust the magnified Ether correction for the account
+        magnifiedEtherCorrections[account] =
+            magnifiedEtherCorrections[account] - int256(magnifiedEtherPerShare * amount);
+    }
+
+    /**
+     * @dev Internal function to burn tokens.
+     * @param account The address of the account.
+     * @param amount The amount of tokens to burn.
+     */
+    function _burn(address account, uint256 amount) private {
+        // Ensure that the account is not the zero address
+        require(account != address(0), "SLF: burn from the zero address");
+        // Ensure that the account has enough balance to burn
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "SLF: burn amount exceeds balance");
+        // Decrease the balance of the account and the total supply
+        _balances[account] = accountBalance - amount;
+        _totalSupply -= amount;
+        // Emit a transfer event from the account to the zero address
+        emit Transfer(account, address(0), amount);
+        // Adjust the magnified Ether correction for the account
+        magnifiedEtherCorrections[account] =
+            magnifiedEtherCorrections[account] + int256(magnifiedEtherPerShare * amount);
+    }
+
+    /**
+     * @dev Function to process an account.
+     * @param account The address of the account.
+     * @return A boolean value indicating whether the process was successful.
+     */
+    function processAccount(address payable account) public onlyOwner returns (bool) {
+        // Withdraw the SLF of the user
+        uint256 amount = _withdrawSLFOfUser(account);
+        // If the amount is greater than 0, update the last claim time and emit a claim event
+        if (amount > 0) {
+            lastClaimTimes[account] = block.timestamp;
+            emit Claim(account, amount);
+            return true;
+        }
+        // If the amount is 0, return false
+        return false;
+    }
+
+    /**
+     * @dev Internal function to withdraw SLF of a user.
+     * @param account The address of the account.
+     * @return The amount of SLF withdrawn.
+     */
+    function _withdrawSLFOfUser(address payable account) private returns (uint256) {
+        // Get the withdrawable Ether of the account
+        uint256 _withdrawableEther = withdrawableEtherOf(account);
+        // If the withdrawable Ether is greater than 0, withdraw it
+        if (_withdrawableEther > 0) {
+            withdrawnEther[account] += _withdrawableEther;
+            totalEtherWithdrawn += _withdrawableEther;
+            emit EtherWithdrawn(account, _withdrawableEther);
+            // Try to transfer the Ether to the account
+            (bool success,) = account.call{value: _withdrawableEther, gas: 3000}("");
+            // If the transfer fails, revert the withdrawal
+            if (!success) {
+                withdrawnEther[account] -= _withdrawableEther;
+                totalEtherWithdrawn -= _withdrawableEther;
+                return 0;
+            }
+            return _withdrawableEther;
+        }
+        // If the withdrawable Ether is 0, return 0
+        return 0;
+    }
+
+    /**
+     * @dev Function to get the withdrawable Ether of an account.
+     * @param account The address of the account.
+     * @return The amount of withdrawable Ether.
+     */
+    function withdrawableEtherOf(address account) public view returns (uint256) {
+        // Return the difference between the accumulative SLF and the withdrawn Ether of the account
+        return accumulativeSLFOf(account) - withdrawnEther[account];
+    }
+
+    /**
+     * @dev Function to get the withdrawn Ether of an account.
+     * @param account The address of the account.
+     * @return The amount of withdrawn Ether.
+     */
+    function withdrawnEtherOf(address account) public view returns (uint256) {
+        // Return the withdrawn Ether of the account
+        return withdrawnEther[account];
+    }
+
+    /**
+     * @dev Function to get the accumulative SLF of an account.
+     * @param account The address of the account.
+     * @return The amount of accumulative SLF.
+     */
+    function accumulativeSLFOf(address account) public view returns (uint256) {
+        // Calculate the accumulative SLF of the account
+        int256 a = int256(magnifiedEtherPerShare * balanceOf(account));
+        int256 b = magnifiedEtherCorrections[account];
+        return uint256(a + b) / magnitude;
+    }
+
+    /**
+     * @dev Function to get the account information of an account.
+     * @param account The address of the account.
+     * @return The account information.
+     */
+    function getAccountInfo(address account) public view returns (address, uint256, uint256, uint256, uint256) {
+        // Create a memory struct to store the account information
+        AccountInfo memory info;
+        info.account = account;
+        info.withdrawableEther = withdrawableEtherOf(account);
+        info.totalSLF = accumulativeSLFOf(account);
+        info.lastClaimTime = lastClaimTimes[account];
+        // Return the account information
+        return (info.account, info.withdrawableEther, info.totalSLF, info.lastClaimTime, totalEtherWithdrawn);
+    }
+
+    /**
+     * @dev Function to get the last claim time of an account.
+     * @param account The address of the account.
+     * @return The last claim time.
+     */
+    function getLastClaimTime(address account) public view returns (uint256) {
+        // Return the last claim time of the account
+        return lastClaimTimes[account];
+    }
+
+    /**
+     * @dev Function to get the name of the token.
+     * @return The name of the token.
+     */
+    function name() public view returns (string memory) {
+        // Return the name of the token
+        return _name;
+    }
+
+    /**
+     * @dev Function to get the symbol of the token.
+     * @return The symbol of the token.
+     */
+    function symbol() public view returns (string memory) {
+        // Return the symbol of the token
+        return _symbol;
+    }
+
+    /**
+     * @dev Function to get the decimals of the token.
+     * @return The decimals of the token.
+     */
+    function decimals() public pure returns (uint8) {
+        // Return the decimals of the token
+        return 18;
+    }
+
+    /**
+     * @dev Function to get the total supply of the token.
+     * @return The total supply of the token.
+     */
+    function totalSupply() public view override returns (uint256) {
+        // Return the total supply of the token
+        return _totalSupply;
+    }
+
+    /**
+     * @dev Function to get the balance of an account.
+     * @param account The address of the account.
+     * @return The balance of the account.
+     */
+    function balanceOf(address account) public view override returns (uint256) {
+        // Return the balance of the account
+        return _balances[account];
+    }
+
+    /**
+     * @dev Function to transfer tokens. This function is not allowed and will always revert.
+     */
+    function transfer(address, uint256) public pure override returns (bool) {
+        // Revert the transaction as this function is not allowed
+        revert("Not Allowed");
+    }
+
+    /**
+     * @dev Function to get the allowance of an account. This function is not allowed and will always revert.
+     */
+    function allowance(address, address) public pure override returns (uint256) {
+        // Revert the transaction as this function is not allowed
+        revert("Not Allowed");
+    }
+
+    /**
+     * @dev Function to approve an account. This function is not allowed and will always revert.
+     */
+    function approve(address, uint256) public pure override returns (bool) {
+        // Revert the transaction as this function is not allowed
+        revert("Not Allowed");
+    }
+
+    /**
+     * @dev Function to transfer tokens from one account to another. This function is not allowed and will always revert.
+     */
+    function transferFrom(address, address, uint256) public pure override returns (bool) {
+        // Revert the transaction as this function is not allowed
+        revert("Not Allowed");
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC-20 standard as defined in the ERC.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol
+pragma solidity >=0.6.2;
+
+interface IUniswapV2Router01 {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+    function removeLiquidityETH(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountToken, uint256 amountETH);
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountA, uint256 amountB);
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountToken, uint256 amountETH);
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts);
+    function swapTokensForExactETH(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+    function swapExactTokensForETH(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+    function swapETHForExactTokens(uint256 amountOut, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts);
+
+    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) external pure returns (uint256 amountB);
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
+        external
+        pure
+        returns (uint256 amountOut);
+    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut)
+        external
+        pure
+        returns (uint256 amountIn);
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+    function getAmountsIn(uint256 amountOut, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+}
+

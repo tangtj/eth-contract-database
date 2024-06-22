@@ -1,0 +1,2185 @@
+
+// File: src/StakingManager.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+import { Staker } from "./Staker.sol";
+
+import { IHoldingManager } from "./interfaces/IHoldingManager.sol";
+import { IIonPool } from "./interfaces/IIonPool.sol";
+import { IStakingManager } from "./interfaces/IStakingManager.sol";
+import { IStaker } from "./interfaces/IStaker.sol";
+
+/**
+ * @title StakingManager
+ *
+ * @notice Manages the distribution of rewards to early users of Jigsaw by facilitating staking of underlying assets.
+ * @notice Staked assets are deposited into Ion's `Pool` Contract to generate yield and earn jPoints, redeemable for
+ * governance $JIG tokens.
+ * @notice For more information on Ion Protocol, visit https://ionprotocol.io.
+ *
+ * @dev This contract inherits functionalities from `Pausable`, `ReentrancyGuard`, and `Ownable2Step`.
+ *
+ * @author Hovooo (@hovooo)
+ *
+ * @custom:security-contact support@jigsaw.finance
+ */
+contract StakingManager is IStakingManager, Pausable, ReentrancyGuard, Ownable2Step {
+    using SafeERC20 for IERC20;
+
+    /**
+     * @notice Address of the Holding Manager contract.
+     * @dev The Holding Manager is responsible for creating and managing user Holdings.
+     */
+    IHoldingManager public immutable override holdingManager;
+
+    /**
+     * @notice Address of the underlying asset used for staking.
+     */
+    address public immutable override underlyingAsset;
+
+    /**
+     * @notice Address of the reward token distributed for staking.
+     */
+    address public immutable override rewardToken;
+
+    /**
+     * @notice Address of the Ion Pool contract.
+     */
+    address public immutable override ionPool;
+
+    /**
+     * @notice Address of the Staker contract used for jPoints distribution.
+     */
+    address public immutable override staker;
+
+    /**
+     * @notice Represents the expiration date for the staking lockup period.
+     * After this date, staked funds can be withdrawn.
+     * @dev If not withdrawn will continue to generate rewards in `underlyingAsset` and,
+     * if applicable, additional jPoints as long as staked.
+     * @return The expiration date for the staking lockup period, in Unix timestamp format.
+     */
+    uint256 public override lockupExpirationDate;
+
+    // --- Modifiers ---
+
+    /**
+     * @notice Modifier to check if the provided amount is valid.
+     * @param _amount to be checked for validity.
+     */
+    modifier validAmount(uint256 _amount) {
+        if (_amount == 0) revert InvalidAmount();
+        _;
+    }
+
+    /**
+     * @notice Modifier to check if the provided address is valid.
+     * @param _address to be checked for validity.
+     */
+    modifier validAddress(address _address) {
+        if (_address == address(0)) revert InvalidAddress();
+        _;
+    }
+
+    // --- Constructor ---
+
+    /**
+     * @notice Constructor function for initializing the StakerManager contract.
+     *
+     * @param _initialOwner Address of the initial owner.
+     * @param _holdingManager Address of the holding manager contract.
+     * @param _underlyingAsset Address of the underlying asset used for staking.
+     * @param _rewardToken Address of the reward token.
+     * @param _ionPool Address of the IonPool Contract.
+     * @param _rewardsDuration Duration of the rewards period.
+     */
+    constructor(
+        address _initialOwner,
+        address _holdingManager,
+        address _underlyingAsset,
+        address _rewardToken,
+        address _ionPool,
+        uint256 _rewardsDuration
+    )
+        Ownable(_initialOwner)
+        validAddress(_holdingManager)
+        validAddress(_underlyingAsset)
+        validAddress(_rewardToken)
+        validAddress(_ionPool)
+        validAmount(_rewardsDuration)
+    {
+        holdingManager = IHoldingManager(_holdingManager);
+        underlyingAsset = _underlyingAsset;
+        rewardToken = _rewardToken;
+        ionPool = _ionPool;
+        staker = address(
+            new Staker({
+                _initialOwner: _initialOwner,
+                _tokenIn: _underlyingAsset,
+                _rewardToken: _rewardToken,
+                _stakingManager: address(this),
+                _rewardsDuration: _rewardsDuration
+            })
+        );
+        lockupExpirationDate = block.timestamp + _rewardsDuration;
+    }
+
+    /**
+     * @notice Stakes a specified amount of assets for the msg.sender.
+     * @dev Initiates the staking operation by transferring the specified `_amount` from the user's wallet to the
+     * contract, while simultaneously recording this deposit within the Jigsaw `Staker` Contract.
+     *
+     * @notice Requirements:
+     * - The caller must have sufficient assets to stake.
+     * - The Ion `Pool` Contract's supply cap should not exceed its limit after the user's stake operation.
+     * - Prior approval is required for this contract to transfer assets on behalf of the user.
+     *
+     * @notice Effects:
+     * - If the user does not have an existing holding, a new holding is created for the user.
+     * - Supplies the specified amount of underlying asset to the Ion's `Pool` Contract to earn interest.
+     * - Tracks the deposit in the `Staker` Contract to earn jPoints for staking.
+     *
+     * @notice Emits:
+     * - `Staked` event indicating the staking action.
+     *
+     * @param _amount of assets to stake.
+     */
+    function stake(uint256 _amount) external override nonReentrant whenNotPaused validAmount(_amount) {
+        // Create a holding for msg.sender if there is no holding associated with their address yet.
+        address holding = holdingManager.getUserHolding(msg.sender);
+        if (holding == address(0)) holding = holdingManager.createHolding(msg.sender);
+
+        // Emit an event indicating the staking action.
+        emit Staked(msg.sender, _amount);
+
+        // Transfer assets from the user's wallet to this contract.
+        IERC20(underlyingAsset).safeTransferFrom({ from: msg.sender, to: address(this), value: _amount });
+        // Approve Ion Pool contract to spend the transferred assets.
+        IERC20(underlyingAsset).safeIncreaseAllowance({ spender: ionPool, value: _amount });
+
+        // Supply to the Ion Pool to earn interest on underlying asset.
+        IIonPool(ionPool).supply({ user: holding, amount: _amount, proof: new bytes32[](0) });
+        // Track deposit in Staker to earn jPoints for staking.
+        IStaker(staker).deposit({ _user: holding, _amount: _amount });
+    }
+
+    /**
+     * @notice Performs unstake operation.
+     * @dev Initiates the withdrawal of staked assets by transferring all the deposited assets plus generated yield from
+     * the Ion's `Pool` Contract and earned jPoint rewards from `Staker` Contract to the designated recipient `_to`.
+     *
+     * @notice Requirements:
+     * - The `lockupExpirationDate` should have already expired.
+     * - The caller must possess sufficient staked assets to fulfill the withdrawal.
+     * - The `_to` address must be a valid Ethereum address.
+     *
+     * @notice Effects:
+     * - Unstakes deposited and accrued underlying assets from Ion's `Pool` Contract.
+     * - Withdraws jPoint rewards from `Staker` Contract.
+     * - Withdraws Ion rewards from `Holding` through `HoldingManager` Contract.
+     *
+     *
+     * @notice Emits:
+     * - `Unstaked` event indicating the unstaking action.
+     *
+     * @param _to address to receive the unstaked assets.
+     */
+    function unstake(address _to) external override nonReentrant whenNotPaused validAddress(_to) {
+        // Check if the lockup expiration date has passed.
+        if (lockupExpirationDate > block.timestamp) revert PreLockupPeriodUnstaking();
+        // Get the holding address of the caller.
+        address holding = holdingManager.getUserHolding(msg.sender);
+
+        // If the caller has no balance in the Ion Pool, revert with `NothingToWithdrawFromIon` error.
+        uint256 ionPoolBalance = IIonPool(ionPool).balanceOf(holding);
+        if (ionPoolBalance == 0) revert NothingToWithdrawFromIon(msg.sender);
+
+        // Emit an event indicating the unstaking action.
+        emit Unstaked(msg.sender, IStaker(staker).balanceOf(holding));
+
+        // Unstake assets and withdraw rewards and transfer them to the specified address.
+        holdingManager.unstake({ _holding: holding, _pool: ionPool, _to: _to, _amount: ionPoolBalance });
+        IStaker(staker).exit({ _user: holding, _to: _to });
+    }
+
+    // --- Administration ---
+
+    /**
+     * @notice Triggers stopped state.
+     */
+    function pause() external override onlyOwner whenNotPaused {
+        _pause();
+    }
+
+    /**
+     * @notice Returns to normal state.
+     */
+    function unpause() external override onlyOwner whenPaused {
+        _unpause();
+    }
+
+    /**
+     * @notice Renounce ownership override to prevent accidental loss of contract ownership.
+     * @dev This function ensures that the contract's ownership cannot be lost unintentionally.
+     */
+    function renounceOwnership() public pure override(IStakingManager, Ownable) {
+        revert RenouncingOwnershipProhibited();
+    }
+
+    /**
+     * @notice Allows the default admin role to set a new lockup expiration date.
+     *
+     * @notice Requirements:
+     * - Caller must be `Owner`.
+     * - `_newDate` should be different from `lockupExpirationDate`.
+     *
+     * @notice Effects:
+     * - Sets `lockupExpirationDate` to `_newDate`.
+     *
+     *  @notice Emits:
+     * - `LockupExpirationDateUpdated` event indicating that lockup expiration date has been updated.
+     *
+     * @param _newDate The new lockup expiration date to be set.
+     */
+    function setLockupExpirationDate(uint256 _newDate) external onlyOwner {
+        // Sanity check that the `_newDate` is different from `lockupExpirationDate`.
+        if (lockupExpirationDate == _newDate) revert SameValue();
+        // Emit event indicating that the lockup expiration date has been updated.
+        emit LockupExpirationDateUpdated(lockupExpirationDate, _newDate);
+        // Update the state variable.
+        lockupExpirationDate = _newDate;
+    }
+
+    // --- Getters ---
+
+    /**
+     * @notice Get the address of the holding associated with the user.
+     * @param _user The address of the user.
+     * @return the holding address.
+     */
+    function getUserHolding(address _user) external view override returns (address) {
+        return holdingManager.getUserHolding(_user);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable2Step.sol)
+
+pragma solidity ^0.8.20;
+
+import {Ownable} from "./Ownable.sol";
+
+/**
+ * @dev Contract module which provides access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is specified at deployment time in the constructor for `Ownable`. This
+ * can later be changed with {transferOwnership} and {acceptOwnership}.
+ *
+ * This module is used through inheritance. It will make available all functions
+ * from parent (Ownable).
+ */
+abstract contract Ownable2Step is Ownable {
+    address private _pendingOwner;
+
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Returns the address of the pending owner.
+     */
+    function pendingOwner() public view virtual returns (address) {
+        return _pendingOwner;
+    }
+
+    /**
+     * @dev Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one.
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        _pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner(), newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual override {
+        delete _pendingOwner;
+        super._transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev The new owner accepts the ownership transfer.
+     */
+    function acceptOwnership() public virtual {
+        address sender = _msgSender();
+        if (pendingOwner() != sender) {
+            revert OwnableUnauthorizedAccount(sender);
+        }
+        _transferOwnership(sender);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Pausable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    bool private _paused;
+
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    /**
+     * @dev The operation failed because the contract is paused.
+     */
+    error EnforcedPause();
+
+    /**
+     * @dev The operation failed because the contract is not paused.
+     */
+    error ExpectedPause();
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        if (paused()) {
+            revert EnforcedPause();
+        }
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        if (!paused()) {
+            revert ExpectedPause();
+        }
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC20} from "../IERC20.sol";
+import {IERC20Permit} from "../extensions/IERC20Permit.sol";
+import {Address} from "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev An operation with an ERC20 token failed.
+     */
+    error SafeERC20FailedOperation(address token);
+
+    /**
+     * @dev Indicates a failed `decreaseAllowance` request.
+     */
+    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        forceApprove(token, spender, oldAllowance + value);
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no
+     * value, non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {
+        unchecked {
+            uint256 currentAllowance = token.allowance(address(this), spender);
+            if (currentAllowance < requestedDecrease) {
+                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);
+            }
+            forceApprove(token, spender, currentAllowance - requestedDecrease);
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data);
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20FailedOperation(address(token));
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return success && (returndata.length == 0 || abi.decode(returndata, (bool))) && address(token).code.length > 0;
+    }
+}
+
+
+// File: src/Staker.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import { IStaker } from "./interfaces/IStaker.sol";
+
+/**
+ * @title Staker
+ * @notice Staker is a contract responsible for distributing rewards in the form of jPoints to early users
+ * of the Jigsaw protocol.
+ * @notice This contract accepts wstETH tokens as `tokenIn` and distributes rewards in jPoints accordingly.
+ * @notice It is not intended for direct use; interaction should be done through the `stakingManager` contract.
+ *
+ * @dev This contract inherits functionalities from `Ownable2Step`, `Pausable`, and `ReentrancyGuard`.
+ *
+ * @author Hovooo (@hovooo)
+ */
+contract Staker is IStaker, Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /**
+     * @notice Address of the staking token.
+     */
+    address public immutable override tokenIn;
+
+    /**
+     * @notice Address of the reward token.
+     */
+    address public immutable override rewardToken;
+
+    /**
+     * @notice Address of the staking manager.
+     */
+    address public immutable override stakingManager;
+
+    /**
+     * @notice Timestamp indicating when the current reward distribution ends.
+     */
+    uint256 public override periodFinish = 0;
+
+    /**
+     * @notice Rate of rewards per second.
+     */
+    uint256 public override rewardRate = 0;
+
+    /**
+     * @notice Duration of current reward period.
+     */
+    uint256 public override rewardsDuration;
+
+    /**
+     * @notice Timestamp of the last update time.
+     */
+    uint256 public override lastUpdateTime;
+
+    /**
+     * @notice Stored rewards per token.
+     */
+    uint256 public override rewardPerTokenStored;
+
+    /**
+     * @notice Mapping of user addresses to the amount of rewards already paid to them.
+     */
+    mapping(address => uint256) public override userRewardPerTokenPaid;
+
+    /**
+     * @notice Mapping of user addresses to their accrued rewards.
+     */
+    mapping(address => uint256) public override rewards;
+
+    /**
+     * @notice Total supply limit of the staking token.
+     */
+    uint256 public constant totalSupplyLimit = 1e34;
+
+    uint256 private _totalSupply;
+    mapping(address => uint256) private _balances;
+
+    // --- Modifiers ---
+
+    /**
+     * @notice Modifier to update the reward for a specified account.
+     * @param account The account for which the reward needs to be updated.
+     */
+    modifier updateReward(address account) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = lastTimeRewardApplicable();
+        if (account != address(0)) {
+            rewards[account] = earned(account);
+            userRewardPerTokenPaid[account] = rewardPerTokenStored;
+        }
+        _;
+    }
+
+    /**
+     * @notice Modifier to check if the provided address is valid.
+     * @param _address to be checked for validity.
+     */
+    modifier validAddress(address _address) {
+        if (_address == address(0)) revert InvalidAddress();
+        _;
+    }
+
+    /**
+     * @notice Modifier to check if the provided amount is valid.
+     * @param _amount to be checked for validity.
+     */
+    modifier validAmount(uint256 _amount) {
+        if (_amount == 0) revert InvalidAmount();
+        _;
+    }
+
+    /**
+     * @notice Modifier to restrict a function to be called only by the staking manager.
+     * @notice Reverts the transaction if the caller is not the staking manager.
+     */
+    modifier onlyStakingManager() {
+        if (msg.sender != stakingManager) revert UnauthorizedCaller();
+        _;
+    }
+
+    // --- Constructor ---
+
+    /**
+     * @notice Constructor function for initializing the Staker contract.
+     *
+     * @param _initialOwner The initial owner of the contract
+     * @param _tokenIn The address of the token to be staked
+     * @param _rewardToken The address of the reward token
+     * @param _stakingManager The address of the staking manager contract
+     * @param _rewardsDuration The duration of the rewards period, in seconds
+     */
+    constructor(
+        address _initialOwner,
+        address _tokenIn,
+        address _rewardToken,
+        address _stakingManager,
+        uint256 _rewardsDuration
+    )
+        Ownable(_initialOwner)
+        validAddress(_tokenIn)
+        validAddress(_rewardToken)
+        validAddress(_stakingManager)
+        validAmount(_rewardsDuration)
+    {
+        tokenIn = _tokenIn;
+        rewardToken = _rewardToken;
+        stakingManager = _stakingManager;
+        rewardsDuration = _rewardsDuration;
+        periodFinish = block.timestamp + rewardsDuration;
+    }
+
+    // -- Staker's operations  --
+
+    /**
+     * @notice Performs a deposit operation for `_user`.
+     * @dev Updates participants' rewards.
+     *
+     * @param _user to deposit for.
+     * @param _amount to deposit.
+     */
+    function deposit(
+        address _user,
+        uint256 _amount
+    )
+        external
+        override
+        onlyStakingManager
+        whenNotPaused
+        nonReentrant
+        updateReward(_user)
+        validAmount(_amount)
+    {
+        uint256 rewardBalance = IERC20(rewardToken).balanceOf(address(this));
+        if (rewardBalance == 0) revert NoRewardsToDistribute();
+
+        // Ensure that deposit operation will never surpass supply limit
+        if (_totalSupply + _amount > totalSupplyLimit) revert DepositSurpassesSupplyLimit(_amount, totalSupplyLimit);
+        _totalSupply += _amount;
+
+        _balances[_user] += _amount;
+        emit Staked(_user, _amount);
+    }
+
+    /**
+     * @notice Withdraws specified `_amount` and claims rewards for the `_user`.
+     * @dev This function enables the caller to exit the investment and claim their rewards.
+     *
+     *  @param _user to withdraw and claim for.
+     *  @param _to address to which funds will be sent.
+     */
+    function exit(address _user, address _to) external override onlyStakingManager {
+        withdraw(_user, _balances[_user]);
+
+        if (rewards[_user] > 0) {
+            claimRewards(_user, _to);
+        }
+    }
+
+    /**
+     * @notice Withdraws investment from staking.
+     * @dev Updates participants' rewards.
+     *
+     * @param _user to withdraw for.
+     * @param _amount to withdraw.
+     */
+    function withdraw(
+        address _user,
+        uint256 _amount
+    )
+        internal
+        whenNotPaused
+        nonReentrant
+        updateReward(_user)
+        validAmount(_amount)
+    {
+        _totalSupply -= _amount;
+        _balances[_user] = _balances[_user] - _amount;
+        emit Withdrawn(_user, _amount);
+    }
+
+    /**
+     * @notice Claims the rewards for the caller.
+     * @dev This function allows the caller to claim their earned rewards.
+     *
+     *  @param _user to claim rewards for.
+     *  @param _to address to which rewards will be sent.
+     */
+    function claimRewards(address _user, address _to) internal nonReentrant updateReward(_user) {
+        uint256 reward = rewards[_user];
+        if (reward == 0) revert NothingToClaim();
+
+        rewards[_user] = 0;
+        emit RewardPaid(_user, reward);
+        IERC20(rewardToken).safeTransfer(_to, reward);
+    }
+
+    // -- Administration --
+
+    /**
+     * @notice Sets the duration of each reward period.
+     * @param _rewardsDuration The new rewards duration.
+     */
+    function setRewardsDuration(uint256 _rewardsDuration) external override onlyOwner {
+        if (block.timestamp <= periodFinish) revert PreviousPeriodNotFinished(block.timestamp, periodFinish);
+        emit RewardsDurationUpdated(rewardsDuration, _rewardsDuration);
+        rewardsDuration = _rewardsDuration;
+    }
+
+    /**
+     * @notice Adds more rewards to the contract.
+     *
+     * @dev Prior approval is required for this contract to transfer rewards from `_from` address.
+     *
+     * @param _from address to transfer rewards from.
+     * @param _amount The amount of new rewards.
+     */
+    function addRewards(
+        address _from,
+        uint256 _amount
+    )
+        external
+        override
+        onlyOwner
+        validAmount(_amount)
+        updateReward(address(0))
+    {
+        // Transfer assets from the user's wallet to this contract.
+        IERC20(rewardToken).safeTransferFrom({ from: _from, to: address(this), value: _amount });
+
+        uint256 duration = rewardsDuration;
+        if (duration == 0) revert ZeroRewardsDuration();
+        if (block.timestamp >= periodFinish) {
+            rewardRate = _amount / duration;
+        } else {
+            uint256 remaining = periodFinish - block.timestamp;
+            uint256 leftover = remaining * rewardRate;
+            rewardRate = (_amount + leftover) / duration;
+        }
+
+        if (rewardRate == 0) revert RewardAmountTooSmall();
+
+        uint256 balance = IERC20(rewardToken).balanceOf(address(this));
+        if (rewardRate > (balance / duration)) revert RewardRateTooBig();
+
+        lastUpdateTime = block.timestamp;
+        periodFinish = block.timestamp + duration;
+        emit RewardAdded(_amount);
+    }
+
+    /**
+     * @notice Triggers stopped state.
+     */
+    function pause() external override onlyOwner whenNotPaused {
+        _pause();
+    }
+
+    /**
+     * @notice Returns to normal state.
+     */
+    function unpause() external override onlyOwner whenPaused {
+        _unpause();
+    }
+
+    /**
+     * @notice Renounce ownership override to prevent accidental loss of contract ownership.
+     * @dev This function ensures that the contract's ownership cannot be lost unintentionally.
+     */
+    function renounceOwnership() public pure override {
+        revert RenouncingOwnershipProhibited();
+    }
+
+    // -- Getters --
+
+    /**
+     * @notice Returns the total supply of the staking token.
+     */
+    function totalSupply() external view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @notice Returns the total invested amount for an account.
+     * @param _account The participant's address.
+     */
+    function balanceOf(address _account) external view override returns (uint256) {
+        return _balances[_account];
+    }
+
+    /**
+     * @notice Returns the last time rewards were applicable.
+     */
+    function lastTimeRewardApplicable() public view override returns (uint256) {
+        return block.timestamp < periodFinish ? block.timestamp : periodFinish;
+    }
+
+    /**
+     * @notice Returns rewards per token.
+     */
+    function rewardPerToken() public view override returns (uint256) {
+        if (_totalSupply == 0) {
+            return rewardPerTokenStored;
+        }
+
+        return
+            rewardPerTokenStored + (((lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * 1e18) / _totalSupply);
+    }
+
+    /**
+     * @notice Returns accrued rewards for an account.
+     * @param _account The participant's address.
+     */
+    function earned(address _account) public view override returns (uint256) {
+        return
+            ((_balances[_account] * (rewardPerToken() - userRewardPerTokenPaid[_account])) / 1e18) + rewards[_account];
+    }
+
+    /**
+     * @notice Returns the reward amount for a specific time range.
+     */
+    function getRewardForDuration() external view override returns (uint256) {
+        return rewardRate * rewardsDuration;
+    }
+}
+
+
+// File: src/interfaces/IHoldingManager.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title IHoldingManager interface
+ * @dev Interface for the HoldingManager contract.
+ */
+interface IHoldingManager {
+    // --- Errors ---
+
+    /**
+     * @notice The operation failed because provided address is invalid.
+     */
+    error InvalidAddress();
+
+    /**
+     * @notice The operation failed because the same address was provided for an update.
+     */
+    error SameAddress();
+
+    /**
+     * @notice The operation failed because renouncing default admin role is prohibited.
+     */
+    error RenouncingDefaultAdminRoleProhibited();
+
+    /**
+     * @notice The operation failed because user attempts an action that requires a holding contract associated with
+     * their
+     * address, but no holding contract is found.
+     * @param user The address of the user who hasn't holding contract.
+     */
+    error MissingHoldingContractForUser(address user);
+
+    /**
+     * @notice The operation failed because the generic caller attempts to invoke a contract via a holding contract,
+     * but the allowance for the invocation is not permitted.
+     * @param caller The address of the generic caller attempting the invocation.
+     */
+    error InvocationNotAllowed(address caller);
+
+    /**
+     * @notice The operation failed because the generic call failed.
+     * @param data returned by the failed call.
+     */
+    error InvocationFailed(bytes data);
+
+    // --- Events ---
+    /**
+     * @notice Emitted when a holding is created for a participant.
+     * @param user address for whom the holding was created.
+     * @param holdingAddress address of the newly created holding.
+     */
+    event HoldingCreated(address indexed user, address indexed holdingAddress);
+
+    /**
+     * @notice emitted when the holding implementation reference is updated.
+     *
+     * @param oldReference address of the previous implementation reference.
+     * @param newReference address of the new implementation reference.
+     */
+    event HoldingImplementationReferenceUpdated(address indexed oldReference, address indexed newReference);
+
+    /**
+     * @notice emitted when the allowance for invoking contracts via a holding contract is set.
+     *
+     * @param holding The address of the holding contract.
+     * @param genericCaller The address of the generic caller.
+     * @param callableContract The address of the contract that can be invoked.
+     * @param oldAllowance of invocations allowed for the specified contract by the generic caller
+     * via the holding contract.
+     * @param newAllowance of invocations allowed for the specified contract by the generic caller
+     * via the holding contract.
+     */
+    event InvocationAllowanceSet(
+        address indexed holding,
+        address indexed genericCaller,
+        address indexed callableContract,
+        uint256 oldAllowance,
+        uint256 newAllowance
+    );
+
+    /**
+     * Declaration of the Staking Manager role - privileged actor, allowed to call unstake function on Holdings.
+     */
+    function STAKING_MANAGER_ROLE() external view returns (bytes32);
+
+    /**
+     * Declaration of the Generic Caller role - privileged actor, allowed to perform low level calls on Holdings.
+     */
+    function GENERIC_CALLER_ROLE() external view returns (bytes32);
+
+    /**
+     * @notice Returns the address of the holding implementation reference.
+     */
+    function holdingImplementationReference() external view returns (address);
+
+    /**
+     * @notice Sets the allowance for a generic caller to invoke specified contracts on behalf of the user
+     * through their holding contract.
+     *
+     * @notice Requirements:
+     * - `_genericCaller` must be a valid address.
+     * - `_callableContract` must be a valid address.
+     * - The caller must have a holding contract associated with their address.
+     * - The `_genericCaller` must have the `GENERIC_CALLER_ROLE`.
+     *
+     * @notice Effects:
+     * - Updates `_invocationsAllowance` mapping.
+     *
+     * @notice Emits:
+     * - Emits an `InvocationAllowanceSet` event upon successful execution.
+     *
+     * @param _genericCaller The address of the generic caller.
+     * @param _callableContract The address of the contract to be invoked.
+     * @param _invocationsAllowance The number of invocations allowed for the specified contract by the generic caller
+     * via the holding contract.
+     */
+    function setInvocationAllowance(
+        address _genericCaller,
+        address _callableContract,
+        uint256 _invocationsAllowance
+    )
+        external;
+
+    /**
+     * @notice Creates a new holding instance for the specified `user`.
+     * @dev Clones a new holding contract instance using the reference implementation and associates it with the
+     * `user`'s address and initializes the holding contract.
+     * @dev Emits an event to signify the creation of the holding contract.
+     *
+     * @param _user The address of the user.
+     *
+     * @return holding The address of the newly created holding contract.
+     */
+    function createHolding(address _user) external returns (address holding);
+
+    /**
+     * @notice Unstake funds from a the specified Ion Protocol's `_pool` contract for `_holding`.
+     *
+     * @param _holding address to unstake for.
+     * @param _pool address of Ion's pool.
+     * @param _to The address where unstaked tokens will be sent.
+     * @param _amount The amount of tokens to unstake.
+     */
+    function unstake(address _holding, address _pool, address _to, uint256 _amount) external;
+
+    /**
+     * @notice Allows a generic caller to invoke a function on a contract via a holding contract.
+     * This function performs a generic call on the specified contract address using the provided call data.
+     *
+     * @notice Requirements:
+     * - `_holding` must be a valid address representing the holding contract.
+     * - `_contract` must be a valid address representing the target contract.
+     * - The caller must have the `GENERIC_CALLER_ROLE`.
+     * - The allowance for the caller on the specified `_contract` via `_holding` must be greater than 0.
+     *
+     *  @notice Effects:
+     * - calls `genericCall` on the specified contract address using the provided call data.
+     *
+     * @param _holding The address of the holding contract where the call is invoked.
+     * @param _contract The external contract being called by the holding contract.
+     * @param _value The amount of Ether to transfer in the call.
+     * @param _call The call data.
+     *
+     * @return success Indicates whether the call was successful or not.
+     * @return result Data obtained from the external call.
+     */
+    function invokeHolding(
+        address _holding,
+        address _contract,
+        uint256 _value,
+        bytes calldata _call
+    )
+        external
+        returns (bool success, bytes memory result);
+
+    /**
+     * @notice Allows the Default Admin to set a new address for `holdingImplementationReference` to be cloned from.
+     *
+     * @notice Requirements:
+     * - Caller must have the `DEFAULT_ADMIN_ROLE`.
+     * - `_newReference` should be valid address.
+     *
+     * @notice Emits:
+     * - `HoldingImplementationReferenceUpdated` event indicating that holding implementation reference
+     * has been updated.
+     *
+     * @param _newReference The address of the new implementation reference.
+     */
+    function setHoldingImplementationReference(address _newReference) external;
+
+    /**
+     * @notice Prevents the renouncement of the `DEFAULT_ADMIN_ROLE` by overriding `beginDefaultAdminTransfer` function
+     * of the `AccessControlDefaultAdminRules` extension of the AccessControl.
+     * @param newAdmin address of the new admin.
+     */
+    function beginDefaultAdminTransfer(address newAdmin) external;
+
+    /**
+     * @notice Get the address of the holding associated with the user.
+     * @param _user The address of the user.
+     * @return the holding address.
+     */
+    function getUserHolding(address _user) external view returns (address);
+
+    /**
+     * @notice Get the allowance for a generic caller to invoke contracts via a holding contract.
+     *
+     * @param _user The address of the user.
+     * @param _genericCaller The address of the generic caller.
+     * @param _callableContract The address of the contract to be invoked.
+     * @return The number of invocations allowed for the specified contract by the generic caller
+     * via the holding contract.
+     */
+    function getInvocationAllowance(
+        address _user,
+        address _genericCaller,
+        address _callableContract
+    )
+        external
+        view
+        returns (uint256);
+}
+
+
+// File: src/interfaces/IIonPool.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IIonPool {
+    /**
+     * @dev Allows lenders to redeem their interest-bearing position for the
+     * underlying asset. It is possible that dust amounts more of the position
+     * are burned than the underlying received due to rounding.
+     * @param receiverOfUnderlying the address to which the redeemed underlying
+     * asset should be sent to.
+     * @param amount of underlying to redeem.
+     */
+    function withdraw(address receiverOfUnderlying, uint256 amount) external;
+
+    /**
+     * @dev Allows lenders to deposit their underlying asset into the pool and
+     * earn interest on it.
+     * @param user the address to receive credit for the position.
+     * @param amount of underlying asset to use to create the position.
+     * @param proof merkle proof that the user is whitelisted.
+     */
+    function supply(address user, uint256 amount, bytes32[] calldata proof) external;
+
+    /**
+     * @dev Current token balance
+     * @param user to get balance of
+     */
+    function balanceOf(address user) external view returns (uint256);
+}
+
+
+// File: src/interfaces/IStakingManager.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import { IHoldingManager } from "./IHoldingManager.sol";
+
+/**
+ * @title IStakingManager interface
+ * @notice Interface for the Staking Manager contract of the Jigsaw Protocol
+ *
+ */
+interface IStakingManager {
+    // --- Errors ---
+    /**
+     * @notice The operation failed because renouncing ownership is prohibited.
+     */
+    error RenouncingOwnershipProhibited();
+
+    /**
+     * @notice The operation failed because amount is invalid.
+     */
+    error InvalidAmount();
+
+    /**
+     * @notice The operation failed because the same value was provided for an update.
+     */
+    error SameValue();
+
+    /**
+     * @notice The operation failed because provided address is invalid.
+     */
+    error InvalidAddress();
+
+    /**
+     * @notice The operation failed because unstaking is not possible before lockup period ends.
+     */
+    error PreLockupPeriodUnstaking();
+
+    /**
+     * @notice The operation failed because caller's holding balance in the Ion Pool is zero.
+     * @param caller address whose holding balance is zero.
+     */
+    error NothingToWithdrawFromIon(address caller);
+
+    // --- Events ---
+    /**
+     * @notice Emitted when a participant stakes tokens.
+     * @param user address of the participant who staked.
+     * @param amount of the staked tokens.
+     */
+    event Staked(address indexed user, uint256 indexed amount);
+
+    /**
+     * @notice Emitted when a participant unstakes tokens.
+     * @param user address of the participant who unstaked.
+     * @param amount of the unstaked tokens.
+     */
+    event Unstaked(address indexed user, uint256 indexed amount);
+
+    /**
+     * @notice emitted when the expiration date of a lockup is updated.
+     * @param oldDate The previous expiration date of the lockup.
+     * @param newDate The new expiration date of the lockup.
+     */
+    event LockupExpirationDateUpdated(uint256 indexed oldDate, uint256 indexed newDate);
+
+    /**
+     * @notice Address of the Holding Manager contract.
+     * @dev The Holding Manager is responsible for creating and managing user Holdings.
+     */
+    function holdingManager() external view returns (IHoldingManager);
+
+    /**
+     * @notice Address of the underlying asset used for staking.
+     */
+    function underlyingAsset() external view returns (address);
+
+    /**
+     * @notice Address of the reward token distributed for staking.
+     */
+    function rewardToken() external view returns (address);
+
+    /**
+     * @notice Address of the Ion Pool contract.
+     */
+    function ionPool() external view returns (address);
+
+    /**
+     * @notice Address of the Staker contract used for jPoints distribution.
+     */
+    function staker() external view returns (address);
+
+    /**
+     * @notice Represents the expiration date for the staking lockup period.
+     * After this date, staked funds can be withdrawn.
+     * @notice If not withdrawn will continue to generate rewards in `underlyingAsset` and,
+     * if applicable, additional jPoints as long as staked.
+     *
+     * @return The expiration date for the staking lockup period, in Unix timestamp format.
+     */
+    function lockupExpirationDate() external view returns (uint256);
+
+    /**
+     * @notice Stakes a specified amount of assets for the msg.sender.
+     * @dev Initiates the staking operation by transferring the specified `_amount` from the user's wallet to the
+     * contract, while simultaneously recording this deposit within the Jigsaw `Staker` Contract.
+     *
+     * @notice Requirements:
+     * - The caller must have sufficient assets to stake.
+     * - The Ion `Pool` Contract's supply cap should not exceed its limit after the user's stake operation.
+     * - Prior approval is required for this contract to transfer assets on behalf of the user.
+     *
+     * @notice Effects:
+     * - If the user does not have an existing holding, a new holding is created for the user.
+     * - Supplies the specified amount of underlying asset to the Ion's `Pool` Contract to earn interest.
+     * - Tracks the deposit in the `Staker` Contract to earn jPoints for staking.
+     *
+     * @notice Emits:
+     * - `Staked` event indicating the staking action.
+     *
+     * @param _amount of assets to stake.
+     */
+    function stake(uint256 _amount) external;
+
+    /**
+     * @notice Performs unstake operation.
+     * @dev Initiates the withdrawal of staked assets by transferring all the deposited assets plus generated yield from
+     * the Ion's `Pool` Contract and earned jPoint rewards from `Staker` Contract to the designated recipient `_to`.
+     *
+     * @notice Requirements:
+     * - The `lockupExpirationDate` should have already expired.
+     * - The caller must possess sufficient staked assets to fulfill the withdrawal.
+     * - The `_to` address must be a valid Ethereum address.
+     *
+     * @notice Effects:
+     * - Unstakes deposited and accrued underlying assets from Ion's `Pool` Contract.
+     * - Withdraws jPoint rewards from `Staker` Contract.
+     * - Withdraws Ion rewards from `Holding` through `HoldingManager` Contract.
+     *
+     *
+     * @notice Emits:
+     * - `Unstaked` event indicating the unstaking action.
+     *
+     * @param _to address to receive the unstaked assets.
+     */
+    function unstake(address _to) external;
+
+    /**
+     * @notice Triggers stopped state.
+     */
+    function pause() external;
+
+    /**
+     * @notice Returns to normal state.
+     */
+    function unpause() external;
+
+    /**
+     * @notice Renounce ownership override to prevent accidental loss of contract ownership.
+     * @dev This function ensures that the contract's ownership cannot be lost unintentionally.
+     */
+    function renounceOwnership() external pure;
+
+    /**
+     * @notice Allows the default admin role to set a new lockup expiration date.
+     *
+     * @notice Requirements:
+     * - Caller must be `Owner`.
+     * - `_newDate` should be different from `lockupExpirationDate`.
+     *
+     * @notice Effects:
+     * - Sets `lockupExpirationDate` to `_newDate`.
+     *
+     *  @notice Emits:
+     * - `LockupExpirationDateUpdated` event indicating that lockup expiration date has been updated.
+     *
+     * @param _newDate The new lockup expiration date to be set.
+     */
+    function setLockupExpirationDate(uint256 _newDate) external;
+
+    /**
+     * @notice Get the address of the holding associated with the user.
+     * @param _user The address of the user.
+     * @return the holding address.
+     */
+    function getUserHolding(address _user) external view returns (address);
+}
+
+
+// File: src/interfaces/IStaker.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title Interface for Staker contract
+interface IStaker {
+    // --- Errors ---
+    /**
+     * @notice The operation failed because provided address is invalid.
+     */
+    error InvalidAddress();
+
+    /**
+     * @notice The operation failed because provided amount is invalid.
+     */
+    error InvalidAmount();
+
+    /**
+     * @notice The operation failed because caller was unauthorized for the action.
+     */
+    error UnauthorizedCaller();
+
+    /**
+     * @notice The operation failed because the previous rewards period must end first.
+     * @param timestamp The current timestamp when the error occurred.
+     * @param periodFinish The timestamp when the current rewards period is expected to end.
+     */
+    error PreviousPeriodNotFinished(uint256 timestamp, uint256 periodFinish);
+
+    /**
+     * @notice The operation failed because rewards duration is zero.
+     */
+    error ZeroRewardsDuration();
+
+    /**
+     * @notice The operation failed because reward rate was zero.
+     * Caused by an insufficient amount of rewards provided.
+     */
+    error RewardAmountTooSmall();
+
+    /**
+     * @notice The operation failed because reward rate is too big.
+     */
+    error RewardRateTooBig();
+
+    /**
+     * @notice The operation failed because there were no rewards to distribute.
+     */
+    error NoRewardsToDistribute();
+
+    /**
+     * @notice The operation failed because deposit surpasses the supply limit.
+     * @param _amount of tokens attempting to be deposited.
+     * @param supplyLimit allowed for deposits.
+     */
+    error DepositSurpassesSupplyLimit(uint256 _amount, uint256 supplyLimit);
+
+    /**
+     * @notice The operation failed because user doesn't have rewards to claim.
+     */
+    error NothingToClaim();
+
+    /**
+     * @notice The operation failed because renouncing ownership is prohibited.
+     */
+    error RenouncingOwnershipProhibited();
+
+    // --- Events ---
+
+    /**
+     * @notice Event emitted when the rewards duration is updated.
+     * @param oldDuration The previous rewards duration.
+     * @param newDuration The new rewards duration.
+     */
+    event RewardsDurationUpdated(uint256 indexed oldDuration, uint256 indexed newDuration);
+
+    /**
+     * @notice Event emitted when new rewards are added.
+     * @param reward The amount of rewards added.
+     */
+    event RewardAdded(uint256 indexed reward);
+
+    /**
+     * @notice Event emitted when a participant deposits an amount.
+     * @param user The address of the participant who made the deposit.
+     * @param amount The amount that was deposited.
+     */
+    event Staked(address indexed user, uint256 indexed amount);
+
+    /**
+     * @notice Event emitted when a participant withdraws their stake.
+     * @param user The address of the participant who withdrew their stake.
+     * @param amount The amount that was withdrawn.
+     */
+    event Withdrawn(address indexed user, uint256 indexed amount);
+
+    /**
+     * @notice Event emitted when a participant claims their rewards.
+     * @param user The address of the participant who claimed the rewards.
+     * @param reward The amount of rewards that were claimed.
+     */
+    event RewardPaid(address indexed user, uint256 indexed reward);
+
+    /**
+     * @notice returns staking token address.
+     */
+    function tokenIn() external view returns (address);
+
+    /**
+     * @notice returns reward token address.
+     */
+    function rewardToken() external view returns (address);
+
+    /**
+     * @notice returns stakingManager address.
+     */
+    function stakingManager() external view returns (address);
+
+    /**
+     * @notice when current contract distribution ends (block timestamp + rewards duration).
+     */
+    function periodFinish() external view returns (uint256);
+
+    /**
+     * @notice rewards per second.
+     */
+    function rewardRate() external view returns (uint256);
+
+    /**
+     * @notice reward period.
+     */
+    function rewardsDuration() external view returns (uint256);
+
+    /**
+     * @notice last reward update timestamp.
+     */
+    function lastUpdateTime() external view returns (uint256);
+
+    /**
+     * @notice reward-token share.
+     */
+    function rewardPerTokenStored() external view returns (uint256);
+
+    /**
+     * @notice rewards paid to participants so far.
+     */
+    function userRewardPerTokenPaid(address participant) external view returns (uint256);
+
+    /**
+     * @notice accrued rewards per participant.
+     */
+    function rewards(address participant) external view returns (uint256);
+
+    /**
+     * @notice sets the new rewards duration.
+     */
+    function setRewardsDuration(uint256 _rewardsDuration) external;
+
+    /**
+     * @notice Adds more rewards to the contract.
+     *
+     * @dev Prior approval is required for this contract to transfer rewards from `_from` address.
+     *
+     * @param _from address to transfer rewards from.
+     * @param _amount The amount of new rewards.
+     */
+    function addRewards(address _from, uint256 _amount) external;
+
+    /**
+     * @notice Triggers stopped state.
+     */
+    function pause() external;
+
+    /**
+     * @notice Returns to normal state.
+     */
+    function unpause() external;
+
+    /**
+     * @notice returns the total tokenIn supply.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @notice returns total invested amount for an account.
+     * @param _account participant address
+     */
+    function balanceOf(address _account) external view returns (uint256);
+
+    /**
+     * @notice returns the last time rewards were applicable.
+     */
+    function lastTimeRewardApplicable() external view returns (uint256);
+
+    /**
+     * @notice returns rewards per tokenIn.
+     */
+    function rewardPerToken() external view returns (uint256);
+
+    /**
+     * @notice rewards accrued rewards for account.
+     *  @param _account participant's address
+     */
+    function earned(address _account) external view returns (uint256);
+
+    /**
+     * @notice returns reward amount for a specific time range.
+     */
+    function getRewardForDuration() external view returns (uint256);
+
+    /**
+     * @notice Performs a deposit operation for `_user`.
+     * @dev Updates participants' rewards.
+     *
+     * @param _user to deposit for.
+     * @param _amount to deposit.
+     */
+    function deposit(address _user, uint256 _amount) external;
+
+    /**
+     * @notice Withdraws specified `_amount` and claims rewards for the `_user`.
+     * @dev This function enables the caller to exit the investment and claim their rewards.
+     *
+     * @param _user to withdraw and claim for.
+     * @param _to address to which funds will be sent.
+     */
+    function exit(address _user, address _to) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error AddressInsufficientBalance(address account);
+
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedInnerCall();
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert AddressInsufficientBalance(address(this));
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert FailedInnerCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {FailedInnerCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert AddressInsufficientBalance(address(this));
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {FailedInnerCall}) in case of an
+     * unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {FailedInnerCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {FailedInnerCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert FailedInnerCall();
+        }
+    }
+}
+

@@ -1,0 +1,2716 @@
+
+// File: src/core/ExecutorPlugin.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {ReentrancyGuard} from "openzeppelin-contracts/security/ReentrancyGuard.sol";
+import {SignatureCheckerLib} from "solady/utils/SignatureCheckerLib.sol";
+import {EIP712} from "solady/utils/EIP712.sol";
+import {ISafeWallet} from "interfaces/external/ISafeWallet.sol";
+import {AddressProviderService} from "src/core/AddressProviderService.sol";
+import {TransactionValidator} from "src/core/TransactionValidator.sol";
+import {ExecutorRegistry} from "src/core/registries/ExecutorRegistry.sol";
+import {SafeHelper} from "src/libraries/SafeHelper.sol";
+import {TypeHashHelper} from "src/libraries/TypeHashHelper.sol";
+import {Types} from "interfaces/Types.sol";
+
+/**
+ * @title ExecutorPlugin
+ * @author Brahma.fi
+ * @notice Responsible for executing transactions on safes with module permissions
+ * @dev ExecutorPlugin needs to be enabled as a module on the safe
+ */
+contract ExecutorPlugin is AddressProviderService, ReentrancyGuard, EIP712 {
+    error InvalidExecutor();
+    error InvalidSignature();
+    error ModuleExecutionFailed();
+
+    /**
+     * @notice datatype for execution requests
+     * @param exec txn params
+     * @param account address of safe to execute txn on
+     * @param executor address that initiated execution request
+     * @param executorSignature executor's signature for execution
+     * @param validatorSignature validator's signature for execution
+     * @dev Signature formats:
+     *  executorSignature = executor's signatures (arbitrary bytes length)
+     *  validatorSignature = abi.encodePacked(policySignature, length, expiryEpoch)
+     *  where:
+     *      policySignature = validity signature signed by validator (arbitrary bytes length)
+     *      length = length of `policySignature` (4 bytes)
+     *      expiryEpoch = expiry timestamp (4 bytes)
+     */
+    struct ExecutionRequest {
+        Types.Executable exec;
+        address account;
+        address executor;
+        bytes executorSignature;
+        bytes validatorSignature;
+    }
+
+    /// @notice EIP712 domain name
+    string private constant _NAME = "ExecutorPlugin";
+    /// @notice EIP712 domain version
+    string private constant _VERSION = "1.0";
+
+    /// @notice mapping of account to nonce of executors
+    mapping(address account => mapping(address executor => uint256 nonce)) public executorNonce;
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice Enables executors to raise execution requests that will be executed via a module transaction
+     * @dev The Executors are expected to sign the EIP712 digest generated from following struct: TypeHashHelper.ExecutionParams
+     * @param execRequest params for execution request
+     * @return returnData of txn
+     */
+    function executeTransaction(ExecutionRequest calldata execRequest) external nonReentrant returns (bytes memory) {
+        address transactionValidator = AddressProviderService._getAuthorizedAddress(_TRANSACTION_VALIDATOR_HASH);
+        _validateExecutionRequest(execRequest, transactionValidator);
+
+        bytes memory txnResult = _executeTxnAsModule(execRequest.account, execRequest.exec);
+
+        TransactionValidator(transactionValidator).validatePostExecutorTransaction(msg.sender, execRequest.account);
+
+        return txnResult;
+    }
+
+    /**
+     * @notice internal helper to execute transaction on a safe as a module
+     * @dev executes txn as a module on `_account`
+     * @param _account address of safe to execute on
+     * @param _executable params of txn to execute
+     * @return returnData of txn
+     */
+    function _executeTxnAsModule(address _account, Types.Executable memory _executable)
+        internal
+        returns (bytes memory)
+    {
+        (bool success, bytes memory txnResult) = ISafeWallet(_account).execTransactionFromModuleReturnData(
+            _executable.target,
+            _executable.value,
+            _executable.data,
+            SafeHelper._parseOperationEnum(_executable.callType)
+        );
+        if (!success) revert ModuleExecutionFailed();
+        return txnResult;
+    }
+
+    /**
+     * @notice internal helper to validate the execution request
+     * @dev - validates executor's signature and checks if the executor is valid for given account.
+     *      - validates policy
+     * @param execRequest params for execution request
+     */
+    function _validateExecutionRequest(ExecutionRequest calldata execRequest, address transactionValidator) internal {
+        if (!ExecutorRegistry(executorRegistry).isExecutor(execRequest.account, execRequest.executor)) {
+            revert InvalidExecutor();
+        }
+
+        // Empty Signature check for EOA executor
+        if (execRequest.executor.code.length == 0 && execRequest.executorSignature.length == 0) {
+            // Executor is an EOA and no executor signature is provided
+            revert InvalidSignature();
+        }
+
+        // Build execution struct hash
+        bytes32 _executionStructHash = TypeHashHelper._buildExecutionParamsHash(
+            TypeHashHelper.ExecutionParams({
+                to: execRequest.exec.target,
+                value: execRequest.exec.value,
+                data: execRequest.exec.data,
+                operation: uint8(SafeHelper._parseOperationEnum(execRequest.exec.callType)),
+                account: execRequest.account,
+                executor: execRequest.executor,
+                nonce: executorNonce[execRequest.account][execRequest.executor]++,
+                safeTxGas: 0,
+                baseGas: 0,
+                gasPrice: 0,
+                gasToken: address(0),
+                refundReceiver: address(0)
+            })
+        );
+
+        // Build EIP712 digest for execution struct hash
+        bytes32 _transactionDigest = _hashTypedData(_executionStructHash);
+
+        // Validate executor signature
+        if (
+            !SignatureCheckerLib.isValidSignatureNow(
+                execRequest.executor, _transactionDigest, execRequest.executorSignature
+            )
+        ) {
+            revert InvalidExecutor();
+        }
+
+        // Validate policy signature
+        TransactionValidator(transactionValidator).validatePreExecutorTransaction(
+            msg.sender, execRequest.account, _executionStructHash, execRequest.validatorSignature
+        );
+    }
+
+    /**
+     * @notice Internal helper to get EIP712 domain name and version
+     * @return name domainName
+     * @return version domainVersion
+     */
+    function _domainNameAndVersion() internal pure override returns (string memory name, string memory version) {
+        return (_NAME, _VERSION);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: lib/solady/src/utils/SignatureCheckerLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Signature verification helper that supports both ECDSA signatures from EOAs
+/// and ERC1271 signatures from smart contract wallets like Argent and Gnosis safe.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/SignatureCheckerLib.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/SignatureChecker.sol)
+///
+/// @dev Note:
+/// - The signature checking functions use the ecrecover precompile (0x1).
+/// - The `bytes memory signature` variants use the identity precompile (0x4)
+///   to copy memory internally.
+/// - Unlike ECDSA signatures, contract signatures are revocable.
+///
+/// WARNING! Do NOT use signatures as unique identifiers.
+/// Please use EIP712 with a nonce included in the digest to prevent replay attacks.
+/// This implementation does NOT check if a signature is non-malleable.
+library SignatureCheckerLib {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*               SIGNATURE CHECKING OPERATIONS                */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns whether `signature` is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNow(address signer, bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                if eq(mload(signature), 65) {
+                    mstore(0x00, hash)
+                    mstore(0x20, byte(0, mload(add(signature, 0x60)))) // `v`.
+                    mstore(0x40, mload(add(signature, 0x20))) // `r`.
+                    mstore(0x60, mload(add(signature, 0x40))) // `s`.
+                    let t :=
+                        staticcall(
+                            gas(), // Amount of gas left for the transaction.
+                            1, // Address of `ecrecover`.
+                            0x00, // Start of input.
+                            0x80, // Size of input.
+                            0x01, // Start of output.
+                            0x20 // Size of output.
+                        )
+                    // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                    if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                        isValid := 1
+                        mstore(0x60, 0) // Restore the zero slot.
+                        mstore(0x40, m) // Restore the free memory pointer.
+                        break
+                    }
+                }
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                // Copy the `signature` over.
+                let n := add(0x20, mload(signature))
+                pop(staticcall(gas(), 4, signature, n, add(m, 0x44), n))
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        add(returndatasize(), 0x44), // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether `signature` is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNowCalldata(address signer, bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                if eq(signature.length, 65) {
+                    mstore(0x00, hash)
+                    mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40)))) // `v`.
+                    calldatacopy(0x40, signature.offset, 0x40) // `r`, `s`.
+                    let t :=
+                        staticcall(
+                            gas(), // Amount of gas left for the transaction.
+                            1, // Address of `ecrecover`.
+                            0x00, // Start of input.
+                            0x80, // Size of input.
+                            0x01, // Start of output.
+                            0x20 // Size of output.
+                        )
+                    // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                    if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                        isValid := 1
+                        mstore(0x60, 0) // Restore the zero slot.
+                        mstore(0x40, m) // Restore the free memory pointer.
+                        break
+                    }
+                }
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                mstore(add(m, 0x44), signature.length)
+                // Copy the `signature` over.
+                calldatacopy(add(m, 0x64), signature.offset, signature.length)
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        add(signature.length, 0x64), // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether the signature (`r`, `vs`) is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNow(address signer, bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                mstore(0x00, hash)
+                mstore(0x20, add(shr(255, vs), 27)) // `v`.
+                mstore(0x40, r) // `r`.
+                mstore(0x60, shr(1, shl(1, vs))) // `s`.
+                let t :=
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        1, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                    isValid := 1
+                    mstore(0x60, 0) // Restore the zero slot.
+                    mstore(0x40, m) // Restore the free memory pointer.
+                    break
+                }
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                mstore(add(m, 0x44), 65) // Length of the signature.
+                mstore(add(m, 0x64), r) // `r`.
+                mstore(add(m, 0x84), mload(0x60)) // `s`.
+                mstore8(add(m, 0xa4), mload(0x20)) // `v`.
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        0xa5, // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether the signature (`v`, `r`, `s`) is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNow(address signer, bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                mstore(0x00, hash)
+                mstore(0x20, and(v, 0xff)) // `v`.
+                mstore(0x40, r) // `r`.
+                mstore(0x60, s) // `s`.
+                let t :=
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        1, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                    isValid := 1
+                    mstore(0x60, 0) // Restore the zero slot.
+                    mstore(0x40, m) // Restore the free memory pointer.
+                    break
+                }
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                mstore(add(m, 0x44), 65) // Length of the signature.
+                mstore(add(m, 0x64), r) // `r`.
+                mstore(add(m, 0x84), s) // `s`.
+                mstore8(add(m, 0xa4), v) // `v`.
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        0xa5, // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+                break
+            }
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     ERC1271 OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns whether `signature` is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNow(address signer, bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            // Copy the `signature` over.
+            let n := add(0x20, mload(signature))
+            pop(staticcall(gas(), 4, signature, n, add(m, 0x44), n))
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    add(returndatasize(), 0x44), // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /// @dev Returns whether `signature` is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNowCalldata(
+        address signer,
+        bytes32 hash,
+        bytes calldata signature
+    ) internal view returns (bool isValid) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            mstore(add(m, 0x44), signature.length)
+            // Copy the `signature` over.
+            calldatacopy(add(m, 0x64), signature.offset, signature.length)
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    add(signature.length, 0x64), // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /// @dev Returns whether the signature (`r`, `vs`) is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNow(address signer, bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            mstore(add(m, 0x44), 65) // Length of the signature.
+            mstore(add(m, 0x64), r) // `r`.
+            mstore(add(m, 0x84), shr(1, shl(1, vs))) // `s`.
+            mstore8(add(m, 0xa4), add(shr(255, vs), 27)) // `v`.
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    0xa5, // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /// @dev Returns whether the signature (`v`, `r`, `s`) is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNow(address signer, bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            mstore(add(m, 0x44), 65) // Length of the signature.
+            mstore(add(m, 0x64), r) // `r`.
+            mstore(add(m, 0x84), s) // `s`.
+            mstore8(add(m, 0xa4), v) // `v`.
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    0xa5, // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an Ethereum Signed Message, created from a `hash`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x20, hash) // Store into scratch space for keccak256.
+            mstore(0x00, "\x00\x00\x00\x00\x19Ethereum Signed Message:\n32") // 28 bytes.
+            result := keccak256(0x04, 0x3c) // `32 * 2 - (32 - 28) = 60 = 0x3c`.
+        }
+    }
+
+    /// @dev Returns an Ethereum Signed Message, created from `s`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    /// Note: Supports lengths of `s` up to 999999 bytes.
+    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let sLength := mload(s)
+            let o := 0x20
+            mstore(o, "\x19Ethereum Signed Message:\n") // 26 bytes, zero-right-padded.
+            mstore(0x00, 0x00)
+            // Convert the `s.length` to ASCII decimal representation: `base10(s.length)`.
+            for { let temp := sLength } 1 {} {
+                o := sub(o, 1)
+                mstore8(o, add(48, mod(temp, 10)))
+                temp := div(temp, 10)
+                if iszero(temp) { break }
+            }
+            let n := sub(0x3a, o) // Header length: `26 + 32 - o`.
+            // Throw an out-of-offset error (consumes all gas) if the header exceeds 32 bytes.
+            returndatacopy(returndatasize(), returndatasize(), gt(n, 0x20))
+            mstore(s, or(mload(0x00), mload(n))) // Temporarily store the header.
+            result := keccak256(add(s, sub(0x20, n)), add(n, sLength))
+            mstore(s, sLength) // Restore the length.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EMPTY CALLDATA HELPERS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an empty calldata bytes.
+    function emptySignature() internal pure returns (bytes calldata signature) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            signature.length := 0
+        }
+    }
+}
+
+
+// File: lib/solady/src/utils/EIP712.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Contract for EIP-712 typed structured data hashing and signing.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/EIP712.sol)
+/// @author Modified from Solbase (https://github.com/Sol-DAO/solbase/blob/main/src/utils/EIP712.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/EIP712.sol)
+///
+/// @dev Note, this implementation:
+/// - Uses `address(this)` for the `verifyingContract` field.
+/// - Does NOT use the optional EIP-712 salt.
+/// - Does NOT use any EIP-712 extensions.
+/// This is for simplicity and to save gas.
+/// If you need to customize, please fork / modify accordingly.
+abstract contract EIP712 {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  CONSTANTS AND IMMUTABLES                  */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`.
+    bytes32 internal constant _DOMAIN_TYPEHASH =
+        0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f;
+
+    address private immutable _cachedThis;
+    uint256 private immutable _cachedChainId;
+    bytes32 private immutable _cachedNameHash;
+    bytes32 private immutable _cachedVersionHash;
+    bytes32 private immutable _cachedDomainSeparator;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        CONSTRUCTOR                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Cache the hashes for cheaper runtime gas costs.
+    /// In the case of upgradeable contracts (i.e. proxies),
+    /// or if the chain id changes due to a hard fork,
+    /// the domain separator will be seamlessly calculated on-the-fly.
+    constructor() {
+        _cachedThis = address(this);
+        _cachedChainId = block.chainid;
+
+        string memory name;
+        string memory version;
+        if (!_domainNameAndVersionMayChange()) (name, version) = _domainNameAndVersion();
+        bytes32 nameHash = _domainNameAndVersionMayChange() ? bytes32(0) : keccak256(bytes(name));
+        bytes32 versionHash =
+            _domainNameAndVersionMayChange() ? bytes32(0) : keccak256(bytes(version));
+        _cachedNameHash = nameHash;
+        _cachedVersionHash = versionHash;
+
+        bytes32 separator;
+        if (!_domainNameAndVersionMayChange()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let m := mload(0x40) // Load the free memory pointer.
+                mstore(m, _DOMAIN_TYPEHASH)
+                mstore(add(m, 0x20), nameHash)
+                mstore(add(m, 0x40), versionHash)
+                mstore(add(m, 0x60), chainid())
+                mstore(add(m, 0x80), address())
+                separator := keccak256(m, 0xa0)
+            }
+        }
+        _cachedDomainSeparator = separator;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   FUNCTIONS TO OVERRIDE                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Please override this function to return the domain name and version.
+    /// ```
+    ///     function _domainNameAndVersion()
+    ///         internal
+    ///         pure
+    ///         virtual
+    ///         returns (string memory name, string memory version)
+    ///     {
+    ///         name = "Solady";
+    ///         version = "1";
+    ///     }
+    /// ```
+    ///
+    /// Note: If the returned result may change after the contract has been deployed,
+    /// you must override `_domainNameAndVersionMayChange()` to return true.
+    function _domainNameAndVersion()
+        internal
+        view
+        virtual
+        returns (string memory name, string memory version);
+
+    /// @dev Returns if `_domainNameAndVersion()` may change
+    /// after the contract has been deployed (i.e. after the constructor).
+    /// Default: false.
+    function _domainNameAndVersionMayChange() internal pure virtual returns (bool result) {}
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the EIP-712 domain separator.
+    function _domainSeparator() internal view virtual returns (bytes32 separator) {
+        if (_domainNameAndVersionMayChange()) {
+            separator = _buildDomainSeparator();
+        } else {
+            separator = _cachedDomainSeparator;
+            if (_cachedDomainSeparatorInvalidated()) separator = _buildDomainSeparator();
+        }
+    }
+
+    /// @dev Returns the hash of the fully encoded EIP-712 message for this domain,
+    /// given `structHash`, as defined in
+    /// https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct.
+    ///
+    /// The hash can be used together with {ECDSA-recover} to obtain the signer of a message:
+    /// ```
+    ///     bytes32 digest = _hashTypedData(keccak256(abi.encode(
+    ///         keccak256("Mail(address to,string contents)"),
+    ///         mailTo,
+    ///         keccak256(bytes(mailContents))
+    ///     )));
+    ///     address signer = ECDSA.recover(digest, signature);
+    /// ```
+    function _hashTypedData(bytes32 structHash) internal view virtual returns (bytes32 digest) {
+        bytes32 separator;
+        if (_domainNameAndVersionMayChange()) {
+            separator = _buildDomainSeparator();
+        } else {
+            separator = _cachedDomainSeparator;
+            if (_cachedDomainSeparatorInvalidated()) separator = _buildDomainSeparator();
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the digest.
+            mstore(0x00, 0x1901000000000000) // Store "\x19\x01".
+            mstore(0x1a, separator) // Store the domain separator.
+            mstore(0x3a, structHash) // Store the struct hash.
+            digest := keccak256(0x18, 0x42)
+            // Restore the part of the free memory slot that was overwritten.
+            mstore(0x3a, 0)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    EIP-5267 OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev See: https://eips.ethereum.org/EIPS/eip-5267
+    function eip712Domain()
+        public
+        view
+        virtual
+        returns (
+            bytes1 fields,
+            string memory name,
+            string memory version,
+            uint256 chainId,
+            address verifyingContract,
+            bytes32 salt,
+            uint256[] memory extensions
+        )
+    {
+        fields = hex"0f"; // `0b01111`.
+        (name, version) = _domainNameAndVersion();
+        chainId = block.chainid;
+        verifyingContract = address(this);
+        salt = salt; // `bytes32(0)`.
+        extensions = extensions; // `new uint256[](0)`.
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      PRIVATE HELPERS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the EIP-712 domain separator.
+    function _buildDomainSeparator() private view returns (bytes32 separator) {
+        bytes32 nameHash;
+        bytes32 versionHash;
+        if (_domainNameAndVersionMayChange()) {
+            (string memory name, string memory version) = _domainNameAndVersion();
+            nameHash = keccak256(bytes(name));
+            versionHash = keccak256(bytes(version));
+        } else {
+            nameHash = _cachedNameHash;
+            versionHash = _cachedVersionHash;
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Load the free memory pointer.
+            mstore(m, _DOMAIN_TYPEHASH)
+            mstore(add(m, 0x20), nameHash)
+            mstore(add(m, 0x40), versionHash)
+            mstore(add(m, 0x60), chainid())
+            mstore(add(m, 0x80), address())
+            separator := keccak256(m, 0xa0)
+        }
+    }
+
+    /// @dev Returns if the cached domain separator has been invalidated.
+    function _cachedDomainSeparatorInvalidated() private view returns (bool result) {
+        uint256 cachedChainId = _cachedChainId;
+        address cachedThis = _cachedThis;
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := iszero(and(eq(chainid(), cachedChainId), eq(address(), cachedThis)))
+        }
+    }
+}
+
+
+// File: interfaces/external/ISafeWallet.sol
+// SPDX-License-Identifier: LGPL-3.0-only
+pragma solidity 0.8.19;
+
+import {IERC165} from "openzeppelin-contracts/utils/introspection/IERC165.sol";
+
+/// @title Enum - Collection of enums
+/// @author Richard Meissner - <richard@gnosis.pm>
+contract Enum {
+    enum Operation {
+        Call,
+        DelegateCall
+    }
+}
+
+interface ISafeWallet {
+    /// @dev Allows a Module to execute a Safe transaction without any further confirmations.
+    /// @param to Destination address of module transaction.
+    /// @param value Ether value of module transaction.
+    /// @param data Data payload of module transaction.
+    /// @param operation Operation type of module transaction.
+    function execTransactionFromModule(address to, uint256 value, bytes calldata data, Enum.Operation operation)
+        external
+        returns (bool success);
+
+    /// @dev Allows a Module to execute a Safe transaction without any further confirmations and return data
+    /// @param to Destination address of module transaction.
+    /// @param value Ether value of module transaction.
+    /// @param data Data payload of module transaction.
+    /// @param operation Operation type of module transaction.
+    function execTransactionFromModuleReturnData(address to, uint256 value, bytes memory data, Enum.Operation operation)
+        external
+        returns (bool success, bytes memory returnData);
+    function getStorageAt(uint256 offset, uint256 length) external view returns (bytes memory);
+    function isOwner(address owner) external view returns (bool);
+    function nonce() external view returns (uint256);
+    function getThreshold() external view returns (uint256);
+    function isModuleEnabled(address module) external view returns (bool);
+    function enableModule(address module) external;
+    function disableModule(address prevModule, address module) external;
+    function removeOwner(address prevOwner, address owner, uint256 _threshold) external;
+    function swapOwner(address prevOwner, address oldOwner, address newOwner) external;
+    function getOwners() external view returns (address[] memory);
+    function approveHash(bytes32 hashToApprove) external;
+    function signedMessages(bytes32 _dataHash) external returns (uint256 _signatures);
+    function execTransaction(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory signatures
+    ) external payable returns (bool);
+
+    function setup(
+        address[] memory _owners,
+        uint256 _threshold,
+        address to,
+        bytes memory data,
+        address fallbackHandler,
+        address paymentToken,
+        uint256 payment,
+        address paymentReceiver
+    ) external;
+
+    function addOwnerWithThreshold(address owner, uint256 _threshold) external;
+    function domainSeparator() external view returns (bytes32);
+    function setFallbackHandler(address _fallbackHandler) external;
+    function setGuard(address guard) external;
+    function encodeTransactionData(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address refundReceiver,
+        uint256 _nonce
+    ) external view returns (bytes memory);
+}
+
+interface Guard is IERC165 {
+    function checkTransaction(
+        address to,
+        uint256 value,
+        bytes memory data,
+        Enum.Operation operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes memory signatures,
+        address msgSender
+    ) external;
+
+    function checkAfterExecution(bytes32 txHash, bool success) external;
+}
+
+
+// File: src/core/AddressProviderService.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {IAddressProviderService} from "../../interfaces/IAddressProviderService.sol";
+import {AddressProvider} from "../core/AddressProvider.sol";
+import {Constants} from "./Constants.sol";
+
+/**
+ * @title AddressProviderService
+ * @author Brahma.fi
+ * @notice Provides a base contract for services to resolve other services through AddressProvider
+ * @dev This contract is designed to be inheritable by other contracts
+ *  Provides quick and easy access to all contracts in Console Ecosystem
+ */
+abstract contract AddressProviderService is IAddressProviderService, Constants {
+    error InvalidAddressProvider();
+    error NotGovernance(address);
+    error InvalidAddress();
+
+    /// @notice address of addressProvider
+    // solhint-disable-next-line immutable-vars-naming
+    AddressProvider public immutable addressProvider;
+    address public immutable walletRegistry;
+    address public immutable policyRegistry;
+    address public immutable executorRegistry;
+
+    constructor(address _addressProvider) {
+        if (_addressProvider == address(0)) revert InvalidAddressProvider();
+        addressProvider = AddressProvider(_addressProvider);
+
+        walletRegistry = addressProvider.getRegistry(_WALLET_REGISTRY_HASH);
+        policyRegistry = addressProvider.getRegistry(_POLICY_REGISTRY_HASH);
+        executorRegistry = addressProvider.getRegistry(_EXECUTOR_REGISTRY_HASH);
+
+        _notNull(walletRegistry);
+        _notNull(policyRegistry);
+        _notNull(executorRegistry);
+    }
+
+    /**
+     * @inheritdoc IAddressProviderService
+     */
+    function addressProviderTarget() external view override returns (address) {
+        return address(addressProvider);
+    }
+
+    /**
+     * @notice Helper to get authorized address from address provider
+     * @param _key keccak256 key corresponding to authorized address
+     * @return authorizedAddress
+     */
+    function _getAuthorizedAddress(bytes32 _key) internal view returns (address authorizedAddress) {
+        authorizedAddress = addressProvider.getAuthorizedAddress(_key);
+        _notNull(authorizedAddress);
+    }
+
+    /**
+     * @notice Helper to revert if address is null
+     * @param _addr address to check
+     */
+    function _notNull(address _addr) internal pure {
+        if (_addr == address(0)) revert InvalidAddress();
+    }
+}
+
+
+// File: src/core/TransactionValidator.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {ISafeWallet, Enum} from "interfaces/external/ISafeWallet.sol";
+import {PolicyValidator} from "src/core/PolicyValidator.sol";
+import {SafeHelper} from "src/libraries/SafeHelper.sol";
+import {AddressProviderService} from "src/core/AddressProviderService.sol";
+import {WalletRegistry} from "src/core/registries/WalletRegistry.sol";
+import {TypeHashHelper} from "src/libraries/TypeHashHelper.sol";
+
+/**
+ * @title TransactionValidator
+ * @author Brahma.fi
+ * @notice Allows validation of transactions pre and post execution
+ */
+contract TransactionValidator is AddressProviderService {
+    error AccountNotFound(address);
+    error InvalidGuard();
+    error InvalidFallbackHandler();
+    error InvalidModule();
+    error InvalidExecutorPlugin();
+    error TxnUnAuthorized();
+
+    /**
+     * @notice datatype for safe transaction params
+     * @param from address of safe
+     * @param to target address
+     * @param value txn value
+     * @param data txn callData
+     * @param operation type of operation
+     * @param safeTxGas gas that should be used for safe txn
+     * @param baseGas gas cost independent of txn cost
+     * @param gasPrice gas price in current block
+     * @param gasToken address of token used for gas
+     * @param refundReceiver address of receiver of gas payment
+     * @param signatures user signatures appended with validation signature
+     * @param msgSender address of msg.sender of original txn
+     */
+    struct SafeTransactionParams {
+        Enum.Operation operation;
+        address from;
+        address to;
+        address payable refundReceiver;
+        address gasToken;
+        address msgSender;
+        uint256 value;
+        uint256 safeTxGas;
+        uint256 baseGas;
+        uint256 gasPrice;
+        bytes data;
+        bytes signatures;
+    }
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   CONSOLE GUARD HOOKS                      */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /**
+     * @notice Validates a txn on guard before execution, for Brahma console accounts
+     * @dev checks for possible console overrides and then performs policy validation
+     * @param txParams params of transaction
+     */
+    function validatePreTransactionOverridable(SafeTransactionParams memory txParams) external view {
+        // Validate policy
+        _validatePolicySignature(
+            TypeHashHelper.ExecutionParams({
+                to: txParams.to,
+                value: txParams.value,
+                data: txParams.data,
+                operation: uint8(txParams.operation),
+                account: txParams.from,
+                executor: address(0),
+                nonce: ISafeWallet(txParams.from).nonce(),
+                safeTxGas: txParams.safeTxGas,
+                baseGas: txParams.baseGas,
+                gasPrice: txParams.gasPrice,
+                gasToken: txParams.gasToken,
+                refundReceiver: txParams.refundReceiver
+            }),
+            txParams.signatures
+        );
+    }
+
+    /* solhint-disable no-empty-blocks */
+    /**
+     * @notice Provides on-chain guarantees on security critical expected states of a Brhma console account
+     * @dev Empty hook available for future use
+     */
+    function validatePostTransactionOverridable(bytes32, /*txHash */ bool, /*success */ address /*console */ )
+        external
+        view
+    {}
+    /* solhint-enable no-empty-blocks */
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   SUBACCOUNT GUARD HOOKS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /**
+     * @notice Validates a txn on guard before execution, for subAccounts
+     * @dev calls policy validator to check if policy signature is valid
+     * @param txParams params of transaction
+     */
+    function validatePreTransaction(SafeTransactionParams memory txParams) external view {
+        _validatePolicySignature(
+            TypeHashHelper.ExecutionParams({
+                to: txParams.to,
+                value: txParams.value,
+                data: txParams.data,
+                operation: uint8(txParams.operation),
+                account: txParams.from,
+                executor: address(0),
+                nonce: ISafeWallet(txParams.from).nonce(),
+                safeTxGas: txParams.safeTxGas,
+                baseGas: txParams.baseGas,
+                gasPrice: txParams.gasPrice,
+                gasToken: txParams.gasToken,
+                refundReceiver: txParams.refundReceiver
+            }),
+            txParams.signatures
+        );
+    }
+
+    /**
+     * @notice Provides on-chain guarantees on security critical expected states of subAccount for guard
+     * @param subAccount address of subAccount to validate
+     */
+    function validatePostTransaction(bytes32, /*txHash */ bool, /*success */ address subAccount) external view {
+        _checkSubAccountSecurityConfig(subAccount);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EXECUTOR PLUGIN GUARD HOOKS              */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /**
+     * @notice Validates a module txn before execution
+     * @dev calls policy validator to check if policy signature is valid
+     * @param from address of safe
+     * @param executionStructHash execution struct hash
+     * @param signatures user signatures appended with validation signature
+     */
+    function validatePreExecutorTransaction(
+        address, /*msgSender */
+        address from,
+        bytes32 executionStructHash,
+        bytes calldata signatures
+    ) external view {
+        _validatePolicySignature(from, executionStructHash, signatures);
+    }
+
+    /**
+     * @notice Provides on-chain guarantees on security critical expected states of account for executor plugin
+     * @param account address of account to validate
+     */
+    function validatePostExecutorTransaction(address, /*msgSender */ address account) external view {
+        // Check if account has executor plugin still enabled as a module on it
+        if (!ISafeWallet(account).isModuleEnabled(AddressProviderService._getAuthorizedAddress(_EXECUTOR_PLUGIN_HASH)))
+        {
+            revert InvalidExecutorPlugin();
+        }
+
+        if (WalletRegistry(walletRegistry).isWallet(account)) {
+            _checkConsoleAccountSecurityConfig(account);
+        } else if (WalletRegistry(walletRegistry).subAccountToWallet(account) != address(0)) {
+            _checkSubAccountSecurityConfig(account);
+        } else {
+            revert AccountNotFound(account);
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   INTERNAL METHODS                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /**
+     * @notice Internal helper to validate the module, guard and fallback handler for a subaccount
+     * @dev Ensures that guard has not been disabled/updated and the owner console as a module has not been disabled
+     * @param _subAccount address of subAccount
+     */
+    function _checkSubAccountSecurityConfig(address _subAccount) internal view {
+        address guard = SafeHelper._getGuard(_subAccount);
+        address fallbackHandler = SafeHelper._getFallbackHandler(_subAccount);
+
+        // Ensure guard has not been disabled
+        if (guard != AddressProviderService._getAuthorizedAddress(_SAFE_MODERATOR_HASH)) revert InvalidGuard();
+
+        // Ensure fallback handler has not been altered
+        if (fallbackHandler != AddressProviderService._getAuthorizedAddress(_CONSOLE_FALLBACK_HANDLER_HASH)) {
+            revert InvalidFallbackHandler();
+        }
+
+        address ownerConsole = WalletRegistry(walletRegistry).subAccountToWallet(_subAccount);
+
+        // Ensure owner console as a module has not been disabled
+        if (!ISafeWallet(_subAccount).isModuleEnabled(ownerConsole)) revert InvalidModule();
+    }
+
+    /**
+     * @notice Internal helper to validate the module, guard and fallback handler for a console account
+     * @dev Ensures that guard has not been disabled/updated
+     * @param _consoleAccount address of consoleAccount
+     */
+    function _checkConsoleAccountSecurityConfig(address _consoleAccount) internal view {
+        address guard = SafeHelper._getGuard(_consoleAccount);
+        address fallbackHandler = SafeHelper._getFallbackHandler(_consoleAccount);
+
+        // Ensure guard has not been disabled
+        if (guard != AddressProviderService._getAuthorizedAddress(_SAFE_MODERATOR_OVERRIDABLE_HASH)) {
+            revert InvalidGuard();
+        }
+
+        // Ensure fallback handler has not been altered
+        if (fallbackHandler != AddressProviderService._getAuthorizedAddress(_CONSOLE_FALLBACK_HANDLER_HASH)) {
+            revert InvalidFallbackHandler();
+        }
+    }
+
+    /**
+     * @notice Internal helper to validate policy signature for a safe txn
+     * @dev Calls policy validator to check if policy signature is valid
+     * @param _executionParams execution params struct
+     * @param _signatures user signatures appended with validation signature
+     */
+    function _validatePolicySignature(TypeHashHelper.ExecutionParams memory _executionParams, bytes memory _signatures)
+        internal
+        view
+    {
+        if (
+            !PolicyValidator(AddressProviderService._getAuthorizedAddress(_POLICY_VALIDATOR_HASH)).isPolicySignatureValid(
+                _executionParams, _signatures
+            )
+        ) {
+            revert TxnUnAuthorized();
+        }
+    }
+
+    /**
+     * @notice Internal helper to validate policy signature for a module txn
+     * @dev Calls policy validator to check if policy signature is valid
+     * @param _from address of safe
+     * @param _executionStructHash execution struct hash
+     * @param _signatures user signatures appended with validation signature
+     */
+    function _validatePolicySignature(address _from, bytes32 _executionStructHash, bytes memory _signatures)
+        internal
+        view
+    {
+        if (
+            !PolicyValidator(AddressProviderService._getAuthorizedAddress(_POLICY_VALIDATOR_HASH)).isPolicySignatureValid(
+                _from, _executionStructHash, _signatures
+            )
+        ) {
+            revert TxnUnAuthorized();
+        }
+    }
+}
+
+
+// File: src/core/registries/ExecutorRegistry.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {AddressProviderService} from "../AddressProviderService.sol";
+import {WalletRegistry} from "./WalletRegistry.sol";
+import {EnumerableSet} from "openzeppelin-contracts/utils/structs/EnumerableSet.sol";
+
+/**
+ * @title ExecutorRegistry
+ * @author Brahma.fi
+ * @notice Registry for executors for sub accounts
+ */
+contract ExecutorRegistry is AddressProviderService {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    error NotAuthorized();
+    error AlreadyExists();
+    error DoesNotExist();
+    error NoPolicyCommit();
+
+    event RegisterExecutor(address indexed _account, address indexed _authorizer, address indexed _executor);
+    event DeRegisterExecutor(address indexed _account, address indexed _authorizer, address indexed _executor);
+
+    /// @notice account addresses mapped to executor addresses
+    mapping(address account => EnumerableSet.AddressSet) private accountExecutors;
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice Registers an executor for account
+     * @dev Adds new executor if it doesn't already exists else reverts with AlreadyExists()
+     * @dev Can be only called by main console
+     * @param _account console/subaccount address to add executor to
+     * @param _executor executor to add
+     */
+    function registerExecutor(address _account, address _executor) external {
+        _validateMsgSenderConsoleAccount(_account);
+        if (!accountExecutors[_account].add(_executor)) revert AlreadyExists();
+        emit RegisterExecutor(_account, msg.sender, _executor);
+    }
+
+    /**
+     * @notice De-registers an executor for console account/ subaccount
+     * @dev removes an executor if it exists else reverts with DoesNotExist()
+     * @dev Can be only called by main console
+     * @param _account console/subaccount address to remove executor from
+     * @param _executor executor to remove
+     */
+    function deRegisterExecutor(address _account, address _executor) external {
+        _validateMsgSenderConsoleAccount(_account);
+
+        if (!accountExecutors[_account].remove(_executor)) revert DoesNotExist();
+        emit DeRegisterExecutor(_account, msg.sender, _executor);
+    }
+
+    /**
+     * @notice checks if _executor is registered for _account
+     * @param _account address of account
+     * @param _executor address of executor
+     * @return isExecutorValid
+     */
+    function isExecutor(address _account, address _executor) external view returns (bool) {
+        return accountExecutors[_account].contains(_executor);
+    }
+
+    /**
+     * @return all the executors for a console account / subaccount
+     * @param _account address of account
+     */
+    function getExecutorsForAccount(address _account) external view returns (address[] memory) {
+        return accountExecutors[_account].values();
+    }
+
+    function _validateMsgSenderConsoleAccount(address _account) internal view {
+        // msg.sender is console account
+        if (msg.sender == _account && WalletRegistry(walletRegistry).isWallet(msg.sender)) return;
+
+        // msg.sender is console account and owns the _account
+        if (WalletRegistry(walletRegistry).subAccountToWallet(_account) == msg.sender) return;
+
+        revert NotAuthorized();
+    }
+}
+
+
+// File: src/libraries/SafeHelper.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {Enum, ISafeWallet} from "interfaces/external/ISafeWallet.sol";
+import {Types} from "interfaces/Types.sol";
+
+/**
+ * @title SafeHelper
+ * @author Brahma.fi
+ * @notice Helper library containing functions to interact with safe wallet
+ */
+library SafeHelper {
+    error InvalidMultiSendInput();
+    error UnableToParseOperation();
+
+    /// @notice uint256(keccak256("guard_manager.guard.address"))
+    /// @dev This refers to the storage slot where guard is stored in Safe's layout: https://github.com/safe-global/safe-contracts/blob/ff4c6761fbfae8ab8a94f36fd26bcfb2b5414eb1/contracts/base/GuardManager.sol#L77
+    uint256 internal constant _GUARD_STORAGE_SLOT =
+        33528237782592280163068556224972516439282563014722366175641814928123294921928;
+    /// @notice uint256(keccak256("fallback_manager.handler.address"))
+    /// @dev This refers to the storage slot where fallback handler is stored in Safe's layout: https://github.com/safe-global/safe-contracts/blob/ff4c6761fbfae8ab8a94f36fd26bcfb2b5414eb1/contracts/base/FallbackManager.sol#L14
+    uint256 internal constant _FALLBACK_HANDLER_STORAGE_SLOT =
+        49122629484629529244014240937346711770925847994644146912111677022347558721749;
+
+    /**
+     * @notice Contains hash for expected overridable guard removal calldata
+     * @dev This is the hash of the calldata for the following function call
+     *
+     * abi.encodeCall(ISafeWallet.setGuard, (address(0))) = 0xe19a9dd90000000000000000000000000000000000000000000000000000000000000000
+     * keccak256(abi.encodeCall(ISafeWallet.setGuard, (address(0)))) = 0xc0e2c16ecb99419a40dd8b9c0b339b27acebd27c481a28cd606927aeb86f5079
+     */
+    bytes32 internal constant _GUARD_REMOVAL_CALLDATA_HASH =
+        0xc0e2c16ecb99419a40dd8b9c0b339b27acebd27c481a28cd606927aeb86f5079;
+
+    /**
+     * @notice Contains hash for expected overridable fallback handler removal calldata
+     * @dev This is the hash of the calldata for the following function call
+     *
+     * abi.encodeCall(ISafeWallet.setFallbackHandler, (address(0))) = 0xf08a03230000000000000000000000000000000000000000000000000000000000000000
+     * keccak256(abi.encodeCall(ISafeWallet.setFallbackHandler, (address(0)))) = 0x5bdf8c44c012c1347b2b15694dc5cc39b899eb99e32614676b7661001be925b7
+     */
+    bytes32 internal constant _FALLBACK_REMOVAL_CALLDATA_HASH =
+        0x5bdf8c44c012c1347b2b15694dc5cc39b899eb99e32614676b7661001be925b7;
+
+    /**
+     * @notice Packs multiple executables into a single bytes array compatible with Safe's MultiSend contract which can be used as argument for multicall method
+     * @dev Reference contract at https://github.com/safe-global/safe-contracts/blob/main/contracts/libraries/MultiSend.sol
+     * @param _txns Array of executables to pack
+     * @return packedTxns bytes array containing packed transactions
+     */
+    function _packMultisendTxns(Types.Executable[] memory _txns) internal pure returns (bytes memory packedTxns) {
+        uint256 len = _txns.length;
+        if (len == 0) revert InvalidMultiSendInput();
+
+        uint256 i = 0;
+        do {
+            uint8 call = uint8(_parseOperationEnum(_txns[i].callType));
+
+            uint256 calldataLength = _txns[i].data.length;
+
+            bytes memory encodedTxn = abi.encodePacked(
+                bytes1(call), bytes20(_txns[i].target), bytes32(_txns[i].value), bytes32(calldataLength), _txns[i].data
+            );
+
+            if (i != 0) {
+                // If not first transaction, append to packedTxns
+                packedTxns = abi.encodePacked(packedTxns, encodedTxn);
+            } else {
+                // If first transaction, set packedTxns to encodedTxn
+                packedTxns = encodedTxn;
+            }
+
+            unchecked {
+                ++i;
+            }
+        } while (i < len);
+    }
+
+    /**
+     * @notice Gets the guard for a safe
+     * @param safe address of safe
+     * @return address of guard, address(0) if no guard exists
+     */
+    function _getGuard(address safe) internal view returns (address) {
+        bytes memory guardAddress = ISafeWallet(safe).getStorageAt(_GUARD_STORAGE_SLOT, 1);
+        return address(uint160(uint256(bytes32(guardAddress))));
+    }
+
+    /**
+     * @notice Gets the fallback handler for a safe
+     * @param safe address of safe
+     * @return address of fallback handler, address(0) if no fallback handler exists
+     */
+    function _getFallbackHandler(address safe) internal view returns (address) {
+        bytes memory fallbackHandlerAddress = ISafeWallet(safe).getStorageAt(_FALLBACK_HANDLER_STORAGE_SLOT, 1);
+        return address(uint160(uint256(bytes32(fallbackHandlerAddress))));
+    }
+
+    /**
+     * @notice Converts a CallType enum to an Operation enum.
+     * @dev Reverts with UnableToParseOperation error if the CallType is not supported.
+     * @param callType The CallType enum to be converted.
+     * @return operation The converted Operation enum.
+     */
+    function _parseOperationEnum(Types.CallType callType) internal pure returns (Enum.Operation operation) {
+        if (callType == Types.CallType.DELEGATECALL) {
+            operation = Enum.Operation.DelegateCall;
+        } else if (callType == Types.CallType.CALL) {
+            operation = Enum.Operation.Call;
+        } else {
+            revert UnableToParseOperation();
+        }
+    }
+}
+
+
+// File: src/libraries/TypeHashHelper.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+/**
+ * @title TypeHashHelper
+ * @author Brahma.fi
+ * @notice Helper library containing functions to build EIP712 struct and type hashes
+ */
+library TypeHashHelper {
+    /**
+     * @notice Structural representation of execution details
+     * @param operation type of operation
+     * @param to address to send tx to
+     * @param account address of safe
+     * @param executor address of executor if executed via executor plugin, address(0) if executed via execTransaction
+     * @param gasToken address of token used for gas
+     * @param refundReceiver address of receiver of gas payment
+     * @param value txn value
+     * @param nonce txn nonce
+     * @param safeTxGas gas that should be used for safe txn
+     * @param baseGas gas cost independent of txn cost
+     * @param gasPrice gas price in current block
+     * @param data txn callData
+     */
+    struct ExecutionParams {
+        uint8 operation;
+        address to;
+        address account;
+        address executor;
+        address gasToken;
+        address refundReceiver;
+        uint256 value;
+        uint256 nonce;
+        uint256 safeTxGas;
+        uint256 baseGas;
+        uint256 gasPrice;
+        bytes data;
+    }
+
+    /**
+     * @notice Type of validation struct to hash
+     * @param expiryEpoch max time till validity of the signature
+     * @param executionStructHash txn digest generated using TypeHashHelper._buildExecutionParamsHash()
+     * @param policyHash policy commit hash of the safe account
+     */
+    struct ValidationParams {
+        uint32 expiryEpoch;
+        bytes32 executionStructHash;
+        bytes32 policyHash;
+    }
+
+    /**
+     * @notice EIP712 typehash for execution params data
+     * @dev keccak256("ExecutionParams(uint8 operation,address to,address account,address executor,address gasToken,address refundReceiver,uint256 value,uint256 nonce,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,bytes data)");
+     */
+    bytes32 public constant EXECUTION_PARAMS_TYPEHASH =
+        0x483ad580f0a8d7881e792d04b2128f3b214b18aa7336126dc2e77a59752bd6f5;
+
+    /**
+     * @notice EIP712 typehash for validation data
+     * @dev keccak256("ValidationParams(uint32 expiryEpoch,ExecutionParams executionParams,bytes32 policyHash)ExecutionParams(uint8 operation,address to,address account,address executor,address gasToken,address refundReceiver,uint256 value,uint256 nonce,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,bytes data)");
+     */
+    bytes32 public constant VALIDATION_PARAMS_TYPEHASH =
+        0x37af4ddfcab5e0a0d11676ce89534ca59ffac1c30a5a4cc21f840d2f4704a952;
+
+    /**
+     * @notice Builds EIP712 execution struct hash
+     * @param txn execution params struct
+     * @return executionStructHash
+     */
+    function _buildExecutionParamsHash(ExecutionParams memory txn) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                EXECUTION_PARAMS_TYPEHASH,
+                txn.operation,
+                txn.to,
+                txn.account,
+                txn.executor,
+                txn.gasToken,
+                txn.refundReceiver,
+                txn.value,
+                txn.nonce,
+                txn.safeTxGas,
+                txn.baseGas,
+                txn.gasPrice,
+                keccak256(txn.data)
+            )
+        );
+    }
+
+    /**
+     * @notice Builds EIP712 validation struct hash
+     * @param validation validation params struct
+     * @return validationStructHash
+     */
+    function _buildValidationParamsHash(ValidationParams memory validation) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                VALIDATION_PARAMS_TYPEHASH,
+                validation.expiryEpoch,
+                validation.executionStructHash,
+                validation.policyHash
+            )
+        );
+    }
+}
+
+
+// File: interfaces/Types.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+interface Types {
+    enum CallType {
+        CALL,
+        DELEGATECALL,
+        STATICCALL
+    }
+
+    struct Executable {
+        CallType callType;
+        address target;
+        uint256 value;
+        bytes data;
+    }
+
+    struct TokenRequest {
+        address token;
+        uint256 amount;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: interfaces/IAddressProviderService.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.19;
+
+interface IAddressProviderService {
+    /// @notice Returns the address of the AddressProvider
+    function addressProviderTarget() external view returns (address);
+}
+
+
+// File: src/core/AddressProvider.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {IAddressProviderService} from "interfaces/IAddressProviderService.sol";
+import {Constants} from "src/core/Constants.sol";
+
+/**
+ * @title AddressProvider
+ * @author Brahma.fi
+ * @notice Single source of truth for resolving addresses of core components and external contracts
+ */
+contract AddressProvider is Constants {
+    error RegistryAlreadyExists();
+    error AddressProviderUnsupported();
+    error NotGovernance(address);
+    error NotPendingGovernance(address);
+    error NullAddress();
+
+    event RegistryInitialised(address indexed registry, bytes32 indexed key);
+    event AuthorizedAddressInitialised(address indexed authorizedAddress, bytes32 indexed key);
+    event GovernanceTransferRequested(address indexed previousGovernance, address indexed newGovernance);
+    event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
+
+    /// @notice address of governance
+    address public governance;
+    /// @notice address of pending governance before accepting
+    address public pendingGovernance;
+
+    /**
+     * @notice keccak256 hash of authorizedAddress keys mapped to their addresses
+     * @dev Core & Roles are used as keys for this mapping. These addresses are mutable
+     * @dev authorizedAddresses are updatable by governance
+     */
+    mapping(bytes32 => address) internal authorizedAddresses;
+
+    /**
+     * @notice keccak256 hash of registry keys mapped to their addresses
+     * @dev registries are only set once by governance and immutable
+     */
+    mapping(bytes32 => address) internal registries;
+
+    constructor(address _governance, address walletRegistry, address policyRegistry, address executorRegistry) {
+        _notNull(_governance);
+        governance = _governance;
+
+        _notNull(walletRegistry);
+        _notNull(policyRegistry);
+        _notNull(executorRegistry);
+        registries[_WALLET_REGISTRY_HASH] = walletRegistry;
+        registries[_POLICY_REGISTRY_HASH] = policyRegistry;
+        registries[_EXECUTOR_REGISTRY_HASH] = executorRegistry;
+    }
+
+    /**
+     * @notice Governance setter
+     * @param _newGovernance address of new governance
+     */
+    function setGovernance(address _newGovernance) external {
+        _notNull(_newGovernance);
+        _onlyGov();
+        emit GovernanceTransferRequested(governance, _newGovernance);
+        pendingGovernance = _newGovernance;
+    }
+
+    /**
+     * @notice Governance accepter
+     */
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) {
+            revert NotPendingGovernance(msg.sender);
+        }
+        emit GovernanceTransferred(governance, msg.sender);
+        governance = msg.sender;
+        delete pendingGovernance;
+    }
+
+    /**
+     * @notice Authorized address setter
+     * @param _key key of authorizedAddress
+     * @param _authorizedAddress address to set
+     * @param _overrideCheck overrides check for supported address provider
+     */
+    function setAuthorizedAddress(bytes32 _key, address _authorizedAddress, bool _overrideCheck) external {
+        _onlyGov();
+        _notNull(_authorizedAddress);
+
+        /// @dev skips checks for supported `addressProvider()` if `_overrideCheck` is true
+        if (!_overrideCheck) {
+            /// @dev skips checks for supported `addressProvider()` if `_authorizedAddress` is an EOA
+            if (_authorizedAddress.code.length != 0) _ensureAddressProvider(_authorizedAddress);
+        }
+
+        authorizedAddresses[_key] = _authorizedAddress;
+
+        emit AuthorizedAddressInitialised(_authorizedAddress, _key);
+    }
+
+    /**
+     * @notice Registry address setter
+     * @param _key key of registry address
+     * @param _registry address to set
+     */
+    function setRegistry(bytes32 _key, address _registry) external {
+        _onlyGov();
+        _ensureAddressProvider(_registry);
+
+        if (registries[_key] != address(0)) revert RegistryAlreadyExists();
+        registries[_key] = _registry;
+
+        emit RegistryInitialised(_registry, _key);
+    }
+
+    /**
+     * @notice Authorized address getter
+     * @param _key key of authorized address
+     * @return address of authorized address
+     */
+    function getAuthorizedAddress(bytes32 _key) external view returns (address) {
+        return authorizedAddresses[_key];
+    }
+
+    /**
+     * @notice Registry address getter
+     * @param _key key of registry address
+     * @return address of registry address
+     */
+    function getRegistry(bytes32 _key) external view returns (address) {
+        return registries[_key];
+    }
+
+    /**
+     * @notice Ensures that the new address supports the AddressProviderService interface
+     * and is pointing to this AddressProvider
+     * @param _newAddress address to check
+     */
+    function _ensureAddressProvider(address _newAddress) internal view {
+        if (IAddressProviderService(_newAddress).addressProviderTarget() != address(this)) {
+            revert AddressProviderUnsupported();
+        }
+    }
+
+    /**
+     * @notice Checks if msg.sender is governance
+     */
+    function _onlyGov() internal view {
+        if (msg.sender != governance) revert NotGovernance(msg.sender);
+    }
+
+    /**
+     * @notice Checks and reverts if address is null
+     * @param addr address to check if null
+     */
+    function _notNull(address addr) internal pure {
+        if (addr == address(0)) revert NullAddress();
+    }
+}
+
+
+// File: src/core/Constants.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+/**
+ * @title Constants
+ * @author Brahma.fi
+ * @notice Contains constants used by multiple contracts
+ * @dev Inflates bytecode size by approximately 560 bytes on deployment, but saves gas on runtime
+ */
+abstract contract Constants {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        REGISTRIES                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /// @notice Key to map address of ExecutorRegistry
+    bytes32 internal constant _EXECUTOR_REGISTRY_HASH = bytes32(uint256(keccak256("console.core.ExecutorRegistry")) - 1);
+
+    /// @notice Key to map address of WalletRegistry
+    bytes32 internal constant _WALLET_REGISTRY_HASH = bytes32(uint256(keccak256("console.core.WalletRegistry")) - 1);
+
+    /// @notice Key to map address of PolicyRegistry
+    bytes32 internal constant _POLICY_REGISTRY_HASH = bytes32(uint256(keccak256("console.core.PolicyRegistry")) - 1);
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          CORE                              */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+    /// @notice Key to map address of ExecutorPlugin
+    bytes32 internal constant _EXECUTOR_PLUGIN_HASH = bytes32(uint256(keccak256("console.core.ExecutorPlugin")) - 1);
+
+    /// @notice Key to map address of ConsoleFallbackHandler
+    bytes32 internal constant _CONSOLE_FALLBACK_HANDLER_HASH =
+        bytes32(uint256(keccak256("console.core.FallbackHandler")) - 1);
+
+    /// @notice Key to map address of Safe FallbackHandler
+    bytes32 internal constant _SAFE_FALLBACK_HANDLER_HASH = bytes32(uint256(keccak256("safe.FallbackHandler")) - 1);
+
+    /// @notice Key to map address of Safe MultiSend
+    bytes32 internal constant _SAFE_MULTI_SEND_HASH = bytes32(uint256(keccak256("safe.MultiSend")) - 1);
+
+    /// @notice Key to map address of SafeProxyFactory
+    bytes32 internal constant _SAFE_PROXY_FACTORY_HASH = bytes32(uint256(keccak256("safe.ProxyFactory")) - 1);
+
+    /// @notice Key to map address of SafeSingleton
+    bytes32 internal constant _SAFE_SINGLETON_HASH = bytes32(uint256(keccak256("safe.Singleton")) - 1);
+
+    /// @notice Key to map address of PolicyValidator
+    bytes32 internal constant _POLICY_VALIDATOR_HASH = bytes32(uint256(keccak256("console.core.PolicyValidator")) - 1);
+
+    /// @notice Key to map address of SafeDeployer
+    bytes32 internal constant _SAFE_DEPLOYER_HASH = bytes32(uint256(keccak256("console.core.SafeDeployer")) - 1);
+
+    /// @notice Key to map address of SafeEnabler
+    bytes32 internal constant _SAFE_ENABLER_HASH = bytes32(uint256(keccak256("console.core.SafeEnabler")) - 1);
+
+    /// @notice Key to map address of SafeModerator
+    bytes32 internal constant _SAFE_MODERATOR_HASH = bytes32(uint256(keccak256("console.core.SafeModerator")) - 1);
+
+    /// @notice Key to map address of SafeModeratorOverridable
+    bytes32 internal constant _SAFE_MODERATOR_OVERRIDABLE_HASH =
+        bytes32(uint256(keccak256("console.core.SafeModeratorOverridable")) - 1);
+
+    /// @notice Key to map address of TransactionValidator
+    bytes32 internal constant _TRANSACTION_VALIDATOR_HASH =
+        bytes32(uint256(keccak256("console.core.TransactionValidator")) - 1);
+
+    /// @notice Key to map address of ConsoleOpBuilder
+    bytes32 internal constant _CONSOLE_OP_BUILDER_HASH =
+        bytes32(uint256(keccak256("console.core.ConsoleOpBuilder")) - 1);
+
+    /// @notice Key to map address of ExecutionBlocker
+    bytes32 internal constant _EXECUTION_BLOCKER_HASH = bytes32(uint256(keccak256("console.core.ExecutionBlocker")) - 1);
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          ROLES                             */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @notice Key to map address of Role PolicyAuthenticator
+    bytes32 internal constant _POLICY_AUTHENTICATOR_HASH =
+        bytes32(uint256(keccak256("console.roles.PolicyAuthenticator")) - 1);
+}
+
+
+// File: src/core/PolicyValidator.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {SignatureCheckerLib} from "solady/utils/SignatureCheckerLib.sol";
+import {EIP712} from "solady/utils/EIP712.sol";
+import {AddressProviderService} from "src/core/AddressProviderService.sol";
+import {PolicyRegistry} from "src/core/registries/PolicyRegistry.sol";
+import {TypeHashHelper} from "src/libraries/TypeHashHelper.sol";
+import {ISafeWallet, Enum} from "interfaces/external/ISafeWallet.sol";
+
+/**
+ * @title PolicyValidator
+ * @author Brahma.fi
+ * @notice Responsible for validating policy signatures for safe transactions
+ */
+contract PolicyValidator is AddressProviderService, EIP712 {
+    error InvalidSignature();
+    error NoPolicyCommit();
+    error TxnExpired(uint32 expiryEpoch);
+    error InvalidSignatures();
+
+    /// @notice EIP712 domain name
+    string private constant _NAME = "PolicyValidator";
+    /// @notice EIP712 domain version
+    string private constant _VERSION = "1.0";
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice generates digest and validates signature against policies for safe transaction
+     * @dev The POLICY_AUTHENTICATOR is expected to sign EIP712 digest generated from the following struct:
+     * TypeHashHelper.ValidationParams, where -
+     *  txnDigest = EIP712 digest generated from struct: TypeHashHelper.ExecutionParams
+     *  policyHash = policy commit hash of the safe account
+     *  expiryEpoch = expiry timestamp
+     *
+     * @dev signatures = abi.encodePacked(safeSignature, validatorSignature, validatorSignatureLength, expiryEpoch)
+     *  safeSignature = safe owners signatures (arbitrary bytes length)
+     *  validatorSignature = EIP 712 digest signature (arbitrary bytes length)
+     *  validatorSignatureLength = length of `validatorSignature` (4 bytes)
+     *  expiryEpoch = expiry timestamp (4 bytes)
+     *
+     * @param executionParams execution params struct
+     * @param signatures user signatures appended with validation signature
+     * @return isSignatureValid boolean
+     */
+    function isPolicySignatureValid(TypeHashHelper.ExecutionParams memory executionParams, bytes calldata signatures)
+        external
+        view
+        returns (bool)
+    {
+        // Build transaction struct hash
+        bytes32 executionStructHash = TypeHashHelper._buildExecutionParamsHash(executionParams);
+
+        // Validate signature
+        return isPolicySignatureValid(executionParams.account, executionStructHash, signatures);
+    }
+
+    /**
+     * @notice generates digest and validates signature against policies for module execution
+     * @dev signatures = abi.encodePacked(safeSignature, validatorSignature, validatorSignatureLength, expiryEpoch)
+     *      safeSignature = safe owners signatures (arbitrary bytes length)
+     *      validatorSignature = EIP 712 digest signed by `POLICY_AUTHENTICATOR`(arbitrary bytes length)
+     *      validatorSignatureLength = length of `validatorSignature` (4 bytes)
+     *      expiryEpoch = expiry timestamp (4 bytes)
+     *  Here,
+     *  The `POLICY_AUTHENTICATOR` is expected to sign the EIP 712 digest generated from following struct:
+     *  TypeHashHelper.ValidationParams -
+     *      txnDigest = EIP712 digest generated from struct: TypeHashHelper.ExecutionParams, with valid executor
+     *      policyHash = policy commit hash of the safe account
+     *      expiryEpoch = expiry timestamp
+     *
+     * @param account address of account to validate txn for
+     * @param executionStructHash execution digest from ExecutorPlugin
+     * @param signatures user signatures appended with validation signature
+     * @return isSignatureValid boolean
+     */
+    function isPolicySignatureValid(address account, bytes32 executionStructHash, bytes calldata signatures)
+        public
+        view
+        returns (bool)
+    {
+        // Get policy hash from registry
+        bytes32 policyHash = PolicyRegistry(policyRegistry).commitments(account);
+        if (policyHash == bytes32(0)) {
+            revert NoPolicyCommit();
+        }
+
+        // Get expiry epoch and validator signature from signatures
+        (uint32 expiryEpoch, bytes memory validatorSignature) = _decompileSignatures(signatures);
+
+        // Ensure transaction has not expired
+        if (expiryEpoch < uint32(block.timestamp)) {
+            revert TxnExpired(expiryEpoch);
+        }
+
+        // Build validation struct hash
+        bytes32 validationStructHash = TypeHashHelper._buildValidationParamsHash(
+            TypeHashHelper.ValidationParams({
+                executionStructHash: executionStructHash,
+                policyHash: policyHash,
+                expiryEpoch: expiryEpoch
+            })
+        );
+
+        // Build EIP712 digest with validation struct hash
+        bytes32 txnValidityDigest = _hashTypedData(validationStructHash);
+
+        address policyAuthenticator = AddressProviderService._getAuthorizedAddress(_POLICY_AUTHENTICATOR_HASH);
+
+        // Empty Signature check for EOA signer
+        if (validatorSignature.length == 0) {
+            uint256 _codesize;
+            assembly {
+                _codesize := extcodesize(policyAuthenticator)
+            }
+            if (_codesize == 0) {
+                // PolicyAuthenticator is an EOA and no policyAuthenticator signature is provided
+                revert InvalidSignature();
+            }
+        }
+
+        // Validate signature
+        return SignatureCheckerLib.isValidSignatureNow(policyAuthenticator, txnValidityDigest, validatorSignature);
+    }
+
+    /**
+     * @notice Internal helper to extract validity signature from overall safe transaction signature
+     * @dev _signatures = abi.encodePacked(safeSignature, validatorSignature, validatorSignatureLength, expiryEpoch)
+     *  safeSignature = safe owners signatures (arbitrary bytes length)
+     *  validatorSignature = EIP 712 digest signed (arbitrary bytes length)
+     *  validatorSignatureLength = length of `validatorSignature` (4 bytes)
+     *  expiryEpoch = expiry timestamp (4 bytes)
+     *
+     * @param _signatures packed transaction signature
+     * @return expiryEpoch extracted expiry epoch signed by brahma backend
+     * @return validatorSignature extracted validity signature
+     */
+    function _decompileSignatures(bytes calldata _signatures)
+        internal
+        pure
+        returns (uint32 expiryEpoch, bytes memory validatorSignature)
+    {
+        if (_signatures.length < 8) revert InvalidSignatures();
+
+        uint32 sigLength = uint32(bytes4(_signatures[_signatures.length - 8:_signatures.length - 4]));
+        if (_signatures.length - 8 < sigLength) revert InvalidSignatures();
+
+        expiryEpoch = uint32(bytes4(_signatures[_signatures.length - 4:_signatures.length]));
+        validatorSignature = _signatures[_signatures.length - 8 - sigLength:_signatures.length - 8];
+    }
+
+    /**
+     * @notice Internal helper to get EIP712 domain name and version
+     * @return name domainName
+     * @return version domainVersion
+     */
+    function _domainNameAndVersion() internal pure override returns (string memory name, string memory version) {
+        return (_NAME, _VERSION);
+    }
+}
+
+
+// File: src/core/registries/WalletRegistry.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {AddressProviderService} from "../AddressProviderService.sol";
+
+/**
+ * @title WalletRegistry
+ * @author Brahma.fi
+ * @notice Registry for wallet and sub account addresses
+ */
+contract WalletRegistry is AddressProviderService {
+    error AlreadyRegistered();
+    error InvalidSender();
+    error IsSubAccount();
+
+    event RegisterWallet(address indexed wallet);
+    event RegisterSubAccount(address indexed wallet, address indexed subAccount);
+
+    /// @notice subAccount addresses mapped to owner wallet
+    mapping(address subAccount => address wallet) public subAccountToWallet;
+    /// @notice wallet addresses mapped to list of subAccounts
+    mapping(address wallet => address[] subAccountList) public walletToSubAccountList;
+    /// @notice address of wallet mapped to boolean indicating if it's a wallet
+    mapping(address => bool) public isWallet;
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice Registers a wallet
+     * @dev Can only be called by wallet to register itself
+     */
+    function registerWallet() external {
+        if (isWallet[msg.sender]) revert AlreadyRegistered();
+        if (subAccountToWallet[msg.sender] != address(0)) revert IsSubAccount();
+        isWallet[msg.sender] = true;
+        emit RegisterWallet(msg.sender);
+    }
+
+    /**
+     * @notice Registers a sub account for a Safe
+     * @param _wallet Console account address, owner of sub account
+     * @param _subAccount Sub account address to register
+     * @dev Can only be called by safe deployer
+     */
+
+    function registerSubAccount(address _wallet, address _subAccount) external {
+        if (msg.sender != AddressProviderService._getAuthorizedAddress(_SAFE_DEPLOYER_HASH)) revert InvalidSender();
+
+        if (subAccountToWallet[_subAccount] != address(0) || isWallet[_subAccount]) revert AlreadyRegistered();
+
+        subAccountToWallet[_subAccount] = _wallet;
+        walletToSubAccountList[_wallet].push(_subAccount);
+        emit RegisterSubAccount(_wallet, _subAccount);
+    }
+
+    /**
+     * @notice sub account list getter
+     * @dev returns sub account list associated with _wallet
+     * @param _wallet safe address
+     * @return list of subAccounts for wallet
+     */
+    function getSubAccountsForWallet(address _wallet) external view returns (address[] memory) {
+        return walletToSubAccountList[_wallet];
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position of the value in the `values` array, plus 1 because index 0
+        // means a value is not in the set.
+        mapping(bytes32 => uint256) _indexes;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._indexes[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We read and store the value's index to prevent multiple reads from the same storage slot
+        uint256 valueIndex = set._indexes[value];
+
+        if (valueIndex != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 toDeleteIndex = valueIndex - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (lastIndex != toDeleteIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the last value to the index where the value to delete is
+                set._values[toDeleteIndex] = lastValue;
+                // Update the index for the moved value
+                set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the index for the deleted slot
+            delete set._indexes[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._indexes[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: src/core/registries/PolicyRegistry.sol
+/// SPDX-License-Identifier: BUSL-1.1
+
+/// Copyright (C) 2023 Brahma.fi
+
+pragma solidity 0.8.19;
+
+import {AddressProviderService} from "src/core/AddressProviderService.sol";
+import {WalletRegistry} from "src/core/registries/WalletRegistry.sol";
+
+/**
+ * @title PolicyRegistry
+ * @author Brahma.fi
+ * @notice Registry for policy commits for wallets and sub accounts
+ */
+contract PolicyRegistry is AddressProviderService {
+    error PolicyCommitInvalid();
+    error UnauthorizedPolicyUpdate();
+
+    event UpdatedPolicyCommit(address indexed account, bytes32 policyCommit, bytes32 oldPolicyCommit);
+
+    /// @notice account addresses mapped to their policy commits
+    mapping(address account => bytes32 policyCommit) public commitments;
+
+    constructor(address _addressProvider) AddressProviderService(_addressProvider) {}
+
+    /**
+     * @notice Enables setting policy commits for accounts
+     * @param account address of account to set policy commit for
+     * @param policyCommit policy commit hash to set
+     * @dev policyCommit for an account can be set by:
+     *  1. by safe deployer, if the account is uninitialized
+     *  2. by the registered wallet, if the account is a subAccount
+     *  3. by the account itself, if account is a registered wallet
+     */
+    function updatePolicy(address account, bytes32 policyCommit) external {
+        if (policyCommit == bytes32(0)) {
+            revert PolicyCommitInvalid();
+        }
+
+        bytes32 currentCommit = commitments[account];
+
+        // solhint-disable no-empty-blocks
+        if (
+            currentCommit == bytes32(0)
+                && msg.sender == AddressProviderService._getAuthorizedAddress(_SAFE_DEPLOYER_HASH)
+        ) {
+            // In case invoker is safe  deployer
+        } else {
+            if (WalletRegistry(walletRegistry).subAccountToWallet(account) == msg.sender) {
+                //In case invoker is updating on behalf of sub account
+            } else if (msg.sender == account && WalletRegistry(walletRegistry).isWallet(msg.sender)) {
+                // In case invoker is a registered wallet
+            } else {
+                revert UnauthorizedPolicyUpdate();
+            }
+        }
+        // solhint-enable no-empty-blocks
+        _updatePolicy(account, policyCommit, currentCommit);
+    }
+
+    /**
+     * @notice Internal function to update policy commit for an account
+     * @param account address of account to set policy commit for
+     * @param policyCommit policy commit hash to set
+     */
+    function _updatePolicy(address account, bytes32 policyCommit, bytes32 oldPolicyCommit) internal {
+        emit UpdatedPolicyCommit(account, policyCommit, oldPolicyCommit);
+        commitments[account] = policyCommit;
+    }
+}
+

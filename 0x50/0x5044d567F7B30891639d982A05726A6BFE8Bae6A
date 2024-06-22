@@ -1,0 +1,162 @@
+/// SPDX-License-Identifier: MIT
+//
+// Symbol          : BRAINERS
+// Name            : Brainers
+// Total supply    : 371,000,000
+// Decimals        : 18
+// Bainers Social  : www.brainers.network
+// Brainers Docs   : www.docs.brainers.network
+// About contract  : www.token.brainers.network
+
+
+pragma solidity ^0.8.11;
+
+/**
+ * @title Brainers Token
+ * @dev Standard ERC20 implementation for the Brainers Token.
+ */
+contract Brainers {
+    string public constant name = "Brainers";
+    string public constant symbol = "BRAINERS";
+    uint8 public constant decimals = 18;
+
+    uint256 private _totalSupply;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    address private immutable _socialNetworkAddress = 0x3170444AaefdBC05C11616c0212b07Dfa351185f;
+    address private immutable _teamAddress = 0x7e898711B28d376297Be8B12AC9c4b18Cf098824;
+
+    uint256 private _teamSupply;
+    uint256 private _teamUnlockTime;
+    uint256 private _teamReleaseAmount;
+    uint256 private _teamReleaseInterval;
+    uint256 private _teamReleaseStartTime;
+
+    uint256 private _socialReleaseInterval;
+    uint256 private _socialReleaseStartTime;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    modifier onlyUnlockedTeam() {
+        require(block.timestamp >= _teamUnlockTime, "Team supply not unlocked yet");
+        _;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == _teamAddress, "Only the owner can call this function");
+        _;
+    }
+
+    constructor() {
+        _totalSupply = 371_000_000 * 10 ** uint256(decimals);
+        uint256 socialPercentage = 80;
+        uint256 teamPercentage = 3;
+        uint256 marketingPercentage = 5;
+        uint256 developmentPercentage = 2;
+        uint256 investorPercentage = 2;
+        uint256 futureDevelopmentPercentage = 8;
+
+        _teamSupply = (_totalSupply * teamPercentage) / 100;
+        _teamUnlockTime = block.timestamp + (12 * 30 days); // Lock team supply for 12 months
+        _teamReleaseAmount = (_teamSupply * 5) / 100; // 5% released every 30 days after 12 months
+        _teamReleaseInterval = 30 days;
+
+        _socialReleaseInterval = 30 days; // Monthly release for Brainers Social
+        _socialReleaseStartTime = block.timestamp;
+
+        _balances[_socialNetworkAddress] = (_totalSupply * socialPercentage) / 100;
+        _balances[_teamAddress] = _teamSupply;
+        _balances[address(this)] = (_totalSupply * (marketingPercentage + developmentPercentage + investorPercentage + futureDevelopmentPercentage)) / 100;
+
+        emit Transfer(address(0), _socialNetworkAddress, _balances[_socialNetworkAddress]);
+        emit Transfer(address(0), _teamAddress, _teamSupply);
+        emit Transfer(address(0), address(this), _balances[address(this)]);
+    }
+
+    function totalSupply() external view returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) external returns (bool) {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) external view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(sender, msg.sender, _allowances[sender][msg.sender] - amount);
+        return true;
+    }
+
+    function increaseAllowance(address spender, uint256 addedValue) external returns (bool) {
+        _approve(msg.sender, spender, _allowances[msg.sender][spender] + addedValue);
+        return true;
+    }
+
+    function decreaseAllowance(address spender, uint256 subtractedValue) external returns (bool) {
+        _approve(msg.sender, spender, _allowances[msg.sender][spender] - subtractedValue);
+        return true;
+    }
+
+    function releaseTeamSupply() external onlyUnlockedTeam {
+        require(_teamReleaseStartTime + _teamReleaseInterval <= block.timestamp, "Team supply release interval not reached yet");
+
+        uint256 releaseAmount = _teamReleaseAmount;
+        if (releaseAmount > _teamSupply) {
+            releaseAmount = _teamSupply;
+        }
+
+        _balances[_teamAddress] += releaseAmount;
+        _teamSupply -= releaseAmount;
+        _teamReleaseStartTime += _teamReleaseInterval;
+
+        emit Transfer(address(this), _teamAddress, releaseAmount);
+    }
+
+    function releaseSocialSupply() external onlyOwner {
+        require(block.timestamp >= _socialReleaseStartTime + _socialReleaseInterval, "Social supply release interval not reached yet");
+
+        uint256 releaseAmount = (_totalSupply * 80) / 1000; // 10% of Brainers Social allocation
+        require(releaseAmount > 0, "No more tokens to release");
+
+        _balances[_socialNetworkAddress] += releaseAmount;
+        _totalSupply -= releaseAmount;
+        _socialReleaseStartTime += _socialReleaseInterval;
+
+        emit Transfer(address(this), _socialNetworkAddress, releaseAmount);
+    }
+
+    function _transfer(address sender, address recipient, uint256 amount) internal {
+        require(sender != address(0), "Transfer from the zero address");
+        require(recipient != address(0), "Transfer to the zero address");
+        require(_balances[sender] >= amount, "Insufficient balance");
+
+        _balances[sender] -= amount;
+        _balances[recipient] += amount;
+
+        emit Transfer(sender, recipient, amount);
+    }
+
+    function _approve(address owner, address spender, uint256 amount) internal {
+        require(owner != address(0), "Approve from the zero address");
+        require(spender != address(0), "Approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+}

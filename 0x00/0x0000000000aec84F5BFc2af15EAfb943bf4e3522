@@ -1,0 +1,2931 @@
+
+// File: contracts/core/SoundCreatorV2.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+import { Clones } from "openzeppelin/proxy/Clones.sol";
+import { ReentrancyGuard } from "openzeppelin/security/ReentrancyGuard.sol";
+import { ISoundCreatorV2 } from "./interfaces/ISoundCreatorV2.sol";
+import { LibMulticaller } from "multicaller/LibMulticaller.sol";
+import { Ownable } from "solady/auth/Ownable.sol";
+import { EIP712 } from "solady/utils/EIP712.sol";
+import { LibZip } from "solady/utils/LibZip.sol";
+import { LibBitmap } from "solady/utils/LibBitmap.sol";
+import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
+import { SignatureCheckerLib } from "solady/utils/SignatureCheckerLib.sol";
+
+/**
+ * @title SoundCreatorV1
+ * @notice A factory that deploys minimal proxies of SoundEditions.
+ * @dev The proxies are OpenZeppelin's Clones implementation of https://eips.ethereum.org/EIPS/eip-1167
+ */
+contract SoundCreatorV2 is ISoundCreatorV2, EIP712, ReentrancyGuard {
+    using LibBitmap for LibBitmap.Bitmap;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /**
+     * @dev For EIP-712 signature digest calculation.
+     */
+    bytes32 public constant SOUND_CREATION_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+            "SoundCreation("
+                "address implementation,"
+                "address owner,"
+                "bytes32 salt,"
+                "bytes initData,"
+                "address[] contracts,"
+                "bytes[] data,"
+                "uint256 nonce"
+            ")"
+        );
+
+    /**
+     * @dev For EIP-712 signature digest calculation.
+     */
+    bytes32 public constant DOMAIN_TYPEHASH = _DOMAIN_TYPEHASH;
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /**
+     * @dev For storing the invalidated nonces.
+     */
+    mapping(address => LibBitmap.Bitmap) internal _invalidatedNonces;
+
+    // =============================================================
+    //               PUBLIC / EXTERNAL WRITE FUNCTIONS
+    // =============================================================
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function create(SoundCreation calldata c) external nonReentrant returns (address edition, bytes[] memory results) {
+        if (c.owner != LibMulticaller.sender()) revert Unauthorized();
+        (edition, results) = _create(c);
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function createWithSignature(SoundCreation calldata creation, bytes calldata signature)
+        external
+        nonReentrant
+        returns (address soundEdition, bytes[] memory results)
+    {
+        (soundEdition, results) = _createWithSignature(creation, signature);
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function mint(
+        address minter,
+        bytes calldata mintData,
+        address refundTo
+    ) external payable nonReentrant {
+        _mint(minter, mintData, refundTo);
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function createWithSignatureAndMint(
+        SoundCreation calldata c,
+        bytes calldata signature,
+        address minter,
+        bytes calldata mintData,
+        address refundTo
+    ) external payable nonReentrant returns (address edition, bytes[] memory results) {
+        // We will skip the `createWithSignature` if the SoundEdtion already exists.
+        (, bool exists) = soundEditionAddress(c.implementation, c.owner, c.salt);
+        if (!exists) (edition, results) = _createWithSignature(c, signature);
+        _mint(minter, mintData, refundTo);
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function invalidateNonces(uint256[] calldata nonces) external {
+        unchecked {
+            address sender = LibMulticaller.sender();
+            LibBitmap.Bitmap storage s = _invalidatedNonces[sender];
+            for (uint256 i; i != nonces.length; ++i) {
+                s.set(nonces[i]);
+            }
+            emit NoncesInvalidated(sender, nonces);
+        }
+    }
+
+    /**
+     * @dev For compressed calldata calling.
+     */
+    fallback() external payable {
+        LibZip.cdFallback();
+    }
+
+    /**
+     * @dev For compressed calldata calling.
+     */
+    receive() external payable {
+        LibZip.cdFallback();
+    }
+
+    // =============================================================
+    //               PUBLIC / EXTERNAL VIEW FUNCTIONS
+    // =============================================================
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function soundEditionAddress(
+        address implementation,
+        address owner,
+        bytes32 salt
+    ) public view returns (address addr, bool exists) {
+        addr = Clones.predictDeterministicAddress(implementation, _saltedSalt(owner, salt), address(this));
+        exists = addr.code.length != 0;
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function isValidSignature(SoundCreation calldata c, bytes calldata signature) public view returns (bool) {
+        return
+            // Whether the signature is correctly signed. Will revert if recovery fails.
+            SignatureCheckerLib.isValidSignatureNowCalldata(c.owner, computeDigest(c), signature) &&
+            // And whether the creation's nonce is not invalidated.
+            !_invalidatedNonces[c.owner].get(c.nonce);
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function computeDigest(SoundCreation calldata c) public view returns (bytes32) {
+        bytes32 encodedDataHash;
+        unchecked {
+            bytes[] calldata cData = c.data;
+            uint256 n = cData.length;
+            bytes32[] memory encodedData = new bytes32[](n);
+            for (uint256 i = 0; i != n; ++i) {
+                encodedData[i] = keccak256(cData[i]);
+            }
+            encodedDataHash = keccak256(abi.encodePacked(encodedData));
+        }
+        return
+            _hashTypedData(
+                keccak256(
+                    abi.encode(
+                        SOUND_CREATION_TYPEHASH,
+                        c.implementation, // address
+                        c.owner, // address
+                        c.salt, // bytes32
+                        keccak256(c.initData), // bytes
+                        keccak256(abi.encodePacked(c.contracts)), // address[]
+                        encodedDataHash, // bytes[]
+                        c.nonce // uint256
+                    )
+                )
+            );
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function noncesInvalidated(address signer, uint256[] calldata nonces) external view returns (bool[] memory result) {
+        unchecked {
+            result = new bool[](nonces.length);
+            LibBitmap.Bitmap storage s = _invalidatedNonces[signer];
+            for (uint256 i; i != nonces.length; ++i) {
+                result[i] = s.get(nonces[i]);
+            }
+        }
+    }
+
+    // EIP712 parameters.
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function name() external pure returns (string memory name_) {
+        (name_, ) = _domainNameAndVersion();
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function version() external pure returns (string memory version_) {
+        (, version_) = _domainNameAndVersion();
+    }
+
+    /**
+     * @inheritdoc ISoundCreatorV2
+     */
+    function domainSeparator() external view returns (bytes32 separator) {
+        separator = _domainSeparator();
+    }
+
+    // =============================================================
+    //                  INTERNAL / PRIVATE HELPERS
+    // =============================================================
+
+    /**
+     * @dev Override for EIP-712.
+     * @return name_    The EIP-712 name.
+     * @return version_ The EIP-712 version.
+     */
+    function _domainNameAndVersion()
+        internal
+        pure
+        virtual
+        override
+        returns (string memory name_, string memory version_)
+    {
+        name_ = "SoundCreator";
+        version_ = "2";
+    }
+
+    /**
+     * @dev Call the `contracts` in order with `data`.
+     * @param contracts The addresses of the contracts.
+     * @param data      The `abi.encodeWithSelector` calldata for each of the contracts.
+     * @return results The results of calling the contracts.
+     */
+    function _callContracts(address[] calldata contracts, bytes[] calldata data)
+        internal
+        returns (bytes[] memory results)
+    {
+        if (contracts.length != data.length) revert ArrayLengthsMismatch();
+
+        assembly {
+            // Grab the free memory pointer.
+            // We will use the free memory to construct the `results` array,
+            // and also as a temporary space for the calldata.
+            results := mload(0x40)
+            // Set `results.length` to be equal to `data.length`.
+            mstore(results, data.length)
+            // Skip the first word, which is used to store the length
+            let resultsOffsets := add(results, 0x20)
+            // Compute the location of the last calldata offset in `data`.
+            // `shl(5, n)` is a gas-saving shorthand for `mul(0x20, n)`.
+            let dataOffsetsEnd := add(data.offset, shl(5, data.length))
+            // This is the start of the unused free memory.
+            // We use it to temporarily store the calldata to call the contracts.
+            let m := add(resultsOffsets, shl(5, data.length))
+
+            // Loop through `contacts` and `data` together.
+            // prettier-ignore
+            for { let i := data.offset } iszero(eq(i, dataOffsetsEnd)) { i := add(i, 0x20) } {
+                // Location of `bytes[i]` in calldata.
+                let o := add(data.offset, calldataload(i))
+                // Copy `bytes[i]` from calldata to the free memory.
+                calldatacopy(
+                    m, // Start of the unused free memory.
+                    add(o, 0x20), // Location of starting byte of `data[i]` in calldata.
+                    calldataload(o) // The length of the `bytes[i]`.
+                )
+                // Grab `contracts[i]` from the calldata.
+                // As `contracts` is the same length as `data`,
+                // `sub(i, data.offset)` gives the relative offset to apply to
+                // `contracts.offset` for `contracts[i]` to match `data[i]`.
+                let c := calldataload(add(contracts.offset, sub(i, data.offset)))
+                // Call the contract, and revert if the call fails.
+                if iszero(
+                    call(
+                        gas(), // Gas remaining.
+                        c, // `contracts[i]`.
+                        0, // `msg.value` of the call: 0 ETH.
+                        m, // Start of the copy of `bytes[i]` in memory.
+                        calldataload(o), // The length of the `bytes[i]`.
+                        0x00, // Start of output. Not used.
+                        0x00 // Size of output. Not used.
+                    )
+                ) {
+                    // Bubble up the revert if the call reverts.
+                    returndatacopy(0x00, 0x00, returndatasize())
+                    revert(0x00, returndatasize())
+                }
+                // Append the current `m` into `resultsOffsets`.
+                mstore(resultsOffsets, m)
+                resultsOffsets := add(resultsOffsets, 0x20)
+
+                // Append the `returndatasize()` to `results`.
+                mstore(m, returndatasize())
+                // Append the return data to `results`.
+                returndatacopy(add(m, 0x20), 0x00, returndatasize())
+                // Advance `m` by `returndatasize() + 0x20`,
+                // rounded up to the next multiple of 32.
+                // `0x3f = 32 + 31`. The mask is `type(uint64).max & ~31`,
+                // which is big enough for all purposes (see memory expansion costs).
+                m := and(add(add(m, returndatasize()), 0x3f), 0xffffffffffffffe0)
+            }
+            // Allocate the memory for `results` by updating the free memory pointer.
+            mstore(0x40, m)
+        }
+    }
+
+    /**
+     * @dev Returns the salted salt.
+     *      To prevent griefing and accidental collisions from clients that don't
+     *      generate their salt properly.
+     * @param owner The initial owner of the SoundEdition.
+     * @param salt  The salt, generated on the client side.
+     * @return result The computed value.
+     */
+    function _saltedSalt(address owner, bytes32 salt) internal view returns (bytes32 result) {
+        assembly {
+            mstore(0x20, owner)
+            mstore(0x0c, chainid())
+            mstore(0x00, salt)
+            result := keccak256(0x00, 0x40)
+        }
+    }
+
+    /**
+     * @dev Creates a new SoundEdtion via `c.soundCreator`, and a new split contract if needed.
+     * @param c The SoundCreation struct.
+     * @return edition The address of the created SoundEdition contract.
+     * @return results      The results of calling the contracts.
+     *                      Use `abi.decode` to decode them.
+     */
+    function _create(SoundCreation calldata c) internal returns (address edition, bytes[] memory results) {
+        if (c.implementation == address(0)) revert ImplementationAddressCantBeZero();
+
+        // Create Sound Edition proxy.
+        edition = payable(Clones.cloneDeterministic(c.implementation, _saltedSalt(c.owner, c.salt)));
+
+        bytes calldata initData = c.initData;
+        // Initialize proxy.
+        assembly {
+            // Grab the free memory pointer.
+            let m := mload(0x40)
+            // Copy the `initData` to the free memory.
+            calldatacopy(m, initData.offset, initData.length)
+            // Call the initializer, and revert if the call fails.
+            if iszero(
+                call(
+                    gas(), // Gas remaining.
+                    edition, // Address of the edition.
+                    0, // `msg.value` of the call: 0 ETH.
+                    m, // Start of input.
+                    initData.length, // Length of input.
+                    0x00, // Start of output. Not used.
+                    0x00 // Size of output. Not used.
+                )
+            ) {
+                // Bubble up the revert if the call reverts.
+                returndatacopy(0x00, 0x00, returndatasize())
+                revert(0x00, returndatasize())
+            }
+        }
+
+        results = _callContracts(c.contracts, c.data);
+
+        Ownable(edition).transferOwnership(c.owner);
+
+        emit Created(c.implementation, edition, c.owner, c.initData, c.contracts, c.data, results);
+    }
+
+    /**
+     * @dev Creates a SoundEdition on behalf of `c.owner`.
+     * @param c  The SoundCreation struct.
+     * @param signature The signature for the SoundCreation struct, by `c.owner`.
+     * @return edition The address of the created SoundEdition contract.
+     * @return results      The results of calling the contracts.
+     *                      Use `abi.decode` to decode them.
+     */
+    function _createWithSignature(SoundCreation calldata c, bytes calldata signature)
+        internal
+        returns (address edition, bytes[] memory results)
+    {
+        if (!isValidSignature(c, signature)) revert InvalidSignature();
+        (edition, results) = _create(c);
+
+        // Invalidate the nonce and emit the event.
+        _invalidatedNonces[c.owner].set(c.nonce);
+        uint256[] memory nonces = new uint256[](1);
+        nonces[0] = c.nonce;
+        emit NoncesInvalidated(c.owner, nonces);
+    }
+
+    /**
+     * @dev Calls `minter` with `mintData`.
+     *      After which, refunds any remaining ETH balance in the adapter contract.
+     *      If `minter` is the zero address, the function is a no-op.
+     * @param minter   The minter contract to call, SAM included.
+     * @param mintData The abi encoded calldata to the minter contract.
+     * @param refundTo The address to transfer any remaining ETH in the contract after the calls.
+     *                 If `address(0)`, remaining ETH will NOT be refunded.
+     *                 If `address(1)`, remaining ETH will be refunded to `msg.sender`.
+     *                 If anything else, remaining ETH will be refunded to `refundTo`.
+     */
+    function _mint(
+        address minter,
+        bytes calldata mintData,
+        address refundTo
+    ) internal {
+        if (minter == address(0)) return;
+        assembly {
+            // Grab the free memory pointer.
+            let m := mload(0x40)
+            // Copy the `mintData` into the free memory.
+            calldatacopy(m, mintData.offset, mintData.length)
+            // Make a call to `minter` with `mintData`, reverting if the call fails.
+            if iszero(
+                call(
+                    gas(), // Gas remaining.
+                    minter, // Address of the minter.
+                    callvalue(), // All the ETH sent to this function.
+                    m, // Start of the `mintData` in memory.
+                    mintData.length, // Length of `mintData`.
+                    0x00, // We'll use returndatasize instead.
+                    0x00 // We'll use returndatasize instead.
+                )
+            ) {
+                // If the call fails, bubble up the revert.
+                returndatacopy(0x00, 0x00, returndatasize())
+                revert(0x00, returndatasize())
+            }
+        }
+        if (refundTo != address(0)) {
+            // Refund any ETH in this contract. In the unlikely case where ETH is
+            // mistakenly sent to this contract, it will be combined into the refund.
+            if (address(this).balance != 0) {
+                if (refundTo == address(1)) refundTo = msg.sender;
+                SafeTransferLib.forceSafeTransferAllETH(refundTo);
+            }
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/proxy/Clones.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (proxy/Clones.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for
+ * deploying minimal proxy contracts, also known as "clones".
+ *
+ * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies
+ * > a minimal bytecode implementation that delegates all calls to a known, fixed address.
+ *
+ * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`
+ * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the
+ * deterministic method.
+ *
+ * _Available since v3.4._
+ */
+library Clones {
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create opcode, which should never revert.
+     */
+    function clone(address implementation) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), shl(0x60, implementation))
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
+            instance := create(0, ptr, 0x37)
+        }
+        require(instance != address(0), "ERC1167: create failed");
+    }
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create2 opcode and a `salt` to deterministically deploy
+     * the clone. Using the same `implementation` and `salt` multiple time will revert, since
+     * the clones cannot be deployed twice at the same address.
+     */
+    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), shl(0x60, implementation))
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
+            instance := create2(0, ptr, 0x37, salt)
+        }
+        require(instance != address(0), "ERC1167: create2 failed");
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt,
+        address deployer
+    ) internal pure returns (address predicted) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), shl(0x60, implementation))
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf3ff00000000000000000000000000000000)
+            mstore(add(ptr, 0x38), shl(0x60, deployer))
+            mstore(add(ptr, 0x4c), salt)
+            mstore(add(ptr, 0x6c), keccak256(ptr, 0x37))
+            predicted := keccak256(add(ptr, 0x37), 0x55)
+        }
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(address implementation, bytes32 salt)
+        internal
+        view
+        returns (address predicted)
+    {
+        return predictDeterministicAddress(implementation, salt, address(this));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _notEntered will be true
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+}
+
+
+// File: contracts/core/interfaces/ISoundCreatorV2.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+/**
+ * @title ISoundCreatorV2
+ * @notice The interface for the Sound edition factory.
+ */
+interface ISoundCreatorV2 {
+    // =============================================================
+    //                            STRUCTS
+    // =============================================================
+
+    /**
+     * @dev A struct containing all the data required for creating a SoundEdition
+     *      and setting up all other relevant contracts.
+     */
+    struct SoundCreation {
+        // The address of the SoundEdition implementation.
+        address implementation;
+        // The initial owner of the deployed SoundEdition.
+        address owner;
+        // The salt used for deploying the SoundEdition via the SoundCreator factory.
+        bytes32 salt;
+        // The calldata passed to the SoundEdition to initialize it.
+        bytes initData;
+        // Array of contracts to call after initializing the SoundEdition.
+        address[] contracts;
+        // Array of abi encoded calldata to pass to each entry in `contracts`.
+        bytes[] data;
+        // The current nonce used to sign the SoundCreation struct, if required.
+        // Just generate some really random number on the client side for this.
+        uint256 nonce;
+    }
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /**
+     * @dev Emitted when an edition is created.
+     * @param implementation The address of the SoundEdition implementation.
+     * @param edition        The address of the deployed SoundEdition.
+     * @param owner          The address of the owner.
+     * @param initData       The calldata to initialize SoundEdition via `abi.encodeWithSelector`.
+     * @param contracts      The list of contracts called.
+     * @param data           The list of calldata created via `abi.encodeWithSelector`
+     * @param results        The results of calling the contracts. Use `abi.decode` to decode them.
+     */
+    event Created(
+        address indexed implementation,
+        address indexed edition,
+        address indexed owner,
+        bytes initData,
+        address[] contracts,
+        bytes[] data,
+        bytes[] results
+    );
+
+    /**
+     * @dev Emitted when the `nonces` of `signer` are invalidated.
+     * @param signer  The signer of the nonces.
+     * @param nonces The nonces.
+     */
+    event NoncesInvalidated(address indexed signer, uint256[] nonces);
+
+    // =============================================================
+    //                            ERRORS
+    // =============================================================
+
+    /**
+     * @dev Thrown if the implementation address is zero.
+     */
+    error ImplementationAddressCantBeZero();
+
+    /**
+     * @dev Thrown if the lengths of the input arrays are not equal.
+     */
+    error ArrayLengthsMismatch();
+
+    /**
+     * @dev Not authorized to perfrom the action.
+     */
+    error Unauthorized();
+
+    /**
+     * @dev The signature for the SoundCreation struct is invalid.
+     *      This could be caused be an invalid parameter, signer, or invalidated nonce.
+     */
+    error InvalidSignature();
+
+    // =============================================================
+    //               PUBLIC / EXTERNAL WRITE FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Creates a SoundEdition and sets up all other relevant contracts.
+     * @param creation The SoundCreation struct.
+     * @return soundEdition The address of the created SoundEdition contract.
+     * @return results      The results of calling the contracts.
+     *                      Use `abi.decode` to decode them.
+     */
+    function create(SoundCreation calldata creation) external returns (address soundEdition, bytes[] memory results);
+
+    /**
+     * @dev Creates a SoundEdition on behalf of `creation.owner`.
+     * @param creation  The SoundCreation struct.
+     * @param signature The signature for the SoundCreation struct, by `creation.owner`.
+     * @return soundEdition The address of the created SoundEdition contract.
+     * @return results      The results of calling the contracts.
+     *                      Use `abi.decode` to decode them.
+     */
+    function createWithSignature(SoundCreation calldata creation, bytes calldata signature)
+        external
+        returns (address soundEdition, bytes[] memory results);
+
+    /**
+     * @dev Calls `minter` with `mintData`.
+     *      After which, refunds any remaining ETH balance in the adapter contract.
+     *      If `minter` is the zero address, the function is a no-op.
+     * @param minter   The minter contract to call, SAM included.
+     * @param mintData The abi encoded calldata to the minter contract.
+     * @param refundTo The address to transfer any remaining ETH in the contract after the calls.
+     *                 If `address(0)`, remaining ETH will NOT be refunded.
+     *                 If `address(1)`, remaining ETH will be refunded to `msg.sender`.
+     *                 If anything else, remaining ETH will be refunded to `refundTo`.
+     */
+    function mint(
+        address minter,
+        bytes calldata mintData,
+        address refundTo
+    ) external payable;
+
+    /**
+     * @dev Equivalent to calling {createWithSignature}, followed by {mint}.
+     * @param creation  The SoundCreation struct.
+     * @param signature The signature for the SoundCreation struct, by `creation.owner`.
+     * @param minter    The minter contract to call, SAM included.
+     * @param mintData  The calldata to the minter contract.
+     * @param refundTo  The address to transfer any remaining ETH in the contract after the calls.
+     *                  If `address(0)`, remaining ETH will NOT be refunded.
+     *                  If `address(1)`, remaining ETH will be refunded to `msg.sender`.
+     *                  If anything else, remaining ETH will be refunded to `refundTo`.
+     * @return soundEdition The address of the created SoundEdition contract.
+     * @return results      The results of calling the contracts.
+     *                      Use `abi.decode` to decode them.
+     */
+    function createWithSignatureAndMint(
+        SoundCreation calldata creation,
+        bytes calldata signature,
+        address minter,
+        bytes calldata mintData,
+        address refundTo
+    ) external payable returns (address soundEdition, bytes[] memory results);
+
+    /**
+     * @dev Invalidates the nonces for the `msg.sender`.
+     * @param nonces The nonces.
+     */
+    function invalidateNonces(uint256[] calldata nonces) external;
+
+    // =============================================================
+    //               PUBLIC / EXTERNAL VIEW FUNCTIONS
+    // =============================================================
+
+    /**
+     * @dev Returns whether each of the `nonces` of `signer` has been invalidated.
+     * @param signer The signer of the signature.
+     * @param nonces An array of nonces.
+     * @return A bool array representing whether each nonce has been invalidated.
+     */
+    function noncesInvalidated(address signer, uint256[] calldata nonces) external view returns (bool[] memory);
+
+    /**
+     * @dev Returns the deterministic address for the SoundEdition clone.
+     * @param implementation The implementation of the SoundEdition.
+     * @param owner          The initial owner of the SoundEdition.
+     * @param salt           The salt, generated on the client side.
+     * @return addr The computed address.
+     * @return exists Whether the contract exists.
+     */
+    function soundEditionAddress(
+        address implementation,
+        address owner,
+        bytes32 salt
+    ) external view returns (address addr, bool exists);
+
+    /**
+     * @dev Returns if the signature for the creation struct is correctly signed,
+     *      as well as the creation's nonce is still valid.
+     * @param creation  The SoundCreation struct.
+     * @param signature The signature for the SoundCreation struct.
+     * @return isValid The computed result.
+     */
+    function isValidSignature(SoundCreation calldata creation, bytes calldata signature) external view returns (bool);
+
+    /**
+     * @dev Computes the EIP-712 hash of the SoundCreation struct.
+     * @param creation The SoundCreation struct.
+     * @return digest The computed result.
+     */
+    function computeDigest(SoundCreation calldata creation) external view returns (bytes32 digest);
+
+    /**
+     * @dev Returns the SoundCreation struct's EIP-712 typehash.
+     * @return The constant value.
+     */
+    function SOUND_CREATION_TYPEHASH() external view returns (bytes32);
+
+    /**
+     * @dev Returns the EIP-712 domain typehash.
+     * @return The constant value.
+     */
+    function DOMAIN_TYPEHASH() external view returns (bytes32);
+
+    /**
+     * @dev Returns the EIP-712 domain name.
+     * @return name_ The constant value.
+     */
+    function name() external pure returns (string memory name_);
+
+    /**
+     * @dev Returns the EIP-712 domain version.
+     * @return version_ The constant value.
+     */
+    function version() external pure returns (string memory version_);
+
+    /**
+     * @dev Returns the EIP-712 domain separator.
+     * @return The current value.
+     */
+    function domainSeparator() external view returns (bytes32);
+}
+
+
+// File: lib/multicaller/src/LibMulticaller.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/**
+ * @title LibMulticaller
+ * @author vectorized.eth
+ * @notice Library to read the `msg.sender` of the multicaller with sender contract.
+ */
+library LibMulticaller {
+    /**
+     * @dev The address of the multicaller contract.
+     */
+    address internal constant MULTICALLER = 0x0000000000009448722dAF1A55EF6D1E71FB162d;
+
+    /**
+     * @dev The address of the multicaller with sender contract.
+     */
+    address internal constant MULTICALLER_WITH_SENDER = 0x00000000002Fd5Aeb385D324B580FCa7c83823A0;
+
+    /**
+     * @dev The address of the multicaller with signer contract.
+     */
+    address internal constant MULTICALLER_WITH_SIGNER = 0x000000000000a89360A6a4786b9B33266F208AF4;
+
+    /**
+     * @dev Returns the caller of `aggregateWithSender` on `MULTICALLER_WITH_SENDER`.
+     */
+    function multicallerSender() internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, 0x00)
+            if iszero(staticcall(gas(), MULTICALLER_WITH_SENDER, 0x00, 0x00, 0x00, 0x20)) {
+                revert(0x00, 0x00) // For better gas estimation.
+            }
+            result := mload(0x00)
+        }
+    }
+
+    /**
+     * @dev Returns the signer of `aggregateWithSigner` on `MULTICALLER_WITH_SIGNER`.
+     */
+    function multicallerSigner() internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, 0x00)
+            if iszero(staticcall(gas(), MULTICALLER_WITH_SIGNER, 0x00, 0x00, 0x00, 0x20)) {
+                revert(0x00, 0x00) // For better gas estimation.
+            }
+            result := mload(0x00)
+        }
+    }
+
+    /**
+     * @dev Returns the caller of `aggregateWithSender` on `MULTICALLER_WITH_SENDER`,
+     *      if the current context's `msg.sender` is `MULTICALLER_WITH_SENDER`.
+     *      Otherwise, returns `msg.sender`.
+     */
+    function sender() internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, caller())
+            let withSender := MULTICALLER_WITH_SENDER
+            if eq(caller(), withSender) {
+                if iszero(staticcall(gas(), withSender, 0x00, 0x00, 0x00, 0x20)) {
+                    revert(0x00, 0x00) // For better gas estimation.
+                }
+            }
+            result := mload(0x00)
+        }
+    }
+
+    /**
+     * @dev Returns the caller of `aggregateWithSender` on `MULTICALLER_WITH_SENDER`,
+     *      if the current context's `msg.sender` is `MULTICALLER_WITH_SENDER`.
+     *      Returns the signer of `aggregateWithSigner` on `MULTICALLER_WITH_SIGNER`,
+     *      if the current context's `msg.sender` is `MULTICALLER_WITH_SIGNER`.
+     *      Otherwise, returns `msg.sender`.
+     */
+    function senderOrSigner() internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, caller())
+            let withSender := MULTICALLER_WITH_SENDER
+            if eq(caller(), withSender) {
+                if iszero(staticcall(gas(), withSender, 0x00, 0x00, 0x00, 0x20)) {
+                    revert(0x00, 0x00) // For better gas estimation.
+                }
+            }
+            let withSigner := MULTICALLER_WITH_SIGNER
+            if eq(caller(), withSigner) {
+                if iszero(staticcall(gas(), withSigner, 0x00, 0x00, 0x00, 0x20)) {
+                    revert(0x00, 0x00) // For better gas estimation.
+                }
+            }
+            result := mload(0x00)
+        }
+    }
+}
+
+
+// File: lib/solady/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+///
+/// @dev Note:
+/// This implementation does NOT auto-initialize the owner to `msg.sender`.
+/// You MUST call the `_initializeOwner` in the constructor / initializer.
+///
+/// While the ownable portion follows
+/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,
+/// the nomenclature for the 2-step ownership handover may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by: `not(_OWNER_SLOT_NOT)`.
+    /// It is intentionally chosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    uint256 private constant _OWNER_SLOT_NOT = 0x8b78c6d8;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Store the new value.
+            sstore(not(_OWNER_SLOT_NOT), newOwner)
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ownerSlot := not(_OWNER_SLOT_NOT)
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+            // Store the new value.
+            sstore(ownerSlot, newOwner)
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(not(_OWNER_SLOT_NOT)))) {
+                mstore(0x00, 0x82b42900) // `Unauthorized()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    /// Override to return a different value if needed.
+    /// Made internal to conserve bytecode. Wrap it in a public function if needed.
+    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + _ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(not(_OWNER_SLOT_NOT))
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+
+
+// File: lib/solady/src/utils/EIP712.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Contract for EIP-712 typed structured data hashing and signing.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/EIP712.sol)
+/// @author Modified from Solbase (https://github.com/Sol-DAO/solbase/blob/main/src/utils/EIP712.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/EIP712.sol)
+///
+/// @dev Note, this implementation:
+/// - Uses `address(this)` for the `verifyingContract` field.
+/// - Does NOT use the optional EIP-712 salt.
+/// - Does NOT use any EIP-712 extensions.
+/// This is for simplicity and to save gas.
+/// If you need to customize, please fork / modify accordingly.
+abstract contract EIP712 {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  CONSTANTS AND IMMUTABLES                  */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`.
+    bytes32 internal constant _DOMAIN_TYPEHASH =
+        0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f;
+
+    address private immutable _cachedThis;
+    uint256 private immutable _cachedChainId;
+    bytes32 private immutable _cachedNameHash;
+    bytes32 private immutable _cachedVersionHash;
+    bytes32 private immutable _cachedDomainSeparator;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        CONSTRUCTOR                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Cache the hashes for cheaper runtime gas costs.
+    /// In the case of upgradeable contracts (i.e. proxies),
+    /// or if the chain id changes due to a hard fork,
+    /// the domain separator will be seamlessly calculated on-the-fly.
+    constructor() {
+        _cachedThis = address(this);
+        _cachedChainId = block.chainid;
+
+        string memory name;
+        string memory version;
+        if (!_domainNameAndVersionMayChange()) (name, version) = _domainNameAndVersion();
+        bytes32 nameHash = _domainNameAndVersionMayChange() ? bytes32(0) : keccak256(bytes(name));
+        bytes32 versionHash =
+            _domainNameAndVersionMayChange() ? bytes32(0) : keccak256(bytes(version));
+        _cachedNameHash = nameHash;
+        _cachedVersionHash = versionHash;
+
+        bytes32 separator;
+        if (!_domainNameAndVersionMayChange()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let m := mload(0x40) // Load the free memory pointer.
+                mstore(m, _DOMAIN_TYPEHASH)
+                mstore(add(m, 0x20), nameHash)
+                mstore(add(m, 0x40), versionHash)
+                mstore(add(m, 0x60), chainid())
+                mstore(add(m, 0x80), address())
+                separator := keccak256(m, 0xa0)
+            }
+        }
+        _cachedDomainSeparator = separator;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   FUNCTIONS TO OVERRIDE                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Please override this function to return the domain name and version.
+    /// ```
+    ///     function _domainNameAndVersion()
+    ///         internal
+    ///         pure
+    ///         virtual
+    ///         returns (string memory name, string memory version)
+    ///     {
+    ///         name = "Solady";
+    ///         version = "1";
+    ///     }
+    /// ```
+    ///
+    /// Note: If the returned result may change after the contract has been deployed,
+    /// you must override `_domainNameAndVersionMayChange()` to return true.
+    function _domainNameAndVersion()
+        internal
+        view
+        virtual
+        returns (string memory name, string memory version);
+
+    /// @dev Returns if `_domainNameAndVersion()` may change
+    /// after the contract has been deployed (i.e. after the constructor).
+    /// Default: false.
+    function _domainNameAndVersionMayChange() internal pure virtual returns (bool result) {}
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the EIP-712 domain separator.
+    function _domainSeparator() internal view virtual returns (bytes32 separator) {
+        if (_domainNameAndVersionMayChange()) {
+            separator = _buildDomainSeparator();
+        } else {
+            separator = _cachedDomainSeparator;
+            if (_cachedDomainSeparatorInvalidated()) separator = _buildDomainSeparator();
+        }
+    }
+
+    /// @dev Returns the hash of the fully encoded EIP-712 message for this domain,
+    /// given `structHash`, as defined in
+    /// https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct.
+    ///
+    /// The hash can be used together with {ECDSA-recover} to obtain the signer of a message:
+    /// ```
+    ///     bytes32 digest = _hashTypedData(keccak256(abi.encode(
+    ///         keccak256("Mail(address to,string contents)"),
+    ///         mailTo,
+    ///         keccak256(bytes(mailContents))
+    ///     )));
+    ///     address signer = ECDSA.recover(digest, signature);
+    /// ```
+    function _hashTypedData(bytes32 structHash) internal view virtual returns (bytes32 digest) {
+        bytes32 separator;
+        if (_domainNameAndVersionMayChange()) {
+            separator = _buildDomainSeparator();
+        } else {
+            separator = _cachedDomainSeparator;
+            if (_cachedDomainSeparatorInvalidated()) separator = _buildDomainSeparator();
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the digest.
+            mstore(0x00, 0x1901000000000000) // Store "\x19\x01".
+            mstore(0x1a, separator) // Store the domain separator.
+            mstore(0x3a, structHash) // Store the struct hash.
+            digest := keccak256(0x18, 0x42)
+            // Restore the part of the free memory slot that was overwritten.
+            mstore(0x3a, 0)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    EIP-5267 OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev See: https://eips.ethereum.org/EIPS/eip-5267
+    function eip712Domain()
+        public
+        view
+        virtual
+        returns (
+            bytes1 fields,
+            string memory name,
+            string memory version,
+            uint256 chainId,
+            address verifyingContract,
+            bytes32 salt,
+            uint256[] memory extensions
+        )
+    {
+        fields = hex"0f"; // `0b01111`.
+        (name, version) = _domainNameAndVersion();
+        chainId = block.chainid;
+        verifyingContract = address(this);
+        salt = salt; // `bytes32(0)`.
+        extensions = extensions; // `new uint256[](0)`.
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      PRIVATE HELPERS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the EIP-712 domain separator.
+    function _buildDomainSeparator() private view returns (bytes32 separator) {
+        bytes32 nameHash;
+        bytes32 versionHash;
+        if (_domainNameAndVersionMayChange()) {
+            (string memory name, string memory version) = _domainNameAndVersion();
+            nameHash = keccak256(bytes(name));
+            versionHash = keccak256(bytes(version));
+        } else {
+            nameHash = _cachedNameHash;
+            versionHash = _cachedVersionHash;
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Load the free memory pointer.
+            mstore(m, _DOMAIN_TYPEHASH)
+            mstore(add(m, 0x20), nameHash)
+            mstore(add(m, 0x40), versionHash)
+            mstore(add(m, 0x60), chainid())
+            mstore(add(m, 0x80), address())
+            separator := keccak256(m, 0xa0)
+        }
+    }
+
+    /// @dev Returns if the cached domain separator has been invalidated.
+    function _cachedDomainSeparatorInvalidated() private view returns (bool result) {
+        uint256 cachedChainId = _cachedChainId;
+        address cachedThis = _cachedThis;
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := iszero(and(eq(chainid(), cachedChainId), eq(address(), cachedThis)))
+        }
+    }
+}
+
+
+// File: lib/solady/src/utils/LibZip.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Library for compressing and decompressing bytes.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/LibZip.sol)
+/// @author Calldata compression by clabby (https://github.com/clabby/op-kompressor)
+/// @author FastLZ by ariya (https://github.com/ariya/FastLZ)
+///
+/// @dev Note:
+/// The accompanying solady.js library includes implementations of
+/// FastLZ and calldata operations for convenience.
+library LibZip {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     FAST LZ OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // LZ77 implementation based on FastLZ.
+    // Equivalent to level 1 compression and decompression at the following commit:
+    // https://github.com/ariya/FastLZ/commit/344eb4025f9ae866ebf7a2ec48850f7113a97a42
+    // Decompression is backwards compatible.
+
+    /// @dev Returns the compressed `data`.
+    function flzCompress(bytes memory data) internal pure returns (bytes memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            function ms8(d_, v_) -> _d {
+                mstore8(d_, v_)
+                _d := add(d_, 1)
+            }
+            function u24(p_) -> _u {
+                let w := mload(p_)
+                _u := or(shl(16, byte(2, w)), or(shl(8, byte(1, w)), byte(0, w)))
+            }
+            function cmp(p_, q_, e_) -> _l {
+                for { e_ := sub(e_, q_) } lt(_l, e_) { _l := add(_l, 1) } {
+                    e_ := mul(iszero(byte(0, xor(mload(add(p_, _l)), mload(add(q_, _l))))), e_)
+                }
+            }
+            function literals(runs_, src_, dest_) -> _o {
+                for { _o := dest_ } iszero(lt(runs_, 0x20)) { runs_ := sub(runs_, 0x20) } {
+                    mstore(ms8(_o, 31), mload(src_))
+                    _o := add(_o, 0x21)
+                    src_ := add(src_, 0x20)
+                }
+                if iszero(runs_) { leave }
+                mstore(ms8(_o, sub(runs_, 1)), mload(src_))
+                _o := add(1, add(_o, runs_))
+            }
+            function match(l_, d_, o_) -> _o {
+                for { d_ := sub(d_, 1) } iszero(lt(l_, 263)) { l_ := sub(l_, 262) } {
+                    o_ := ms8(ms8(ms8(o_, add(224, shr(8, d_))), 253), and(0xff, d_))
+                }
+                if iszero(lt(l_, 7)) {
+                    _o := ms8(ms8(ms8(o_, add(224, shr(8, d_))), sub(l_, 7)), and(0xff, d_))
+                    leave
+                }
+                _o := ms8(ms8(o_, add(shl(5, l_), shr(8, d_))), and(0xff, d_))
+            }
+            function setHash(i_, v_) {
+                let p := add(mload(0x40), shl(2, i_))
+                mstore(p, xor(mload(p), shl(224, xor(shr(224, mload(p)), v_))))
+            }
+            function getHash(i_) -> _h {
+                _h := shr(224, mload(add(mload(0x40), shl(2, i_))))
+            }
+            function hash(v_) -> _r {
+                _r := and(shr(19, mul(2654435769, v_)), 0x1fff)
+            }
+            function setNextHash(ip_, ipStart_) -> _ip {
+                setHash(hash(u24(ip_)), sub(ip_, ipStart_))
+                _ip := add(ip_, 1)
+            }
+            codecopy(mload(0x40), codesize(), 0x8000) // Zeroize the hashmap.
+            let op := add(mload(0x40), 0x8000)
+            let a := add(data, 0x20)
+            let ipStart := a
+            let ipLimit := sub(add(ipStart, mload(data)), 13)
+            for { let ip := add(2, a) } lt(ip, ipLimit) {} {
+                let r := 0
+                let d := 0
+                for {} 1 {} {
+                    let s := u24(ip)
+                    let h := hash(s)
+                    r := add(ipStart, getHash(h))
+                    setHash(h, sub(ip, ipStart))
+                    d := sub(ip, r)
+                    if iszero(lt(ip, ipLimit)) { break }
+                    ip := add(ip, 1)
+                    if iszero(gt(d, 0x1fff)) { if eq(s, u24(r)) { break } }
+                }
+                if iszero(lt(ip, ipLimit)) { break }
+                ip := sub(ip, 1)
+                if gt(ip, a) { op := literals(sub(ip, a), a, op) }
+                let l := cmp(add(r, 3), add(ip, 3), add(ipLimit, 9))
+                op := match(l, d, op)
+                ip := setNextHash(setNextHash(add(ip, l), ipStart), ipStart)
+                a := ip
+            }
+            op := literals(sub(add(ipStart, mload(data)), a), a, op)
+            result := mload(0x40)
+            let t := add(result, 0x8000)
+            let n := sub(op, t)
+            mstore(result, n) // Store the length.
+            // Copy the result to compact the memory, overwriting the hashmap.
+            let o := add(result, 0x20)
+            for { let i } lt(i, n) { i := add(i, 0x20) } { mstore(add(o, i), mload(add(t, i))) }
+            mstore(add(o, n), 0) // Zeroize the slot after the string.
+            mstore(0x40, add(add(o, n), 0x20)) // Allocate the memory.
+        }
+    }
+
+    /// @dev Returns the decompressed `data`.
+    function flzDecompress(bytes memory data) internal pure returns (bytes memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let n := 0
+            let end := add(add(data, 0x20), mload(data))
+            result := mload(0x40)
+            let op := add(result, 0x20)
+            for { data := add(data, 0x20) } lt(data, end) {} {
+                let w := mload(data)
+                let c := byte(0, w)
+                let t := shr(5, c)
+                if iszero(t) {
+                    mstore(add(op, n), mload(add(data, 1)))
+                    data := add(data, add(2, c))
+                    n := add(n, add(1, c))
+                    continue
+                }
+                let g := eq(t, 7)
+                let l := add(2, xor(t, mul(g, xor(t, add(7, byte(1, w))))))
+                for {
+                    let s := add(add(shl(8, and(0x1f, c)), byte(add(1, g), w)), 1)
+                    let r := add(op, sub(n, s))
+                    let o := add(op, n)
+                    let f := xor(s, mul(gt(s, 0x20), xor(s, 0x20)))
+                    let j := 0
+                } 1 {} {
+                    mstore(add(o, j), mload(add(r, j)))
+                    j := add(j, f)
+                    if iszero(lt(j, l)) { break }
+                }
+                data := add(data, add(2, g))
+                n := add(n, l)
+            }
+            mstore(result, n) // Store the length.
+            let o := add(add(result, 0x20), n)
+            mstore(o, 0) // Zeroize the slot after the string.
+            mstore(0x40, add(o, 0x20)) // Allocate the memory.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    CALLDATA OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // Calldata compression and decompression using selective run length encoding:
+    // - Sequences of 0x00 (up to 128 consecutive).
+    // - Sequences of 0xff (up to 32 consecutive).
+    //
+    // A run length encoded block consists of two bytes:
+    // (0) 0x00
+    // (1) A control byte with the following bit layout:
+    //     - [7]     `0: 0x00, 1: 0xff`.
+    //     - [0..6]  `runLength - 1`.
+    //
+    // The first 4 bytes are bitwise negated so that the compressed calldata
+    // can be dispatched into the `fallback` and `receive` functions.
+
+    /// @dev Returns the compressed `data`.
+    function cdCompress(bytes memory data) internal pure returns (bytes memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            function rle(v_, o_, d_) -> _o, _d {
+                mstore(o_, shl(240, or(and(0xff, add(d_, 0xff)), and(0x80, v_))))
+                _o := add(o_, 2)
+            }
+            result := mload(0x40)
+            let o := add(result, 0x20)
+            let z := 0 // Number of consecutive 0x00.
+            let y := 0 // Number of consecutive 0xff.
+            for { let end := add(data, mload(data)) } iszero(eq(data, end)) {} {
+                data := add(data, 1)
+                let c := byte(31, mload(data))
+                if iszero(c) {
+                    if y { o, y := rle(0xff, o, y) }
+                    z := add(z, 1)
+                    if eq(z, 0x80) { o, z := rle(0x00, o, 0x80) }
+                    continue
+                }
+                if eq(c, 0xff) {
+                    if z { o, z := rle(0x00, o, z) }
+                    y := add(y, 1)
+                    if eq(y, 0x20) { o, y := rle(0xff, o, 0x20) }
+                    continue
+                }
+                if y { o, y := rle(0xff, o, y) }
+                if z { o, z := rle(0x00, o, z) }
+                mstore8(o, c)
+                o := add(o, 1)
+            }
+            if y { o, y := rle(0xff, o, y) }
+            if z { o, z := rle(0x00, o, z) }
+            // Bitwise negate the first 4 bytes.
+            mstore(add(result, 4), not(mload(add(result, 4))))
+            mstore(result, sub(o, add(result, 0x20))) // Store the length.
+            mstore(o, 0) // Zeroize the slot after the string.
+            mstore(0x40, add(o, 0x20)) // Allocate the memory.
+        }
+    }
+
+    /// @dev Returns the decompressed `data`.
+    function cdDecompress(bytes memory data) internal pure returns (bytes memory result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if mload(data) {
+                result := mload(0x40)
+                let o := add(result, 0x20)
+                let s := add(data, 4)
+                let v := mload(s)
+                let end := add(data, mload(data))
+                mstore(s, not(v)) // Bitwise negate the first 4 bytes.
+                for {} lt(data, end) {} {
+                    data := add(data, 1)
+                    let c := byte(31, mload(data))
+                    if iszero(c) {
+                        data := add(data, 1)
+                        let d := byte(31, mload(data))
+                        // Fill with either 0xff or 0x00.
+                        mstore(o, not(0))
+                        if iszero(gt(d, 0x7f)) { codecopy(o, codesize(), add(d, 1)) }
+                        o := add(o, add(and(d, 0x7f), 1))
+                        continue
+                    }
+                    mstore8(o, c)
+                    o := add(o, 1)
+                }
+                mstore(s, v) // Restore the first 4 bytes.
+                mstore(result, sub(o, add(result, 0x20))) // Store the length.
+                mstore(o, 0) // Zeroize the slot after the string.
+                mstore(0x40, add(o, 0x20)) // Allocate the memory.
+            }
+        }
+    }
+
+    /// @dev To be called in the `receive` and `fallback` functions.
+    /// ```
+    ///     receive() external payable { LibZip.cdFallback(); }
+    ///     fallback() external payable { LibZip.cdFallback(); }
+    /// ```
+    /// For efficiency, this function will directly return the results, terminating the context.
+    /// If called internally, it must be called at the end of the function.
+    function cdFallback() internal {
+        assembly {
+            if iszero(calldatasize()) { return(calldatasize(), calldatasize()) }
+            let o := 0
+            let f := not(3) // For negating the first 4 bytes.
+            for { let i := 0 } lt(i, calldatasize()) {} {
+                let c := byte(0, xor(add(i, f), calldataload(i)))
+                i := add(i, 1)
+                if iszero(c) {
+                    let d := byte(0, xor(add(i, f), calldataload(i)))
+                    i := add(i, 1)
+                    // Fill with either 0xff or 0x00.
+                    mstore(o, not(0))
+                    if iszero(gt(d, 0x7f)) { codecopy(o, codesize(), add(d, 1)) }
+                    o := add(o, add(and(d, 0x7f), 1))
+                    continue
+                }
+                mstore8(o, c)
+                o := add(o, 1)
+            }
+            let success := delegatecall(gas(), address(), 0x00, o, 0x00, 0x00)
+            returndatacopy(0x00, 0x00, returndatasize())
+            if iszero(success) { revert(0x00, returndatasize()) }
+            return(0x00, returndatasize())
+        }
+    }
+}
+
+
+// File: lib/solady/src/utils/LibBitmap.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import {LibBit} from "./LibBit.sol";
+
+/// @notice Library for storage of packed unsigned booleans.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/LibBitmap.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/LibBitmap.sol)
+/// @author Modified from Solidity-Bits (https://github.com/estarriolvetch/solidity-bits/blob/main/contracts/BitMaps.sol)
+library LibBitmap {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The constant returned when a bitmap scan does not find a result.
+    uint256 internal constant NOT_FOUND = type(uint256).max;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STRUCTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev A bitmap in storage.
+    struct Bitmap {
+        mapping(uint256 => uint256) map;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         OPERATIONS                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the boolean value of the bit at `index` in `bitmap`.
+    function get(Bitmap storage bitmap, uint256 index) internal view returns (bool isSet) {
+        // It is better to set `isSet` to either 0 or 1, than zero vs non-zero.
+        // Both cost the same amount of gas, but the former allows the returned value
+        // to be reused without cleaning the upper bits.
+        uint256 b = (bitmap.map[index >> 8] >> (index & 0xff)) & 1;
+        /// @solidity memory-safe-assembly
+        assembly {
+            isSet := b
+        }
+    }
+
+    /// @dev Updates the bit at `index` in `bitmap` to true.
+    function set(Bitmap storage bitmap, uint256 index) internal {
+        bitmap.map[index >> 8] |= (1 << (index & 0xff));
+    }
+
+    /// @dev Updates the bit at `index` in `bitmap` to false.
+    function unset(Bitmap storage bitmap, uint256 index) internal {
+        bitmap.map[index >> 8] &= ~(1 << (index & 0xff));
+    }
+
+    /// @dev Flips the bit at `index` in `bitmap`.
+    /// Returns the boolean result of the flipped bit.
+    function toggle(Bitmap storage bitmap, uint256 index) internal returns (bool newIsSet) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, shr(8, index))
+            mstore(0x20, bitmap.slot)
+            let storageSlot := keccak256(0x00, 0x40)
+            let shift := and(index, 0xff)
+            let storageValue := sload(storageSlot)
+
+            let mask := shl(shift, 1)
+            storageValue := xor(storageValue, mask)
+            // It makes sense to return the `newIsSet`,
+            // as it allow us to skip an additional warm `sload`,
+            // and it costs minimal gas (about 15),
+            // which may be optimized away if the returned value is unused.
+            newIsSet := iszero(iszero(and(storageValue, mask)))
+            sstore(storageSlot, storageValue)
+        }
+    }
+
+    /// @dev Updates the bit at `index` in `bitmap` to `shouldSet`.
+    function setTo(Bitmap storage bitmap, uint256 index, bool shouldSet) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x20, bitmap.slot)
+            mstore(0x00, shr(8, index))
+            let storageSlot := keccak256(0x00, 0x40)
+            let storageValue := sload(storageSlot)
+            let shift := and(index, 0xff)
+
+            sstore(
+                storageSlot,
+                // Unsets the bit at `shift` via `and`, then sets its new value via `or`.
+                or(and(storageValue, not(shl(shift, 1))), shl(shift, iszero(iszero(shouldSet))))
+            )
+        }
+    }
+
+    /// @dev Consecutively sets `amount` of bits starting from the bit at `start`.
+    function setBatch(Bitmap storage bitmap, uint256 start, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let max := not(0)
+            let shift := and(start, 0xff)
+            mstore(0x20, bitmap.slot)
+            mstore(0x00, shr(8, start))
+            if iszero(lt(add(shift, amount), 257)) {
+                let storageSlot := keccak256(0x00, 0x40)
+                sstore(storageSlot, or(sload(storageSlot), shl(shift, max)))
+                let bucket := add(mload(0x00), 1)
+                let bucketEnd := add(mload(0x00), shr(8, add(amount, shift)))
+                amount := and(add(amount, shift), 0xff)
+                shift := 0
+                for {} iszero(eq(bucket, bucketEnd)) { bucket := add(bucket, 1) } {
+                    mstore(0x00, bucket)
+                    sstore(keccak256(0x00, 0x40), max)
+                }
+                mstore(0x00, bucket)
+            }
+            let storageSlot := keccak256(0x00, 0x40)
+            sstore(storageSlot, or(sload(storageSlot), shl(shift, shr(sub(256, amount), max))))
+        }
+    }
+
+    /// @dev Consecutively unsets `amount` of bits starting from the bit at `start`.
+    function unsetBatch(Bitmap storage bitmap, uint256 start, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let shift := and(start, 0xff)
+            mstore(0x20, bitmap.slot)
+            mstore(0x00, shr(8, start))
+            if iszero(lt(add(shift, amount), 257)) {
+                let storageSlot := keccak256(0x00, 0x40)
+                sstore(storageSlot, and(sload(storageSlot), not(shl(shift, not(0)))))
+                let bucket := add(mload(0x00), 1)
+                let bucketEnd := add(mload(0x00), shr(8, add(amount, shift)))
+                amount := and(add(amount, shift), 0xff)
+                shift := 0
+                for {} iszero(eq(bucket, bucketEnd)) { bucket := add(bucket, 1) } {
+                    mstore(0x00, bucket)
+                    sstore(keccak256(0x00, 0x40), 0)
+                }
+                mstore(0x00, bucket)
+            }
+            let storageSlot := keccak256(0x00, 0x40)
+            sstore(
+                storageSlot, and(sload(storageSlot), not(shl(shift, shr(sub(256, amount), not(0)))))
+            )
+        }
+    }
+
+    /// @dev Returns number of set bits within a range by
+    /// scanning `amount` of bits starting from the bit at `start`.
+    function popCount(Bitmap storage bitmap, uint256 start, uint256 amount)
+        internal
+        view
+        returns (uint256 count)
+    {
+        unchecked {
+            uint256 bucket = start >> 8;
+            uint256 shift = start & 0xff;
+            if (!(amount + shift < 257)) {
+                count = LibBit.popCount(bitmap.map[bucket] >> shift);
+                uint256 bucketEnd = bucket + ((amount + shift) >> 8);
+                amount = (amount + shift) & 0xff;
+                shift = 0;
+                for (++bucket; bucket != bucketEnd; ++bucket) {
+                    count += LibBit.popCount(bitmap.map[bucket]);
+                }
+            }
+            count += LibBit.popCount((bitmap.map[bucket] >> shift) << (256 - amount));
+        }
+    }
+
+    /// @dev Returns the index of the most significant set bit before the bit at `before`.
+    /// If no set bit is found, returns `NOT_FOUND`.
+    function findLastSet(Bitmap storage bitmap, uint256 before)
+        internal
+        view
+        returns (uint256 setBitIndex)
+    {
+        uint256 bucket;
+        uint256 bucketBits;
+        /// @solidity memory-safe-assembly
+        assembly {
+            setBitIndex := not(0)
+            bucket := shr(8, before)
+            mstore(0x00, bucket)
+            mstore(0x20, bitmap.slot)
+            let offset := and(0xff, not(before)) // `256 - (255 & before) - 1`.
+            bucketBits := shr(offset, shl(offset, sload(keccak256(0x00, 0x40))))
+            if iszero(bucketBits) {
+                for {} bucket {} {
+                    bucket := add(bucket, setBitIndex) // `sub(bucket, 1)`.
+                    mstore(0x00, bucket)
+                    bucketBits := sload(keccak256(0x00, 0x40))
+                    if bucketBits { break }
+                }
+            }
+        }
+        if (bucketBits != 0) {
+            setBitIndex = (bucket << 8) | LibBit.fls(bucketBits);
+            /// @solidity memory-safe-assembly
+            assembly {
+                setBitIndex := or(setBitIndex, sub(0, gt(setBitIndex, before)))
+            }
+        }
+    }
+}
+
+
+// File: lib/solady/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/SafeTransferLib.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+///
+/// @dev Note:
+/// - For ETH transfers, please use `forceSafeTransferETH` for DoS protection.
+/// - For ERC20s, this implementation won't check that a token has code,
+///   responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ETH transfer has failed.
+    error ETHTransferFailed();
+
+    /// @dev The ERC20 `transferFrom` has failed.
+    error TransferFromFailed();
+
+    /// @dev The ERC20 `transfer` has failed.
+    error TransferFailed();
+
+    /// @dev The ERC20 `approve` has failed.
+    error ApproveFailed();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Suggested gas stipend for contract receiving ETH that disallows any storage writes.
+    uint256 internal constant GAS_STIPEND_NO_STORAGE_WRITES = 2300;
+
+    /// @dev Suggested gas stipend for contract receiving ETH to perform a few
+    /// storage reads and writes, but low enough to prevent griefing.
+    uint256 internal constant GAS_STIPEND_NO_GRIEF = 100000;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       ETH OPERATIONS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // If the ETH transfer MUST succeed with a reasonable gas budget, use the force variants.
+    //
+    // The regular variants:
+    // - Forwards all remaining gas to the target.
+    // - Reverts if the target reverts.
+    // - Reverts if the current contract has insufficient balance.
+    //
+    // The force variants:
+    // - Forwards with an optional gas stipend
+    //   (defaults to `GAS_STIPEND_NO_GRIEF`, which is sufficient for most cases).
+    // - If the target reverts, or if the gas stipend is exhausted,
+    //   creates a temporary contract to force send the ETH via `SELFDESTRUCT`.
+    //   Future compatible with `SENDALL`: https://eips.ethereum.org/EIPS/eip-4758.
+    // - Reverts if the current contract has insufficient balance.
+    //
+    // The try variants:
+    // - Forwards with a mandatory gas stipend.
+    // - Instead of reverting, returns whether the transfer succeeded.
+
+    /// @dev Sends `amount` (in wei) ETH to `to`.
+    function safeTransferETH(address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(call(gas(), to, amount, gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Sends all the ETH in the current contract to `to`.
+    function safeTransferAllETH(address to) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer all the ETH and check if it succeeded or not.
+            if iszero(call(gas(), to, selfbalance(), gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Force sends `amount` (in wei) ETH to `to`, with a `gasStipend`.
+    function forceSafeTransferETH(address to, uint256 amount, uint256 gasStipend) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if lt(selfbalance(), amount) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            if iszero(call(gasStipend, to, amount, gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(amount, 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Force sends all the ETH in the current contract to `to`, with a `gasStipend`.
+    function forceSafeTransferAllETH(address to, uint256 gasStipend) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(call(gasStipend, to, selfbalance(), gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(selfbalance(), 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Force sends `amount` (in wei) ETH to `to`, with `GAS_STIPEND_NO_GRIEF`.
+    function forceSafeTransferETH(address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if lt(selfbalance(), amount) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            if iszero(call(GAS_STIPEND_NO_GRIEF, to, amount, gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(amount, 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Force sends all the ETH in the current contract to `to`, with `GAS_STIPEND_NO_GRIEF`.
+    function forceSafeTransferAllETH(address to) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(call(GAS_STIPEND_NO_GRIEF, to, selfbalance(), gas(), 0x00, gas(), 0x00)) {
+                mstore(0x00, to) // Store the address in scratch space.
+                mstore8(0x0b, 0x73) // Opcode `PUSH20`.
+                mstore8(0x20, 0xff) // Opcode `SELFDESTRUCT`.
+                if iszero(create(selfbalance(), 0x0b, 0x16)) {
+                    returndatacopy(gas(), returndatasize(), shr(20, gas())) // For gas estimation.
+                }
+            }
+        }
+    }
+
+    /// @dev Sends `amount` (in wei) ETH to `to`, with a `gasStipend`.
+    function trySafeTransferETH(address to, uint256 amount, uint256 gasStipend)
+        internal
+        returns (bool success)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            success := call(gasStipend, to, amount, gas(), 0x00, gas(), 0x00)
+        }
+    }
+
+    /// @dev Sends all the ETH in the current contract to `to`, with a `gasStipend`.
+    function trySafeTransferAllETH(address to, uint256 gasStipend)
+        internal
+        returns (bool success)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            success := call(gasStipend, to, selfbalance(), gas(), 0x00, gas(), 0x00)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      ERC20 OPERATIONS                      */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Sends `amount` of ERC20 `token` from `from` to `to`.
+    /// Reverts upon failure.
+    ///
+    /// The `from` account must have at least `amount` approved for
+    /// the current contract to manage.
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x60, amount) // Store the `amount` argument.
+            mstore(0x40, to) // Store the `to` argument.
+            mstore(0x2c, shl(96, from)) // Store the `from` argument.
+            mstore(0x0c, 0x23b872dd000000000000000000000000) // `transferFrom(address,address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x1c, 0x64, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Sends all of ERC20 `token` from `from` to `to`.
+    /// Reverts upon failure.
+    ///
+    /// The `from` account must have their entire balance approved for
+    /// the current contract to manage.
+    function safeTransferAllFrom(address token, address from, address to)
+        internal
+        returns (uint256 amount)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x40, to) // Store the `to` argument.
+            mstore(0x2c, shl(96, from)) // Store the `from` argument.
+            mstore(0x0c, 0x70a08231000000000000000000000000) // `balanceOf(address)`.
+            // Read the balance, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    gt(returndatasize(), 0x1f), // At least 32 bytes returned.
+                    staticcall(gas(), token, 0x1c, 0x24, 0x60, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x00, 0x23b872dd) // `transferFrom(address,address,uint256)`.
+            amount := mload(0x60) // The `amount` is already at 0x60. We'll need to return it.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x1c, 0x64, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Sends `amount` of ERC20 `token` from the current contract to `to`.
+    /// Reverts upon failure.
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0xa9059cbb000000000000000000000000) // `transfer(address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Sends all of ERC20 `token` from the current contract to `to`.
+    /// Reverts upon failure.
+    function safeTransferAll(address token, address to) internal returns (uint256 amount) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, 0x70a08231) // Store the function selector of `balanceOf(address)`.
+            mstore(0x20, address()) // Store the address of the current contract.
+            // Read the balance, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    gt(returndatasize(), 0x1f), // At least 32 bytes returned.
+                    staticcall(gas(), token, 0x1c, 0x24, 0x34, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x14, to) // Store the `to` argument.
+            amount := mload(0x34) // The `amount` is already at 0x34. We'll need to return it.
+            mstore(0x00, 0xa9059cbb000000000000000000000000) // `transfer(address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Sets `amount` of ERC20 `token` for `to` to manage on behalf of the current contract.
+    /// Reverts upon failure.
+    function safeApprove(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
+            // Perform the approval, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x3e3f8f73) // `ApproveFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Sets `amount` of ERC20 `token` for `to` to manage on behalf of the current contract.
+    /// If the initial attempt to approve fails, attempts to reset the approved amount to zero,
+    /// then retries the approval again (some tokens, e.g. USDT, requires this).
+    /// Reverts upon failure.
+    function safeApproveWithRetry(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
+            // Perform the approval, retrying upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x34, 0) // Store 0 for the `amount`.
+                mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
+                pop(call(gas(), token, 0, 0x10, 0x44, 0x00, 0x00)) // Reset the approval.
+                mstore(0x34, amount) // Store back the original `amount`.
+                // Retry the approval, reverting upon failure.
+                if iszero(
+                    and(
+                        or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                        call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                    )
+                ) {
+                    mstore(0x00, 0x3e3f8f73) // `ApproveFailed()`.
+                    revert(0x1c, 0x04)
+                }
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
+    }
+
+    /// @dev Returns the amount of ERC20 `token` owned by `account`.
+    /// Returns zero if the `token` does not exist.
+    function balanceOf(address token, address account) internal view returns (uint256 amount) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, account) // Store the `account` argument.
+            mstore(0x00, 0x70a08231000000000000000000000000) // `balanceOf(address)`.
+            amount :=
+                mul(
+                    mload(0x20),
+                    and( // The arguments of `and` are evaluated from right to left.
+                        gt(returndatasize(), 0x1f), // At least 32 bytes returned.
+                        staticcall(gas(), token, 0x10, 0x24, 0x20, 0x20)
+                    )
+                )
+        }
+    }
+}
+
+
+// File: lib/solady/src/utils/SignatureCheckerLib.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Signature verification helper that supports both ECDSA signatures from EOAs
+/// and ERC1271 signatures from smart contract wallets like Argent and Gnosis safe.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/SignatureCheckerLib.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/SignatureChecker.sol)
+///
+/// @dev Note:
+/// - The signature checking functions use the ecrecover precompile (0x1).
+/// - The `bytes memory signature` variants use the identity precompile (0x4)
+///   to copy memory internally.
+/// - Unlike ECDSA signatures, contract signatures are revocable.
+///
+/// WARNING! Do NOT use signatures as unique identifiers.
+/// Please use EIP712 with a nonce included in the digest to prevent replay attacks.
+/// This implementation does NOT check if a signature is non-malleable.
+library SignatureCheckerLib {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*               SIGNATURE CHECKING OPERATIONS                */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns whether `signature` is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNow(address signer, bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                if eq(mload(signature), 65) {
+                    mstore(0x00, hash)
+                    mstore(0x20, byte(0, mload(add(signature, 0x60)))) // `v`.
+                    mstore(0x40, mload(add(signature, 0x20))) // `r`.
+                    mstore(0x60, mload(add(signature, 0x40))) // `s`.
+                    let t :=
+                        staticcall(
+                            gas(), // Amount of gas left for the transaction.
+                            1, // Address of `ecrecover`.
+                            0x00, // Start of input.
+                            0x80, // Size of input.
+                            0x01, // Start of output.
+                            0x20 // Size of output.
+                        )
+                    // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                    if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                        isValid := 1
+                        mstore(0x60, 0) // Restore the zero slot.
+                        mstore(0x40, m) // Restore the free memory pointer.
+                        break
+                    }
+                }
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                // Copy the `signature` over.
+                let n := add(0x20, mload(signature))
+                pop(staticcall(gas(), 4, signature, n, add(m, 0x44), n))
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        add(returndatasize(), 0x44), // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether `signature` is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNowCalldata(address signer, bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                if eq(signature.length, 65) {
+                    mstore(0x00, hash)
+                    mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40)))) // `v`.
+                    calldatacopy(0x40, signature.offset, 0x40) // `r`, `s`.
+                    let t :=
+                        staticcall(
+                            gas(), // Amount of gas left for the transaction.
+                            1, // Address of `ecrecover`.
+                            0x00, // Start of input.
+                            0x80, // Size of input.
+                            0x01, // Start of output.
+                            0x20 // Size of output.
+                        )
+                    // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                    if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                        isValid := 1
+                        mstore(0x60, 0) // Restore the zero slot.
+                        mstore(0x40, m) // Restore the free memory pointer.
+                        break
+                    }
+                }
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                mstore(add(m, 0x44), signature.length)
+                // Copy the `signature` over.
+                calldatacopy(add(m, 0x64), signature.offset, signature.length)
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        add(signature.length, 0x64), // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether the signature (`r`, `vs`) is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNow(address signer, bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                mstore(0x00, hash)
+                mstore(0x20, add(shr(255, vs), 27)) // `v`.
+                mstore(0x40, r) // `r`.
+                mstore(0x60, shr(1, shl(1, vs))) // `s`.
+                let t :=
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        1, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                    isValid := 1
+                    mstore(0x60, 0) // Restore the zero slot.
+                    mstore(0x40, m) // Restore the free memory pointer.
+                    break
+                }
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                mstore(add(m, 0x44), 65) // Length of the signature.
+                mstore(add(m, 0x64), r) // `r`.
+                mstore(add(m, 0x84), mload(0x60)) // `s`.
+                mstore8(add(m, 0xa4), mload(0x20)) // `v`.
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        0xa5, // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+                break
+            }
+        }
+    }
+
+    /// @dev Returns whether the signature (`v`, `r`, `s`) is valid for `signer` and `hash`.
+    /// If `signer` is a smart contract, the signature is validated with ERC1271.
+    /// Otherwise, the signature is validated with `ECDSA.recover`.
+    function isValidSignatureNow(address signer, bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits of `signer` in case they are dirty.
+            for { signer := shr(96, shl(96, signer)) } signer {} {
+                let m := mload(0x40)
+                mstore(0x00, hash)
+                mstore(0x20, and(v, 0xff)) // `v`.
+                mstore(0x40, r) // `r`.
+                mstore(0x60, s) // `s`.
+                let t :=
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        1, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                if iszero(or(iszero(returndatasize()), xor(signer, mload(t)))) {
+                    isValid := 1
+                    mstore(0x60, 0) // Restore the zero slot.
+                    mstore(0x40, m) // Restore the free memory pointer.
+                    break
+                }
+
+                let f := shl(224, 0x1626ba7e)
+                mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+                mstore(add(m, 0x04), hash)
+                let d := add(m, 0x24)
+                mstore(d, 0x40) // The offset of the `signature` in the calldata.
+                mstore(add(m, 0x44), 65) // Length of the signature.
+                mstore(add(m, 0x64), r) // `r`.
+                mstore(add(m, 0x84), s) // `s`.
+                mstore8(add(m, 0xa4), v) // `v`.
+                // forgefmt: disable-next-item
+                isValid := and(
+                    // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                    eq(mload(d), f),
+                    // Whether the staticcall does not revert.
+                    // This must be placed at the end of the `and` clause,
+                    // as the arguments are evaluated from right to left.
+                    staticcall(
+                        gas(), // Remaining gas.
+                        signer, // The `signer` address.
+                        m, // Offset of calldata in memory.
+                        0xa5, // Length of calldata in memory.
+                        d, // Offset of returndata.
+                        0x20 // Length of returndata to write.
+                    )
+                )
+                mstore(0x60, 0) // Restore the zero slot.
+                mstore(0x40, m) // Restore the free memory pointer.
+                break
+            }
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     ERC1271 OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns whether `signature` is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNow(address signer, bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            // Copy the `signature` over.
+            let n := add(0x20, mload(signature))
+            pop(staticcall(gas(), 4, signature, n, add(m, 0x44), n))
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    add(returndatasize(), 0x44), // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /// @dev Returns whether `signature` is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNowCalldata(
+        address signer,
+        bytes32 hash,
+        bytes calldata signature
+    ) internal view returns (bool isValid) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            mstore(add(m, 0x44), signature.length)
+            // Copy the `signature` over.
+            calldatacopy(add(m, 0x64), signature.offset, signature.length)
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    add(signature.length, 0x64), // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /// @dev Returns whether the signature (`r`, `vs`) is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNow(address signer, bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            mstore(add(m, 0x44), 65) // Length of the signature.
+            mstore(add(m, 0x64), r) // `r`.
+            mstore(add(m, 0x84), shr(1, shl(1, vs))) // `s`.
+            mstore8(add(m, 0xa4), add(shr(255, vs), 27)) // `v`.
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    0xa5, // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /// @dev Returns whether the signature (`v`, `r`, `s`) is valid for `hash`
+    /// for an ERC1271 `signer` contract.
+    function isValidERC1271SignatureNow(address signer, bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (bool isValid)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40)
+            let f := shl(224, 0x1626ba7e)
+            mstore(m, f) // `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
+            mstore(add(m, 0x04), hash)
+            let d := add(m, 0x24)
+            mstore(d, 0x40) // The offset of the `signature` in the calldata.
+            mstore(add(m, 0x44), 65) // Length of the signature.
+            mstore(add(m, 0x64), r) // `r`.
+            mstore(add(m, 0x84), s) // `s`.
+            mstore8(add(m, 0xa4), v) // `v`.
+            // forgefmt: disable-next-item
+            isValid := and(
+                // Whether the returndata is the magic value `0x1626ba7e` (left-aligned).
+                eq(mload(d), f),
+                // Whether the staticcall does not revert.
+                // This must be placed at the end of the `and` clause,
+                // as the arguments are evaluated from right to left.
+                staticcall(
+                    gas(), // Remaining gas.
+                    signer, // The `signer` address.
+                    m, // Offset of calldata in memory.
+                    0xa5, // Length of calldata in memory.
+                    d, // Offset of returndata.
+                    0x20 // Length of returndata to write.
+                )
+            )
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EMPTY CALLDATA HELPERS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an empty calldata bytes.
+    function emptySignature() internal pure returns (bytes calldata signature) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            signature.length := 0
+        }
+    }
+}
+
+
+// File: lib/solady/src/utils/LibBit.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Library for bit twiddling and boolean operations.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/LibBit.sol)
+/// @author Inspired by (https://graphics.stanford.edu/~seander/bithacks.html)
+library LibBit {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  BIT TWIDDLING OPERATIONS                  */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Find last set.
+    /// Returns the index of the most significant bit of `x`,
+    /// counting from the least significant bit position.
+    /// If `x` is zero, returns 256.
+    function fls(uint256 x) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r := or(shl(8, iszero(x)), shl(7, lt(0xffffffffffffffffffffffffffffffff, x)))
+            r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, x))))
+            r := or(r, shl(5, lt(0xffffffff, shr(r, x))))
+            r := or(r, shl(4, lt(0xffff, shr(r, x))))
+            r := or(r, shl(3, lt(0xff, shr(r, x))))
+            r := or(r, shl(2, lt(0xf, shr(r, x))))
+            r := or(r, byte(shr(r, x), hex"00000101020202020303030303030303"))
+        }
+    }
+
+    /// @dev Count leading zeros.
+    /// Returns the number of zeros preceding the most significant one bit.
+    /// If `x` is zero, returns 256.
+    function clz(uint256 x) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r := shl(7, lt(0xffffffffffffffffffffffffffffffff, x))
+            r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, x))))
+            r := or(r, shl(5, lt(0xffffffff, shr(r, x))))
+            r := or(r, shl(4, lt(0xffff, shr(r, x))))
+            r := or(r, shl(3, lt(0xff, shr(r, x))))
+            r := or(r, shl(2, lt(0xf, shr(r, x))))
+            // forgefmt: disable-next-item
+            r := add(iszero(x), xor(255,
+                or(r, byte(shr(r, x), hex"00000101020202020303030303030303"))))
+        }
+    }
+
+    /// @dev Find first set.
+    /// Returns the index of the least significant bit of `x`,
+    /// counting from the least significant bit position.
+    /// If `x` is zero, returns 256.
+    /// Equivalent to `ctz` (count trailing zeros), which gives
+    /// the number of zeros following the least significant one bit.
+    function ffs(uint256 x) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Isolate the least significant bit.
+            let b := and(x, add(not(x), 1))
+
+            r := or(shl(8, iszero(x)), shl(7, lt(0xffffffffffffffffffffffffffffffff, b)))
+            r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, b))))
+            r := or(r, shl(5, lt(0xffffffff, shr(r, b))))
+
+            // For the remaining 32 bits, use a De Bruijn lookup.
+            // forgefmt: disable-next-item
+            r := or(r, byte(and(div(0xd76453e0, shr(r, b)), 0x1f),
+                0x001f0d1e100c1d070f090b19131c1706010e11080a1a141802121b1503160405))
+        }
+    }
+
+    /// @dev Returns the number of set bits in `x`.
+    function popCount(uint256 x) internal pure returns (uint256 c) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let max := not(0)
+            let isMax := eq(x, max)
+            x := sub(x, and(shr(1, x), div(max, 3)))
+            x := add(and(x, div(max, 5)), and(shr(2, x), div(max, 5)))
+            x := and(add(x, shr(4, x)), div(max, 17))
+            c := or(shl(8, isMax), shr(248, mul(x, div(max, 255))))
+        }
+    }
+
+    /// @dev Returns whether `x` is a power of 2.
+    function isPo2(uint256 x) internal pure returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Equivalent to `x && !(x & (x - 1))`.
+            result := iszero(add(and(x, sub(x, 1)), iszero(x)))
+        }
+    }
+
+    /// @dev Returns `x` reversed at the bit level.
+    function reverseBits(uint256 x) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Computing masks on-the-fly reduces bytecode size by about 500 bytes.
+            let m := not(0)
+            r := x
+            for { let s := 128 } 1 {} {
+                m := xor(m, shl(s, m))
+                r := or(and(shr(s, r), m), and(shl(s, r), not(m)))
+                s := shr(1, s)
+                if iszero(s) { break }
+            }
+        }
+    }
+
+    /// @dev Returns `x` reversed at the byte level.
+    function reverseBytes(uint256 x) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Computing masks on-the-fly reduces bytecode size by about 200 bytes.
+            let m := not(0)
+            r := x
+            for { let s := 128 } 1 {} {
+                m := xor(m, shl(s, m))
+                r := or(and(shr(s, r), m), and(shl(s, r), not(m)))
+                s := shr(1, s)
+                if eq(s, 4) { break }
+            }
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     BOOLEAN OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // A Solidity bool on the stack or memory is represented as a 256-bit word.
+    // Non-zero values are true, zero is false.
+    // A clean bool is either 0 (false) or 1 (true) under the hood.
+    // Usually, if not always, the bool result of a regular Solidity expression,
+    // or the argument of a public/external function will be a clean bool.
+    // You can usually use the raw variants for more performance.
+    // If uncertain, test (best with exact compiler settings).
+    // Or use the non-raw variants (compiler can sometimes optimize out the double `iszero`s).
+
+    /// @dev Returns `x & y`. Inputs must be clean.
+    function rawAnd(bool x, bool y) internal pure returns (bool z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            z := and(x, y)
+        }
+    }
+
+    /// @dev Returns `x & y`.
+    function and(bool x, bool y) internal pure returns (bool z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            z := and(iszero(iszero(x)), iszero(iszero(y)))
+        }
+    }
+
+    /// @dev Returns `x | y`. Inputs must be clean.
+    function rawOr(bool x, bool y) internal pure returns (bool z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            z := or(x, y)
+        }
+    }
+
+    /// @dev Returns `x | y`.
+    function or(bool x, bool y) internal pure returns (bool z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            z := or(iszero(iszero(x)), iszero(iszero(y)))
+        }
+    }
+
+    /// @dev Returns 1 if `b` is true, else 0. Input must be clean.
+    function rawToUint(bool b) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            z := b
+        }
+    }
+
+    /// @dev Returns 1 if `b` is true, else 0.
+    function toUint(bool b) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            z := iszero(iszero(b))
+        }
+    }
+}
+

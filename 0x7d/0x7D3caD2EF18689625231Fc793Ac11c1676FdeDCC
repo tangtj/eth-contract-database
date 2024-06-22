@@ -1,0 +1,1025 @@
+
+// File: contracts/LiquidityMaker.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+import "./IWETH.sol";
+import "./ISwapsPair.sol";
+import "./ISwapsRouter.sol";
+import "./ISwapsFactory.sol";
+import "./LiquidityHelper.sol";
+
+contract LiquidityMaker is LiquidityHelper {
+
+    address immutable WETH_ADDRESS;
+    address immutable ROUTER_ADDRESS;
+
+    IWETH public immutable WETH;
+    ISwapsRouter public immutable ROUTER;
+    ISwapsFactory public immutable FACTORY;
+
+    event SwapResults(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+
+    event LiquidityAdded(
+        uint256 tokenAmountA,
+        uint256 tokenAmountB,
+        uint256 tokenAmountLP,
+        address indexed tokenA,
+        address indexed tokenB,
+        address indexed addedTo
+    );
+
+    event CleanUp(
+        uint256 tokenAmount,
+        ISwapsERC20 indexed tokenAddress
+    );
+
+    constructor(
+        ISwapsRouter _router,
+        ISwapsFactory _factory
+    ) {
+        ROUTER_ADDRESS = address(
+            _router
+        );
+
+        ROUTER = _router;
+        FACTORY = _factory;
+
+        WETH_ADDRESS = ROUTER.WETH();
+
+        WETH = IWETH(
+            WETH_ADDRESS
+        );
+    }
+
+    /**
+     * @dev
+     * Optimal one-sided supply using ETH
+     * 1. Swaps optimal amount from ETH to ERC20
+     * 2. Adds liquidity for ETH and Token pair
+    */
+    function makeLiquidity(
+        address _tokenAddress,
+        uint256 _expectedTokenAmount,
+        uint256 _minimumLiquidityEther,
+        uint256 _minimumLiquidityToken
+    )
+        external
+        payable
+        returns (uint256)
+    {
+        _wrapEther(
+            msg.value
+        );
+
+        return _makeLiquidity(
+            WETH_ADDRESS,
+            _tokenAddress,
+            msg.value,
+            _expectedTokenAmount,
+            _minimumLiquidityEther,
+            _minimumLiquidityToken,
+            msg.sender
+        );
+    }
+
+    /**
+     * @dev
+     * Optimal one-sided supply using ERC20
+     * 1. Swaps optimal amount from ERC20-A to ERC20-B
+     * 2. Adds liquidity for _tokenA and _tokenB pair
+    */
+    function makeLiquidityDual(
+        address _tokenA,
+        address _tokenB,
+        uint256 _initialAmountA,
+        uint256 _expectedAmountB,
+        uint256 _minimumLiquidityA,
+        uint256 _minimumLiquidityB
+    )
+        external
+    {
+        _safeTransferFrom(
+            _tokenA,
+            msg.sender,
+            address(this),
+            _initialAmountA
+        );
+
+        _makeLiquidity(
+            _tokenA,
+            _tokenB,
+            _initialAmountA,
+            _expectedAmountB,
+            _minimumLiquidityA,
+            _minimumLiquidityB,
+            msg.sender
+        );
+    }
+
+    function _makeLiquidity(
+        address _tokenA,
+        address _tokenB,
+        uint256 _initialAmountA,
+        uint256 _expectedAmountB,
+        uint256 _minimumLiquidityA,
+        uint256 _minimumLiquidityB,
+        address _beneficiaryAddress
+    )
+        internal
+        returns (uint256)
+    {
+        ISwapsPair pair = _getPair(
+            _tokenA,
+            _tokenB
+        );
+
+        (
+            uint256 reserve0,
+            uint256 reserve1,
+        ) = pair.getReserves();
+
+        uint256 swapAmount = pair.token0() == _tokenA
+            ? getSwapAmount(reserve0, _initialAmountA)
+            : getSwapAmount(reserve1, _initialAmountA);
+
+        uint256[] memory swapResults = _swapTokens(
+            _tokenA,
+            _tokenB,
+            swapAmount,
+            _expectedAmountB
+        );
+
+        emit SwapResults(
+            _tokenA,
+            _tokenB,
+            swapResults[0],
+            swapResults[1]
+        );
+
+        _addLiquidity(
+            _tokenA,
+            _tokenB,
+            swapResults[0],
+            swapResults[1],
+            _minimumLiquidityA,
+            _minimumLiquidityB,
+            _beneficiaryAddress
+        );
+
+        return swapAmount;
+    }
+
+    /**
+     * @dev
+     * Uses swapExactTokensForTokens to split provided value
+     * 1. Swaps optimal amount from _tokenIn to _tokenOut
+     * return swap amounts as a result (input and ouput)
+    */
+    function _swapTokens(
+        address _tokenIn,
+        address _tokenOut,
+        uint256 _swapAmountIn,
+        uint256 _expectedAmountOut
+    )
+        private
+        returns (uint256[] memory)
+    {
+        if (ISwapsERC20(_tokenIn).allowance(address(this), ROUTER_ADDRESS) == 0) {
+            _forceApprove(
+                IERC20(_tokenIn),
+                ROUTER_ADDRESS,
+                MAX_VALUE
+            );
+        }
+
+        return ROUTER.swapExactTokensForTokens(
+            _swapAmountIn,
+            _expectedAmountOut,
+            _makePath(
+                _tokenIn,
+                _tokenOut
+            ),
+            address(this),
+            block.timestamp
+        );
+    }
+
+    /**
+     * @dev
+     * Adds liquidity for _tokenA and _tokenB pair
+     * can send LP tokens to _beneficiary address
+    */
+    function _addLiquidity(
+        address _tokenA,
+        address _tokenB,
+        uint256 _amountA,
+        uint256 _amountB,
+        uint256 _minTokenA,
+        uint256 _minTokenB,
+        address _beneficiary
+    )
+        private
+    {
+        _forceApprove(
+            IERC20(_tokenB),
+            ROUTER_ADDRESS,
+            _amountB
+        );
+
+        (
+            uint256 tokenAmountA,
+            uint256 tokenAmountB,
+            uint256 tokenAmountLP
+        ) = ROUTER.addLiquidity(
+            _tokenA,
+            _tokenB,
+            _amountA,
+            _amountB,
+            _minTokenA,
+            _minTokenB,
+            _beneficiary,
+            block.timestamp
+        );
+
+        emit LiquidityAdded(
+            tokenAmountA,
+            tokenAmountB,
+            tokenAmountLP,
+            _tokenA,
+            _tokenB,
+            _beneficiary
+        );
+    }
+
+    /**
+     * @dev
+     * Read address of the pair
+     * by calling FACTORY contract
+    */
+    function _getPair(
+        address _tokenA,
+        address _tokenB
+    )
+        private
+        view
+        returns (ISwapsPair)
+    {
+        return ISwapsPair(
+            FACTORY.getPair(
+                _tokenA,
+                _tokenB
+            )
+        );
+    }
+
+    /**
+     * @dev
+     * Allows to wrap Ether
+     * by calling WETH contract
+    */
+    function _wrapEther(
+        uint256 _amount
+    )
+        private
+    {
+        WETH.deposit{
+            value: _amount
+        }();
+    }
+
+    /**
+     * @dev
+     * Allows to cleanup any tokens stuck
+     * in the contract as leftover dust or
+     * if accidentally sent to the contract
+    */
+    function cleanUp(
+        ISwapsERC20 _token
+    )
+        external
+    {
+        uint256 balance = _token.balanceOf(
+            address(this)
+        );
+
+        _token.transfer(
+            FACTORY.feeTo(),
+            balance
+        );
+
+        emit CleanUp(
+            balance,
+            _token
+        );
+    }
+}
+
+
+// File: contracts/IWETH.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+interface IWETH {
+
+    function deposit()
+        external
+        payable;
+
+    function transfer(
+        address _to,
+        uint256 _value
+    )
+        external
+        returns (bool);
+
+    function withdraw(
+        uint256
+    )
+        external;
+}
+
+
+// File: contracts/ISwapsPair.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+import "./ISwapsERC20.sol";
+
+interface ISwapsPair is ISwapsERC20 {
+
+    function MINIMUM_LIQUIDITY()
+        external
+        pure
+        returns (uint256);
+
+    function factory()
+        external
+        view
+        returns (address);
+
+    function token0()
+        external
+        view
+        returns (address);
+
+    function token1()
+        external
+        view
+        returns (address);
+
+    function getReserves()
+        external
+        view
+        returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast
+        );
+
+    function price0CumulativeLast()
+        external
+        view
+        returns (uint256);
+
+    function price1CumulativeLast()
+        external
+        view
+        returns (uint256);
+
+    function kLast()
+        external
+        view
+        returns (uint256);
+
+    function mint(
+        address _to
+    )
+        external
+        returns (uint256 liquidity);
+
+    function burn(
+        address _to
+    )
+        external
+        returns (
+            uint256 amount0,
+            uint256 amount1
+        );
+
+    function swap(
+        uint256 _amount0Out,
+        uint256 _amount1Out,
+        address _to,
+        bytes calldata _data
+    )
+        external;
+
+    function skim()
+        external;
+
+    function initialize(
+        address,
+        address
+    )
+        external;
+}
+
+
+// File: contracts/ISwapsRouter.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+interface ISwapsRouter {
+
+    function WETH()
+        external
+        returns (address);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        returns (
+            uint256 amountA,
+            uint256 amountB,
+            uint256 liquidity
+        );
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    )
+        external
+        returns (
+            uint[] memory amounts
+        );
+
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        returns (
+            uint256 amountA,
+            uint256 amountB
+        );
+
+    function getReserves(
+        address factory,
+        address tokenA,
+        address tokenB
+    )
+        external
+        view
+        returns (
+            uint112 reserveA,
+            uint112 reserveB,
+            uint32 blockTimestampLast
+        );
+
+    function FACTORY()
+        external
+        view
+        returns (address);
+
+    function quote(
+        uint256 amountA,
+        uint256 reserveA,
+        uint256 reserveB
+    )
+        external
+        pure
+        returns (uint256 amountB);
+
+    function pairFor(
+        address factory,
+        address tokenA,
+        address tokenB
+    )
+        external
+        pure
+        returns (address);
+}
+
+
+// File: contracts/ISwapsFactory.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+interface ISwapsFactory {
+
+    function feeTo()
+        external
+        view
+        returns (address);
+
+    function feeToSetter()
+        external
+        view
+        returns (address);
+
+    function getPair(
+        address _tokenA,
+        address _tokenB
+    )
+        external
+        view
+        returns (address pair);
+
+    function allPairs(uint256)
+        external
+        view
+        returns (address pair);
+
+    function allPairsLength()
+        external
+        view
+        returns (uint256);
+
+    function createPair(
+        address _tokenA,
+        address _tokenB
+    )
+        external
+        returns (address pair);
+
+    function setFeeTo(
+        address
+    )
+        external;
+
+    function setFeeToSetter(
+        address
+    )
+        external;
+
+    function cloneTarget()
+        external
+        view
+        returns (address target);
+}
+
+
+// File: contracts/LiquidityHelper.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+import "./IERC20.sol";
+import "./Errors.sol";
+
+contract LiquidityHelper {
+
+    uint256 constant MAX_VALUE = type(uint256).max;
+    uint256 constant ZERO_VALUE = 0;
+
+    /**
+     * @dev
+     * Prepares path for the swap
+     */
+    function _makePath(
+        address _tokenIn,
+        address _tokenOut
+    )
+        internal
+        pure
+        returns (address[] memory path)
+    {
+        path = new address[](2);
+
+        path[0] = _tokenIn;
+        path[1] = _tokenOut;
+
+        return path;
+    }
+
+    /**
+     * @dev
+     * Allows to execute transferFrom for a token
+     */
+    function _safeTransferFrom(
+        address _token,
+        address _from,
+        address _to,
+        uint256 _value
+    )
+        internal
+    {
+        IERC20 token = IERC20(_token);
+
+        _callOptionalReturn(
+            _token,
+            abi.encodeWithSelector(
+                token.transferFrom.selector,
+                _from,
+                _to,
+                _value
+            )
+        );
+    }
+
+    function _callOptionalReturn(
+        address _token,
+        bytes memory _data
+    )
+        private
+    {
+        (
+            bool success,
+            bytes memory returndata
+        ) = _token.call(_data);
+
+        require(
+            success,
+            "LiquidityHelper: CALL_FAILED"
+        );
+
+        if (returndata.length > 0) {
+            require(
+                abi.decode(
+                    returndata,
+                    (bool)
+                ),
+                "LiquidityHelper: OPERATION_FAILED"
+            );
+        }
+    }
+
+    /**
+     * @dev
+     * s = optimal swap amount
+     * r = amount of reserve for token a
+     * a = amount of token a the user currently has (not added to reserve yet)
+     * f = swap fee percent
+     * s = (sqrt(((2 - f)r)^2 + 4(1 - f)ar) - (2 - f)r) / (2(1 - f))
+    */
+    function getSwapAmount(
+        uint256 _r,
+        uint256 _a
+    )
+        public
+        pure
+        returns (uint256)
+    {
+        return (
+            _sqrt(
+                _r * (_r * 3988009 + _a * 3988000)
+            ) - _r * 1997
+        ) / 1994;
+    }
+
+    /**
+     * @dev
+     * Calculates square root of the _y number
+    */
+    function _sqrt(
+        uint256 _y
+    )
+        internal
+        pure
+        returns (uint256 z)
+    {
+        if (_y > 3) {
+            z = _y;
+            uint256 x = _y / 2 + 1;
+            while (x < z) {
+                z = x;
+                x = (_y / x + x) / 2;
+            }
+        } else if (_y != 0) {
+            z = 1;
+        }
+    }
+
+    function _forceApprove(
+        IERC20 _token,
+        address _spender,
+        uint256 _value
+    )
+        internal
+    {
+        bytes memory approvalCall = abi.encodeCall(
+            _token.approve,
+            (
+                _spender,
+                _value
+            )
+        );
+
+        if (!_callOptionalReturnBool(_token, approvalCall)) {
+
+            bytes memory zeroApprove = abi.encodeCall(
+                _token.approve, (
+                    _spender,
+                    ZERO_VALUE
+                )
+            );
+
+            _callOptionalReturn(
+                _token,
+                zeroApprove
+            );
+
+            _callOptionalReturn(
+                _token,
+                approvalCall
+            );
+        }
+    }
+
+    function _callOptionalReturn(
+        IERC20 _token,
+        bytes memory _data
+    )
+        private
+    {
+        bytes memory returndata = _functionCall(
+            address(_token),
+            _data
+        );
+
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20FailedOperation(
+                address(_token)
+            );
+        }
+    }
+
+    function _callOptionalReturnBool(
+        IERC20 _token,
+        bytes memory _data
+    )
+        private
+        returns (bool)
+    {
+        (
+            bool success,
+            bytes memory returndata
+        ) = address(_token).call(_data);
+
+        return success
+            && (returndata.length == 0 || abi.decode(returndata, (bool)))
+            && address(_token).code.length > 0;
+    }
+
+    function _functionCall(
+        address _target,
+        bytes memory _data
+    )
+        internal
+        returns (bytes memory)
+    {
+        return _functionCallWithValue(
+            _target,
+            _data,
+            ZERO_VALUE
+        );
+    }
+
+    function _functionCallWithValue(
+        address _target,
+        bytes memory _data,
+        uint256 _value
+    )
+        internal
+        returns (bytes memory)
+    {
+        if (address(this).balance < _value) {
+            revert InsufficientBalance(
+                address(this).balance,
+                _value
+            );
+        }
+
+        (
+            bool success,
+            bytes memory returndata
+        ) = _target.call{
+            value: _value
+        }(_data);
+
+        return _verifyCallResultFromTarget(
+            _target,
+            success,
+            returndata
+        );
+    }
+
+    function _verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    )
+        internal
+        view
+        returns (bytes memory)
+    {
+        if (!success) {
+            _revert(
+                returndata
+            );
+        } else {
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(
+                    target
+                );
+            }
+            return returndata;
+        }
+    }
+
+    function _revert(
+        bytes memory _returndata
+    )
+        private
+        pure
+    {
+        if (_returndata.length > 0) {
+            assembly {
+                let returndata_size := mload(_returndata)
+                revert(add(32, _returndata), returndata_size)
+            }
+        } else {
+            revert FailedCall();
+        }
+    }
+}
+
+
+// File: contracts/ISwapsERC20.sol
+// SPDX-License-Identifier: BCOM
+
+pragma solidity =0.8.25;
+
+interface ISwapsERC20 {
+
+    function name()
+        external
+        pure
+        returns (string memory);
+
+    function symbol()
+        external
+        pure
+        returns (string memory);
+
+    function decimals()
+        external
+        pure
+        returns (uint8);
+
+    function totalSupply()
+        external
+        view
+        returns (uint256);
+
+    function balanceOf(
+        address _owner
+    )
+        external
+        view
+        returns (uint256);
+
+    function allowance(
+        address _owner,
+        address _spender
+    )
+        external
+        view
+        returns (uint256);
+
+    function approve(
+        address _spender,
+        uint256 _value
+    )
+        external
+        returns (bool);
+
+    function transfer(
+        address _to,
+        uint256 _value
+    )
+        external
+        returns (bool);
+
+    function transferFrom(
+        address _from,
+        address _to,
+        uint256 _value
+    )
+        external
+        returns (bool);
+
+    function DOMAIN_SEPARATOR()
+        external
+        view
+        returns (bytes32);
+
+    function PERMIT_TYPEHASH()
+        external
+        pure
+        returns (bytes32);
+
+    function nonces(
+        address _owner
+    )
+        external
+        view
+        returns (uint256);
+
+    function permit(
+        address _owner,
+        address _spender,
+        uint256 _value,
+        uint256 _deadline,
+        uint8 _v,
+        bytes32 _r,
+        bytes32 _s
+    )
+        external;
+}
+
+
+// File: contracts/IERC20.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+interface IERC20 {
+
+    function balanceOf(
+        address _owner
+    )
+        external
+        view
+        returns (uint256);
+
+    function transfer(
+        address _to,
+        uint256 _value
+    )
+        external
+        returns (bool);
+
+    function transferFrom(
+        address _from,
+        address _to,
+        uint256 _value
+    )
+        external
+        returns (bool);
+
+    function approve(
+        address _spender,
+        uint256 _value
+    )
+        external
+        returns (bool);
+}
+
+
+// File: contracts/Errors.sol
+// SPDX-License-Identifier: -- BCOM --
+
+pragma solidity =0.8.25;
+
+error FailedCall();
+
+error AddressEmptyCode(
+    address target
+);
+
+error SafeERC20FailedOperation(
+    address token
+);
+
+error InsufficientBalance(
+    uint256 balance,
+    uint256 value
+);

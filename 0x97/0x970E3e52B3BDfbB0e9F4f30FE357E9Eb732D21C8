@@ -1,0 +1,345 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+ * @title ERC721 Token (Batch Mint)
+ * @author 0xSumo <@PBADAO>
+ */
+
+abstract contract ERC721TokenReceiver {
+    function onERC721Received(address, address, uint256, bytes calldata) external virtual returns (bytes4) { return ERC721TokenReceiver.onERC721Received.selector; }
+}
+
+abstract contract ERC721 {
+    
+    event Transfer(address indexed from_, address indexed to_, uint256 indexed tokenId_);
+    event Approval(address indexed owner_, address indexed spender_, uint256 indexed id_);
+    event ApprovalForAll(address indexed owner_, address indexed operator_, bool approved_);
+
+    string public name; 
+    string public symbol;
+
+    uint256 public nextTokenId;
+    uint256 public totalBurned;
+    uint256 public constant maxBatchSize = 20;
+    
+    function startTokenId() public pure virtual returns (uint256) {
+        return 0;
+    }
+
+    function totalSupply() public view virtual returns (uint256) {
+        return nextTokenId - totalBurned - startTokenId();
+    }
+
+    constructor(string memory name_, string memory symbol_) {
+        name = name_;
+        symbol = symbol_;
+        nextTokenId = startTokenId();
+    }
+
+    struct TokenData {
+        address owner;
+        uint40 lastTransfer;
+        bool burned;
+        bool nextInitialized;
+    }
+    struct BalanceData {
+        uint32 balance;
+        uint32 mintedAmount;
+    }
+
+    mapping(uint256 => TokenData) public _tokenData;
+    mapping(address => BalanceData) public _balanceData;
+
+    mapping(uint256 => address) public getApproved;
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+    function _getTokenDataOf(uint256 tokenId_) public view virtual returns (TokenData memory) {
+        uint256 _lookupId = tokenId_;
+        require(_lookupId >= startTokenId(), "_getTokenDataOf _lookupId < startTokenId");
+        TokenData memory _TokenData = _tokenData[_lookupId];
+        if (_TokenData.owner != address(0) && !_TokenData.burned) return _TokenData;
+        require(!_TokenData.burned, "_getTokenDataOf burned token!");
+        require(_lookupId < nextTokenId, "_getTokenDataOf _lookupId > _nextTokenId");
+        unchecked { while(_tokenData[--_lookupId].owner == address(0)) {} }
+        return _tokenData[_lookupId];
+    }
+
+    function balanceOf(address owner_) public virtual view returns (uint256) {
+        require(owner_ != address(0), "balanceOf to 0x0");
+        return _balanceData[owner_].balance;
+    }
+
+    function ownerOf(uint256 tokenId_) public view returns (address) {
+        return _getTokenDataOf(tokenId_).owner;
+    }
+
+    function _mintInternal(address to_, uint256 amount_) internal virtual { unchecked {
+        require(to_ != address(0), "_mint to 0x0");
+        uint256 _startId = nextTokenId;
+        uint256 _endId = _startId + amount_;
+        _tokenData[_startId].owner = to_;
+        _tokenData[_startId].lastTransfer = uint40(block.timestamp);
+        _balanceData[to_].balance += uint32(amount_);
+        _balanceData[to_].mintedAmount += uint32(amount_);
+        do { emit Transfer(address(0), to_, _startId); } while (++_startId < _endId);
+        nextTokenId = _endId;
+    }}
+
+    function _mint(address to_, uint256 amount_) internal virtual {
+        uint256 _amountToMint = amount_;
+        while (_amountToMint > maxBatchSize) {
+            _amountToMint -= maxBatchSize;
+            _mintInternal(to_, maxBatchSize);
+        }
+        _mintInternal(to_, _amountToMint);
+    }
+
+    function _burn(uint256 tokenId_, bool checkApproved_) internal virtual { unchecked {
+        TokenData memory _TokenData = _getTokenDataOf(tokenId_);
+        address _owner = _TokenData.owner;
+        if (checkApproved_) require(_isApprovedOrOwner(_owner, msg.sender, tokenId_), "_burn not approved");
+        delete getApproved[tokenId_];
+        _tokenData[tokenId_].owner = _owner;
+        _tokenData[tokenId_].lastTransfer = uint40(block.timestamp);
+        _tokenData[tokenId_].burned = true;
+        _tokenData[tokenId_].nextInitialized = true;
+
+        if (!_TokenData.nextInitialized) {
+            uint256 _tokenIdIncremented = tokenId_ + 1;
+            if (_tokenData[_tokenIdIncremented].owner == address(0)) {
+                if (tokenId_ < nextTokenId - 1) {
+                    _tokenData[_tokenIdIncremented] = _TokenData;
+                }
+            }
+        }
+        
+        _balanceData[_owner].balance--;
+        emit Transfer(_owner, address(0), tokenId_);
+        totalBurned++;
+    }}
+
+    function _transfer(address from_, address to_, uint256 tokenId_, bool checkApproved_) internal virtual { unchecked {
+        require(to_ != address(0), "_transfer to 0x0");
+        TokenData memory _TokenData = _getTokenDataOf(tokenId_);
+        address _owner = _TokenData.owner;
+        require(from_ == _owner, "_transfer not from owner");
+        if (checkApproved_) require(_isApprovedOrOwner(_owner, msg.sender, tokenId_), "_transfer not approved");
+        delete getApproved[tokenId_];
+        _tokenData[tokenId_].owner = to_;
+        _tokenData[tokenId_].lastTransfer = uint40(block.timestamp);
+        _tokenData[tokenId_].nextInitialized = true;
+        
+        if (!_TokenData.nextInitialized) {
+            uint256 _tokenIdIncremented = tokenId_ + 1;
+            if (_tokenData[_tokenIdIncremented].owner == address(0)) {
+                if (tokenId_ < nextTokenId - 1) {
+                    _tokenData[_tokenIdIncremented] = _TokenData;
+                }
+            }
+        }
+
+        _balanceData[from_].balance--;
+        _balanceData[to_].balance++;
+        emit Transfer(from_, to_, tokenId_);
+    }}
+
+    function transferFrom(address from_, address to_, uint256 tokenId_) public virtual {
+        _transfer(from_, to_, tokenId_, true);
+    }
+
+    function safeTransferFrom(address from_, address to_, uint256 tokenId_, bytes memory data_) public virtual {
+        transferFrom(from_, to_, tokenId_);
+        require(to_.code.length == 0 || ERC721TokenReceiver(to_).onERC721Received(msg.sender, from_, tokenId_, data_) ==
+        ERC721TokenReceiver.onERC721Received.selector, "safeTransferFrom to unsafe address");
+    }
+
+    function safeTransferFrom(address from_, address to_, uint256 tokenId_) public virtual {
+        safeTransferFrom(from_, to_, tokenId_, "");
+    }
+
+    function approve(address spender_, uint256 tokenId_) public virtual {
+        address _owner = ownerOf(tokenId_);
+        require(msg.sender == _owner || isApprovedForAll[_owner][msg.sender], "approve not authorized!");
+        getApproved[tokenId_] = spender_;
+        emit Approval(_owner, spender_, tokenId_);
+    }
+
+    function setApprovalForAll(address operator_, bool approved_) public virtual {
+        isApprovedForAll[msg.sender][operator_] = approved_;
+        emit ApprovalForAll(msg.sender, operator_, approved_);
+    }
+
+    function _isApprovedOrOwner(address owner_, address spender_, uint256 tokenId_) internal virtual view returns (bool) {
+        return (owner_ == spender_ || getApproved[tokenId_] == spender_ || isApprovedForAll[owner_][spender_]);
+    }
+
+    function supportsInterface(bytes4 id_) public virtual view returns (bool) {
+        return  id_ == 0x01ffc9a7 || id_ == 0x80ac58cd || id_ == 0x5b5e139f;
+    }
+
+    function tokenURI(uint256 tokenId_) public virtual view returns (string memory);
+}
+
+abstract contract ERC721TokenURI {
+    string public baseTokenURI;
+    function _setBaseTokenURI(string memory uri_) internal virtual {
+        baseTokenURI = uri_;
+    }
+    function _toString(uint256 value_) internal pure virtual returns (string memory _str) {
+        assembly {
+            let m := add(mload(0x40), 0xa0)
+            mstore(0x40, m)
+            _str := sub(m, 0x20)
+            mstore(_str, 0)
+            let end := _str
+            for { let temp := value_ } 1 {} {
+                _str := sub(_str, 1)
+                mstore8(_str, add(48, mod(temp, 10)))
+                temp := div(temp, 10)
+                if iszero(temp) { break }
+            }
+            let length := sub(end, _str)
+            _str := sub(_str, 0x20)
+            mstore(_str, length)
+        }
+    }
+    function _getTokenURI(uint256 tokenId_) internal virtual view returns (string memory) {
+        return string(abi.encodePacked(baseTokenURI, _toString(tokenId_), ".json"));
+    }
+}
+
+abstract contract MerkleProof {
+    bytes32 internal _merkleRoot;
+    function _setMerkleRoot(bytes32 merkleRoot_) internal virtual { _merkleRoot = merkleRoot_; }
+    function isWhitelisted(address address_, bytes32[] memory proof_) public view returns (bool) {
+        bytes32 _leaf = keccak256(abi.encodePacked(address_));
+        for (uint256 i = 0; i < proof_.length; i++) {
+            _leaf = _leaf < proof_[i] ? keccak256(abi.encodePacked(_leaf, proof_[i])) : keccak256(abi.encodePacked(proof_[i], _leaf));
+        }
+        return _leaf == _merkleRoot;
+    }
+}
+
+abstract contract OwnWithAuth {
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event AdminSet(bytes32 indexed controllerType, bytes32 indexed controllerSlot, address indexed controller, bool status);
+    address public owner;
+    mapping(bytes32 => mapping(address => bool)) internal admin;
+    constructor() { owner = msg.sender; }
+    modifier onlyOwner() { require(owner == msg.sender, "only owner");_; }
+    modifier onlyAdmin(string memory type_) { require(isAdmin(type_, msg.sender), "only admin");_; }
+    function transferOwnership(address newOwner) external onlyOwner {
+        emit OwnershipTransferred(owner, newOwner); owner = newOwner; 
+    }
+    function _setAdmin(string memory type_, address controller, bool status) internal {
+        bytes32 typeHash = keccak256(abi.encodePacked(type_)); 
+        admin[typeHash][controller] = status; 
+        emit AdminSet(typeHash, typeHash, controller, status); 
+    }
+    function setAdmin(string memory type_, address controller, bool status) external onlyOwner { 
+        bytes32 typeHash = keccak256(abi.encodePacked(type_)); 
+        admin[typeHash][controller] = status; 
+        emit AdminSet(typeHash, typeHash, controller, status); 
+    }
+    function isAdmin(string memory type_, address controller) public view returns (bool) { 
+        bytes32 typeHash = keccak256(abi.encodePacked(type_)); 
+        return admin[typeHash][controller]; 
+    }
+}
+
+contract ERC721Token is ERC721, ERC721TokenURI, MerkleProof, OwnWithAuth {
+
+    bool public active;
+
+    uint256 public maxTokens = 400;
+
+    uint256 public maxTokenPerMint = 2;
+
+    uint256 public totalMintOut;
+
+    uint256 public mintPrice = 0.003 ether;
+
+    uint256 public mintPricePublic = 0.006 ether;
+
+    mapping(address => uint256) public minted;
+
+    modifier onlySender {
+        require(msg.sender == tx.origin, "No smart contracts!");
+        _;
+    }
+
+    constructor() ERC721("8CH1", "8CH1") {
+        _setAdmin("MINTER", msg.sender, true);
+        _setAdmin("BURNER", msg.sender, true);
+        _setAdmin("ADMIN", msg.sender, true);
+        _setMerkleRoot(0x94702ffeb6195bdd82ea3ceabb655836cf9440d40441d147519e4d9d4352671c);
+    }
+
+    function whitelistMint(uint256 amount_, bytes32[] memory proof_) external payable onlySender {
+        require(active, "closed");
+        require(isWhitelisted(msg.sender, proof_), "You are not whitelisted!");
+        require(maxTokenPerMint >= amount_, "Exceed max");
+        require(maxTokenPerMint >= minted[msg.sender] + amount_, "Exceed max per address");
+        require(maxTokens >= totalMintOut + amount_, "No mints remaining");
+        require(msg.value == mintPrice * amount_, "Invalid value sent");
+        _mint(msg.sender, amount_);
+        minted[msg.sender] += amount_;
+        totalMintOut += amount_;
+    }
+
+    function publicMint(address to_, uint256 amount_) external payable onlySender {
+        require(active, "closed");
+        require(maxTokens >= totalMintOut + amount_, "No mints remaining");
+        require(msg.value == mintPricePublic * amount_, "Invalid value sent");
+        _mint(to_, amount_);
+        totalMintOut += amount_;
+    }
+
+    function mint(address to_, uint256 amount_) external onlyAdmin("MINTER") {
+        _mint(to_, amount_);
+    }
+
+    function burn(uint256 id_, bool approved_) external onlyAdmin("BURNER") {
+        _burn(id_, approved_);
+    }
+
+    function setActive(bool bool_) external onlyAdmin("ADMIN") {
+        active = bool_;
+    }
+
+    function setMaxTokens(uint256 amount_) external onlyAdmin("ADMIN") {
+        maxTokens = amount_;
+    }
+
+    function setMintPrice(uint256 price_) external onlyAdmin("ADMIN") {
+        mintPrice = price_;
+    }
+
+    function setMintPricePublic(uint256 price_) external onlyAdmin("ADMIN") {
+        mintPricePublic = price_;
+    }
+
+    function setTokenToURI(string memory uri_) external onlyAdmin("ADMIN") {
+        _setBaseTokenURI(uri_);
+    }
+
+    function setMerkleRoot(bytes32 merkleRoot_) external onlyAdmin("ADMIN") {
+        _setMerkleRoot(merkleRoot_);
+    }
+
+    function startTokenId() public pure override returns (uint256) {
+        return 1;
+    }
+
+    function tokenURI(uint256 tokenId_) public view override returns (string memory) {
+        return _getTokenURI(tokenId_);
+    }
+
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        (bool transferTx, ) = msg.sender.call{value: balance}("");
+        require(transferTx, "Transfer failed.");
+    }
+}

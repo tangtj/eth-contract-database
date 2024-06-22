@@ -1,0 +1,1196 @@
+
+// File: src/Fundrop/stickers/Stickers.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.19;
+
+import {ECDSA} from "solady/utils/ECDSA.sol";
+import {Ownable} from "solady/auth/Ownable.sol";
+import {ERC1155} from "solmate/tokens/ERC1155.sol";
+
+import {IERC165} from "openzeppelin/utils/introspection/IERC165.sol";
+import {IERC1155} from "openzeppelin/token/ERC1155/IERC1155.sol";
+import "fundrop/IMetadataRenderer.sol";
+import "fundrop/IERC4906.sol";
+
+contract Stickers is ERC1155, Ownable {
+    address public signer;
+    address public metadataRenderer;
+    uint256 public mintEnd;
+    mapping(bytes32 => bool) _hasMinted;
+
+    error InvalidSignature();
+    error MintClosed();
+    error MintedAlready();
+
+    constructor() {
+        _initializeOwner(tx.origin);
+    }
+
+    function name() public view virtual returns (string memory) {
+        return "!fundrop Stickers";
+    }
+
+    function _packRecipientAndRound(address _address, uint16 _round) internal pure returns (bytes32) {
+        return (bytes32(uint256(uint160(_address))) << 96) | bytes32(uint256(_round));
+    }
+
+    function mint(uint256[] calldata tokens, uint256[] calldata amounts, uint16 round, bytes calldata signature)
+        public
+        payable
+    {
+        bytes32 packedRecipientAndRound = _packRecipientAndRound(msg.sender, round);
+        if (block.timestamp > mintEnd) revert MintClosed();
+        if (_hasMinted[packedRecipientAndRound]) revert MintedAlready();
+        address recovered =
+            ECDSA.tryRecoverCalldata(keccak256(abi.encodePacked(msg.sender, round, tokens, amounts)), signature);
+        if (recovered != signer) revert InvalidSignature();
+        _hasMinted[packedRecipientAndRound] = true;
+        _batchMint(msg.sender, tokens, amounts, "");
+    }
+
+    function adminMint(address to, uint256[] calldata tokens, uint256[] calldata amounts) public onlyOwner {
+        _batchMint(to, tokens, amounts, "");
+    }
+
+    function uri(uint256 id) public view override returns (string memory) {
+        return IMetadataRenderer(metadataRenderer).tokenURI(id);
+    }
+
+    // Admin functions
+
+    function setMetadataRenderer(address _metadataRenderer) public onlyOwner {
+        metadataRenderer = _metadataRenderer;
+    }
+
+    function setSigner(address _signer) public onlyOwner {
+        signer = _signer;
+    }
+
+    function setMintEnd(uint256 _mintEnd) public onlyOwner {
+        mintEnd = _mintEnd;
+    }
+
+    function supportsInterface(bytes4 interfaceId) public pure virtual override returns (bool) {
+        return interfaceId == type(IERC165).interfaceId || interfaceId == type(IERC1155).interfaceId
+            || interfaceId == type(IERC4906).interfaceId;
+    }
+}
+
+
+// File: lib/solady/src/utils/ECDSA.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Gas optimized ECDSA wrapper.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/ECDSA.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/ECDSA.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/ECDSA.sol)
+library ECDSA {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        CUSTOM ERRORS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The signature is invalid.
+    error InvalidSignature();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The number which `s` must not exceed in order for
+    /// the signature to be non-malleable.
+    bytes32 private constant _MALLEABILITY_THRESHOLD =
+        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    RECOVERY OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // Note: as of Solady version 0.0.68, these functions will
+    // revert upon recovery failure for more safety by default.
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function recover(bytes32 hash, bytes memory signature) internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Copy the free memory pointer so that we can restore it later.
+            let m := mload(0x40)
+            // Copy `r` and `s`.
+            mstore(0x40, mload(add(signature, 0x20))) // `r`.
+            let s := mload(add(signature, 0x40))
+            mstore(0x60, s)
+            // Store the `hash` in the scratch space.
+            mstore(0x00, hash)
+            // Compute `v` and store it in the scratch space.
+            mstore(0x20, byte(0, mload(add(signature, 0x60))))
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    and(
+                        // If the signature is exactly 65 bytes in length.
+                        eq(mload(signature), 65),
+                        // If `s` in lower half order, such that the signature is not malleable.
+                        lt(s, add(_MALLEABILITY_THRESHOLD, 1))
+                    ), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                // Store the function selector of `InvalidSignature()`.
+                mstore(0x00, 0x8baa579f)
+                // Revert with (offset, size).
+                revert(0x1c, 0x04)
+            }
+            // Restore the zero slot.
+            mstore(0x60, 0)
+            // Restore the free memory pointer.
+            mstore(0x40, m)
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function recoverCalldata(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Copy the free memory pointer so that we can restore it later.
+            let m := mload(0x40)
+            // Directly copy `r` and `s` from the calldata.
+            calldatacopy(0x40, signature.offset, 0x40)
+            // Store the `hash` in the scratch space.
+            mstore(0x00, hash)
+            // Compute `v` and store it in the scratch space.
+            mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40))))
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    and(
+                        // If the signature is exactly 65 bytes in length.
+                        eq(signature.length, 65),
+                        // If `s` in lower half order, such that the signature is not malleable.
+                        lt(mload(0x60), add(_MALLEABILITY_THRESHOLD, 1))
+                    ), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                // Store the function selector of `InvalidSignature()`.
+                mstore(0x00, 0x8baa579f)
+                // Revert with (offset, size).
+                revert(0x1c, 0x04)
+            }
+            // Restore the zero slot.
+            mstore(0x60, 0)
+            // Restore the free memory pointer.
+            mstore(0x40, m)
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the EIP-2098 short form signature defined by `r` and `vs`.
+    ///
+    /// This function only accepts EIP-2098 short form signatures.
+    /// See: https://eips.ethereum.org/EIPS/eip-2098
+    ///
+    /// To be honest, I do not recommend using EIP-2098 signatures
+    /// for simplicity, performance, and security reasons. Most if not
+    /// all clients support traditional non EIP-2098 signatures by default.
+    /// As such, this method is intentionally not fully inlined.
+    /// It is merely included for completeness.
+    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal view returns (address result) {
+        uint8 v;
+        bytes32 s;
+        /// @solidity memory-safe-assembly
+        assembly {
+            s := shr(1, shl(1, vs))
+            v := add(shr(255, vs), 27)
+        }
+        result = recover(hash, v, r, s);
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the signature defined by `v`, `r`, `s`.
+    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Copy the free memory pointer so that we can restore it later.
+            let m := mload(0x40)
+            mstore(0x00, hash)
+            mstore(0x20, and(v, 0xff))
+            mstore(0x40, r)
+            mstore(0x60, s)
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    // If `s` in lower half order, such that the signature is not malleable.
+                    lt(s, add(_MALLEABILITY_THRESHOLD, 1)), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                // Store the function selector of `InvalidSignature()`.
+                mstore(0x00, 0x8baa579f)
+                // Revert with (offset, size).
+                revert(0x1c, 0x04)
+            }
+            // Restore the zero slot.
+            mstore(0x60, 0)
+            // Restore the free memory pointer.
+            mstore(0x40, m)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   TRY-RECOVER OPERATIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // WARNING!
+    // These functions will NOT revert upon recovery failure.
+    // Instead, they will return the zero address upon recovery failure.
+    // It is critical that the returned address is NEVER compared against
+    // a zero address (e.g. an uninitialized address variable).
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function tryRecover(bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(xor(mload(signature), 65)) {
+                // Copy the free memory pointer so that we can restore it later.
+                let m := mload(0x40)
+                // Copy `r` and `s`.
+                mstore(0x40, mload(add(signature, 0x20))) // `r`.
+                let s := mload(add(signature, 0x40))
+                mstore(0x60, s)
+                // If `s` in lower half order, such that the signature is not malleable.
+                if iszero(gt(s, _MALLEABILITY_THRESHOLD)) {
+                    // Store the `hash` in the scratch space.
+                    mstore(0x00, hash)
+                    // Compute `v` and store it in the scratch space.
+                    mstore(0x20, byte(0, mload(add(signature, 0x60))))
+                    pop(
+                        staticcall(
+                            gas(), // Amount of gas left for the transaction.
+                            0x01, // Address of `ecrecover`.
+                            0x00, // Start of input.
+                            0x80, // Size of input.
+                            0x40, // Start of output.
+                            0x20 // Size of output.
+                        )
+                    )
+                    // Restore the zero slot.
+                    mstore(0x60, 0)
+                    // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                    result := mload(xor(0x60, returndatasize()))
+                }
+                // Restore the free memory pointer.
+                mstore(0x40, m)
+            }
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function tryRecoverCalldata(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(xor(signature.length, 65)) {
+                // Copy the free memory pointer so that we can restore it later.
+                let m := mload(0x40)
+                // Directly copy `r` and `s` from the calldata.
+                calldatacopy(0x40, signature.offset, 0x40)
+                // If `s` in lower half order, such that the signature is not malleable.
+                if iszero(gt(mload(0x60), _MALLEABILITY_THRESHOLD)) {
+                    // Store the `hash` in the scratch space.
+                    mstore(0x00, hash)
+                    // Compute `v` and store it in the scratch space.
+                    mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40))))
+                    pop(
+                        staticcall(
+                            gas(), // Amount of gas left for the transaction.
+                            0x01, // Address of `ecrecover`.
+                            0x00, // Start of input.
+                            0x80, // Size of input.
+                            0x40, // Start of output.
+                            0x20 // Size of output.
+                        )
+                    )
+                    // Restore the zero slot.
+                    mstore(0x60, 0)
+                    // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                    result := mload(xor(0x60, returndatasize()))
+                }
+                // Restore the free memory pointer.
+                mstore(0x40, m)
+            }
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the EIP-2098 short form signature defined by `r` and `vs`.
+    ///
+    /// This function only accepts EIP-2098 short form signatures.
+    /// See: https://eips.ethereum.org/EIPS/eip-2098
+    ///
+    /// To be honest, I do not recommend using EIP-2098 signatures
+    /// for simplicity, performance, and security reasons. Most if not
+    /// all clients support traditional non EIP-2098 signatures by default.
+    /// As such, this method is intentionally not fully inlined.
+    /// It is merely included for completeness.
+    function tryRecover(bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (address result)
+    {
+        uint8 v;
+        bytes32 s;
+        /// @solidity memory-safe-assembly
+        assembly {
+            s := shr(1, shl(1, vs))
+            v := add(shr(255, vs), 27)
+        }
+        result = tryRecover(hash, v, r, s);
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the signature defined by `v`, `r`, `s`.
+    function tryRecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Copy the free memory pointer so that we can restore it later.
+            let m := mload(0x40)
+            // If `s` in lower half order, such that the signature is not malleable.
+            if iszero(gt(s, _MALLEABILITY_THRESHOLD)) {
+                // Store the `hash`, `v`, `r`, `s` in the scratch space.
+                mstore(0x00, hash)
+                mstore(0x20, and(v, 0xff))
+                mstore(0x40, r)
+                mstore(0x60, s)
+                pop(
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        0x01, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x40, // Start of output.
+                        0x20 // Size of output.
+                    )
+                )
+                // Restore the zero slot.
+                mstore(0x60, 0)
+                // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+                result := mload(xor(0x60, returndatasize()))
+            }
+            // Restore the free memory pointer.
+            mstore(0x40, m)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an Ethereum Signed Message, created from a `hash`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Store into scratch space for keccak256.
+            mstore(0x20, hash)
+            mstore(0x00, "\x00\x00\x00\x00\x19Ethereum Signed Message:\n32")
+            // 0x40 - 0x04 = 0x3c
+            result := keccak256(0x04, 0x3c)
+        }
+    }
+
+    /// @dev Returns an Ethereum Signed Message, created from `s`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32 result) {
+        assembly {
+            // The length of "\x19Ethereum Signed Message:\n" is 26 bytes (i.e. 0x1a).
+            // If we reserve 2 words, we'll have 64 - 26 = 38 bytes to store the
+            // ASCII decimal representation of the length of `s` up to about 2 ** 126.
+
+            // Instead of allocating, we temporarily copy the 64 bytes before the
+            // start of `s` data to some variables.
+            let m := mload(sub(s, 0x20))
+            // The length of `s` is in bytes.
+            let sLength := mload(s)
+            let ptr := add(s, 0x20)
+            let w := not(0)
+            // `end` marks the end of the memory which we will compute the keccak256 of.
+            let end := add(ptr, sLength)
+            // Convert the length of the bytes to ASCII decimal representation
+            // and store it into the memory.
+            for { let temp := sLength } 1 {} {
+                ptr := add(ptr, w) // `sub(ptr, 1)`.
+                mstore8(ptr, add(48, mod(temp, 10)))
+                temp := div(temp, 10)
+                if iszero(temp) { break }
+            }
+            // Copy the header over to the memory.
+            mstore(sub(ptr, 0x20), "\x00\x00\x00\x00\x00\x00\x19Ethereum Signed Message:\n")
+            // Compute the keccak256 of the memory.
+            result := keccak256(sub(ptr, 0x1a), sub(end, sub(ptr, 0x1a)))
+            // Restore the previous memory.
+            mstore(s, sLength)
+            mstore(sub(s, 0x20), m)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EMPTY CALLDATA HELPERS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an empty calldata bytes.
+    function emptySignature() internal pure returns (bytes calldata signature) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            signature.length := 0
+        }
+    }
+}
+
+
+// File: lib/solady/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+/// @dev While the ownable portion follows [EIP-173](https://eips.ethereum.org/EIPS/eip-173)
+/// for compatibility, the nomenclature for the 2-step ownership handover
+/// may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /// @dev `bytes4(keccak256(bytes("Unauthorized()")))`.
+    uint256 private constant _UNAUTHORIZED_ERROR_SELECTOR = 0x82b42900;
+
+    /// @dev `bytes4(keccak256(bytes("NewOwnerIsZeroAddress()")))`.
+    uint256 private constant _NEW_OWNER_IS_ZERO_ADDRESS_ERROR_SELECTOR = 0x7448fbae;
+
+    /// @dev `bytes4(keccak256(bytes("NoHandoverRequest()")))`.
+    uint256 private constant _NO_HANDOVER_REQUEST_ERROR_SELECTOR = 0x6f5e8818;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by: `not(_OWNER_SLOT_NOT)`.
+    /// It is intentionally choosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    uint256 private constant _OWNER_SLOT_NOT = 0x8b78c6d8;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Store the new value.
+            sstore(not(_OWNER_SLOT_NOT), newOwner)
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ownerSlot := not(_OWNER_SLOT_NOT)
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+            // Store the new value.
+            sstore(ownerSlot, newOwner)
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(not(_OWNER_SLOT_NOT)))) {
+                mstore(0x00, _UNAUTHORIZED_ERROR_SELECTOR)
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, _NEW_OWNER_IS_ZERO_ADDRESS_ERROR_SELECTOR)
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will be automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, _NO_HANDOVER_REQUEST_ERROR_SELECTOR)
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(not(_OWNER_SLOT_NOT))
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    function ownershipHandoverValidFor() public view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC1155.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Minimalist and gas efficient standard ERC1155 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC1155.sol)
+abstract contract ERC1155 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event TransferSingle(
+        address indexed operator,
+        address indexed from,
+        address indexed to,
+        uint256 id,
+        uint256 amount
+    );
+
+    event TransferBatch(
+        address indexed operator,
+        address indexed from,
+        address indexed to,
+        uint256[] ids,
+        uint256[] amounts
+    );
+
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    event URI(string value, uint256 indexed id);
+
+    /*//////////////////////////////////////////////////////////////
+                             ERC1155 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(address => mapping(uint256 => uint256)) public balanceOf;
+
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+    /*//////////////////////////////////////////////////////////////
+                             METADATA LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function uri(uint256 id) public view virtual returns (string memory);
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC1155 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function setApprovalForAll(address operator, bool approved) public virtual {
+        isApprovedForAll[msg.sender][operator] = approved;
+
+        emit ApprovalForAll(msg.sender, operator, approved);
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes calldata data
+    ) public virtual {
+        require(msg.sender == from || isApprovedForAll[from][msg.sender], "NOT_AUTHORIZED");
+
+        balanceOf[from][id] -= amount;
+        balanceOf[to][id] += amount;
+
+        emit TransferSingle(msg.sender, from, to, id, amount);
+
+        require(
+            to.code.length == 0
+                ? to != address(0)
+                : ERC1155TokenReceiver(to).onERC1155Received(msg.sender, from, id, amount, data) ==
+                    ERC1155TokenReceiver.onERC1155Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] calldata ids,
+        uint256[] calldata amounts,
+        bytes calldata data
+    ) public virtual {
+        require(ids.length == amounts.length, "LENGTH_MISMATCH");
+
+        require(msg.sender == from || isApprovedForAll[from][msg.sender], "NOT_AUTHORIZED");
+
+        // Storing these outside the loop saves ~15 gas per iteration.
+        uint256 id;
+        uint256 amount;
+
+        for (uint256 i = 0; i < ids.length; ) {
+            id = ids[i];
+            amount = amounts[i];
+
+            balanceOf[from][id] -= amount;
+            balanceOf[to][id] += amount;
+
+            // An array can't have a total length
+            // larger than the max uint256 value.
+            unchecked {
+                ++i;
+            }
+        }
+
+        emit TransferBatch(msg.sender, from, to, ids, amounts);
+
+        require(
+            to.code.length == 0
+                ? to != address(0)
+                : ERC1155TokenReceiver(to).onERC1155BatchReceived(msg.sender, from, ids, amounts, data) ==
+                    ERC1155TokenReceiver.onERC1155BatchReceived.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function balanceOfBatch(address[] calldata owners, uint256[] calldata ids)
+        public
+        view
+        virtual
+        returns (uint256[] memory balances)
+    {
+        require(owners.length == ids.length, "LENGTH_MISMATCH");
+
+        balances = new uint256[](owners.length);
+
+        // Unchecked because the only math done is incrementing
+        // the array index counter which cannot possibly overflow.
+        unchecked {
+            for (uint256 i = 0; i < owners.length; ++i) {
+                balances[i] = balanceOf[owners[i]][ids[i]];
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC165 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return
+            interfaceId == 0x01ffc9a7 || // ERC165 Interface ID for ERC165
+            interfaceId == 0xd9b67a26 || // ERC165 Interface ID for ERC1155
+            interfaceId == 0x0e89341c; // ERC165 Interface ID for ERC1155MetadataURI
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) internal virtual {
+        balanceOf[to][id] += amount;
+
+        emit TransferSingle(msg.sender, address(0), to, id, amount);
+
+        require(
+            to.code.length == 0
+                ? to != address(0)
+                : ERC1155TokenReceiver(to).onERC1155Received(msg.sender, address(0), id, amount, data) ==
+                    ERC1155TokenReceiver.onERC1155Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function _batchMint(
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual {
+        uint256 idsLength = ids.length; // Saves MLOADs.
+
+        require(idsLength == amounts.length, "LENGTH_MISMATCH");
+
+        for (uint256 i = 0; i < idsLength; ) {
+            balanceOf[to][ids[i]] += amounts[i];
+
+            // An array can't have a total length
+            // larger than the max uint256 value.
+            unchecked {
+                ++i;
+            }
+        }
+
+        emit TransferBatch(msg.sender, address(0), to, ids, amounts);
+
+        require(
+            to.code.length == 0
+                ? to != address(0)
+                : ERC1155TokenReceiver(to).onERC1155BatchReceived(msg.sender, address(0), ids, amounts, data) ==
+                    ERC1155TokenReceiver.onERC1155BatchReceived.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function _batchBurn(
+        address from,
+        uint256[] memory ids,
+        uint256[] memory amounts
+    ) internal virtual {
+        uint256 idsLength = ids.length; // Saves MLOADs.
+
+        require(idsLength == amounts.length, "LENGTH_MISMATCH");
+
+        for (uint256 i = 0; i < idsLength; ) {
+            balanceOf[from][ids[i]] -= amounts[i];
+
+            // An array can't have a total length
+            // larger than the max uint256 value.
+            unchecked {
+                ++i;
+            }
+        }
+
+        emit TransferBatch(msg.sender, from, address(0), ids, amounts);
+    }
+
+    function _burn(
+        address from,
+        uint256 id,
+        uint256 amount
+    ) internal virtual {
+        balanceOf[from][id] -= amount;
+
+        emit TransferSingle(msg.sender, from, address(0), id, amount);
+    }
+}
+
+/// @notice A generic interface for a contract which properly accepts ERC1155 tokens.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC1155.sol)
+abstract contract ERC1155TokenReceiver {
+    function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes calldata
+    ) external virtual returns (bytes4) {
+        return ERC1155TokenReceiver.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] calldata,
+        uint256[] calldata,
+        bytes calldata
+    ) external virtual returns (bytes4) {
+        return ERC1155TokenReceiver.onERC1155BatchReceived.selector;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC1155/IERC1155.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC1155/IERC1155.sol)
+
+pragma solidity ^0.8.0;
+
+import "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC1155 compliant contract, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-1155[EIP].
+ *
+ * _Available since v3.1._
+ */
+interface IERC1155 is IERC165 {
+    /**
+     * @dev Emitted when `value` tokens of token type `id` are transferred from `from` to `to` by `operator`.
+     */
+    event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
+
+    /**
+     * @dev Equivalent to multiple {TransferSingle} events, where `operator`, `from` and `to` are the same for all
+     * transfers.
+     */
+    event TransferBatch(
+        address indexed operator,
+        address indexed from,
+        address indexed to,
+        uint256[] ids,
+        uint256[] values
+    );
+
+    /**
+     * @dev Emitted when `account` grants or revokes permission to `operator` to transfer their tokens, according to
+     * `approved`.
+     */
+    event ApprovalForAll(address indexed account, address indexed operator, bool approved);
+
+    /**
+     * @dev Emitted when the URI for token type `id` changes to `value`, if it is a non-programmatic URI.
+     *
+     * If an {URI} event was emitted for `id`, the standard
+     * https://eips.ethereum.org/EIPS/eip-1155#metadata-extensions[guarantees] that `value` will equal the value
+     * returned by {IERC1155MetadataURI-uri}.
+     */
+    event URI(string value, uint256 indexed id);
+
+    /**
+     * @dev Returns the amount of tokens of token type `id` owned by `account`.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {balanceOf}.
+     *
+     * Requirements:
+     *
+     * - `accounts` and `ids` must have the same length.
+     */
+    function balanceOfBatch(address[] calldata accounts, uint256[] calldata ids)
+        external
+        view
+        returns (uint256[] memory);
+
+    /**
+     * @dev Grants or revokes permission to `operator` to transfer the caller's tokens, according to `approved`,
+     *
+     * Emits an {ApprovalForAll} event.
+     *
+     * Requirements:
+     *
+     * - `operator` cannot be the caller.
+     */
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /**
+     * @dev Returns true if `operator` is approved to transfer ``account``'s tokens.
+     *
+     * See {setApprovalForAll}.
+     */
+    function isApprovedForAll(address account, address operator) external view returns (bool);
+
+    /**
+     * @dev Transfers `amount` tokens of token type `id` from `from` to `to`.
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - If the caller is not `from`, it must have been approved to spend ``from``'s tokens via {setApprovalForAll}.
+     * - `from` must have a balance of tokens of type `id` of at least `amount`.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155Received} and return the
+     * acceptance magic value.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes calldata data
+    ) external;
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {safeTransferFrom}.
+     *
+     * Emits a {TransferBatch} event.
+     *
+     * Requirements:
+     *
+     * - `ids` and `amounts` must have the same length.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155BatchReceived} and return the
+     * acceptance magic value.
+     */
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] calldata ids,
+        uint256[] calldata amounts,
+        bytes calldata data
+    ) external;
+}
+
+
+// File: src/Fundrop/IMetadataRenderer.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.17;
+
+interface IMetadataRenderer {
+    function tokenURI(uint256 id) external view returns (string memory);
+}
+
+
+// File: src/Fundrop/IERC4906.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IERC4906 {
+    /// @dev This event emits when the metadata of a token is changed.
+    /// So that the third-party platforms such as NFT market could
+    /// timely update the images and related attributes of the NFT.
+    event MetadataUpdate(uint256 _tokenId);
+
+    /// @dev This event emits when the metadata of a range of tokens is changed.
+    /// So that the third-party platforms such as NFT market could
+    /// timely update the images and related attributes of the NFTs.
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
+}
+
