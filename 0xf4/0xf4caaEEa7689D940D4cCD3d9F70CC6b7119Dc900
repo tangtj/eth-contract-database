@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract DoYouUseBitCOIN {
+        
+    event DoYouUseBitCoin(bool UseTrueInput_1_OrFalseInput_0);
+
+    function doYouUseBitCoin(bool _useTrueInput_1_OrFalseInput_0) public {
+        emit DoYouUseBitCoin(_useTrueInput_1_OrFalseInput_0);
+    }
+
+
+}

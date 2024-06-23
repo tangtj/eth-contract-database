@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract DoYouHaveUseBlockCHain {
+        
+    event DoYouHaveUseBlockChain(bool True_1_OrFalse_0);
+
+    function doYouHaveUseBlockChain(bool _True_1_OrFalse_0) public {
+        emit DoYouHaveUseBlockChain(_True_1_OrFalse_0);
+    }
+
+
+}

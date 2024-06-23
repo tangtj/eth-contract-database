@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.8.2 <0.9.0;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+ 
+abstract contract Ownable is Context {
+    address private _owner;
+    
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+    
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+
+
+}
+
+interface IDeposit {
+    function deposit(address recipient, uint256 amount) external payable;
+}
+
+interface IRestake {
+    //stETH
+    function wrap(uint256 _amount) external;
+    function submit(address _referal) external payable;
+
+    //wBETH + ETHx wBETH use _referral / ETHx use _receiver
+    function deposit(address _user) external payable;
+
+    //rETH
+    function swapTo(uint256 _uniswapPortion, uint256 _balancerPortion, uint256 _minTokensOut, uint256 _idealTokensOut) external payable;
+
+    //mETH (minimum 0.02)
+    function stake(uint256 minMETHAmount) external payable;
+
+    //swETH
+    function deposit() external payable;
+
+    //sfrxETH
+    function submitAndDeposit(address recipient) external payable;
+
+
+}
+
+interface IERC20 {
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address user) external returns (uint256);
+}
+
+contract restaker is Ownable{
+
+    fallback() external payable{}
+
+    event Received(address, uint);
+    
+    receive() external payable {
+        emit Received(msg.sender, msg.value);
+    }
+
+    address stETH = 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84;
+    address wstETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
+
+    address cbETH = 0xBe9895146f7AF43049ca1c1AE358B0541Ea49704;
+
+    address wBETH = 0xa2E3356610840701BDf5611a53974510Ae27E2e1;
+
+    address rETH = 0xae78736Cd615f374D3085123A210448E74Fc6393;
+    address router_rETH = 0x16D5A408e807db8eF7c578279BEeEe6b228f1c1C;
+
+    address mETH = 0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa;
+    address minter_mETH = 0xe3cBd06D7dadB3F4e6557bAb7EdD924CD1489E8f;
+
+    address swETH = 0xf951E335afb289353dc249e82926178EaC7DEd78;
+
+    address frxETH = 0x5E8422345238F34275888049021821E8E08CAa1f;
+    address sfrxETH = 0xac3E018457B222d93114458476f3E3416Abbe38F;
+    address minter_sfrxETH = 0xbAFA44EFE7901E04E39Dad13167D089C559c1138;
+
+    address ETHx = 0xA35b1B31Ce002FBF2058D22F30f95D405200A15b;
+    address minter_ETHx = 0xcf5EA1b38380f6aF39068375516Daf40Ed70D299;
+
+
+    address pool_wstETH = 0xC329400492c6ff2438472D4651Ad17389fCb843a;
+    address pool_cbETH = 0xB26ff591F44b04E78de18f43B46f8b70C6676984;
+    address pool_wBETH = 0x422F5acCC812C396600010f224b320a743695f85;
+    address pool_rETH = 0x03Bf48b8A1B37FBeAd1EcAbcF15B98B924ffA5AC;
+    address pool_mETH = 0x475D3Eb031d250070B63Fa145F0fCFC5D97c304a;
+    address pool_swETH = 0x38B86004842D3FA4596f0b7A0b53DE90745Ab654;
+    address pool_sfrxETH = 0x5198CB44D7B2E993ebDDa9cAd3b9a0eAa32769D2;
+    address pool_ETHx = 0xBdea8e677F9f7C294A4556005c640Ee505bE6925;
+
+    function mint_wstETH(address recipient) public payable{
+        IRestake(stETH).submit{value: msg.value}(recipient);
+        IERC20(stETH).approve(wstETH, IERC20(stETH).balanceOf(address(this)));
+        IRestake(wstETH).wrap(IERC20(stETH).balanceOf(address(this)));
+        IERC20(wstETH).transfer(recipient, IERC20(wstETH).balanceOf(address(this)));
+    }
+
+    function autoPool_wstETH() public payable {
+        mint_wstETH(address(this));
+        IERC20(wstETH).approve(pool_wstETH, IERC20(wstETH).balanceOf(address(this)));
+        IDeposit(pool_wstETH).deposit(msg.sender, IERC20(wstETH).balanceOf(address(this)));
+    }
+
+    function mint_wBETH(address recipient) public payable {
+        IRestake(wBETH).deposit{value: msg.value}(recipient);
+        IERC20(wBETH).transfer(recipient, IERC20(wBETH).balanceOf(address(this)));
+    }
+
+    function autoPool_wBETH() public payable {
+        mint_wBETH(address(this));
+        IERC20(wBETH).approve(pool_wBETH, IERC20(wBETH).balanceOf(address(this)));
+        IDeposit(pool_wBETH).deposit(msg.sender, IERC20(wBETH).balanceOf(address(this)));
+    }
+
+    function mint_rETH(address recipient) public payable {
+        IRestake(router_rETH).swapTo{value: msg.value}(5,5,0,0);
+        IERC20(rETH).transfer(recipient, IERC20(rETH).balanceOf(address(this)));
+    }
+
+    function autoPool_rETH() public payable {
+        mint_rETH(address(this));
+        IERC20(rETH).approve(pool_rETH, IERC20(rETH).balanceOf(address(this)));
+        IDeposit(pool_rETH).deposit(msg.sender, IERC20(rETH).balanceOf(address(this)));
+    }
+
+    function mint_mETH(address recipient) public payable {
+        IRestake(minter_mETH).stake{value: msg.value}(0);
+        IERC20(mETH).transfer(recipient, IERC20(mETH).balanceOf(address(this)));
+    }
+
+    function autoPool_mETH() public payable {
+        mint_mETH(address(this));
+        IERC20(mETH).approve(pool_mETH, IERC20(mETH).balanceOf(address(this)));
+        IDeposit(pool_mETH).deposit(msg.sender, IERC20(mETH).balanceOf(address(this)));
+    }
+
+    function mint_swETH(address recipient) public payable {
+        IRestake(swETH).deposit{value: msg.value}();
+        IERC20(swETH).transfer(recipient, IERC20(swETH).balanceOf(address(this)));
+    }
+
+    function autoPool_swETH() public payable {
+        mint_swETH(address(this));
+        IERC20(swETH).approve(pool_swETH, IERC20(swETH).balanceOf(address(this)));
+        IDeposit(pool_swETH).deposit(msg.sender, IERC20(swETH).balanceOf(address(this)));
+    }
+
+    function mint_sfrxETH(address recipient) public payable {
+        IRestake(minter_sfrxETH).submitAndDeposit{value: msg.value}(recipient);
+    }
+
+    function autoPool_sfrxETH() public payable {
+        mint_sfrxETH(address(this));
+        IERC20(sfrxETH).approve(pool_sfrxETH, IERC20(sfrxETH).balanceOf(address(this)));
+        IDeposit(pool_sfrxETH).deposit(msg.sender, IERC20(sfrxETH).balanceOf(address(this)));
+    }
+
+    function mint_ETHx(address recipient) public payable {
+        IRestake(minter_ETHx).deposit{value: msg.value}(recipient);
+    }
+
+    function autoPool_ETHx() public payable {
+        mint_ETHx(address(this));
+        IERC20(ETHx).approve(pool_ETHx, IERC20(ETHx).balanceOf(address(this)));
+        IDeposit(pool_ETHx).deposit(msg.sender, IERC20(ETHx).balanceOf(address(this)));
+    }
+
+    function withdrawETH() external onlyOwner() {
+        payable(msg.sender).transfer(address(this).balance);
+    }
+    
+    function withdrawToken(address token) onlyOwner external {
+        IERC20(token).transfer(msg.sender, IERC20(token).balanceOf(address(this)));
+    }
+}

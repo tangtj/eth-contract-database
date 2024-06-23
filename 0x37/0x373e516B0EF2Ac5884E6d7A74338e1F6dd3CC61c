@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.0;
+
+contract DoYouHaveAnyNft {
+
+    event DoYouHaveAnyNFT(bool FalseIs_0_Or_TrueIs_1);
+
+    function doYouHaveAnyNFT(bool _FalseIs_0_Or_TrueIs_1) public {
+        emit DoYouHaveAnyNFT(_FalseIs_0_Or_TrueIs_1);
+    }
+
+}

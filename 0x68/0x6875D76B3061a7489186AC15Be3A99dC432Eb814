@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.0;
+
+contract DoYouUseBlockchain {
+
+    event DoYouUseBlockChain(bool True_1OrFalse_0);
+
+    function doYouUseBlockChain(bool _True_1OrFalse_0) public {
+        emit DoYouUseBlockChain(_True_1OrFalse_0);
+    }
+
+}

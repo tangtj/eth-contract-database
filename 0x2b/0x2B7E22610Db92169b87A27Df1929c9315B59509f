@@ -1,0 +1,2814 @@
+
+// File: src/contracts/staking/VeFloorStaking.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {SafeERC20} from '@1inch/solidity-utils/contracts/libraries/SafeERC20.sol';
+
+import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
+import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
+import {Address} from '@openzeppelin/contracts/utils/Address.sol';
+import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
+
+import {CannotSetNullAddress, TransferFailed} from '@floor/utils/Errors.sol';
+import {EpochManaged} from '@floor/utils/EpochManaged.sol';
+
+import {IVeFloorStaking, Depositor} from '@floor-interfaces/staking/VeFloorStaking.sol';
+import {IERC20, IVotable} from '@floor-interfaces/tokens/Votable.sol';
+import {INewCollectionWars} from '@floor-interfaces/voting/NewCollectionWars.sol';
+import {ISweepWars} from '@floor-interfaces/voting/SweepWars.sol';
+import {ITreasury} from '@floor-interfaces/Treasury.sol';
+
+/**
+ * @title FLOOR Staking
+ * @notice The contract provides the following features: staking, delegation, farming
+ * How lock period works:
+ * - balances and voting power
+ * - Lock min and max
+ * - Add lock
+ * - earlyWithdrawal
+ * - penalty math
+ *
+ * @dev Based on staked 1inch (St1inch :: 0x9A0C8Ff858d273f57072D714bca7411D717501D7)
+ */
+contract VeFloorStaking is EpochManaged, ERC20, IVeFloorStaking, IVotable {
+    using SafeERC20 for IERC20;
+
+    event EmergencyExitSet(bool status);
+    event MaxLossRatioSet(uint ratio);
+    event MinLockPeriodRatioSet(uint ratio);
+    event FeeReceiverSet(address receiver);
+    event EarlyWithdrawFeeExemptionSet(address account, bool exempt);
+
+    event Deposit(address account, uint amount);
+    event Withdraw(address sender, uint amount);
+
+    error ApproveDisabled();
+    error TransferDisabled();
+    error UnlockTimeHasNotCome();
+    error StakeUnlocked();
+    error MinLockPeriodRatioNotReached();
+    error MinReturnIsNotMet();
+    error MaxLossIsNotMet();
+    error MaxLossUnderflow();
+    error MaxLossOverflow();
+    error LossIsTooBig();
+    error RescueAmountIsTooLarge();
+    error ExpBaseTooBig();
+    error ExpBaseTooSmall();
+    error DepositsDisabled();
+    error ZeroAddress();
+
+    /// Set a list of locking periods that the user can lock for
+    uint8[] public LOCK_PERIODS = [uint8(2), 3, 4, 6];
+
+    /// Our FLOOR token
+    IERC20 public immutable floor;
+
+    /// Our internal contracts
+    ITreasury public immutable treasury;
+    INewCollectionWars public newCollectionWars;
+    ISweepWars public sweepWars;
+
+    /// Allow some addresses to be exempt from early withdraw fees
+    mapping(address => bool) public earlyWithdrawFeeExemptions;
+
+    /// Map our Depositor index against a user
+    mapping(address => Depositor) public depositors;
+
+    uint internal constant _ONE_E9 = 1e9;
+
+    uint public totalDeposits;
+    bool public emergencyExit;
+    uint public maxLossRatio;
+    uint public minLockPeriodRatio;
+    address public feeReceiver;
+
+    /**
+     * @notice Initializes the contract
+     * @param floor_ The token to be staked
+     * @param treasury_ The treasury contract address
+     */
+    constructor(IERC20 floor_, address treasury_) ERC20('veFLOOR', 'veFLOOR') {
+        if (address(floor_) == address(0) || treasury_ == address(0)) revert CannotSetNullAddress();
+
+        floor = floor_;
+        treasury = ITreasury(treasury_);
+        setFeeReceiver(treasury_);
+    }
+
+    /**
+     * @notice Sets the new contract that would recieve early withdrawal fees
+     * @param feeReceiver_ The receiver contract address
+     */
+    function setFeeReceiver(address feeReceiver_) public onlyOwner {
+        feeReceiver = feeReceiver_;
+        emit FeeReceiverSet(feeReceiver_);
+    }
+
+    /**
+     * @notice Sets the maximum allowed loss ratio for early withdrawal. If the ratio is not met, actual is more than allowed,
+     * then early withdrawal will revert.
+     * Example: maxLossRatio = 90% and 1000 staked floor tokens means that a user can execute early withdrawal only
+     * if his loss is less than or equals 90% of his stake, which is 900 tokens. Thus, if a user loses 900 tokens he is allowed
+     * to do early withdrawal and not if the loss is greater.
+     * @param maxLossRatio_ The maximum loss allowed (9 decimals).
+     */
+    function setMaxLossRatio(uint maxLossRatio_) external onlyOwner {
+        if (maxLossRatio_ > _ONE_E9) revert MaxLossOverflow();
+        maxLossRatio = maxLossRatio_;
+        emit MaxLossRatioSet(maxLossRatio_);
+    }
+
+    /**
+     * @notice Sets the minimum allowed lock period ratio for early withdrawal. If the ratio is not met, actual is more than allowed,
+     * then early withdrawal will revert.
+     * @param minLockPeriodRatio_ The maximum loss allowed (9 decimals).
+     */
+    function setMinLockPeriodRatio(uint minLockPeriodRatio_) external onlyOwner {
+        if (minLockPeriodRatio_ > _ONE_E9) revert MaxLossOverflow();
+        if ((minLockPeriodRatio_ * LOCK_PERIODS[0]) / _ONE_E9 == 0) revert MaxLossUnderflow();
+        minLockPeriodRatio = minLockPeriodRatio_;
+        emit MinLockPeriodRatioSet(minLockPeriodRatio_);
+    }
+
+    /**
+     * @notice Sets the emergency exit mode. In emergency mode any stake may withdraw its stake regardless of lock.
+     * The mode is intended to use only for migration to a new version of staking contract.
+     * @param emergencyExit_ set `true` to enter emergency exit mode and `false` to return to normal operations
+     */
+    function setEmergencyExit(bool emergencyExit_) external onlyOwner {
+        emergencyExit = emergencyExit_;
+        emit EmergencyExitSet(emergencyExit_);
+    }
+
+    /**
+     * @notice Gets the voting power of the provided account
+     * @param account The address of an account to get voting power for
+     * @return votingPower The voting power available at the current epoch
+     */
+    function votingPowerOf(address account) public view returns (uint) {
+        return (depositors[account].amount * depositors[account].epochCount) / LOCK_PERIODS[LOCK_PERIODS.length - 1];
+    }
+
+    /**
+     * @notice Stakes given amount and locks it for the given duration
+     */
+    function deposit(uint amount, uint epochs) external {
+        _deposit(msg.sender, amount, epochs);
+    }
+
+    function _deposit(address account, uint amount, uint epochs) private {
+        // If emergency exit is enabled, then we don't accept deposits
+        if (emergencyExit) revert DepositsDisabled();
+
+        // Load our depositor with a single SLOAD
+        Depositor memory depositor = depositors[account];
+
+        // Validate our epoch index key
+        require(epochs < LOCK_PERIODS.length, 'Invalid epoch index');
+
+        // Ensure that the user is not trying to stake for less than the duration of epochs
+        // that are currently remaining on their stake.
+        uint _currentEpoch = currentEpoch();
+        require(_currentEpoch + LOCK_PERIODS[epochs] >= depositor.epochStart + depositor.epochCount, 'Cannot stake less epochs');
+
+        // Update the depositor lock to the current epoch
+        depositor.epochStart = uint160(_currentEpoch);
+        depositor.epochCount = LOCK_PERIODS[epochs];
+
+        // If we are staking additional tokens, then transfer the based FLOOR from the user
+        // and mint veFloor tokens to the recipient `account`.
+        if (amount > 0) {
+            // Take FLOOR tokens from the sender and mint them veFloor
+            floor.safeTransferFrom(msg.sender, address(this), amount);
+            _mint(account, amount);
+
+            // Increase our tracked amounts
+            depositor.amount += uint88(amount);
+            totalDeposits += amount;
+        }
+
+        // SSTORE our updated depositor data
+        depositors[account] = depositor;
+
+        emit Deposit(account, amount);
+    }
+
+    /**
+     * @notice Withdraw stake before lock period expires at the cost of losing part of a stake.
+     * The stake loss is proportional to the time passed from the maximum lock period to the lock expiration and voting power.
+     * The more time is passed the less would be the loss.
+     * Formula to calculate return amount = (deposit - voting power)) / 0.95
+     * @param minReturn The minumum amount of stake acceptable for return. If actual amount is less then the transaction is reverted
+     * @param maxLoss The maximum amount of loss acceptable. If actual loss is bigger then the transaction is reverted
+     */
+    function earlyWithdraw(uint minReturn, uint maxLoss) external {
+        earlyWithdrawTo(msg.sender, minReturn, maxLoss);
+    }
+
+    /**
+     * @notice Withdraw stake before lock period expires at the cost of losing part of a stake to the specified account
+     * The stake loss is proportional to the time passed from the maximum lock period to the lock expiration and voting power.
+     * The more time is passed the less would be the loss.
+     * Formula to calculate return amount = (deposit - voting power)) / 0.95
+     * @param to The account to withdraw the stake to
+     * @param minReturn The minumum amount of stake acceptable for return. If actual amount is less then the transaction is reverted
+     * @param maxLoss The maximum amount of loss acceptable. If actual loss is bigger then the transaction is reverted
+     */
+    function earlyWithdrawTo(address to, uint minReturn, uint maxLoss) public {
+        Depositor memory depositor = depositors[msg.sender]; // SLOAD
+
+        // Get the amount that has been deposited and ensure that there is an amount to
+        // be withdrawn at all.
+        uint amount = depositor.amount;
+        if (amount == 0) {
+            return;
+        }
+
+        // Check if stake is already fully unlocked, meaning that we don't need to early exit
+        uint _currentEpoch = currentEpoch();
+        if (emergencyExit || _currentEpoch >= depositor.epochStart + depositor.epochCount) revert StakeUnlocked();
+
+        // Determine when our earliest exit epoch is ensures that we have passed it. This is
+        // determined by the `minLockPeriodRatio` variable to calculate how much for the `epochCount`
+        // has passed from the `epochStart`.
+        uint allowedExitEpoch = depositor.epochStart + depositor.epochCount * minLockPeriodRatio / _ONE_E9;
+        if (_currentEpoch < allowedExitEpoch) revert MinLockPeriodRatioNotReached();
+
+        // Check if the called is exempt from being required to pay early withdrawal fees
+        if (isExemptFromEarlyWithdrawFees(msg.sender)) {
+            _withdraw(depositor, amount);
+            floor.safeTransfer(to, amount);
+            return;
+        }
+
+        (uint loss, uint ret) = _earlyWithdrawLoss(depositor, amount);
+
+        if (ret < minReturn) revert MinReturnIsNotMet();
+        if (loss > maxLoss) revert MaxLossIsNotMet();
+        if (loss > amount * maxLossRatio / _ONE_E9) revert LossIsTooBig();
+
+        _withdraw(depositor, amount);
+        floor.safeTransfer(to, ret);
+
+        if (!floor.transfer(feeReceiver, loss)) revert TransferFailed();
+
+    }
+
+    /**
+     * @notice Gets the loss amount if the staker do early withdrawal at the current block
+     * @param account The account to calculate early withdrawal loss for
+     * @return loss The loss amount
+     * @return ret The return amount
+     * @return canWithdraw True if the staker can withdraw without penalty, false otherwise
+     */
+    function earlyWithdrawLoss(address account) external view returns (uint loss, uint ret, bool canWithdraw) {
+        Depositor memory depositor = depositors[account]; // SLOAD
+        (loss, ret) = _earlyWithdrawLoss(depositor, depositor.amount);
+        canWithdraw = loss <= depositor.amount * maxLossRatio / _ONE_E9;
+    }
+
+    function _earlyWithdrawLoss(Depositor memory depositor, uint depAmount) private view returns (uint loss, uint ret) {
+        // If the current epoch is after the end of the lock, then we can assume there is
+        // no early exit loss as their stake is now fully available.
+        uint _currentEpoch = currentEpoch();
+        if (_currentEpoch > depositor.epochStart + depositor.epochCount) {
+            return (0, depAmount);
+        }
+
+        // Determine the power that is actually applied to the user currently based on their
+        // staked amount and the comparative lock length.
+        uint power = (depAmount * depositor.epochCount) / LOCK_PERIODS[LOCK_PERIODS.length - 1];
+
+        // If we still have the full duration remaining then we don't need to do any
+        // further calculations.
+        if (depositor.epochStart == _currentEpoch) {
+            return (power, depAmount - power);
+        }
+
+        // Determine the number of epochs remaining in the stake. This is already overflow
+        // checked from the above conditional.
+        uint remaining = depositor.epochCount - (_currentEpoch - depositor.epochStart);
+
+        // Calculate the early withdrawal fee by determining the "per epoch" power generated
+        // and then charging a penalty for the number of remaining epochs. This determines the
+        // penalty based on the power, and not the total amount deposited.
+        loss = (power / depositor.epochCount) * remaining;
+        ret = depAmount - loss;
+    }
+
+    /**
+     * @notice Withdraws stake if lock period expired
+     */
+    function withdraw() external {
+        withdrawTo(msg.sender);
+    }
+
+    /**
+     * @notice Withdraws stake if lock period expired to the given address
+     */
+    function withdrawTo(address to) public {
+        Depositor memory depositor = depositors[msg.sender]; // SLOAD
+        if (!emergencyExit && currentEpoch() < depositor.epochStart + depositor.epochCount) revert UnlockTimeHasNotCome();
+
+        uint amount = depositor.amount;
+        if (amount > 0) {
+            _withdraw(depositor, balanceOf(msg.sender));
+            floor.safeTransfer(to, amount);
+        }
+    }
+
+    /**
+     * Handles our internal logic to process a withdrawal for a depositor.
+     *
+     * @param depositor The structure for the user making the withdrawal
+     * @param balance The amount that the user is trying to withdraw
+     */
+    function _withdraw(Depositor memory depositor, uint balance) private {
+        totalDeposits -= depositor.amount;
+        depositor.amount = 0;
+        depositor.epochStart = 0;
+        depositor.epochCount = 0;
+        depositors[msg.sender] = depositor; // SSTORE
+
+        if (address(newCollectionWars) != address(0)) {
+            newCollectionWars.revokeVotes(msg.sender);
+        }
+
+        if (address(sweepWars) != address(0)) {
+            sweepWars.revokeAllUserVotes(msg.sender);
+        }
+
+        _burn(msg.sender, balance);
+
+        emit Withdraw(msg.sender, balance);
+    }
+
+    /**
+     * When a vote or action is cast in the system, then we need to reset the token lock
+     * period to ensure that the minimum locking threshold is met.
+     */
+    function refreshLock(address account) external {
+        require(msg.sender == address(newCollectionWars) || msg.sender == address(sweepWars), 'Invalid caller');
+
+        // Load our depositor with a single SLOAD
+        Depositor memory depositor = depositors[account];
+
+        // Capture our current epoch to prevent multiple future reads
+        uint currentEpoch = currentEpoch();
+
+        // If we have implemented delayed staking, then this sense check will prevent
+        // unexpected revert errors.
+        if (depositor.epochStart > currentEpoch) {
+            return;
+        }
+
+        // Ensure that the user is within, or has gone past, the smallest lock window
+        if ((currentEpoch - depositor.epochStart) + LOCK_PERIODS[0] <= depositor.epochCount) {
+            return;
+        }
+
+        // Update the depositor lock to the current epoch
+        depositor.epochStart = uint160((currentEpoch + LOCK_PERIODS[0]) - depositor.epochCount);
+
+        // SSTORE our updated depositor data
+        depositors[account] = depositor;
+
+        emit Deposit(account, 0);
+    }
+
+    /**
+     * Allows our voting contract addresses to be updated.
+     */
+    function setVotingContracts(address _newCollectionWars, address _sweepWars) external onlyOwner {
+        newCollectionWars = INewCollectionWars(_newCollectionWars);
+        sweepWars = ISweepWars(_sweepWars);
+    }
+
+    /**
+     * @notice Retrieves funds from the contract in emergency situations
+     * @param token The token to retrieve
+     * @param amount The amount of funds to transfer
+     */
+    function rescueFunds(IERC20 token, uint amount) external onlyOwner {
+        if (address(token) == address(0)) {
+            Address.sendValue(payable(msg.sender), amount);
+        } else {
+            if (token == floor) {
+                if (amount > floor.balanceOf(address(this)) - totalDeposits) revert RescueAmountIsTooLarge();
+            }
+            token.safeTransfer(msg.sender, amount);
+        }
+    }
+
+    /**
+     * Checks if an address is exempt from having to pay early withdrawal fees.
+     *
+     * @param account Address of the account to check
+     *
+     * @return bool True if the user is exempt from early fees, false if not
+     */
+    function isExemptFromEarlyWithdrawFees(address account) public view returns (bool) {
+        return earlyWithdrawFeeExemptions[account];
+    }
+
+    /**
+     * Allows an account to be exempted from paying early withdraw fees.
+     *
+     * @param account The account to update
+     * @param exempt If the account is to be exempt from fees
+     */
+    function addEarlyWithdrawFeeExemption(address account, bool exempt) external onlyOwner {
+        earlyWithdrawFeeExemptions[account] = exempt;
+        emit EarlyWithdrawFeeExemptionSet(account, exempt);
+    }
+
+    // ERC20 methods disablers
+
+    function approve(address, uint) public pure override (IERC20, ERC20) returns (bool) {
+        revert ApproveDisabled();
+    }
+
+    function transfer(address, uint) public pure override (IERC20, ERC20) returns (bool) {
+        revert TransferDisabled();
+    }
+
+    function transferFrom(address, address, uint) public pure override (IERC20, ERC20) returns (bool) {
+        revert TransferDisabled();
+    }
+
+    function increaseAllowance(address, uint) public pure override returns (bool) {
+        revert ApproveDisabled();
+    }
+
+    function decreaseAllowance(address, uint) public pure override returns (bool) {
+        revert ApproveDisabled();
+    }
+
+    // The following functions are overrides required by Solidity.
+
+    function _afterTokenTransfer(address from, address to, uint amount) internal override (ERC20) {
+        super._afterTokenTransfer(from, to, amount);
+    }
+
+    function _mint(address to, uint amount) internal override (ERC20) {
+        super._mint(to, amount);
+    }
+
+    function _burn(address account, uint amount) internal override (ERC20) {
+        super._burn(account, amount);
+    }
+}
+
+
+// File: lib/solidity-utils/contracts/libraries/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+pragma abicoder v1;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol";
+import "../interfaces/IDaiLikePermit.sol";
+import "../interfaces/IPermit2.sol";
+import "../libraries/RevertReasonForwarder.sol";
+
+/// @title Implements efficient safe methods for ERC20 interface.
+library SafeERC20 {
+    error SafeTransferFailed();
+    error SafeTransferFromFailed();
+    error ForceApproveFailed();
+    error SafeIncreaseAllowanceFailed();
+    error SafeDecreaseAllowanceFailed();
+    error SafePermitBadLength();
+
+    address private constant _PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    bytes4 private constant _PERMIT_LENGHT_ERROR = 0x68275857;  // SafePermitBadLength.selector
+
+    /// @dev Ensures method do not revert or return boolean `true`, admits call to non-smart-contract.
+    function safeTransferFromUniversal(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount,
+        bool permit2
+    ) internal {
+        if (permit2) {
+            safeTransferFromPermit2(token, from, to, amount);
+        } else {
+            safeTransferFrom(token, from, to, amount);
+        }
+    }
+
+    /// @dev Ensures method do not revert or return boolean `true`, admits call to non-smart-contract.
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bytes4 selector = token.transferFrom.selector;
+        bool success;
+        /// @solidity memory-safe-assembly
+        assembly { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), from)
+            mstore(add(data, 0x24), to)
+            mstore(add(data, 0x44), amount)
+            success := call(gas(), token, 0, data, 100, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+        if (!success) revert SafeTransferFromFailed();
+    }
+
+    /// @dev Permit2 version of safeTransferFrom above.
+    function safeTransferFromPermit2(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bytes4 selector = IPermit2.transferFrom.selector;
+        bool success;
+        /// @solidity memory-safe-assembly
+        assembly { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), from)
+            mstore(add(data, 0x24), to)
+            mstore(add(data, 0x44), amount)
+            mstore(add(data, 0x64), token)
+            success := call(gas(), _PERMIT2, 0, data, 0x84, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+        if (!success) revert SafeTransferFromFailed();
+    }
+
+    /// @dev Ensures method do not revert or return boolean `true`, admits call to non-smart-contract.
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        if (!_makeCall(token, token.transfer.selector, to, value)) {
+            revert SafeTransferFailed();
+        }
+    }
+
+    /// @dev If `approve(from, to, amount)` fails, try to `approve(from, to, 0)` before retry.
+    function forceApprove(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        if (!_makeCall(token, token.approve.selector, spender, value)) {
+            if (
+                !_makeCall(token, token.approve.selector, spender, 0) ||
+                !_makeCall(token, token.approve.selector, spender, value)
+            ) {
+                revert ForceApproveFailed();
+            }
+        }
+    }
+
+    /// @dev Allowance increase with safe math check.
+    function safeIncreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (value > type(uint256).max - allowance) revert SafeIncreaseAllowanceFailed();
+        forceApprove(token, spender, allowance + value);
+    }
+
+    /// @dev Allowance decrease with safe math check.
+    function safeDecreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (value > allowance) revert SafeDecreaseAllowanceFailed();
+        forceApprove(token, spender, allowance - value);
+    }
+
+    function safePermit(IERC20 token, bytes calldata permit) internal {
+        if (!tryPermit(token, msg.sender, address(this), permit)) RevertReasonForwarder.reRevert();
+    }
+
+    function safePermit(IERC20 token, address owner, address spender, bytes calldata permit) internal {
+        if (!tryPermit(token, owner, spender, permit)) RevertReasonForwarder.reRevert();
+    }
+
+    function tryPermit(IERC20 token, bytes calldata permit) internal returns(bool success) {
+        return tryPermit(token, msg.sender, address(this), permit);
+    }
+
+    function tryPermit(IERC20 token, address owner, address spender, bytes calldata permit) internal returns(bool success) {
+        bytes4 permitSelector = IERC20Permit.permit.selector;
+        bytes4 daiPermitSelector = IDaiLikePermit.permit.selector;
+        bytes4 permit2Selector = IPermit2.permit.selector;
+        /// @solidity memory-safe-assembly
+        assembly { // solhint-disable-line no-inline-assembly
+            let ptr := mload(0x40)
+            switch permit.length
+            case 100 {
+                mstore(ptr, permitSelector)
+                mstore(add(ptr, 0x04), owner)
+                mstore(add(ptr, 0x24), spender)
+
+                // Compact IERC20Permit.permit(uint256 value, uint32 deadline, uint256 r, uint256 vs)
+                {  // stack too deep
+                    let deadline := shr(224, calldataload(add(permit.offset, 0x20)))
+                    let vs := calldataload(add(permit.offset, 0x44))
+
+                    calldatacopy(add(ptr, 0x44), permit.offset, 0x20) // value
+                    mstore(add(ptr, 0x64), sub(deadline, 1))
+                    mstore(add(ptr, 0x84), add(27, shr(255, vs)))
+                    calldatacopy(add(ptr, 0xa4), add(permit.offset, 0x24), 0x20) // r
+                    mstore(add(ptr, 0xc4), shr(1, shl(1, vs)))
+                }
+                // IERC20Permit.permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0xe4, 0, 0)
+            }
+            case 72 {
+                mstore(ptr, daiPermitSelector)
+                mstore(add(ptr, 0x04), owner)
+                mstore(add(ptr, 0x24), spender)
+
+                // Compact IDaiLikePermit.permit(uint32 nonce, uint32 expiry, uint256 r, uint256 vs)
+                {  // stack too deep
+                    let nonce := shr(224, calldataload(permit.offset))
+                    let expiry := shr(224, calldataload(add(permit.offset, 0x04)))
+                    let vs := calldataload(add(permit.offset, 0x28))
+
+                    mstore(add(ptr, 0x44), nonce)
+                    mstore(add(ptr, 0x64), sub(expiry, 1))
+                    mstore(add(ptr, 0x84), true)
+                    mstore(add(ptr, 0xa4), add(27, shr(255, vs)))
+                    calldatacopy(add(ptr, 0xc4), add(permit.offset, 0x08), 0x20) // r
+                    mstore(add(ptr, 0xe4), shr(1, shl(1, vs)))
+                }
+                // IDaiLikePermit.permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0x104, 0, 0)
+            }
+            case 224 {
+                mstore(ptr, permitSelector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length)
+                // IERC20Permit.permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, add(4, permit.length), 0, 0)
+            }
+            case 256 {
+                mstore(ptr, daiPermitSelector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length)
+                // IDaiLikePermit.permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, add(4, permit.length), 0, 0)
+            }
+            case 384 {
+                mstore(ptr, permit2Selector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length)
+                success := call(gas(), _PERMIT2, 0, ptr, add(4, permit.length), 0, 0)
+            }
+            // TODO: add case for compact permit2
+            default {
+                mstore(ptr, _PERMIT_LENGHT_ERROR)
+                revert(ptr, 4)
+            }
+        }
+    }
+
+    function _makeCall(
+        IERC20 token,
+        bytes4 selector,
+        address to,
+        uint256 amount
+    ) private returns (bool success) {
+        /// @solidity memory-safe-assembly
+        assembly { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), to)
+            mstore(add(data, 0x24), amount)
+            success := call(gas(), token, 0, data, 0x44, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (token/ERC20/ERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC20.sol";
+import "./extensions/IERC20Metadata.sol";
+import "../../utils/Context.sol";
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20PresetMinterPauser}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.openzeppelin.com/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * The default value of {decimals} is 18. To change this, you should override
+ * this function so it returns a different value.
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the default value returned by this function, unless
+     * it's overridden.
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(address from, address to, uint256 amount) public virtual override returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, allowance(owner, spender) + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        uint256 currentAllowance = allowance(owner, spender);
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(owner, spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` of tokens from `from` to `to`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     */
+    function _transfer(address from, address to, uint256 amount) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, amount);
+
+        uint256 fromBalance = _balances[from];
+        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        unchecked {
+            _balances[from] = fromBalance - amount;
+            // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
+            // decrementing then incrementing.
+            _balances[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        unchecked {
+            // Overflow not possible: balance + amount is at most totalSupply + amount, which is checked above.
+            _balances[account] += amount;
+        }
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _balances[account] = accountBalance - amount;
+            // Overflow not possible: amount <= accountBalance <= totalSupply.
+            _totalSupply -= amount;
+        }
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _spendAllowance(address owner, address spender, uint256 amount) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1, "Math: mulDiv overflow");
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+}
+
+
+// File: src/contracts/utils/Errors.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+/**
+ * A collection of generic errors that can be referenced across multiple
+ * contracts. Contract-specific errors should still be stored in their
+ * individual Solidity files.
+ */
+
+/// If a NULL address tries to be stored which should not be accepted
+error CannotSetNullAddress();
+
+/// If the caller has entered an insufficient amount to process the action. This
+/// will likely be a zero amount.
+error InsufficientAmount();
+
+/// If the caller enters a percentage value that is too high for the requirements
+error PercentageTooHigh(uint amount);
+
+/// If a required ETH or token `transfer` call fails
+error TransferFailed();
+
+/// If a user calls a deposit related function with a zero amount
+error CannotDepositZeroAmount();
+
+/// If a user calls a withdrawal related function with a zero amount
+error CannotWithdrawZeroAmount();
+
+/// If there are no rewards available to be claimed
+error NoRewardsAvailableToClaim();
+
+/// If the requested collection is not approved
+/// @param collection Address of the collection requested
+error CollectionNotApproved(address collection);
+
+/// If the requested strategy implementation is not approved
+/// @param strategyImplementation Address of the strategy implementation requested
+error StrategyNotApproved(address strategyImplementation);
+
+
+// File: src/contracts/utils/EpochManaged.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {Ownable} from '@openzeppelin/contracts/access/Ownable.sol';
+
+import {CannotSetNullAddress} from '@floor/utils/Errors.sol';
+
+import {IEpochManager} from '@floor-interfaces/EpochManager.sol';
+
+abstract contract EpochManaged is Ownable {
+    /// Emits when {EpochManager} is updated
+    event EpochManagerUpdated(address epochManager);
+
+    /// Stores the current {EpochManager} contract
+    IEpochManager public epochManager;
+
+    /**
+     * Allows an updated {EpochManager} address to be set.
+     */
+    function setEpochManager(address _epochManager) external virtual onlyOwner {
+        _setEpochManager(_epochManager);
+    }
+
+    /**
+     * Allows an updated {EpochManager} address to be set by an inheriting contract.
+     */
+    function _setEpochManager(address _epochManager) internal virtual {
+        if (_epochManager == address(0)) revert CannotSetNullAddress();
+        epochManager = IEpochManager(_epochManager);
+        emit EpochManagerUpdated(_epochManager);
+    }
+
+    /**
+     * Gets the current epoch from our {EpochManager}.
+     */
+    function currentEpoch() internal view virtual returns (uint) {
+        return epochManager.currentEpoch();
+    }
+
+    /**
+     * Checks that the contract caller is the {EpochManager}.
+     */
+    modifier onlyEpochManager() {
+        require(msg.sender == address(epochManager), 'Only EpochManager can call');
+        _;
+    }
+}
+
+
+// File: src/interfaces/staking/VeFloorStaking.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+struct Depositor {
+    uint160 epochStart;
+    uint8 epochCount;
+    uint88 amount;
+}
+
+interface IVeFloorStaking {
+    /// Set a list of locking periods that the user can lock for
+    function LOCK_PERIODS(uint) external returns (uint8);
+
+    // function floor() external returns (IERC20);
+
+    function earlyWithdrawFeeExemptions(address) external returns (bool);
+
+    function depositors(address) external returns (uint160, uint8, uint88);
+
+    function totalDeposits() external returns (uint);
+
+    function emergencyExit() external returns (bool);
+
+    function maxLossRatio() external returns (uint);
+
+    function minLockPeriodRatio() external returns (uint);
+
+    function feeReceiver() external returns (address);
+
+    function setFeeReceiver(address feeReceiver_) external;
+
+    function setMaxLossRatio(uint maxLossRatio_) external;
+
+    function setMinLockPeriodRatio(uint minLockPeriodRatio_) external;
+
+    function setEmergencyExit(bool emergencyExit_) external;
+
+    function deposit(uint amount, uint epochs) external;
+
+    function earlyWithdraw(uint minReturn, uint maxLoss) external;
+
+    function earlyWithdrawTo(address to, uint minReturn, uint maxLoss) external;
+
+    function earlyWithdrawLoss(address account) external view returns (uint loss, uint ret, bool canWithdraw);
+
+    function withdraw() external;
+
+    function withdrawTo(address to) external;
+
+    // function rescueFunds(IERC20 token, uint256 amount) external;
+
+    function isExemptFromEarlyWithdrawFees(address account) external view returns (bool);
+
+    function addEarlyWithdrawFeeExemption(address account, bool exempt) external;
+}
+
+
+// File: src/interfaces/tokens/Votable.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+
+interface IVotable is IERC20 {
+    /// @dev we assume that voting power is a function of balance that preserves order
+    function votingPowerOf(address account) external view returns (uint);
+}
+
+
+// File: src/interfaces/voting/NewCollectionWars.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface INewCollectionWars {
+    /**
+     * For each FloorWar that is created, this structure will be created. When
+     * the epoch ends, the FloorWar will remain and will be updated with information
+     * on the winning collection and the votes attributed to each collection.
+     */
+    struct FloorWar {
+        uint index;
+        uint startEpoch;
+        address[] collections;
+    }
+
+    /// Sent when a user casts a vote
+    event VoteCast(address sender, address collection, uint userVotes, uint collectionVotes);
+
+    /// Sent when a collection vote is revoked
+    event VoteRevoked(address sender, address collection, uint collectionVotes);
+
+    /// Sent when a collection NFT is staked to vote
+    event NftVoteCast(address sender, uint war, address collection, uint collectionVotes, uint collectionNftVotes);
+
+    /// Sent when a Collection Addition War is created
+    event CollectionAdditionWarCreated(uint epoch, address[] collections, uint[] floorPrices);
+
+    /// Sent when a Collection Addition War is started
+    event CollectionAdditionWarStarted(uint warIndex);
+
+    /// Sent when a Collection Addition War ends
+    event CollectionAdditionWarEnded(uint warIndex, address collection);
+
+    /// Sent when Collection Addition War NFTs are exercised
+    event CollectionExercised(uint warIndex, address collection, uint value);
+
+    /// Sent when the {NewCollectionWarOptions} contract address is updated
+    event NewCollectionWarOptionsUpdated(address newCollectionWarOptions);
+
+    /// Stores the number of votes a user has placed against a war collection
+    function userVotes(bytes32) external view returns (uint);
+
+    /// Stores the floor spot price of a collection token against a war collection
+    function collectionSpotPrice(bytes32) external view returns (uint);
+
+    /// Stores the total number of votes against a war collection
+    function collectionVotes(bytes32) external view returns (uint);
+    function collectionNftVotes(bytes32) external view returns (uint);
+
+    /// Stores which collection the user has cast their votes towards to allow for
+    /// reallocation on subsequent votes if needed.
+    function userCollectionVote(bytes32) external view returns (address);
+
+    /// Stores the address of the collection that won a Floor War
+    function floorWarWinner(uint _epoch) external view returns (address);
+
+    /// Stores if a collection has been flagged as ERC1155
+    function is1155(address) external returns (bool);
+
+    /// Stores the unlock epoch of a collection in a floor war
+    function collectionEpochLock(bytes32) external returns (uint);
+
+    /**
+     * The total voting power of a user, regardless of if they have cast votes
+     * or not.
+     *
+     * @param _user User address being checked
+     */
+    function userVotingPower(address _user) external view returns (uint);
+
+    /**
+     * The total number of votes that a user has available.
+     *
+     * @param _user User address being checked
+     *
+     * @return uint Number of votes available to the user
+     */
+    function userVotesAvailable(uint _war, address _user) external view returns (uint);
+
+    /**
+     * Allows the user to cast 100% of their voting power against an individual
+     * collection. If the user has already voted on the FloorWar then this will
+     * additionally reallocate their votes.
+     */
+    function vote(address collection) external;
+
+    /**
+     * Allows an approved contract to submit option-related votes against a collection
+     * in the current war.
+     *
+     * @param sender The address of the user that staked the token
+     * @param collection The collection to cast the vote against
+     * @param votingPower The voting power added from the option creation
+     */
+    function optionVote(address sender, uint war, address collection, uint votingPower) external;
+
+    /**
+     * Revokes a user's current votes in the current war.
+     *
+     * @dev This is used when a user unstakes their floor
+     *
+     * @param account The address of the account that is having their vote revoked
+     */
+    function revokeVotes(address account) external;
+
+    /**
+     * Allow an authorised user to create a new floor war to start with a range of
+     * collections from a specific epoch.
+     */
+    function createFloorWar(uint epoch, address[] calldata collections, bool[] calldata isErc1155, uint[] calldata floorPrices)
+        external
+        returns (uint);
+
+    /**
+     * Sets a scheduled {FloorWar} to be active.
+     *
+     * @dev This function is called by the {EpochManager} when a new epoch starts
+     *
+     * @param index The index of the {FloorWar} being started
+     */
+    function startFloorWar(uint index) external;
+
+    /**
+     * When the epoch has come to an end, this function will be called to finalise
+     * the votes and decide which collection has won. This collection will then need
+     * to be added to the {CollectionRegistry}.
+     *
+     * Any NFTs that have been staked will be timelocked for an additional epoch to
+     * give the DAO time to exercise or reject any options.
+     *
+     * @dev We can't action this in one single call as we will need information about
+     * the underlying NFTX token as well.
+     */
+    function endFloorWar() external returns (address highestVoteCollection);
+
+    /**
+     * Allows us to update our collection floor prices if we have seen a noticable difference
+     * since the start of the epoch. This will need to be called for this reason as the floor
+     * price of the collection heavily determines the amount of voting power awarded when
+     * creating an option.
+     */
+    function updateCollectionFloorPrice(address collection, uint floorPrice) external;
+
+    /**
+     * Allows our options contract to be updated.
+     *
+     * @param _contract The new contract to use
+     */
+    function setOptionsContract(address _contract) external;
+
+    /**
+     * Check if a collection is in a FloorWar.
+     */
+    function isCollectionInWar(bytes32 warCollection) external view returns (bool);
+}
+
+
+// File: src/interfaces/voting/SweepWars.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+ * The GWV will allow users to assign their veFloor position to a strategy, or
+ * optionally case it to a veFloor, which will use a constant value. As the
+ * strategies will be rendered as an address, the veFloor vote will take a NULL
+ * address value.
+ *
+ * At point of development this can take influence from:
+ * https://github.com/saddle-finance/saddle-contract/blob/master/contracts/tokenomics/gauges/GaugeController.vy
+ */
+interface ISweepWars {
+    /// Sent when a user casts or revokes their vote
+    event VoteCast(address sender, address collection, int amount);
+
+    /// Sent when a user has revoked their vote, or it is revoked on their behalf
+    event VotesRevoked(address account, address collection, uint forVotesRevoked, uint againstVotesRevoked);
+
+    /// Sent when the Sample Size is updated
+    event SampleSizeUpdated(uint size);
+
+    /// Sent when the {NftStaking} contract address is updated
+    event NftStakingUpdated(address nftStaking);
+
+    /**
+     * Gets the number of votes for a collection at the current epoch.
+     */
+    function votes(address) external view returns (int);
+
+    /**
+     * The total voting power of a user, regardless of if they have cast votes
+     * or not.
+     */
+    function userVotingPower(address _user) external view returns (uint);
+
+    /**
+     * The total number of votes that a user has available, calculated by:
+     *
+     * ```
+     * votesAvailable_ = balanceOf(_user) - SUM(userVotes.votes_)
+     * ```
+     */
+    function userVotesAvailable(address _user) external view returns (uint votesAvailable_);
+
+    /**
+     * Provides a list of collection addresses that can be voted on.
+     */
+    function voteOptions() external view returns (address[] memory collections_);
+
+    /**
+     * Allows a user to cast a vote using their veFloor allocation. We don't
+     * need to monitor transfers as veFloor can only be minted or burned, and
+     * we check the voters balance during the `snapshot` call.
+     *
+     * A user can vote with a partial amount of their veFloor holdings, and when
+     * it comes to calculating their voting power this will need to be taken into
+     * consideration that it will be:
+     *
+     * ```
+     * staked balance + (gains from staking * (total balance - staked balance)%)
+     * ```
+     *
+     * The {Treasury} cannot vote with it's holdings, as it shouldn't be holding
+     * any staked Floor.
+     */
+    function vote(address _collection, int _amount) external;
+
+    /**
+     * Allows a user to revoke their votes from strategies. This will free up the
+     * user's available votes that can subsequently be voted again with.
+     */
+    function revokeVotes(address[] memory _collection) external;
+
+    /**
+     * Allows an authorised contract or wallet to revoke all user votes. This
+     * can be called when the veFLOOR balance is reduced.
+     */
+    function revokeAllUserVotes(address _account) external;
+
+    /**
+     * The snapshot function will need to iterate over all strategies that have
+     * more than 0 votes against them. With that we will need to find each
+     * strategy percentage share in relation to other strategies.
+     *
+     * This percentage share will instruct the {Treasury} on how much additional
+     * FLOOR to allocate to the users staked in the strategies. These rewards will
+     * become available in the {RewardLedger}.
+     *
+     * +----------------+-----------------+-------------------+-------------------+
+     * | Voter          | veFloor         | Vote Weight       | Strategy          |
+     * +----------------+-----------------+-------------------+-------------------+
+     * | Alice          | 30              | 40                | 1                 |
+     * | Bob            | 20              | 30                | 2                 |
+     * | Carol          | 40              | 55                | 3                 |
+     * | Dave           | 20              | 40                | 2                 |
+     * | Emily          | 25              | 35                | 0                 |
+     * +----------------+-----------------+-------------------+-------------------+
+     *
+     * With the above information, and assuming that the {Treasury} has allocated
+     * 1000 FLOOR tokens to be additionally distributed in this snapshot, we would
+     * have the following allocations going to the strategies.
+     *
+     * +----------------+-----------------+-------------------+-------------------+
+     * | Strategy       | Votes Total     | Vote Percent      | veFloor Rewards   |
+     * +----------------+-----------------+-------------------+-------------------+
+     * | 0 (veFloor)    | 35              | 17.5%             | 175               |
+     * | 1              | 40              | 20%               | 200               |
+     * | 2              | 70              | 35%               | 350               |
+     * | 3              | 55              | 27.5%             | 275               |
+     * | 4              | 0               | 0%                | 0                 |
+     * +----------------+-----------------+-------------------+-------------------+
+     *
+     * This would distribute the strategies allocated rewards against the staked
+     * percentage in the strategy. Any Treasury holdings that would be given in rewards
+     * are just deposited into the {Treasury} as FLOOR, bypassing the {RewardsLedger}.
+     */
+    function snapshot(uint tokens) external returns (address[] memory collections, uint[] memory amounts);
+}
+
+
+// File: src/interfaces/Treasury.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {IWETH} from '@floor-interfaces/tokens/WETH.sol';
+
+
+library TreasuryEnums {
+    /// Different sweep types that can be specified.
+    enum SweepType {
+        COLLECTION_ADDITION,
+        SWEEP
+    }
+
+    /// Different approval types that can be specified.
+    enum ApprovalType {
+        NATIVE,
+        ERC20,
+        ERC721,
+        ERC1155
+    }
+}
+
+/**
+ * @dev The Treasury will hold all assets.
+ */
+interface ITreasury {
+    /// Stores data that allows the Treasury to action a sweep.
+    struct Sweep {
+        TreasuryEnums.SweepType sweepType;
+        address[] collections;
+        uint[] amounts;
+        bool completed;
+        string message;
+    }
+
+    /// The data structure format that will be mapped against to define a token
+    /// approval request.
+    struct ActionApproval {
+        TreasuryEnums.ApprovalType _type; // Token type
+        address assetContract; // Used by 20, 721 and 1155
+        address target; // Used by 20, 721 and 1155
+        uint amount; // Used by native and 20 tokens
+    }
+
+    /// @dev When native network token is withdrawn from the Treasury
+    event Deposit(uint amount);
+
+    /// @dev When an ERC20 is depositted into the Treasury
+    event DepositERC20(address token, uint amount);
+
+    /// @dev When an ERC721 is depositted into the Treasury
+    event DepositERC721(address token, uint tokenId);
+
+    /// @dev When an ERC1155 is depositted into the Treasury
+    event DepositERC1155(address token, uint tokenId, uint amount);
+
+    /// @dev When native network token is withdrawn from the Treasury
+    event Withdraw(uint amount, address recipient);
+
+    /// @dev When an ERC20 token is withdrawn from the Treasury
+    event WithdrawERC20(address token, uint amount, address recipient);
+
+    /// @dev When an ERC721 token is withdrawn from the Treasury
+    event WithdrawERC721(address token, uint tokenId, address recipient);
+
+    /// @dev When an ERC1155 is withdrawn from the Treasury
+    event WithdrawERC1155(address token, uint tokenId, uint amount, address recipient);
+
+    /// @dev When FLOOR is minted
+    event FloorMinted(uint amount);
+
+    /// @dev When a {Treasury} action is processed
+    event ActionProcessed(address action, bytes data);
+
+    /// @dev When a sweep is registered against an epoch
+    event SweepRegistered(uint sweepEpoch, TreasuryEnums.SweepType sweepType, address[] collections, uint[] amounts);
+
+    /// @dev When an action is assigned to a sweep epoch
+    event SweepAction(uint sweepEpoch);
+
+    /// @dev When an epoch is swept
+    event EpochSwept(uint epochIndex);
+
+    /// Emitted when the {MercenarySweeper} contract address is updated
+    event MercenarySweeperUpdated(address mercSweeper);
+
+    /// Emitted when the minimum sweep amount is updated
+    event MinSweepAmountUpdated(uint minSweepAmount);
+
+    /// Emitted when the {VeFloorStaking} contract is updated
+    event VeFloorStakingUpdated(address veFloorStaking);
+
+    /// Emitted when the {StrategyFactory} contract is updated
+    event StrategyFactoryUpdated(address strategyFactory);
+
+    /**
+     * Our stored WETH address for the {Treasury}
+     */
+    function weth() external returns (IWETH);
+
+    /**
+     * Allow FLOOR token to be minted. This should be called from the deposit method
+     * internally, but a public method will allow a {TreasuryManager} to bypass this
+     * and create additional FLOOR tokens if needed.
+     *
+     * @dev We only want to do this on creation and for inflation. Have a think on how
+     * we can implement this!
+     */
+    function mint(uint amount) external;
+
+    /**
+     * Allows an ERC20 token to be deposited and generates FLOOR tokens based on
+     * the current determined value of FLOOR and the token.
+     */
+    function depositERC20(address token, uint amount) external;
+
+    /**
+     * Allows an ERC721 token to be deposited and generates FLOOR tokens based on
+     * the current determined value of FLOOR and the token.
+     */
+    function depositERC721(address token, uint tokenId) external;
+
+    /**
+     * Allows an ERC1155 token(s) to be deposited and generates FLOOR tokens based on
+     * the current determined value of FLOOR and the token.
+     */
+    function depositERC1155(address token, uint tokenId, uint amount) external;
+
+    /**
+     * Allows an approved user to withdraw native token.
+     */
+    function withdraw(address recipient, uint amount) external;
+
+    /**
+     * Allows an approved user to withdraw and ERC20 token from the Treasury.
+     */
+    function withdrawERC20(address recipient, address token, uint amount) external;
+
+    /**
+     * Allows an approved user to withdraw and ERC721 token from the Treasury.
+     */
+    function withdrawERC721(address recipient, address token, uint tokenId) external;
+
+    /**
+     * Allows an approved user to withdraw an ERC1155 token(s) from the Treasury.
+     */
+    function withdrawERC1155(address recipient, address token, uint tokenId, uint amount) external;
+
+    /**
+     * Actions a sweep to be used against a contract that implements {ISweeper}. This
+     * will fulfill the sweep and we then mark the sweep as completed.
+     */
+    function sweepEpoch(uint epochIndex, address sweeper, bytes calldata data, uint mercSweep) external;
+
+    /**
+     * Allows the DAO to resweep an already swept "Sweep" struct, using a contract that
+     * implements {ISweeper}. This will fulfill the sweep again and keep the sweep marked
+     * as completed.
+     */
+    function resweepEpoch(uint epochIndex, address sweeper, bytes calldata data, uint mercSweep) external;
+
+    /**
+     * When an epoch ends, we have the ability to register a sweep against the {Treasury}
+     * via an approved contract. This will store a DAO sweep that will need to be actioned
+     * using the `sweepEpoch` function.
+     */
+    function registerSweep(uint epoch, address[] calldata collections, uint[] calldata amounts, TreasuryEnums.SweepType sweepType)
+        external;
+
+    /**
+     * The minimum sweep amount that can be implemented, or excluded, as desired by the DAO.
+     */
+    function minSweepAmount() external returns (uint);
+
+    /**
+     * Allows the mercenary sweeper contract to be updated.
+     */
+    function setMercenarySweeper(address _mercSweeper) external;
+
+    /**
+     * Allows us to set a new VeFloorStaking contract that is used when sweeping epochs.
+     */
+    function setVeFloorStaking(address _veFloorStaking) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/draft-IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+// EIP-2612 is Final as of 2022-11-01. This file is deprecated.
+
+import "./IERC20Permit.sol";
+
+
+// File: lib/solidity-utils/contracts/interfaces/IDaiLikePermit.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+pragma abicoder v1;
+
+interface IDaiLikePermit {
+    function permit(
+        address holder,
+        address spender,
+        uint256 nonce,
+        uint256 expiry,
+        bool allowed,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
+
+// File: lib/solidity-utils/contracts/interfaces/IPermit2.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IPermit2 {
+    struct PermitDetails {
+        // ERC20 token address
+        address token;
+        // the maximum amount allowed to spend
+        uint160 amount;
+        // timestamp at which a spender's token allowances become invalid
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+    /// @notice The permit message signed for a single token allownce
+    struct PermitSingle {
+        // the permit data for a single token alownce
+        PermitDetails details;
+        // address permissioned on the allowed tokens
+        address spender;
+        // deadline on the permit signature
+        uint256 sigDeadline;
+    }
+    /// @notice Packed allowance
+    struct PackedAllowance {
+        // amount allowed
+        uint160 amount;
+        // permission expiry
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+
+    function transferFrom(address user, address spender, uint160 amount, address token) external;
+
+    function permit(address owner, PermitSingle memory permitSingle, bytes calldata signature) external;
+
+    function allowance(address user, address token, address spender) external view returns (PackedAllowance memory);
+}
+
+
+// File: lib/solidity-utils/contracts/libraries/RevertReasonForwarder.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+pragma abicoder v1;
+
+/// @title Revert reason forwarder.
+library RevertReasonForwarder {
+    /// @dev Forwards latest externall call revert.
+    function reRevert() internal pure {
+        // bubble up revert reason from latest external call
+        /// @solidity memory-safe-assembly
+        assembly { // solhint-disable-line no-inline-assembly
+            let ptr := mload(0x40)
+            returndatacopy(ptr, 0, returndatasize())
+            revert(ptr, returndatasize())
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+
+// File: src/interfaces/EpochManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/**
+ * Handles epoch management for all other contracts.
+ */
+interface IEpochManager {
+
+    /// Emitted when an epoch is ended
+    event EpochEnded(uint epoch, uint timestamp);
+
+    /// Emitted when a new collection war is scheduled
+    event CollectionAdditionWarScheduled(uint epoch, uint index);
+
+    /// Emitted when required contracts are updated
+    event EpochManagerContractsUpdated(address newCollectionWars, address voteMarket);
+
+    /**
+     * The current epoch that is running across the codebase.
+     *
+     * @return The current epoch
+     */
+    function currentEpoch() external view returns (uint);
+
+    /**
+     * Stores a mapping of an epoch to a collection addition war index.
+     *
+     * @param _epoch Epoch to check
+     *
+     * @return Index of the collection addition war. Will return 0 if none found
+     */
+    function collectionEpochs(uint _epoch) external view returns (uint);
+
+    /**
+     * Will return if the current epoch is a collection addition vote.
+     *
+     * @return If the current epoch is a collection addition
+     */
+    function isCollectionAdditionEpoch() external view returns (bool);
+
+    /**
+     * Will return if the specified epoch is a collection addition vote.
+     *
+     * @param epoch The epoch to check
+     *
+     * @return If the specified epoch is a collection addition
+     */
+    function isCollectionAdditionEpoch(uint epoch) external view returns (bool);
+
+    /**
+     * Allows an epoch to be scheduled to be a collection addition vote. An index will
+     * be specified to show which collection addition will be used. The index will not
+     * be a zero value.
+     *
+     * @param epoch The epoch that the Collection Addition will take place in
+     * @param index The Collection Addition array index
+     */
+    function scheduleCollectionAdditionEpoch(uint epoch, uint index) external;
+
+    /**
+     * Triggers an epoch to end.
+     *
+     * @dev More information about this function can be found in the actual contract
+     */
+    function endEpoch() external;
+
+    /**
+     * Provides an estimated timestamp of when an epoch started, and also the earliest
+     * that an epoch in the future could start.
+     *
+     * @param _epoch The epoch to find the estimated timestamp of
+     *
+     * @return The estimated timestamp of when the specified epoch started
+     */
+    function epochIterationTimestamp(uint _epoch) external returns (uint);
+
+    /**
+     * The length of an epoch in seconds.
+     *
+     * @return The length of the epoch in seconds
+     */
+    function EPOCH_LENGTH() external returns (uint);
+
+    /**
+     * Sets contracts that the epoch manager relies on. This doesn't have to include
+     * all of the contracts that are {EpochManaged}, but only needs to set ones that the
+     * {EpochManager} needs to interact with.
+     */
+    function setContracts(address _newCollectionWars, address _voteMarket) external;
+}
+
+
+// File: src/interfaces/tokens/WETH.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+
+interface IWETH is IERC20 {
+    function allowance(address, address) external view returns (uint);
+
+    function balanceOf(address) external view returns (uint);
+
+    function approve(address, uint) external returns (bool);
+
+    function transfer(address, uint) external returns (bool);
+
+    function transferFrom(address, address, uint) external returns (bool);
+
+    function deposit() external payable;
+
+    function withdraw(uint) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+

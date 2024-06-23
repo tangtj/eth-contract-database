@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+pragma solidity ^0.8.8;
+
+contract HowManyBtcDoYouOwn {
+        
+    event HowManyBTCDoYouOwn(uint NumRoundToAnInteger);
+
+    function howManyBTCDoYouOwn(uint _NumRoundToAnInteger) public {
+        emit HowManyBTCDoYouOwn(_NumRoundToAnInteger);
+    }
+
+
+}

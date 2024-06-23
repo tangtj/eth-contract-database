@@ -1,0 +1,538 @@
+// SPDX-License-Identifier: Unlicensed
+pragma solidity ^0.8.14;
+
+interface IERC20 {
+    function decimals() external view returns (uint8);
+
+    function symbol() external view returns (string memory);
+
+    function name() external view returns (string memory);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function allowance(address owner, address spender)
+        external
+        view
+        returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+interface ISwapRouter {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 amountToken,
+            uint256 amountETH,
+            uint256 liquidity
+        );
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
+}
+
+interface ISwapFactory {
+    function createPair(address tokenA, address tokenB)
+        external
+        returns (address pair);
+}
+
+interface ISwapPair {
+    function burn(address to)
+        external
+        returns (uint256 amount0, uint256 amount1);
+
+    function mint(address to) external returns (uint256 liquidity);
+
+    function getReserves()
+        external
+        view
+        returns (
+            uint256 reserve0,
+            uint256 reserve1,
+            uint32 blockTimestampLast
+        );
+
+    function totalSupply() external view returns (uint256);
+    function sync() external;
+}
+
+interface IPair {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves()
+        external
+        view
+        returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast
+        );
+}
+
+abstract contract Ownable {
+    address internal _owner;
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    constructor() {
+        address msgSender = msg.sender;
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == msg.sender, "!owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "new is 0");
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+    }
+}
+
+abstract contract AbsToken is IERC20, Ownable {
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    address public fundAddress;
+    address public buyAddress;
+    address public sellAddress;
+    address public WETH;
+
+    mapping(address => address) public inviter;
+
+    string private _name;
+    string private _symbol;
+    uint8 private _decimals;
+
+
+    uint256 private _tTotal;
+
+    ISwapRouter public _swapRouter;
+    mapping(address => bool) public _swapPairList;
+    mapping(address => bool) public _feeWhiteList;
+
+
+    uint256 private constant MAX = ~uint256(0);
+
+    address public _mainPair;
+
+
+    uint256 public day1Sec = 86400;
+
+
+    mapping(address => uint256) public childCount;
+
+    constructor(
+        // address RouterAddress,
+        // address USDTAddress,
+        string memory Name,
+        string memory Symbol,
+        uint8 Decimals,
+        uint256 Supply,
+        address FundAddress,
+        address Buy,
+        address Sell,
+        address ReceiveAddress
+    ) {
+        _name = Name;
+        _symbol = Symbol;
+        _decimals = Decimals;
+
+
+        uint256 total = Supply * 10**Decimals;
+        _tTotal = total;
+
+        _balances[ReceiveAddress] = total;
+        emit Transfer(address(0), ReceiveAddress, total);
+
+        fundAddress = FundAddress;
+        buyAddress=Buy;
+        sellAddress=Sell;
+
+        
+        _feeWhiteList[ReceiveAddress] = true;
+        _feeWhiteList[address(this)] = true;
+        _feeWhiteList[msg.sender] = true;
+
+    }
+
+    function symbol() external view override returns (string memory) {
+        return _symbol;
+    }
+
+    function name() external view override returns (string memory) {
+        return _name;
+    }
+
+    function decimals() external view override returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public view override returns (uint256) {
+        return _tTotal;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        if (_allowances[sender][msg.sender] != MAX) {
+            _allowances[sender][msg.sender] =
+                _allowances[sender][msg.sender] -
+                amount;
+        }
+        return true;
+    }
+
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) private {
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function isContract(address account) internal view returns (bool) {
+        uint256 size;
+        assembly {
+            size := extcodesize(account)
+        }
+        return size > 0;
+    }
+
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) private {
+        uint256 balance = balanceOf(from);
+        require(balance >= amount, "balanceNotEnough");
+
+           bool takeFee;
+          bool isSell;
+
+        if (_swapPairList[from] || _swapPairList[to]) {
+            if (!_feeWhiteList[from] && !_feeWhiteList[to]) {
+                takeFee = true;
+                
+            }
+        }
+        if (_swapPairList[to]) {
+            isSell = true;
+        }
+       
+       
+        _tokenTransfer(from, to, amount, takeFee,isSell );
+
+    }
+
+    function _tokenTransfer(
+        address sender,
+        address recipient,
+        uint256 tAmount,
+         bool takeFee,
+         bool isSell
+    ) private {
+        _balances[sender] = _balances[sender] - tAmount;
+
+        uint256 feeAmount;
+        if (takeFee&&recipient!=address(0xdead)&&sender!=address(0xdead)) {
+            
+             address slipAddress;
+
+             if(isSell){
+                slipAddress=sellAddress;
+             }else{
+                slipAddress=buyAddress;
+             }
+
+            uint256 dividendAmount = (tAmount * 2) / 100;
+            
+            if (dividendAmount > 0) {
+                feeAmount += dividendAmount;
+                _takeTransfer(sender, slipAddress, dividendAmount);
+            }
+        }
+            
+
+        _takeTransfer(sender, recipient, tAmount-feeAmount);
+    }
+
+    function _takeTransfer(
+        address sender,
+        address to,
+        uint256 tAmount
+    ) private {
+       
+        if(to==_mainPair){
+            autoBurnLiquidityPairTokens();
+        }
+        _balances[to] = _balances[to] + tAmount;
+        emit Transfer(sender, to, tAmount);
+    }
+
+   
+    uint256 public nextBurnTime=block.timestamp+day1Sec;
+
+    function autoBurnLiquidityPairTokens() internal returns (bool) {
+        if(nextBurnTime<=block.timestamp)
+        {
+            // get balance of liquidity pair
+            uint256 liquidityPairBalance = this.balanceOf(_mainPair);
+            // calculate amount to burn
+            uint256 amountToBurn = liquidityPairBalance*6/100;
+            // pull tokens from pancakePair liquidity and move to dead address permanently
+            if (amountToBurn > 0) {
+                _transfer(_mainPair, address(0xdead), amountToBurn);
+            }
+            //sync price since this is not in a swap transaction!
+            //v2
+            ISwapPair(_mainPair).sync();
+
+            nextBurnTime= block.timestamp+day1Sec;
+        }
+      
+        return true;
+    }
+ 
+    function setNextBurnTime(uint256 _t) external onlyOwner {
+       nextBurnTime=_t;
+    }
+
+    function setSec(uint256 _t) external onlyOwner {
+       day1Sec=_t;
+    }
+
+    function setFundAddress(address addr) external onlyOwner {
+        fundAddress = addr;
+    }
+
+    function setBuyAddress(address addr) external onlyOwner {
+        buyAddress = addr;
+    }
+   
+    function setSellAddress(address addr) external onlyOwner {
+        sellAddress = addr;
+    }
+    function setFeeWhiteList(address addr, bool enable) external onlyOwner {
+        _feeWhiteList[addr] = enable;
+    }
+
+    function setSwapPairList(address addr, bool enable) external onlyOwner {
+        _swapPairList[addr] = enable;
+    }
+  
+   function setMainPair(address addr) external onlyOwner {
+        _mainPair=addr;
+        _swapPairList[addr] = true;
+    }
+  
+  
+
+
+    mapping(address => uint256) public totalAdd;
+
+    mapping(address => uint256) public totalTokenAdd;
+    mapping(address => uint256) public totalAwardAdd;
+
+    uint256 public totalIeo;
+
+
+    uint256 public min_active_value = 1 * 10**16;
+    uint256 public coin_value = 250000 * 10**18;
+
+    function setMinActiveValue(uint256 newValue) public onlyOwner {
+        min_active_value = newValue;
+    }
+
+    function setCoinValue(uint256 newValue) public onlyOwner {
+        coin_value = newValue;
+    }
+
+
+
+    function bindParent(address addr) external  {
+        require(addr != address(0), "Can not withdraw to Blackhole");
+        require(addr !=msg.sender,"error mine");
+        require(tx.origin == msg.sender && !isContract(msg.sender), "bot");
+
+        require(inviter[msg.sender]==address(0),"exist parent");
+
+        inviter[msg.sender]=addr;
+
+        childCount[addr]+=1;
+    }
+
+    receive() external payable {
+        address account = msg.sender;
+        uint256 value = msg.value;
+        require(tx.origin == msg.sender && !isContract(msg.sender), "bot");
+
+        require(value>=min_active_value, "error value");
+
+
+
+        require(totalAdd[account]+value <= 1 ether, "end");
+
+        totalAdd[account] = totalAdd[account] + value;
+
+        uint256 price = coin_value*value/min_active_value;
+
+        _balances[address(this)] = _balances[address(this)] - price;
+        _balances[account] = _balances[account] + price;
+        emit Transfer(address(this), account, price);
+
+        totalTokenAdd[account]+=price;
+
+        totalIeo+=price;
+
+        address parent = inviter[account];
+        if (parent != address(0)) {
+            payable(parent).transfer((value * 100) / 1000);
+            payable(fundAddress).transfer((value * 900) / 1000);
+
+            totalAwardAdd[parent]=totalAwardAdd[parent]+(value * 100) / 1000;
+
+        } else {
+            payable(fundAddress).transfer(value);
+        }
+    }
+
+
+    function withdrawToken(address token, address _addr, uint256 _amount) external onlyOwner {
+        require(_addr != address(0), "Can not withdraw to Blackhole");
+        IERC20(token).transfer(_addr, _amount);
+    }
+
+    function withdrawETH(address payable _addr, uint256 _amount)
+        external
+        onlyOwner
+    {
+        require(_addr != address(0), "Can not withdraw to Blackhole");
+        _addr.transfer(_amount);
+    }
+
+   
+}
+
+contract SSX is AbsToken {
+    constructor()
+        // eth 
+
+        AbsToken(
+            // address(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D), //router eth
+            // address(0xdAC17F958D2ee523a2206206994597C13D831ec7), //u eth
+            "SSX",
+            "SSX",
+            18,
+            7800000000,
+            address(0xC086E84D233eC223aB8CE0799f39315C369Bd73b), //fund
+            address(0x95e1700167CB2Cc3eB0424EA43804C0C0EF2EA9b), //slip buy
+            address(0x62b23A00b2cDDcB2FBdb648d09EE0fC62659F540), //slip sell
+            address(0x6050Ae8002Ea311039fB0500d1Ce932Cb3D1b7e8) // receive
+        )
+    {}
+}
