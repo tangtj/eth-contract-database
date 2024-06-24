@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: UNLICENSED
+// copyright Dox || Etho Protocol || 2023 || contact: dox@ethoprotocol.com
+pragma solidity ^0.8.0;
+
+contract Token {
+    uint256 public totalSupply = 0;
+    address public owner;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => bool) public isIssuer;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event IssuerRights(address indexed issuer, bool value);
+    event TransferOwnership(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    function mint(address _to, uint256 _amount)
+        public
+        returns (bool success)
+    {
+        totalSupply += _amount;
+        balanceOf[_to] += _amount;
+        emit Transfer(address(0), _to, _amount);
+        return true;
+    }
+
+    function burnFrom(address _from, uint256 _amount)
+        public
+        returns (bool success)
+    {
+        balanceOf[_from] -= _amount;
+        totalSupply -= _amount;
+        emit Transfer(_from, address(0), _amount);
+        return true;
+    }
+
+    function transferOwnership(address _newOwner) public restricted {
+        require(_newOwner != address(0), "Invalid address: should not be 0x0");
+        emit TransferOwnership(owner, _newOwner);
+        owner = _newOwner;
+    }
+
+    function setIssuerRights(address _issuer, bool _value) public restricted {
+        isIssuer[_issuer] = _value;
+        emit IssuerRights(_issuer, _value);
+    }
+    modifier restricted {
+        require(msg.sender == owner, "This function is restricted to owner");
+        _;
+    }
+}
+
+contract MultiSigWallet {
+    address[] public owners;
+    uint public required;
+    mapping (address => bool) public isOwner;
+
+    function getOwners()
+        public
+		view
+        returns (address[] memory)
+    {
+        return owners;
+    }
+}
+
+contract MultiSig_Token_Owner_Verify {
+    event NewTransactionExecution(string transaction_id, address to, uint amount, uint fee,string event_name, address tx_submitter);
+    event TransactionFailure(string transaction_id, address to, uint amount, uint fee, string event_name, address tx_submitter);
+    event NetworkFailure(string transaction_id, address to, uint amount, uint fee, string event_name, address tx_submitter);
+    event SignatureCountFailure(string transaction_id, uint counted_signatures,uint required_signatures);
+
+    event DuplicateTransaction(string transaction_id, address tx_submitter);
+
+    address public multisig_contract_address;
+    address public token_contract_address;
+
+    bytes32 mintHash = keccak256(abi.encodePacked("mint"));
+    bytes32 forceMintHash = keccak256(abi.encodePacked("forceMint"));
+    bytes32 burnFromHash = keccak256(abi.encodePacked("burnFrom"));
+    bytes32 transferOwnershipHash = keccak256(abi.encodePacked("transferOwnership"));
+
+
+    mapping (string => bytes32) public function_names;
+
+    mapping (string => address) public validated_transactions; 
+    
+    struct Transaction {
+        address to;
+        uint amount;
+        uint fee;
+        string tx_id;
+        string event_name;
+        uint256 target_network;
+    }
+
+    function getMessageHash(
+        Transaction memory transaction
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(transaction.to, transaction.amount, transaction.fee, transaction.tx_id, transaction.event_name, transaction.target_network));
+    }
+
+    function getEthSignedMessageHash(
+        bytes32 _messageHash
+    ) public pure returns (bytes32) {
+        return
+            keccak256(
+                abi.encodePacked("\x19Ethereum Signed Message:\n32", _messageHash)
+            );
+    }
+
+    function recoverSigner(
+        bytes32 _ethSignedMessageHash,
+        bytes calldata _signature
+    ) public pure returns (address) {
+        (bytes32 r, bytes32 s, uint8 v) = splitSignature(_signature);
+
+        return ecrecover(_ethSignedMessageHash, v, r, s);
+    }
+
+    function splitSignature(
+        bytes memory sig
+    ) public pure returns (bytes32 r, bytes32 s, uint8 v) {
+        require(sig.length == 65, "invalid signature length");
+
+        assembly {
+            // first 32 bytes, after the length prefix
+            r := mload(add(sig, 32))
+            // second 32 bytes
+            s := mload(add(sig, 64))
+            // final byte (first byte of the next 32 bytes)
+            v := byte(0, mload(add(sig, 96)))
+        }
+    }
+
+    function checkOwner(address check_address) public view returns (bool) { 
+		return MultiSigWallet(multisig_contract_address).isOwner(check_address) == true;
+    }
+
+    function getOwners() public view returns (address[] memory) {
+        return MultiSigWallet(multisig_contract_address).getOwners();
+    }
+
+    function getRequired() public view returns (uint) {
+        return MultiSigWallet(multisig_contract_address).required();
+    }
+
+	function IsTransactionSubmitted(string calldata tx_id) public view returns (bool) {
+		return validated_transactions[tx_id] != address(0); 
+	}
+
+	function GetTransactionSubmitter(string calldata tx_id) public view returns (address tx_submitter) { 
+		return validated_transactions[tx_id];
+	}
+
+    function setFunctionNames() internal  { 
+        function_names["mint"] = mintHash;
+        function_names["forceMint"] = forceMintHash;
+        function_names["burnFrom"] = burnFromHash;
+        function_names["transferOwnership"] = transferOwnershipHash;
+	}
+
+
+    function trigger_transaction(Transaction memory transaction) internal returns (bool) { 
+
+        if (transaction.target_network == block.chainid) {
+            Token _token = Token(token_contract_address);
+            bytes32 eventHash = function_names[transaction.event_name];
+
+            if (eventHash == mintHash) {
+                _token.mint(transaction.to,transaction.amount-transaction.fee);
+            } else if (eventHash == burnFromHash) {
+                _token.burnFrom(transaction.to,transaction.amount);
+            } 
+            else if (eventHash == forceMintHash) {
+                _token.mint(transaction.to,transaction.amount);
+ 
+            } else if (eventHash == transferOwnershipHash) { 
+                _token.setIssuerRights(transaction.to,true); 
+                _token.setIssuerRights(address(this),false); 
+                _token.transferOwnership(transaction.to);
+            } else {
+                emit TransactionFailure(transaction.tx_id,transaction.to,transaction.amount,transaction.fee,transaction.event_name,msg.sender);
+                return false;
+            }
+        } else {
+            emit NetworkFailure(transaction.tx_id,transaction.to,transaction.amount,transaction.fee,transaction.event_name,msg.sender);
+            return false;
+        }
+
+        validated_transactions[transaction.tx_id] = msg.sender;
+
+        emit NewTransactionExecution(transaction.tx_id,transaction.to,transaction.amount,transaction.fee,transaction.event_name,msg.sender);
+        return true;
+
+    }
+
+    function submitSignaturePackage(string calldata _transaction_id, address _to, uint _amount, uint _fee, string memory _event_name, uint256 _target_network, bytes[] calldata signatures) public restricted returns (bool) { 
+        
+        if (validated_transactions[_transaction_id] == address(0)) { 
+            uint required_signatures = getRequired();
+            uint8 count_signatures = 1;
+
+            Transaction memory transaction = Transaction({to:_to,amount:_amount,fee:_fee,tx_id:_transaction_id,event_name:_event_name,target_network:_target_network});
+
+            bytes32 ethSignedMessageHash = getEthSignedMessageHash(getMessageHash(transaction));
+
+            address[] memory multisig_owners = getOwners();
+
+            for (uint8 i=0; i<signatures.length; i++) {
+
+                address signature_owner = recoverSigner(ethSignedMessageHash, signatures[i]);
+
+                for (uint8 j=0; j<multisig_owners.length; j++) {
+                    if (multisig_owners[j] == signature_owner) {
+                        count_signatures++;
+                        multisig_owners[j] = address(0);
+                        break;
+                    }
+                }
+
+            }
+
+            if (count_signatures >= required_signatures) {
+                return trigger_transaction(transaction);
+            }
+
+            emit SignatureCountFailure(_transaction_id,count_signatures,required_signatures);
+        } else {
+            emit DuplicateTransaction(_transaction_id,msg.sender);
+        }
+        return false;
+    }
+
+    modifier restricted {
+        require(checkOwner(msg.sender), "This function is restricted to owners of Multisig");
+        _;
+    }
+
+    constructor() {
+        multisig_contract_address = 0x1509c8F22b7a14bab4EA829324BFcc44371A5667;
+        token_contract_address = 0x0b5326Da634f9270FB84481DD6F94d3dC2cA7096;
+        setFunctionNames();
+    }
+
+}

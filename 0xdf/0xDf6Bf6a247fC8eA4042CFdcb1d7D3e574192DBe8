@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract DoYouHaveBtc {
+        
+    event DoYouHaveBTC(bool True_1_OrFalse_0);
+
+    function doYouHaveBTC(bool _True_1_OrFalse_0) public {
+        emit DoYouHaveBTC(_True_1_OrFalse_0);
+    }
+
+
+}

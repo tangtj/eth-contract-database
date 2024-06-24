@@ -1,0 +1,4488 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity <0.9.0 >=0.8.0 ^0.8.20;
+
+// node_modules/@openzeppelin/contracts/access/manager/IAccessManaged.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/manager/IAccessManaged.sol)
+
+interface IAccessManaged {
+    /**
+     * @dev Authority that manages this contract was updated.
+     */
+    event AuthorityUpdated(address authority);
+
+    error AccessManagedUnauthorized(address caller);
+    error AccessManagedRequiredDelay(address caller, uint32 delay);
+    error AccessManagedInvalidAuthority(address authority);
+
+    /**
+     * @dev Returns the current authority.
+     */
+    function authority() external view returns (address);
+
+    /**
+     * @dev Transfers control to a new authority. The caller must be the current authority.
+     */
+    function setAuthority(address) external;
+
+    /**
+     * @dev Returns true only in the context of a delayed restricted call, at the moment that the scheduled operation is
+     * being consumed. Prevents denial of service for delayed restricted calls in the case that the contract performs
+     * attacker controlled calls.
+     */
+    function isConsumingScheduledOp() external view returns (bytes4);
+}
+
+// node_modules/@openzeppelin/contracts/access/manager/IAuthority.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/manager/IAuthority.sol)
+
+/**
+ * @dev Standard interface for permissioning originally defined in Dappsys.
+ */
+interface IAuthority {
+    /**
+     * @dev Returns true if the caller can invoke on a target the function identified by a function selector.
+     */
+    function canCall(address caller, address target, bytes4 selector) external view returns (bool allowed);
+}
+
+// node_modules/@openzeppelin/contracts/utils/Base64.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Base64.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides a set of functions to operate with Base64 strings.
+ */
+library Base64 {
+    /**
+     * @dev Base64 Encoding/Decoding Table
+     */
+    string internal constant _TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /**
+     * @dev Converts a `bytes` to its Bytes64 `string` representation.
+     */
+    function encode(bytes memory data) internal pure returns (string memory) {
+        /**
+         * Inspired by Brecht Devos (Brechtpd) implementation - MIT licence
+         * https://github.com/Brechtpd/base64/blob/e78d9fd951e7b0977ddca77d92dc85183770daf4/base64.sol
+         */
+        if (data.length == 0) return "";
+
+        // Loads the table into memory
+        string memory table = _TABLE;
+
+        // Encoding takes 3 bytes chunks of binary data from `bytes` data parameter
+        // and split into 4 numbers of 6 bits.
+        // The final Base64 length should be `bytes` data length multiplied by 4/3 rounded up
+        // - `data.length + 2`  -> Round up
+        // - `/ 3`              -> Number of 3-bytes chunks
+        // - `4 *`              -> 4 characters for each chunk
+        string memory result = new string(4 * ((data.length + 2) / 3));
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Prepare the lookup table (skip the first "length" byte)
+            let tablePtr := add(table, 1)
+
+            // Prepare result pointer, jump over length
+            let resultPtr := add(result, 32)
+
+            // Run over the input, 3 bytes at a time
+            for {
+                let dataPtr := data
+                let endPtr := add(data, mload(data))
+            } lt(dataPtr, endPtr) {
+
+            } {
+                // Advance 3 bytes
+                dataPtr := add(dataPtr, 3)
+                let input := mload(dataPtr)
+
+                // To write each character, shift the 3 bytes (18 bits) chunk
+                // 4 times in blocks of 6 bits for each character (18, 12, 6, 0)
+                // and apply logical AND with 0x3F which is the number of
+                // the previous character in the ASCII table prior to the Base64 Table
+                // The result is then added to the table to get the character to write,
+                // and finally write it in the result pointer but with a left shift
+                // of 256 (1 byte) - 8 (1 ASCII char) = 248 bits
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(18, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(12, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(6, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(input, 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+            }
+
+            // When data `bytes` is not exactly 3 bytes long
+            // it is padded with `=` characters at the end
+            switch mod(mload(data), 3)
+            case 1 {
+                mstore8(sub(resultPtr, 1), 0x3d)
+                mstore8(sub(resultPtr, 2), 0x3d)
+            }
+            case 2 {
+                mstore8(sub(resultPtr, 1), 0x3d)
+            }
+        }
+
+        return result;
+    }
+}
+
+// node_modules/@openzeppelin/contracts/utils/Context.sol
+
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+// node_modules/@openzeppelin/contracts/utils/math/Math.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/Math.sol)
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    /**
+     * @dev Muldiv operation overflow.
+     */
+    error MathOverflowedMulDiv();
+
+    enum Rounding {
+        Floor, // Toward negative infinity
+        Ceil, // Toward positive infinity
+        Trunc, // Toward zero
+        Expand // Away from zero
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds towards infinity instead
+     * of rounding towards zero.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (b == 0) {
+            // Guarantee the same behavior as in a regular Solidity division.
+            return a / b;
+        }
+
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or
+     * denominator == 0.
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv) with further edits by
+     * Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0 = x * y; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            if (denominator <= prod1) {
+                revert MathOverflowedMulDiv();
+            }
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator.
+            // Always >= 1. See https://cs.stackexchange.com/q/138556/92363.
+
+            uint256 twos = denominator & (0 - denominator);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also
+            // works in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (unsignedRoundsUp(rounding) && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded
+     * towards zero.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (unsignedRoundsUp(rounding) && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (unsignedRoundsUp(rounding) && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (unsignedRoundsUp(rounding) && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (unsignedRoundsUp(rounding) && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Returns whether a provided rounding mode is considered rounding up for unsigned integers.
+     */
+    function unsignedRoundsUp(Rounding rounding) internal pure returns (bool) {
+        return uint8(rounding) % 2 == 1;
+    }
+}
+
+// node_modules/@openzeppelin/contracts/utils/math/SafeCast.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/SafeCast.sol)
+// This file was procedurally generated from scripts/generate/templates/SafeCast.js.
+
+/**
+ * @dev Wrappers over Solidity's uintXX/intXX casting operators with added overflow
+ * checks.
+ *
+ * Downcasting from uint256/int256 in Solidity does not revert on overflow. This can
+ * easily result in undesired exploitation or bugs, since developers usually
+ * assume that overflows raise errors. `SafeCast` restores this intuition by
+ * reverting the transaction when such an operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ */
+library SafeCast {
+    /**
+     * @dev Value doesn't fit in an uint of `bits` size.
+     */
+    error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value);
+
+    /**
+     * @dev An int value doesn't fit in an uint of `bits` size.
+     */
+    error SafeCastOverflowedIntToUint(int256 value);
+
+    /**
+     * @dev Value doesn't fit in an int of `bits` size.
+     */
+    error SafeCastOverflowedIntDowncast(uint8 bits, int256 value);
+
+    /**
+     * @dev An uint value doesn't fit in an int of `bits` size.
+     */
+    error SafeCastOverflowedUintToInt(uint256 value);
+
+    /**
+     * @dev Returns the downcasted uint248 from uint256, reverting on
+     * overflow (when the input is greater than largest uint248).
+     *
+     * Counterpart to Solidity's `uint248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     */
+    function toUint248(uint256 value) internal pure returns (uint248) {
+        if (value > type(uint248).max) {
+            revert SafeCastOverflowedUintDowncast(248, value);
+        }
+        return uint248(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint240 from uint256, reverting on
+     * overflow (when the input is greater than largest uint240).
+     *
+     * Counterpart to Solidity's `uint240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     */
+    function toUint240(uint256 value) internal pure returns (uint240) {
+        if (value > type(uint240).max) {
+            revert SafeCastOverflowedUintDowncast(240, value);
+        }
+        return uint240(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint232 from uint256, reverting on
+     * overflow (when the input is greater than largest uint232).
+     *
+     * Counterpart to Solidity's `uint232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     */
+    function toUint232(uint256 value) internal pure returns (uint232) {
+        if (value > type(uint232).max) {
+            revert SafeCastOverflowedUintDowncast(232, value);
+        }
+        return uint232(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint224 from uint256, reverting on
+     * overflow (when the input is greater than largest uint224).
+     *
+     * Counterpart to Solidity's `uint224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     */
+    function toUint224(uint256 value) internal pure returns (uint224) {
+        if (value > type(uint224).max) {
+            revert SafeCastOverflowedUintDowncast(224, value);
+        }
+        return uint224(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint216 from uint256, reverting on
+     * overflow (when the input is greater than largest uint216).
+     *
+     * Counterpart to Solidity's `uint216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     */
+    function toUint216(uint256 value) internal pure returns (uint216) {
+        if (value > type(uint216).max) {
+            revert SafeCastOverflowedUintDowncast(216, value);
+        }
+        return uint216(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint208 from uint256, reverting on
+     * overflow (when the input is greater than largest uint208).
+     *
+     * Counterpart to Solidity's `uint208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     */
+    function toUint208(uint256 value) internal pure returns (uint208) {
+        if (value > type(uint208).max) {
+            revert SafeCastOverflowedUintDowncast(208, value);
+        }
+        return uint208(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint200 from uint256, reverting on
+     * overflow (when the input is greater than largest uint200).
+     *
+     * Counterpart to Solidity's `uint200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     */
+    function toUint200(uint256 value) internal pure returns (uint200) {
+        if (value > type(uint200).max) {
+            revert SafeCastOverflowedUintDowncast(200, value);
+        }
+        return uint200(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint192 from uint256, reverting on
+     * overflow (when the input is greater than largest uint192).
+     *
+     * Counterpart to Solidity's `uint192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     */
+    function toUint192(uint256 value) internal pure returns (uint192) {
+        if (value > type(uint192).max) {
+            revert SafeCastOverflowedUintDowncast(192, value);
+        }
+        return uint192(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint184 from uint256, reverting on
+     * overflow (when the input is greater than largest uint184).
+     *
+     * Counterpart to Solidity's `uint184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     */
+    function toUint184(uint256 value) internal pure returns (uint184) {
+        if (value > type(uint184).max) {
+            revert SafeCastOverflowedUintDowncast(184, value);
+        }
+        return uint184(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint176 from uint256, reverting on
+     * overflow (when the input is greater than largest uint176).
+     *
+     * Counterpart to Solidity's `uint176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     */
+    function toUint176(uint256 value) internal pure returns (uint176) {
+        if (value > type(uint176).max) {
+            revert SafeCastOverflowedUintDowncast(176, value);
+        }
+        return uint176(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint168 from uint256, reverting on
+     * overflow (when the input is greater than largest uint168).
+     *
+     * Counterpart to Solidity's `uint168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     */
+    function toUint168(uint256 value) internal pure returns (uint168) {
+        if (value > type(uint168).max) {
+            revert SafeCastOverflowedUintDowncast(168, value);
+        }
+        return uint168(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint160 from uint256, reverting on
+     * overflow (when the input is greater than largest uint160).
+     *
+     * Counterpart to Solidity's `uint160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     */
+    function toUint160(uint256 value) internal pure returns (uint160) {
+        if (value > type(uint160).max) {
+            revert SafeCastOverflowedUintDowncast(160, value);
+        }
+        return uint160(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint152 from uint256, reverting on
+     * overflow (when the input is greater than largest uint152).
+     *
+     * Counterpart to Solidity's `uint152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     */
+    function toUint152(uint256 value) internal pure returns (uint152) {
+        if (value > type(uint152).max) {
+            revert SafeCastOverflowedUintDowncast(152, value);
+        }
+        return uint152(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint144 from uint256, reverting on
+     * overflow (when the input is greater than largest uint144).
+     *
+     * Counterpart to Solidity's `uint144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     */
+    function toUint144(uint256 value) internal pure returns (uint144) {
+        if (value > type(uint144).max) {
+            revert SafeCastOverflowedUintDowncast(144, value);
+        }
+        return uint144(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint136 from uint256, reverting on
+     * overflow (when the input is greater than largest uint136).
+     *
+     * Counterpart to Solidity's `uint136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     */
+    function toUint136(uint256 value) internal pure returns (uint136) {
+        if (value > type(uint136).max) {
+            revert SafeCastOverflowedUintDowncast(136, value);
+        }
+        return uint136(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint128 from uint256, reverting on
+     * overflow (when the input is greater than largest uint128).
+     *
+     * Counterpart to Solidity's `uint128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     */
+    function toUint128(uint256 value) internal pure returns (uint128) {
+        if (value > type(uint128).max) {
+            revert SafeCastOverflowedUintDowncast(128, value);
+        }
+        return uint128(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint120 from uint256, reverting on
+     * overflow (when the input is greater than largest uint120).
+     *
+     * Counterpart to Solidity's `uint120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     */
+    function toUint120(uint256 value) internal pure returns (uint120) {
+        if (value > type(uint120).max) {
+            revert SafeCastOverflowedUintDowncast(120, value);
+        }
+        return uint120(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint112 from uint256, reverting on
+     * overflow (when the input is greater than largest uint112).
+     *
+     * Counterpart to Solidity's `uint112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     */
+    function toUint112(uint256 value) internal pure returns (uint112) {
+        if (value > type(uint112).max) {
+            revert SafeCastOverflowedUintDowncast(112, value);
+        }
+        return uint112(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint104 from uint256, reverting on
+     * overflow (when the input is greater than largest uint104).
+     *
+     * Counterpart to Solidity's `uint104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     */
+    function toUint104(uint256 value) internal pure returns (uint104) {
+        if (value > type(uint104).max) {
+            revert SafeCastOverflowedUintDowncast(104, value);
+        }
+        return uint104(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint96 from uint256, reverting on
+     * overflow (when the input is greater than largest uint96).
+     *
+     * Counterpart to Solidity's `uint96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     */
+    function toUint96(uint256 value) internal pure returns (uint96) {
+        if (value > type(uint96).max) {
+            revert SafeCastOverflowedUintDowncast(96, value);
+        }
+        return uint96(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint88 from uint256, reverting on
+     * overflow (when the input is greater than largest uint88).
+     *
+     * Counterpart to Solidity's `uint88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     */
+    function toUint88(uint256 value) internal pure returns (uint88) {
+        if (value > type(uint88).max) {
+            revert SafeCastOverflowedUintDowncast(88, value);
+        }
+        return uint88(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint80 from uint256, reverting on
+     * overflow (when the input is greater than largest uint80).
+     *
+     * Counterpart to Solidity's `uint80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     */
+    function toUint80(uint256 value) internal pure returns (uint80) {
+        if (value > type(uint80).max) {
+            revert SafeCastOverflowedUintDowncast(80, value);
+        }
+        return uint80(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint72 from uint256, reverting on
+     * overflow (when the input is greater than largest uint72).
+     *
+     * Counterpart to Solidity's `uint72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     */
+    function toUint72(uint256 value) internal pure returns (uint72) {
+        if (value > type(uint72).max) {
+            revert SafeCastOverflowedUintDowncast(72, value);
+        }
+        return uint72(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint64 from uint256, reverting on
+     * overflow (when the input is greater than largest uint64).
+     *
+     * Counterpart to Solidity's `uint64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     */
+    function toUint64(uint256 value) internal pure returns (uint64) {
+        if (value > type(uint64).max) {
+            revert SafeCastOverflowedUintDowncast(64, value);
+        }
+        return uint64(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint56 from uint256, reverting on
+     * overflow (when the input is greater than largest uint56).
+     *
+     * Counterpart to Solidity's `uint56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     */
+    function toUint56(uint256 value) internal pure returns (uint56) {
+        if (value > type(uint56).max) {
+            revert SafeCastOverflowedUintDowncast(56, value);
+        }
+        return uint56(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint48 from uint256, reverting on
+     * overflow (when the input is greater than largest uint48).
+     *
+     * Counterpart to Solidity's `uint48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     */
+    function toUint48(uint256 value) internal pure returns (uint48) {
+        if (value > type(uint48).max) {
+            revert SafeCastOverflowedUintDowncast(48, value);
+        }
+        return uint48(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint40 from uint256, reverting on
+     * overflow (when the input is greater than largest uint40).
+     *
+     * Counterpart to Solidity's `uint40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     */
+    function toUint40(uint256 value) internal pure returns (uint40) {
+        if (value > type(uint40).max) {
+            revert SafeCastOverflowedUintDowncast(40, value);
+        }
+        return uint40(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint32 from uint256, reverting on
+     * overflow (when the input is greater than largest uint32).
+     *
+     * Counterpart to Solidity's `uint32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     */
+    function toUint32(uint256 value) internal pure returns (uint32) {
+        if (value > type(uint32).max) {
+            revert SafeCastOverflowedUintDowncast(32, value);
+        }
+        return uint32(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint24 from uint256, reverting on
+     * overflow (when the input is greater than largest uint24).
+     *
+     * Counterpart to Solidity's `uint24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     */
+    function toUint24(uint256 value) internal pure returns (uint24) {
+        if (value > type(uint24).max) {
+            revert SafeCastOverflowedUintDowncast(24, value);
+        }
+        return uint24(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint16 from uint256, reverting on
+     * overflow (when the input is greater than largest uint16).
+     *
+     * Counterpart to Solidity's `uint16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     */
+    function toUint16(uint256 value) internal pure returns (uint16) {
+        if (value > type(uint16).max) {
+            revert SafeCastOverflowedUintDowncast(16, value);
+        }
+        return uint16(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint8 from uint256, reverting on
+     * overflow (when the input is greater than largest uint8).
+     *
+     * Counterpart to Solidity's `uint8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     */
+    function toUint8(uint256 value) internal pure returns (uint8) {
+        if (value > type(uint8).max) {
+            revert SafeCastOverflowedUintDowncast(8, value);
+        }
+        return uint8(value);
+    }
+
+    /**
+     * @dev Converts a signed int256 into an unsigned uint256.
+     *
+     * Requirements:
+     *
+     * - input must be greater than or equal to 0.
+     */
+    function toUint256(int256 value) internal pure returns (uint256) {
+        if (value < 0) {
+            revert SafeCastOverflowedIntToUint(value);
+        }
+        return uint256(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int248 from int256, reverting on
+     * overflow (when the input is less than smallest int248 or
+     * greater than largest int248).
+     *
+     * Counterpart to Solidity's `int248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     */
+    function toInt248(int256 value) internal pure returns (int248 downcasted) {
+        downcasted = int248(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(248, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int240 from int256, reverting on
+     * overflow (when the input is less than smallest int240 or
+     * greater than largest int240).
+     *
+     * Counterpart to Solidity's `int240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     */
+    function toInt240(int256 value) internal pure returns (int240 downcasted) {
+        downcasted = int240(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(240, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int232 from int256, reverting on
+     * overflow (when the input is less than smallest int232 or
+     * greater than largest int232).
+     *
+     * Counterpart to Solidity's `int232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     */
+    function toInt232(int256 value) internal pure returns (int232 downcasted) {
+        downcasted = int232(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(232, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int224 from int256, reverting on
+     * overflow (when the input is less than smallest int224 or
+     * greater than largest int224).
+     *
+     * Counterpart to Solidity's `int224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     */
+    function toInt224(int256 value) internal pure returns (int224 downcasted) {
+        downcasted = int224(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(224, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int216 from int256, reverting on
+     * overflow (when the input is less than smallest int216 or
+     * greater than largest int216).
+     *
+     * Counterpart to Solidity's `int216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     */
+    function toInt216(int256 value) internal pure returns (int216 downcasted) {
+        downcasted = int216(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(216, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int208 from int256, reverting on
+     * overflow (when the input is less than smallest int208 or
+     * greater than largest int208).
+     *
+     * Counterpart to Solidity's `int208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     */
+    function toInt208(int256 value) internal pure returns (int208 downcasted) {
+        downcasted = int208(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(208, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int200 from int256, reverting on
+     * overflow (when the input is less than smallest int200 or
+     * greater than largest int200).
+     *
+     * Counterpart to Solidity's `int200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     */
+    function toInt200(int256 value) internal pure returns (int200 downcasted) {
+        downcasted = int200(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(200, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int192 from int256, reverting on
+     * overflow (when the input is less than smallest int192 or
+     * greater than largest int192).
+     *
+     * Counterpart to Solidity's `int192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     */
+    function toInt192(int256 value) internal pure returns (int192 downcasted) {
+        downcasted = int192(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(192, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int184 from int256, reverting on
+     * overflow (when the input is less than smallest int184 or
+     * greater than largest int184).
+     *
+     * Counterpart to Solidity's `int184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     */
+    function toInt184(int256 value) internal pure returns (int184 downcasted) {
+        downcasted = int184(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(184, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int176 from int256, reverting on
+     * overflow (when the input is less than smallest int176 or
+     * greater than largest int176).
+     *
+     * Counterpart to Solidity's `int176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     */
+    function toInt176(int256 value) internal pure returns (int176 downcasted) {
+        downcasted = int176(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(176, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int168 from int256, reverting on
+     * overflow (when the input is less than smallest int168 or
+     * greater than largest int168).
+     *
+     * Counterpart to Solidity's `int168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     */
+    function toInt168(int256 value) internal pure returns (int168 downcasted) {
+        downcasted = int168(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(168, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int160 from int256, reverting on
+     * overflow (when the input is less than smallest int160 or
+     * greater than largest int160).
+     *
+     * Counterpart to Solidity's `int160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     */
+    function toInt160(int256 value) internal pure returns (int160 downcasted) {
+        downcasted = int160(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(160, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int152 from int256, reverting on
+     * overflow (when the input is less than smallest int152 or
+     * greater than largest int152).
+     *
+     * Counterpart to Solidity's `int152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     */
+    function toInt152(int256 value) internal pure returns (int152 downcasted) {
+        downcasted = int152(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(152, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int144 from int256, reverting on
+     * overflow (when the input is less than smallest int144 or
+     * greater than largest int144).
+     *
+     * Counterpart to Solidity's `int144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     */
+    function toInt144(int256 value) internal pure returns (int144 downcasted) {
+        downcasted = int144(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(144, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int136 from int256, reverting on
+     * overflow (when the input is less than smallest int136 or
+     * greater than largest int136).
+     *
+     * Counterpart to Solidity's `int136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     */
+    function toInt136(int256 value) internal pure returns (int136 downcasted) {
+        downcasted = int136(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(136, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int128 from int256, reverting on
+     * overflow (when the input is less than smallest int128 or
+     * greater than largest int128).
+     *
+     * Counterpart to Solidity's `int128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     */
+    function toInt128(int256 value) internal pure returns (int128 downcasted) {
+        downcasted = int128(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(128, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int120 from int256, reverting on
+     * overflow (when the input is less than smallest int120 or
+     * greater than largest int120).
+     *
+     * Counterpart to Solidity's `int120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     */
+    function toInt120(int256 value) internal pure returns (int120 downcasted) {
+        downcasted = int120(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(120, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int112 from int256, reverting on
+     * overflow (when the input is less than smallest int112 or
+     * greater than largest int112).
+     *
+     * Counterpart to Solidity's `int112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     */
+    function toInt112(int256 value) internal pure returns (int112 downcasted) {
+        downcasted = int112(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(112, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int104 from int256, reverting on
+     * overflow (when the input is less than smallest int104 or
+     * greater than largest int104).
+     *
+     * Counterpart to Solidity's `int104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     */
+    function toInt104(int256 value) internal pure returns (int104 downcasted) {
+        downcasted = int104(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(104, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int96 from int256, reverting on
+     * overflow (when the input is less than smallest int96 or
+     * greater than largest int96).
+     *
+     * Counterpart to Solidity's `int96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     */
+    function toInt96(int256 value) internal pure returns (int96 downcasted) {
+        downcasted = int96(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(96, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int88 from int256, reverting on
+     * overflow (when the input is less than smallest int88 or
+     * greater than largest int88).
+     *
+     * Counterpart to Solidity's `int88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     */
+    function toInt88(int256 value) internal pure returns (int88 downcasted) {
+        downcasted = int88(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(88, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int80 from int256, reverting on
+     * overflow (when the input is less than smallest int80 or
+     * greater than largest int80).
+     *
+     * Counterpart to Solidity's `int80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     */
+    function toInt80(int256 value) internal pure returns (int80 downcasted) {
+        downcasted = int80(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(80, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int72 from int256, reverting on
+     * overflow (when the input is less than smallest int72 or
+     * greater than largest int72).
+     *
+     * Counterpart to Solidity's `int72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     */
+    function toInt72(int256 value) internal pure returns (int72 downcasted) {
+        downcasted = int72(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(72, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int64 from int256, reverting on
+     * overflow (when the input is less than smallest int64 or
+     * greater than largest int64).
+     *
+     * Counterpart to Solidity's `int64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     */
+    function toInt64(int256 value) internal pure returns (int64 downcasted) {
+        downcasted = int64(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(64, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int56 from int256, reverting on
+     * overflow (when the input is less than smallest int56 or
+     * greater than largest int56).
+     *
+     * Counterpart to Solidity's `int56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     */
+    function toInt56(int256 value) internal pure returns (int56 downcasted) {
+        downcasted = int56(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(56, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int48 from int256, reverting on
+     * overflow (when the input is less than smallest int48 or
+     * greater than largest int48).
+     *
+     * Counterpart to Solidity's `int48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     */
+    function toInt48(int256 value) internal pure returns (int48 downcasted) {
+        downcasted = int48(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(48, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int40 from int256, reverting on
+     * overflow (when the input is less than smallest int40 or
+     * greater than largest int40).
+     *
+     * Counterpart to Solidity's `int40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     */
+    function toInt40(int256 value) internal pure returns (int40 downcasted) {
+        downcasted = int40(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(40, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int32 from int256, reverting on
+     * overflow (when the input is less than smallest int32 or
+     * greater than largest int32).
+     *
+     * Counterpart to Solidity's `int32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     */
+    function toInt32(int256 value) internal pure returns (int32 downcasted) {
+        downcasted = int32(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(32, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int24 from int256, reverting on
+     * overflow (when the input is less than smallest int24 or
+     * greater than largest int24).
+     *
+     * Counterpart to Solidity's `int24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     */
+    function toInt24(int256 value) internal pure returns (int24 downcasted) {
+        downcasted = int24(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(24, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int16 from int256, reverting on
+     * overflow (when the input is less than smallest int16 or
+     * greater than largest int16).
+     *
+     * Counterpart to Solidity's `int16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     */
+    function toInt16(int256 value) internal pure returns (int16 downcasted) {
+        downcasted = int16(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(16, value);
+        }
+    }
+
+    /**
+     * @dev Returns the downcasted int8 from int256, reverting on
+     * overflow (when the input is less than smallest int8 or
+     * greater than largest int8).
+     *
+     * Counterpart to Solidity's `int8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     */
+    function toInt8(int256 value) internal pure returns (int8 downcasted) {
+        downcasted = int8(value);
+        if (downcasted != value) {
+            revert SafeCastOverflowedIntDowncast(8, value);
+        }
+    }
+
+    /**
+     * @dev Converts an unsigned uint256 into a signed int256.
+     *
+     * Requirements:
+     *
+     * - input must be less than or equal to maxInt256.
+     */
+    function toInt256(uint256 value) internal pure returns (int256) {
+        // Note: Unsafe cast below is okay because `type(int256).max` is guaranteed to be positive
+        if (value > uint256(type(int256).max)) {
+            revert SafeCastOverflowedUintToInt(value);
+        }
+        return int256(value);
+    }
+}
+
+// node_modules/rave/src/BytesUtils.sol
+
+// Copied from https://github.com/ensdomains/ens-contracts/blob/f5f2ededccbb7e52be44925c0050620d71762e32/contracts/dnssec-oracle/BytesUtils.sol
+library BytesUtils {
+    error OffsetOutOfBoundsError(uint256 offset, uint256 length);
+
+    /*
+     * @dev Returns the keccak-256 hash of a byte range.
+     * @param self The byte string to hash.
+     * @param offset The position to start hashing at.
+     * @param len The number of bytes to hash.
+     * @return The hash of the byte range.
+     */
+    function keccak(bytes memory self, uint256 offset, uint256 len) internal pure returns (bytes32 ret) {
+        require(offset + len <= self.length);
+        assembly {
+            ret := keccak256(add(add(self, 32), offset), len)
+        }
+    }
+
+    /*
+     * @dev Returns a positive number if `other` comes lexicographically after
+     *      `self`, a negative number if it comes before, or zero if the
+     *      contents of the two bytes are equal.
+     * @param self The first bytes to compare.
+     * @param other The second bytes to compare.
+     * @return The result of the comparison.
+     */
+    function compare(bytes memory self, bytes memory other) internal pure returns (int256) {
+        return compare(self, 0, self.length, other, 0, other.length);
+    }
+
+    /*
+     * @dev Returns a positive number if `other` comes lexicographically after
+     *      `self`, a negative number if it comes before, or zero if the
+     *      contents of the two bytes are equal. Comparison is done per-rune,
+     *      on unicode codepoints.
+     * @param self The first bytes to compare.
+     * @param offset The offset of self.
+     * @param len    The length of self.
+     * @param other The second bytes to compare.
+     * @param otheroffset The offset of the other string.
+     * @param otherlen    The length of the other string.
+     * @return The result of the comparison.
+     */
+    function compare(
+        bytes memory self,
+        uint256 offset,
+        uint256 len,
+        bytes memory other,
+        uint256 otheroffset,
+        uint256 otherlen
+    ) internal pure returns (int256) {
+        if (offset + len > self.length) {
+            revert OffsetOutOfBoundsError(offset + len, self.length);
+        }
+        if (otheroffset + otherlen > other.length) {
+            revert OffsetOutOfBoundsError(otheroffset + otherlen, other.length);
+        }
+
+        uint256 shortest = len;
+        if (otherlen < len) shortest = otherlen;
+
+        uint256 selfptr;
+        uint256 otherptr;
+
+        assembly {
+            selfptr := add(self, add(offset, 32))
+            otherptr := add(other, add(otheroffset, 32))
+        }
+        for (uint256 idx = 0; idx < shortest; idx += 32) {
+            uint256 a;
+            uint256 b;
+            assembly {
+                a := mload(selfptr)
+                b := mload(otherptr)
+            }
+            if (a != b) {
+                // Mask out irrelevant bytes and check again
+                uint256 mask;
+                if (shortest - idx >= 32) {
+                    mask = type(uint256).max;
+                } else {
+                    mask = ~(2 ** (8 * (idx + 32 - shortest)) - 1);
+                }
+                int256 diff = int256(a & mask) - int256(b & mask);
+                if (diff != 0) return diff;
+            }
+            selfptr += 32;
+            otherptr += 32;
+        }
+
+        return int256(len) - int256(otherlen);
+    }
+
+    /*
+     * @dev Returns true if the two byte ranges are equal.
+     * @param self The first byte range to compare.
+     * @param offset The offset into the first byte range.
+     * @param other The second byte range to compare.
+     * @param otherOffset The offset into the second byte range.
+     * @param len The number of bytes to compare
+     * @return True if the byte ranges are equal, false otherwise.
+     */
+    function equals(bytes memory self, uint256 offset, bytes memory other, uint256 otherOffset, uint256 len)
+        internal
+        pure
+        returns (bool)
+    {
+        return keccak(self, offset, len) == keccak(other, otherOffset, len);
+    }
+
+    /*
+     * @dev Returns true if the two byte ranges are equal with offsets.
+     * @param self The first byte range to compare.
+     * @param offset The offset into the first byte range.
+     * @param other The second byte range to compare.
+     * @param otherOffset The offset into the second byte range.
+     * @return True if the byte ranges are equal, false otherwise.
+     */
+    function equals(bytes memory self, uint256 offset, bytes memory other, uint256 otherOffset)
+        internal
+        pure
+        returns (bool)
+    {
+        return keccak(self, offset, self.length - offset) == keccak(other, otherOffset, other.length - otherOffset);
+    }
+
+    /*
+     * @dev Compares a range of 'self' to all of 'other' and returns True iff
+     *      they are equal.
+     * @param self The first byte range to compare.
+     * @param offset The offset into the first byte range.
+     * @param other The second byte range to compare.
+     * @return True if the byte ranges are equal, false otherwise.
+     */
+    function equals(bytes memory self, uint256 offset, bytes memory other) internal pure returns (bool) {
+        return self.length == offset + other.length && equals(self, offset, other, 0, other.length);
+    }
+
+    /*
+     * @dev Returns true if the two byte ranges are equal.
+     * @param self The first byte range to compare.
+     * @param other The second byte range to compare.
+     * @return True if the byte ranges are equal, false otherwise.
+     */
+    function equals(bytes memory self, bytes memory other) internal pure returns (bool) {
+        return self.length == other.length && equals(self, 0, other, 0, self.length);
+    }
+
+    /*
+     * @dev Returns the 8-bit number at the specified index of self.
+     * @param self The byte string.
+     * @param idx The index into the bytes
+     * @return The specified 8 bits of the string, interpreted as an integer.
+     */
+    function readUint8(bytes memory self, uint256 idx) internal pure returns (uint8 ret) {
+        return uint8(self[idx]);
+    }
+
+    /*
+     * @dev Returns the 16-bit number at the specified index of self.
+     * @param self The byte string.
+     * @param idx The index into the bytes
+     * @return The specified 16 bits of the string, interpreted as an integer.
+     */
+    function readUint16(bytes memory self, uint256 idx) internal pure returns (uint16 ret) {
+        require(idx + 2 <= self.length);
+        assembly {
+            ret := and(mload(add(add(self, 2), idx)), 0xFFFF)
+        }
+    }
+
+    /*
+     * @dev Returns the 32-bit number at the specified index of self.
+     * @param self The byte string.
+     * @param idx The index into the bytes
+     * @return The specified 32 bits of the string, interpreted as an integer.
+     */
+    function readUint32(bytes memory self, uint256 idx) internal pure returns (uint32 ret) {
+        require(idx + 4 <= self.length);
+        assembly {
+            ret := and(mload(add(add(self, 4), idx)), 0xFFFFFFFF)
+        }
+    }
+
+    /*
+     * @dev Returns the 32 byte value at the specified index of self.
+     * @param self The byte string.
+     * @param idx The index into the bytes
+     * @return The specified 32 bytes of the string.
+     */
+    function readBytes32(bytes memory self, uint256 idx) internal pure returns (bytes32 ret) {
+        require(idx + 32 <= self.length);
+        assembly {
+            ret := mload(add(add(self, 32), idx))
+        }
+    }
+
+    /*
+     * @dev Returns the 32 byte value at the specified index of self.
+     * @param self The byte string.
+     * @param idx The index into the bytes
+     * @return The specified 32 bytes of the string.
+     */
+    function readBytes20(bytes memory self, uint256 idx) internal pure returns (bytes20 ret) {
+        require(idx + 20 <= self.length);
+        assembly {
+            ret :=
+                and(mload(add(add(self, 32), idx)), 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000000000000000000000)
+        }
+    }
+
+    /*
+     * @dev Returns the n byte value at the specified index of self.
+     * @param self The byte string.
+     * @param idx The index into the bytes.
+     * @param len The number of bytes.
+     * @return The specified 32 bytes of the string.
+     */
+    function readBytesN(bytes memory self, uint256 idx, uint256 len) internal pure returns (bytes32 ret) {
+        require(len <= 32);
+        require(idx + len <= self.length);
+        assembly {
+            let mask := not(sub(exp(256, sub(32, len)), 1))
+            ret := and(mload(add(add(self, 32), idx)), mask)
+        }
+    }
+
+    function memcpy(uint256 dest, uint256 src, uint256 len) private pure {
+        // Copy word-length chunks while possible
+        for (; len >= 32; len -= 32) {
+            assembly {
+                mstore(dest, mload(src))
+            }
+            dest += 32;
+            src += 32;
+        }
+
+        // Copy remaining bytes
+        unchecked {
+            uint256 mask = (256 ** (32 - len)) - 1;
+            assembly {
+                let srcpart := and(mload(src), not(mask))
+                let destpart := and(mload(dest), mask)
+                mstore(dest, or(destpart, srcpart))
+            }
+        }
+    }
+
+    /*
+     * @dev Copies a substring into a new byte string.
+     * @param self The byte string to copy from.
+     * @param offset The offset to start copying at.
+     * @param len The number of bytes to copy.
+     */
+    function substring(bytes memory self, uint256 offset, uint256 len) internal pure returns (bytes memory) {
+        require(offset + len <= self.length);
+
+        bytes memory ret = new bytes(len);
+        uint256 dest;
+        uint256 src;
+
+        assembly {
+            dest := add(ret, 32)
+            src := add(add(self, 32), offset)
+        }
+        memcpy(dest, src, len);
+
+        return ret;
+    }
+
+    // Maps characters from 0x30 to 0x7A to their base32 values.
+    // 0xFF represents invalid characters in that range.
+    bytes constant base32HexTable =
+        hex"00010203040506070809FFFFFFFFFFFFFF0A0B0C0D0E0F101112131415161718191A1B1C1D1E1FFFFFFFFFFFFFFFFFFFFF0A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+
+    /**
+     * @dev Decodes unpadded base32 data of up to one word in length.
+     * @param self The data to decode.
+     * @param off Offset into the string to start at.
+     * @param len Number of characters to decode.
+     * @return The decoded data, left aligned.
+     */
+    function base32HexDecodeWord(bytes memory self, uint256 off, uint256 len) internal pure returns (bytes32) {
+        require(len <= 52);
+
+        uint256 ret = 0;
+        uint8 decoded;
+        for (uint256 i = 0; i < len; i++) {
+            bytes1 char = self[off + i];
+            require(char >= 0x30 && char <= 0x7A);
+            decoded = uint8(base32HexTable[uint256(uint8(char)) - 0x30]);
+            require(decoded <= 0x20);
+            if (i == len - 1) {
+                break;
+            }
+            ret = (ret << 5) | decoded;
+        }
+
+        uint256 bitlen = len * 5;
+        if (len % 8 == 0) {
+            // Multiple of 8 characters, no padding
+            ret = (ret << 5) | decoded;
+        } else if (len % 8 == 2) {
+            // Two extra characters - 1 byte
+            ret = (ret << 3) | (decoded >> 2);
+            bitlen -= 2;
+        } else if (len % 8 == 4) {
+            // Four extra characters - 2 bytes
+            ret = (ret << 1) | (decoded >> 4);
+            bitlen -= 4;
+        } else if (len % 8 == 5) {
+            // Five extra characters - 3 bytes
+            ret = (ret << 4) | (decoded >> 1);
+            bitlen -= 1;
+        } else if (len % 8 == 7) {
+            // Seven extra characters - 4 bytes
+            ret = (ret << 2) | (decoded >> 3);
+            bitlen -= 3;
+        } else {
+            revert();
+        }
+
+        return bytes32(ret << (256 - bitlen));
+    }
+
+    /**
+     * @dev Finds the first occurrence of the byte `needle` in `self`.
+     * @param self The string to search
+     * @param off The offset to start searching at
+     * @param len The number of bytes to search
+     * @param needle The byte to search for
+     * @return The offset of `needle` in `self`, or 2**256-1 if it was not found.
+     */
+    function find(bytes memory self, uint256 off, uint256 len, bytes1 needle) internal pure returns (uint256) {
+        for (uint256 idx = off; idx < off + len; idx++) {
+            if (self[idx] == needle) {
+                return idx;
+            }
+        }
+        return type(uint256).max;
+    }
+
+    /**
+     * @dev Attempts to parse an address from a hex string
+     * @param str The string to parse
+     * @param idx The offset to start parsing at
+     * @param lastIdx The (exclusive) last index in `str` to consider. Use `str.length` to scan the whole string.
+     */
+    function hexToAddress(bytes memory str, uint256 idx, uint256 lastIdx) internal pure returns (address, bool) {
+        if (lastIdx - idx < 40) return (address(0x0), false);
+        uint256 ret = 0;
+        for (uint256 i = idx; i < idx + 40; i++) {
+            ret <<= 4;
+            uint256 x = readUint8(str, i);
+            if (x >= 48 && x < 58) {
+                ret |= x - 48;
+            } else if (x >= 65 && x < 71) {
+                ret |= x - 55;
+            } else if (x >= 97 && x < 103) {
+                ret |= x - 87;
+            } else {
+                return (address(0x0), false);
+            }
+        }
+        return (address(uint160(ret)), true);
+    }
+}
+
+// node_modules/rave/src/IRave.sol
+
+/**
+ * @title IRave interface
+ * @author Puffer finance
+ * @custom:security-contact security@puffer.fi
+ * @notice IRave interface
+ */
+interface IRave {
+    /**
+     * Bad report signature
+     */
+    error BadReportSignature();
+
+    /*
+    * @dev Verifies the RSA-SHA256 signature of the attestation report.
+    * @param report The attestation evidence report from IAS.
+    * @param sig The RSA-SHA256 signature over the report.
+    * @param signingMod The expected signer's RSA modulus
+    * @param signingExp The expected signer's RSA exponent
+    * @return True if the signature is valid
+    */
+    function verifyReportSignature(
+        bytes memory report,
+        bytes calldata sig,
+        bytes memory signingMod,
+        bytes memory signingExp
+    ) external view returns (bool);
+
+    /*
+    * @dev Verifies that the leafX509Cert was signed by the expected signer (signingMod, signingExp). 
+        Then uses leafX509Cert RSA public key to verify the signature over the report, sig. 
+        The trusted report is verified for correct fields and then the enclave' 64 byte commitment is extracted. 
+    * @param report The attestation evidence report from IAS.
+    * @param sig The RSA-SHA256 signature over the report.
+    * @param leafX509Cert The signed leaf x509 certificate.
+    * @param signingMod The expected signer's RSA modulus
+    * @param signingExp The expected signer's RSA exponent
+    * @param mrenclave The expected enclave measurement.
+    * @param mrsigner The expected enclave signer.
+    * @return The 64 byte payload from the report.
+    */
+    function rave(
+        bytes calldata report,
+        bytes memory sig,
+        bytes memory leafX509Cert,
+        bytes memory signingMod,
+        bytes memory signingExp,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) external view returns (bytes memory payload);
+
+    /*
+    * @dev Verifies that this report was signed by the expected signer, then extracts out the report's 64 byte payload.
+    * @param report The attestation evidence report from IAS.
+    * @param sig The RSA-SHA256 signature over the report.
+    * @param signingMod The expected signer's RSA modulus
+    * @param signingExp The expected signer's RSA exponent
+    * @param mrenclave The expected enclave measurement.
+    * @param mrsigner The expected enclave signer.
+    * @return The 64 byte payload from the report.
+    */
+    function verifyRemoteAttestation(
+        bytes calldata report,
+        bytes memory sig,
+        bytes memory signingMod,
+        bytes memory signingExp,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) external view returns (bytes memory payload);
+}
+
+// node_modules/rave/src/JSONBuilder.sol
+
+contract JSONBuilder {
+    struct Values {
+        bytes id;
+        bytes timestamp;
+        bytes version;
+        bytes epidPseudonym;
+        bytes advisoryURL;
+        bytes advisoryIDs;
+        bytes isvEnclaveQuoteStatus;
+        bytes isvEnclaveQuoteBody;
+    }
+
+    function buildJSON(Values memory values) public pure returns (string memory json) {
+        json = string(
+            abi.encodePacked(
+                '{"id":"',
+                values.id,
+                '","timestamp":"',
+                values.timestamp,
+                '","version":',
+                values.version,
+                ',"epidPseudonym":"',
+                values.epidPseudonym
+            )
+        );
+        json = string(
+            abi.encodePacked(
+                json,
+                '","advisoryURL":"',
+                values.advisoryURL,
+                '","advisoryIDs":',
+                values.advisoryIDs,
+                ',"isvEnclaveQuoteStatus":"',
+                values.isvEnclaveQuoteStatus,
+                '","isvEnclaveQuoteBody":"',
+                values.isvEnclaveQuoteBody,
+                '"}'
+            )
+        );
+    }
+}
+
+contract CustomJSONBuilder {
+    string[] public keys;
+
+    constructor(string[] memory _keys) {
+        keys = _keys;
+    }
+
+    function buildJSON(string[] memory values) public view returns (string memory) {
+        require(values.length == keys.length);
+        string memory json = "";
+        for (uint256 i = 0; i < keys.length; i++) {
+            json = string(abi.encodePacked(json, keys[i], values[i]));
+        }
+        return string(abi.encodePacked("{", json, '"}'));
+    }
+}
+
+// node_modules/rave/src/RSAVerify.sol
+
+// Copied from https://github.com/ensdomains/ens-contracts/blob/80aa5108f11d11cd7956135ef21ac45da8eb934d/contracts/dnssec-oracle/algorithms/RSAVerify.sol
+
+library ModexpPrecompile {
+    /**
+     * @dev Computes (base ^ exponent) % modulus over big numbers.
+     */
+    function modexp(bytes memory base, bytes memory exponent, bytes memory modulus)
+        internal
+        view
+        returns (bool success, bytes memory output)
+    {
+        bytes memory input = abi.encodePacked(
+            uint256(base.length), uint256(exponent.length), uint256(modulus.length), base, exponent, modulus
+        );
+
+        output = new bytes(modulus.length);
+
+        assembly {
+            success := staticcall(gas(), 5, add(input, 32), mload(input), add(output, 32), mload(modulus))
+        }
+    }
+}
+
+library RSAVerify {
+    /**
+     * @dev Recovers the input data from an RSA signature, returning the result in S.
+     * @param N The RSA public modulus.
+     * @param E The RSA public exponent.
+     * @param S The signature to recover.
+     * @return True if the recovery succeeded.
+     */
+    function rsarecover(bytes memory N, bytes memory E, bytes memory S) internal view returns (bool, bytes memory) {
+        return ModexpPrecompile.modexp(S, E, N);
+    }
+}
+
+// src/Errors.sol
+
+/**
+ * @notice Thrown when the operation is not authorized
+ * @dev Signature "0x82b42900"
+ */
+error Unauthorized();
+
+/**
+ * @notice Thrown if the address supplied is not valid
+ * @dev Signature "0xe6c4247b"
+ */
+error InvalidAddress();
+
+// src/interface/IPufferOracle.sol
+
+/**
+ * @title IPufferOracle
+ * @author Puffer Finance
+ * @custom:security-contact security@puffer.fi
+ */
+interface IPufferOracle {
+    /**
+     * @notice Thrown if the new ValidatorTicket mint price is invalid
+     */
+    error InvalidValidatorTicketPrice();
+
+    /**
+     * @notice Emitted when the price to mint ValidatorTicket is updated
+     * @dev Signature "0xf76811fec27423d0853e6bf49d7ea78c666629c2f67e29647d689954021ae0ea"
+     */
+    event ValidatorTicketMintPriceUpdated(uint256 oldPrice, uint256 newPrice);
+
+    /**
+     * @notice Retrieves the current mint price for minting one ValidatorTicket
+     * @return pricePerVT The current ValidatorTicket mint price
+     */
+    function getValidatorTicketPrice() external view returns (uint256 pricePerVT);
+
+    /**
+     * @notice Returns true if the number of active Puffer Validators is over the burst threshold
+     */
+    function isOverBurstThreshold() external view returns (bool);
+
+    /**
+     * @notice Returns the locked ETH amount
+     * @return lockedEthAmount The amount of ETH locked in Beacon chain
+     */
+    function getLockedEthAmount() external view returns (uint256 lockedEthAmount);
+}
+
+// src/interface/IValidatorTicketPricer.sol
+
+/**
+ * @title IValidatorTicketPricer
+ * @notice Interface for the ValidatorTicketPricer contract
+ */
+interface IValidatorTicketPricer {
+    /**
+     * @notice Thrown if the new value is invalid
+     */
+    error InvalidValue();
+
+    /**
+     * @notice Emitted when daily MEV payouts are updated
+     * @param oldValue The old value of daily MEV payouts
+     * @param newValue The new value of daily MEV payouts
+     */
+    event DailyMevPayoutsUpdated(uint104 oldValue, uint104 newValue);
+
+    /**
+     * @notice Emitted when daily consensus rewards are updated
+     * @param oldValue The old value of daily consensus rewards
+     * @param newValue The new value of daily consensus rewards
+     */
+    event DailyConsensusRewardsUpdated(uint104 oldValue, uint104 newValue);
+
+    /**
+     * @notice Emitted when daily MEV payouts change tolerance is updated
+     * @param oldValue The old tolerance value
+     * @param newValue The new tolerance value
+     */
+    event DailyMevPayoutsChangeToleranceBPSUpdated(uint16 oldValue, uint16 newValue);
+
+    /**
+     * @notice Emitted when daily consensus rewards change tolerance is updated
+     * @param oldValue The old tolerance value
+     * @param newValue The new tolerance value
+     */
+    event DailyConsensusRewardsChangeToleranceBPSUpdated(uint16 oldValue, uint16 newValue);
+
+    /**
+     * @notice Emitted when the discount rate is updated
+     * @param oldValue The old discount rate
+     * @param newValue The new discount rate
+     */
+    event DiscountRateUpdated(uint16 oldValue, uint16 newValue);
+
+    /**
+     * @notice Sets the daily MEV payouts change tolerance in basis points
+     * @param newValue The new tolerance value to set
+     */
+    function setDailyMevPayoutsChangeToleranceBps(uint16 newValue) external;
+
+    /**
+     * @notice Sets the daily consensus rewards change tolerance in basis points
+     * @param newValue The new tolerance value to set
+     */
+    function setDailyConsensusRewardsChangeToleranceBps(uint16 newValue) external;
+
+    /**
+     * @notice Updates the allowed price change tolerance percentage
+     * @param newValue The new discount rate to set
+     */
+    function setDiscountRate(uint16 newValue) external;
+
+    /**
+     * @notice Updates the daily MEV payouts
+     * @param newValue The new daily MEV payouts value to set
+     */
+    function setDailyMevPayouts(uint104 newValue) external;
+
+    /**
+     * @notice Updates the daily consensus rewards
+     * @param newValue The new daily consensus rewards value to set
+     */
+    function setDailyConsensusRewards(uint104 newValue) external;
+
+    /**
+     * @notice Posts the mint price based on current MEV payouts and consensus rewards
+     */
+    function postMintPrice() external;
+
+    /**
+     * @notice Updates daily rewards and posts the mint price
+     * @param dailyMevPayouts The new daily MEV payouts value to set
+     * @param dailyConsensusRewards The new daily consensus rewards value to set
+     */
+    function setDailyRewardsAndPostMintPrice(uint104 dailyMevPayouts, uint104 dailyConsensusRewards) external;
+
+    /**
+     * @notice Gets the daily MEV payouts change tolerance in basis points
+     * @return The current daily MEV payouts change tolerance in basis points
+     */
+    function getDailyMevPayoutsChangeToleranceBps() external view returns (uint16);
+
+    /**
+     * @notice Gets the daily consensus rewards change tolerance in basis points
+     * @return The current daily consensus rewards change tolerance in basis points
+     */
+    function getDailyConsensusRewardsChangeToleranceBps() external view returns (uint16);
+
+    /**
+     * @notice Gets the discount rate in basis points
+     * @return The current discount rate in basis points
+     */
+    function getDiscountRateBps() external view returns (uint16);
+
+    /**
+     * @notice Gets the daily MEV payouts
+     * @return The current daily MEV payouts
+     */
+    function getDailyMevPayouts() external view returns (uint104);
+
+    /**
+     * @notice Gets the daily consensus rewards
+     * @return The current daily consensus rewards
+     */
+    function getDailyConsensusRewards() external view returns (uint104);
+}
+
+// src/struct/RaveEvidence.sol
+
+struct RaveEvidence {
+    // Preprocessed remote attestation report
+    bytes report;
+    // Preprocessed RSA signature over the report
+    bytes signature;
+    // The hash of a whitelisted Intel-signed leaf x509 certificate
+    bytes32 leafX509CertDigest;
+}
+
+// src/struct/StoppedValidatorInfo.sol
+
+/**
+ * @dev Stopped validator info
+ */
+struct StoppedValidatorInfo {
+    ///@dev Module address.
+    address module;
+    ///@dev Validator start epoch.
+    uint256 startEpoch;
+    ///@dev Validator stop epoch.
+    uint256 endEpoch;
+    /// @dev Indicates whether the validator was slashed before stopping.
+    bool wasSlashed;
+    /// @dev Name of the module where the validator was participating.
+    bytes32 moduleName;
+    /// @dev Index of the validator in the module's validator list.
+    uint256 pufferModuleIndex;
+    /// @dev Amount of funds withdrawn upon validator stoppage.
+    uint256 withdrawalAmount;
+}
+
+// node_modules/@openzeppelin/contracts/access/manager/AuthorityUtils.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/manager/AuthorityUtils.sol)
+
+library AuthorityUtils {
+    /**
+     * @dev Since `AccessManager` implements an extended IAuthority interface, invoking `canCall` with backwards compatibility
+     * for the preexisting `IAuthority` interface requires special care to avoid reverting on insufficient return data.
+     * This helper function takes care of invoking `canCall` in a backwards compatible way without reverting.
+     */
+    function canCallWithDelay(
+        address authority,
+        address caller,
+        address target,
+        bytes4 selector
+    ) internal view returns (bool immediate, uint32 delay) {
+        (bool success, bytes memory data) = authority.staticcall(
+            abi.encodeCall(IAuthority.canCall, (caller, target, selector))
+        );
+        if (success) {
+            if (data.length >= 0x40) {
+                (immediate, delay) = abi.decode(data, (bool, uint32));
+            } else if (data.length >= 0x20) {
+                immediate = abi.decode(data, (bool));
+            }
+        }
+        return (immediate, delay);
+    }
+}
+
+// node_modules/rave/src/ASN1Decode.sol
+
+// Original source: https://github.com/JonahGroendal/asn1-decode
+
+library NodePtr {
+    // Unpack first byte index
+    function ixs(uint256 self) internal pure returns (uint256) {
+        return uint80(self);
+    }
+    // Unpack first content byte index
+
+    function ixf(uint256 self) internal pure returns (uint256) {
+        return uint80(self >> 80);
+    }
+    // Unpack last content byte index
+
+    function ixl(uint256 self) internal pure returns (uint256) {
+        return uint80(self >> 160);
+    }
+    // Pack 3 uint80s into a uint256
+
+    function getPtr(uint256 _ixs, uint256 _ixf, uint256 _ixl) internal pure returns (uint256) {
+        _ixs |= _ixf << 80;
+        _ixs |= _ixl << 160;
+        return _ixs;
+    }
+}
+
+library Asn1Decode {
+    using NodePtr for uint256;
+    using BytesUtils for bytes;
+
+    /*
+    * @dev Get the root node. First step in traversing an ASN1 structure
+    * @param der The DER-encoded ASN1 structure
+    * @return A pointer to the outermost node
+    */
+    function root(bytes memory der) internal pure returns (uint256) {
+        return readNodeLength(der, 0);
+    }
+
+    /*
+    * @dev Get the root node of an ASN1 structure that's within a bit string value
+    * @param der The DER-encoded ASN1 structure
+    * @return A pointer to the outermost node
+    */
+    function rootOfBitStringAt(bytes memory der, uint256 ptr) internal pure returns (uint256) {
+        require(der[ptr.ixs()] == 0x03, "Not type BIT STRING");
+        return readNodeLength(der, ptr.ixf() + 1);
+    }
+
+    /*
+    * @dev Get the root node of an ASN1 structure that's within an octet string value
+    * @param der The DER-encoded ASN1 structure
+    * @return A pointer to the outermost node
+    */
+    function rootOfOctetStringAt(bytes memory der, uint256 ptr) internal pure returns (uint256) {
+        require(der[ptr.ixs()] == 0x04, "Not type OCTET STRING");
+        return readNodeLength(der, ptr.ixf());
+    }
+
+    /*
+    * @dev Get the next sibling node
+    * @param der The DER-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return A pointer to the next sibling node
+    */
+    function nextSiblingOf(bytes memory der, uint256 ptr) internal pure returns (uint256) {
+        return readNodeLength(der, ptr.ixl() + 1);
+    }
+
+    /*
+    * @dev Get the first child node of the current node
+    * @param der The DER-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return A pointer to the first child node
+    */
+    function firstChildOf(bytes memory der, uint256 ptr) internal pure returns (uint256) {
+        require(der[ptr.ixs()] & 0x20 == 0x20, "Not a constructed type");
+        return readNodeLength(der, ptr.ixf());
+    }
+
+    /*
+    * @dev Use for looping through children of a node (either i or j).
+    * @param i Pointer to an ASN1 node
+    * @param j Pointer to another ASN1 node of the same ASN1 structure
+    * @return True iff j is child of i or i is child of j.
+    */
+    function isChildOf(uint256 i, uint256 j) internal pure returns (bool) {
+        return (((i.ixf() <= j.ixs()) && (j.ixl() <= i.ixl())) || ((j.ixf() <= i.ixs()) && (i.ixl() <= j.ixl())));
+    }
+
+    /*
+    * @dev Extract value of node from DER-encoded structure
+    * @param der The der-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return Value bytes of node
+    */
+    function bytesAt(bytes memory der, uint256 ptr) internal pure returns (bytes memory) {
+        return der.substring(ptr.ixf(), ptr.ixl() + 1 - ptr.ixf());
+    }
+
+    /*
+    * @dev Extract entire node from DER-encoded structure
+    * @param der The DER-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return All bytes of node
+    */
+    function allBytesAt(bytes memory der, uint256 ptr) internal pure returns (bytes memory) {
+        return der.substring(ptr.ixs(), ptr.ixl() + 1 - ptr.ixs());
+    }
+
+    /*
+    * @dev Extract value of node from DER-encoded structure
+    * @param der The DER-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return Value bytes of node as bytes32
+    */
+    function bytes32At(bytes memory der, uint256 ptr) internal pure returns (bytes32) {
+        return der.readBytesN(ptr.ixf(), ptr.ixl() + 1 - ptr.ixf());
+    }
+
+    /*
+    * @dev Extract value of node from DER-encoded structure
+    * @param der The der-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return Uint value of node
+    */
+    function uintAt(bytes memory der, uint256 ptr) internal pure returns (uint256) {
+        require(der[ptr.ixs()] == 0x02, "Not type INTEGER");
+        require(der[ptr.ixf()] & 0x80 == 0, "Not positive");
+        uint256 len = ptr.ixl() + 1 - ptr.ixf();
+        return uint256(der.readBytesN(ptr.ixf(), len) >> (32 - len) * 8);
+    }
+
+    /*
+    * @dev Extract value of a positive integer node from DER-encoded structure
+    * @param der The DER-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return Value bytes of a positive integer node
+    */
+    function uintBytesAt(bytes memory der, uint256 ptr) internal pure returns (bytes memory) {
+        require(der[ptr.ixs()] == 0x02, "Not type INTEGER");
+        require(der[ptr.ixf()] & 0x80 == 0, "Not positive");
+        uint256 valueLength = ptr.ixl() + 1 - ptr.ixf();
+        if (der[ptr.ixf()] == 0) {
+            return der.substring(ptr.ixf() + 1, valueLength - 1);
+        } else {
+            return der.substring(ptr.ixf(), valueLength);
+        }
+    }
+
+    function keccakOfBytesAt(bytes memory der, uint256 ptr) internal pure returns (bytes32) {
+        return der.keccak(ptr.ixf(), ptr.ixl() + 1 - ptr.ixf());
+    }
+
+    function keccakOfAllBytesAt(bytes memory der, uint256 ptr) internal pure returns (bytes32) {
+        return der.keccak(ptr.ixs(), ptr.ixl() + 1 - ptr.ixs());
+    }
+
+    /*
+    * @dev Extract value of bitstring node from DER-encoded structure
+    * @param der The DER-encoded ASN1 structure
+    * @param ptr Points to the indices of the current node
+    * @return Value of bitstring converted to bytes
+    */
+    function bitstringAt(bytes memory der, uint256 ptr) internal pure returns (bytes memory) {
+        require(der[ptr.ixs()] == 0x03, "Not type BIT STRING");
+        // Only 00 padded bitstr can be converted to bytestr!
+        require(der[ptr.ixf()] == 0x00);
+        uint256 valueLength = ptr.ixl() + 1 - ptr.ixf();
+        return der.substring(ptr.ixf() + 1, valueLength - 1);
+    }
+
+    function readNodeLength(bytes memory der, uint256 ix) private pure returns (uint256) {
+        uint256 length;
+        uint80 ixFirstContentByte;
+        uint80 ixLastContentByte;
+        if ((der[ix + 1] & 0x80) == 0) {
+            length = uint8(der[ix + 1]);
+            ixFirstContentByte = uint80(ix + 2);
+            ixLastContentByte = uint80(ixFirstContentByte + length - 1);
+        } else {
+            uint8 lengthbytesLength = uint8(der[ix + 1] & 0x7F);
+            if (lengthbytesLength == 1) {
+                length = der.readUint8(ix + 2);
+            } else if (lengthbytesLength == 2) {
+                length = der.readUint16(ix + 2);
+            } else {
+                length = uint256(der.readBytesN(ix + 2, lengthbytesLength) >> (32 - lengthbytesLength) * 8);
+            }
+            ixFirstContentByte = uint80(ix + 2 + lengthbytesLength);
+            ixLastContentByte = uint80(ixFirstContentByte + length - 1);
+        }
+        return NodePtr.getPtr(ix, ixFirstContentByte, ixLastContentByte);
+    }
+}
+
+// src/interface/IEnclaveVerifier.sol
+
+/**
+ * @title IEnclaveVerifier interface
+ * @author Puffer Finance
+ * @custom:security-contact security@puffer.fi
+ */
+interface IEnclaveVerifier {
+    struct RSAPubKey {
+        bytes modulus;
+        bytes exponent;
+    }
+
+    /**
+     * @notice Thrown if the Evidence that we're trying to verify is stale
+     * Evidence should be submitted for the recent block < `FRESHNESS_BLOCKS`
+     * @dev Signature "0x5d4ad9a9"
+     */
+    error StaleEvidence();
+
+    /**
+     * @notice Emitted when the `pubKeyHash` is added to valid pubKeys
+     * @dev Signature "0x13b85b042d2bb270091da7111e3b3cc407f6b86c85882cf48ae94123cae22b17"
+     */
+    event AddedPubKey(bytes32 indexed pubKeyHash);
+
+    /**
+     * @notice Emitted when the `pubKeyHash` is removed from valid pubKeys
+     * @dev Signature "0x0ebd07953ae533bded7d9b0715fa49e0a0ed0a6cef4638a685737ffef8b86254"
+     */
+    event RemovedPubKey(bytes32 indexed pubKeyHash);
+
+    /**
+     * @notice Getter for intelRootCAPubKey
+     */
+    function getIntelRootCAPubKey() external pure returns (RSAPubKey memory);
+
+    /**
+     * @notice Adds a leaf x509 RSA public key if the x509 was signed by Intel's root CA
+     * @param leafX509Cert certificate
+     */
+    function addLeafX509(bytes calldata leafX509Cert) external;
+
+    /**
+     * @notice Verifies remote attestation evidence: the report contains the expected MRENCLAVE/MRSIGNER values, a valid TCB status, and was signed by an Intel-issued x509 certificate. The report will contain a 64B payload in the form (32B_Commitment || 32B_BlockHash), where 32B_Blockhash is a recent L1 blockhash and 32B_Commitment is a keccak256 hash that the enclave is committing to. The calling contract is expected to precompute raveCommitment from public inputs. The function returns true if the report is valid and the extracted payload matches the expected.
+     * @param blockNumber is the block number to fetch 32B_Blockhash
+     * @param raveCommitment is the keccak256 hash commitment 32B_Commitment
+     * @param evidence is the remote attestation evidence
+     * @param mrenclave is the MRENCLAVE value expected by the calling contract
+     * @param mrsigner is the MRSIGNER value expected by the calling contract
+     * @return true if evidence verification is a success
+     */
+    function verifyEvidence(
+        uint256 blockNumber,
+        bytes32 raveCommitment,
+        RaveEvidence calldata evidence,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) external view returns (bool);
+}
+
+// src/interface/IPufferOracleV2.sol
+
+/**
+ * @title IPufferOracle
+ * @author Puffer Finance
+ * @custom:security-contact security@puffer.fi
+ */
+interface IPufferOracleV2 is IPufferOracle {
+    error InvalidUpdate();
+    /**
+     * @notice Emitted when the number of active Puffer validators is updated
+     * @param numberOfActivePufferValidators is the number of active Puffer validators
+     */
+
+    event NumberOfActiveValidators(uint256 numberOfActivePufferValidators);
+
+    /**
+     * @notice Emitted when the total number of validators is updated
+     * @param oldNumberOfValidators is the old number of validators
+     * @param newNumberOfValidators is the new number of validators
+     */
+    event TotalNumberOfValidatorsUpdated(
+        uint256 oldNumberOfValidators, uint256 newNumberOfValidators, uint256 epochNumber
+    );
+
+    /**
+     * @notice Returns the total number of active validators on Ethereum
+     */
+    function getTotalNumberOfValidators() external view returns (uint256);
+
+    /**
+     * @notice Returns the number of active puffer validators on Ethereum
+     */
+    function getNumberOfActiveValidators() external view returns (uint256);
+
+    /**
+     * @notice Exits `validatorNumber` validators, decreasing the `lockedETHAmount` by validatorNumber * 32 ETH.
+     * It is called when when the validator exits the system in the `batchHandleWithdrawals` on the PufferProtocol.
+     * In the same transaction, we are transferring full withdrawal ETH from the PufferModule to the Vault
+     * Decrementing the `lockedETHAmount` by 32 ETH and we burn the Node Operator's pufETH (bond) if we need to cover up the loss.
+     * @dev Restricted to PufferProtocol contract
+     */
+    function exitValidators(uint256 validatorNumber) external;
+
+    /**
+     * @notice Increases the `lockedETHAmount` on the PufferOracle by 32 ETH to account for a new deposit.
+     * It is called when the Beacon chain receives a new deposit from the PufferProtocol.
+     * The PufferVault's balance will simultaneously decrease by 32 ETH as the deposit is made.
+     * @dev Restricted to PufferProtocol contract
+     */
+    function provisionNode() external;
+}
+
+// node_modules/@openzeppelin/contracts/utils/types/Time.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/types/Time.sol)
+
+/**
+ * @dev This library provides helpers for manipulating time-related objects.
+ *
+ * It uses the following types:
+ * - `uint48` for timepoints
+ * - `uint32` for durations
+ *
+ * While the library doesn't provide specific types for timepoints and duration, it does provide:
+ * - a `Delay` type to represent duration that can be programmed to change value automatically at a given point
+ * - additional helper functions
+ */
+library Time {
+    using Time for *;
+
+    /**
+     * @dev Get the block timestamp as a Timepoint.
+     */
+    function timestamp() internal view returns (uint48) {
+        return SafeCast.toUint48(block.timestamp);
+    }
+
+    /**
+     * @dev Get the block number as a Timepoint.
+     */
+    function blockNumber() internal view returns (uint48) {
+        return SafeCast.toUint48(block.number);
+    }
+
+    // ==================================================== Delay =====================================================
+    /**
+     * @dev A `Delay` is a uint32 duration that can be programmed to change value automatically at a given point in the
+     * future. The "effect" timepoint describes when the transitions happens from the "old" value to the "new" value.
+     * This allows updating the delay applied to some operation while keeping some guarantees.
+     *
+     * In particular, the {update} function guarantees that if the delay is reduced, the old delay still applies for
+     * some time. For example if the delay is currently 7 days to do an upgrade, the admin should not be able to set
+     * the delay to 0 and upgrade immediately. If the admin wants to reduce the delay, the old delay (7 days) should
+     * still apply for some time.
+     *
+     *
+     * The `Delay` type is 112 bits long, and packs the following:
+     *
+     * ```
+     *   | [uint48]: effect date (timepoint)
+     *   |           | [uint32]: value before (duration)
+     *   ↓           ↓       ↓ [uint32]: value after (duration)
+     * 0xAAAAAAAAAAAABBBBBBBBCCCCCCCC
+     * ```
+     *
+     * NOTE: The {get} and {withUpdate} functions operate using timestamps. Block number based delays are not currently
+     * supported.
+     */
+    type Delay is uint112;
+
+    /**
+     * @dev Wrap a duration into a Delay to add the one-step "update in the future" feature
+     */
+    function toDelay(uint32 duration) internal pure returns (Delay) {
+        return Delay.wrap(duration);
+    }
+
+    /**
+     * @dev Get the value at a given timepoint plus the pending value and effect timepoint if there is a scheduled
+     * change after this timepoint. If the effect timepoint is 0, then the pending value should not be considered.
+     */
+    function _getFullAt(Delay self, uint48 timepoint) private pure returns (uint32, uint32, uint48) {
+        (uint32 valueBefore, uint32 valueAfter, uint48 effect) = self.unpack();
+        return effect <= timepoint ? (valueAfter, 0, 0) : (valueBefore, valueAfter, effect);
+    }
+
+    /**
+     * @dev Get the current value plus the pending value and effect timepoint if there is a scheduled change. If the
+     * effect timepoint is 0, then the pending value should not be considered.
+     */
+    function getFull(Delay self) internal view returns (uint32, uint32, uint48) {
+        return _getFullAt(self, timestamp());
+    }
+
+    /**
+     * @dev Get the current value.
+     */
+    function get(Delay self) internal view returns (uint32) {
+        (uint32 delay, , ) = self.getFull();
+        return delay;
+    }
+
+    /**
+     * @dev Update a Delay object so that it takes a new duration after a timepoint that is automatically computed to
+     * enforce the old delay at the moment of the update. Returns the updated Delay object and the timestamp when the
+     * new delay becomes effective.
+     */
+    function withUpdate(
+        Delay self,
+        uint32 newValue,
+        uint32 minSetback
+    ) internal view returns (Delay updatedDelay, uint48 effect) {
+        uint32 value = self.get();
+        uint32 setback = uint32(Math.max(minSetback, value > newValue ? value - newValue : 0));
+        effect = timestamp() + setback;
+        return (pack(value, newValue, effect), effect);
+    }
+
+    /**
+     * @dev Split a delay into its components: valueBefore, valueAfter and effect (transition timepoint).
+     */
+    function unpack(Delay self) internal pure returns (uint32 valueBefore, uint32 valueAfter, uint48 effect) {
+        uint112 raw = Delay.unwrap(self);
+
+        valueAfter = uint32(raw);
+        valueBefore = uint32(raw >> 32);
+        effect = uint48(raw >> 64);
+
+        return (valueBefore, valueAfter, effect);
+    }
+
+    /**
+     * @dev pack the components into a Delay object.
+     */
+    function pack(uint32 valueBefore, uint32 valueAfter, uint48 effect) internal pure returns (Delay) {
+        return Delay.wrap((uint112(effect) << 64) | (uint112(valueBefore) << 32) | uint112(valueAfter));
+    }
+}
+
+// node_modules/rave/src/RAVEBase.sol
+
+abstract contract RAVEBase is IRave {
+    using BytesUtils for *;
+
+    uint256 constant MAX_JSON_ELEMENTS = 19;
+    uint256 constant QUOTE_BODY_LENGTH = 432;
+    uint256 constant MRENCLAVE_OFFSET = 112;
+    uint256 constant MRSIGNER_OFFSET = 176;
+    uint256 constant PAYLOAD_OFFSET = 368;
+    uint256 constant PAYLOAD_SIZE = 64;
+
+    bytes32 constant OK_STATUS = keccak256("OK");
+    bytes32 constant HARDENING_STATUS = keccak256("SW_HARDENING_NEEDED");
+
+    constructor() { }
+
+    /**
+     * @inheritdoc IRave
+     */
+    function verifyReportSignature(
+        bytes memory report,
+        bytes calldata sig,
+        bytes memory signingMod,
+        bytes memory signingExp
+    ) public view returns (bool) {
+        // Use signingPK to verify sig is the RSA signature over sha256(report)
+        (bool success, bytes memory got) = RSAVerify.rsarecover(signingMod, signingExp, sig);
+        // Last 32 bytes is recovered signed digest
+        bytes32 recovered = got.readBytes32(got.length - 32);
+        return success && recovered == sha256(report);
+    }
+
+    /**
+     * @inheritdoc IRave
+     */
+    function verifyRemoteAttestation(
+        bytes calldata report,
+        bytes calldata sig,
+        bytes memory signingMod,
+        bytes memory signingExp,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) public view virtual returns (bytes memory payload) { }
+
+    /**
+     * @inheritdoc IRave
+     */
+    function rave(
+        bytes calldata report,
+        bytes calldata sig,
+        bytes memory leafX509Cert,
+        bytes memory signingMod,
+        bytes memory signingExp,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) external view virtual returns (bytes memory payload) { }
+}
+
+// node_modules/rave/src/X509Verifier.sol
+
+library X509Verifier {
+    using Asn1Decode for bytes;
+    using BytesUtils for bytes;
+
+    /*
+     * @dev Verifies an x509 certificate was signed (RSASHA256) by the supplied public key. 
+     * @param childCertBody The DER-encoded body (preimage) of the x509   child certificate
+     * @param certSig The RSASHA256 signature of the childCertBody
+     * @param parentMod The modulus of the parent certificate's public RSA key
+     * @param parentExp The exponent of the parent certificate's public RSA key
+     * @return Returns true if this childCertBody was signed by the parent's RSA private key
+     */
+    function verifyChildCert(
+        bytes memory childCertBody,
+        bytes memory certSig,
+        bytes memory parentMod,
+        bytes memory parentExp
+    ) public view returns (bool) {
+        // Recover the digest using parent's public key
+        (bool success, bytes memory res) = RSAVerify.rsarecover(parentMod, parentExp, certSig);
+        // Digest is last 32 bytes of res
+        bytes32 recovered = res.readBytes32(res.length - 32);
+        return success && recovered == sha256(childCertBody);
+    }
+
+    /*
+     * @dev specs: https://www.ietf.org/rfc/rfc5280.txt
+     * @dev     Certificate  ::=  SEQUENCE  {
+     * @dev         tbsCertificate       TBSCertificate,
+     * @dev         signatureAlgorithm   AlgorithmIdentifier,
+     * @dev         signatureValue       BIT STRING  }
+     * @dev
+     * @dev     TBSCertificate  ::=  SEQUENCE  {
+     * @dev         version         [0]  EXPLICIT Version DEFAULT v1,
+     * @dev         serialNumber         CertificateSerialNumber,
+     * @dev         signature            AlgorithmIdentifier,
+     * @dev         issuer               Name,
+     * @dev         validity             Validity,
+     * @dev         subject              Name,
+     * @dev         subjectPublicKeyInfo SubjectPublicKeyInfo,
+     * @dev         issuerUniqueID  [1]  IMPLICIT UniqueIdentifier OPTIONAL,
+     * @dev                              -- If present, version MUST be v2 or v3
+     * @dev         subjectUniqueID [2]  IMPLICIT UniqueIdentifier OPTIONAL,
+     * @dev                              -- If present, version MUST be v2 or v3
+     * @dev         extensions      [3]  EXPLICIT Extensions OPTIONAL
+     * @dev                              -- If present, version MUST be v3
+     * @dev         }
+     * @dev Verifies an x509 certificate was signed (RSASHA256) by the parent's
+     * @dev supplied modulus and exponent, then returns the child x509's modulus and exponent.
+     * @param cert The DER-encoded signed x509 certificate.
+     * @param parentMod The parent RSA modulus.
+     * @param parentExp The parent RSA exponent.
+     * @return Returns the RSA modulus and exponent of the signed x509 certificate iff it was signed by the parent.
+     */
+    function verifySignedX509(bytes memory cert, bytes memory parentMod, bytes memory parentExp)
+        public
+        view
+        returns (bytes memory, bytes memory)
+    {
+        // Pointer to top level asn1 object: Sequence{tbsCertificate, signatureAlgorithm, signatureValue}
+        uint256 root = cert.root();
+
+        // Traverse to first in sequence (the tbsCertificate)
+        uint256 tbsPtr = cert.firstChildOf(root);
+
+        // Extracts the TBSCerificate (what is used as input to RSA-SHA256)
+        bytes memory certBody = cert.allBytesAt(tbsPtr);
+
+        // Top level traverse to signatureAlgorithm
+        uint256 sigAlgPtr = cert.nextSiblingOf(tbsPtr);
+
+        // Top level traverse to signatureValue
+        uint256 sigPtr = cert.nextSiblingOf(sigAlgPtr);
+
+        // Extracts the signed certificate body
+        bytes memory signature = cert.bytesAt(sigPtr);
+
+        // Verify the parent signed the certBody
+        require(verifyChildCert(certBody, signature, parentMod, parentExp), "verifyChildCert fail");
+
+        //  ----------------
+        // Begin traversing the tbsCertificate
+        //  ----------------
+
+        // Traverse to first child of tbsCertificate
+        uint256 ptr = cert.firstChildOf(tbsPtr);
+
+        // Account for v1 vs v3
+        if (cert[NodePtr.ixs(ptr)] == 0xa0) {
+            ptr = cert.nextSiblingOf(ptr);
+        }
+
+        // Extract serialNumber (CertificateSerialNumber)
+        // uint256 serialNumber = uint160(cert.uintAt(ptr));
+
+        // Skip the next 3 fields (signature, issuer, validity, subject)
+        ptr = cert.nextSiblingOf(ptr); // point to signature
+        ptr = cert.nextSiblingOf(ptr); // point to issuer
+        ptr = cert.nextSiblingOf(ptr); // point to validity
+
+        // Arrive at the validity field
+        // todo verifiy validity timestamps
+        // uint256 validityPtr = ptr;
+        // bytes memory validNotBefore = cert.bytesAt(validityPtr);
+        // console.logBytes(validNotBefore);
+        // uint40 validNotBefore = uint40(toTimestamp(cert.bytesAt(validityPtr)));
+        // console.log("validNotBefore: %s", validNotBefore);
+        // validityPtr = cert.nextSiblingOf(validityPtr);
+        // bytes memory validNotAfter = cert.bytesAt(validityPtr);
+        // console.logBytes(validNotAfter);
+        // uint40 validNotAfter = uint40(toTimestamp(cert.bytesAt(validityPtr)));
+        // console.log("validNotAfter: %s", validNotAfter);
+
+        // Traverse until the subjectPublicKeyInfo field
+        ptr = cert.nextSiblingOf(ptr); // point to subject
+        ptr = cert.nextSiblingOf(ptr); // point to subjectPublicKeyInfo
+
+        // Enter subjectPublicKeyInfo
+        ptr = cert.firstChildOf(ptr); // point to subjectPublicKeyInfo.algorithm
+        ptr = cert.nextSiblingOf(ptr); // point to subjectPublicKeyInfo.subjectPublicKey
+
+        // Extract DER-encoded RSA public key
+        bytes memory pubKey = cert.bitstringAt(ptr);
+
+        // Extract RSA modulus
+        uint256 pkPtr = pubKey.root();
+        pkPtr = pubKey.firstChildOf(pkPtr);
+        bytes memory modulus = pubKey.bytesAt(pkPtr);
+
+        // Extract RSA exponent
+        pkPtr = pubKey.nextSiblingOf(pkPtr);
+        bytes memory exponent = pubKey.bytesAt(pkPtr);
+
+        return (modulus, exponent);
+    }
+
+    /*
+     * @dev Verifies the x509 certificate hasn't expired
+     * @param certBody The DER-encoded body (preimage) of the x509 
+     * @return Returns ...
+     */
+    function notExpired(bytes calldata) public pure returns (bool) {
+        // TODO
+        return true;
+    }
+}
+
+// node_modules/@openzeppelin/contracts/access/manager/IAccessManager.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/manager/IAccessManager.sol)
+
+interface IAccessManager {
+    /**
+     * @dev A delayed operation was scheduled.
+     */
+    event OperationScheduled(
+        bytes32 indexed operationId,
+        uint32 indexed nonce,
+        uint48 schedule,
+        address caller,
+        address target,
+        bytes data
+    );
+
+    /**
+     * @dev A scheduled operation was executed.
+     */
+    event OperationExecuted(bytes32 indexed operationId, uint32 indexed nonce);
+
+    /**
+     * @dev A scheduled operation was canceled.
+     */
+    event OperationCanceled(bytes32 indexed operationId, uint32 indexed nonce);
+
+    /**
+     * @dev Informational labelling for a roleId.
+     */
+    event RoleLabel(uint64 indexed roleId, string label);
+
+    /**
+     * @dev Emitted when `account` is granted `roleId`.
+     *
+     * NOTE: The meaning of the `since` argument depends on the `newMember` argument.
+     * If the role is granted to a new member, the `since` argument indicates when the account becomes a member of the role,
+     * otherwise it indicates the execution delay for this account and roleId is updated.
+     */
+    event RoleGranted(uint64 indexed roleId, address indexed account, uint32 delay, uint48 since, bool newMember);
+
+    /**
+     * @dev Emitted when `account` membership or `roleId` is revoked. Unlike granting, revoking is instantaneous.
+     */
+    event RoleRevoked(uint64 indexed roleId, address indexed account);
+
+    /**
+     * @dev Role acting as admin over a given `roleId` is updated.
+     */
+    event RoleAdminChanged(uint64 indexed roleId, uint64 indexed admin);
+
+    /**
+     * @dev Role acting as guardian over a given `roleId` is updated.
+     */
+    event RoleGuardianChanged(uint64 indexed roleId, uint64 indexed guardian);
+
+    /**
+     * @dev Grant delay for a given `roleId` will be updated to `delay` when `since` is reached.
+     */
+    event RoleGrantDelayChanged(uint64 indexed roleId, uint32 delay, uint48 since);
+
+    /**
+     * @dev Target mode is updated (true = closed, false = open).
+     */
+    event TargetClosed(address indexed target, bool closed);
+
+    /**
+     * @dev Role required to invoke `selector` on `target` is updated to `roleId`.
+     */
+    event TargetFunctionRoleUpdated(address indexed target, bytes4 selector, uint64 indexed roleId);
+
+    /**
+     * @dev Admin delay for a given `target` will be updated to `delay` when `since` is reached.
+     */
+    event TargetAdminDelayUpdated(address indexed target, uint32 delay, uint48 since);
+
+    error AccessManagerAlreadyScheduled(bytes32 operationId);
+    error AccessManagerNotScheduled(bytes32 operationId);
+    error AccessManagerNotReady(bytes32 operationId);
+    error AccessManagerExpired(bytes32 operationId);
+    error AccessManagerLockedAccount(address account);
+    error AccessManagerLockedRole(uint64 roleId);
+    error AccessManagerBadConfirmation();
+    error AccessManagerUnauthorizedAccount(address msgsender, uint64 roleId);
+    error AccessManagerUnauthorizedCall(address caller, address target, bytes4 selector);
+    error AccessManagerUnauthorizedConsume(address target);
+    error AccessManagerUnauthorizedCancel(address msgsender, address caller, address target, bytes4 selector);
+    error AccessManagerInvalidInitialAdmin(address initialAdmin);
+
+    /**
+     * @dev Check if an address (`caller`) is authorised to call a given function on a given contract directly (with
+     * no restriction). Additionally, it returns the delay needed to perform the call indirectly through the {schedule}
+     * & {execute} workflow.
+     *
+     * This function is usually called by the targeted contract to control immediate execution of restricted functions.
+     * Therefore we only return true if the call can be performed without any delay. If the call is subject to a
+     * previously set delay (not zero), then the function should return false and the caller should schedule the operation
+     * for future execution.
+     *
+     * If `immediate` is true, the delay can be disregarded and the operation can be immediately executed, otherwise
+     * the operation can be executed if and only if delay is greater than 0.
+     *
+     * NOTE: The IAuthority interface does not include the `uint32` delay. This is an extension of that interface that
+     * is backward compatible. Some contracts may thus ignore the second return argument. In that case they will fail
+     * to identify the indirect workflow, and will consider calls that require a delay to be forbidden.
+     *
+     * NOTE: This function does not report the permissions of this manager itself. These are defined by the
+     * {_canCallSelf} function instead.
+     */
+    function canCall(
+        address caller,
+        address target,
+        bytes4 selector
+    ) external view returns (bool allowed, uint32 delay);
+
+    /**
+     * @dev Expiration delay for scheduled proposals. Defaults to 1 week.
+     *
+     * IMPORTANT: Avoid overriding the expiration with 0. Otherwise every contract proposal will be expired immediately,
+     * disabling any scheduling usage.
+     */
+    function expiration() external view returns (uint32);
+
+    /**
+     * @dev Minimum setback for all delay updates, with the exception of execution delays. It
+     * can be increased without setback (and reset via {revokeRole} in the case event of an
+     * accidental increase). Defaults to 5 days.
+     */
+    function minSetback() external view returns (uint32);
+
+    /**
+     * @dev Get whether the contract is closed disabling any access. Otherwise role permissions are applied.
+     */
+    function isTargetClosed(address target) external view returns (bool);
+
+    /**
+     * @dev Get the role required to call a function.
+     */
+    function getTargetFunctionRole(address target, bytes4 selector) external view returns (uint64);
+
+    /**
+     * @dev Get the admin delay for a target contract. Changes to contract configuration are subject to this delay.
+     */
+    function getTargetAdminDelay(address target) external view returns (uint32);
+
+    /**
+     * @dev Get the id of the role that acts as an admin for the given role.
+     *
+     * The admin permission is required to grant the role, revoke the role and update the execution delay to execute
+     * an operation that is restricted to this role.
+     */
+    function getRoleAdmin(uint64 roleId) external view returns (uint64);
+
+    /**
+     * @dev Get the role that acts as a guardian for a given role.
+     *
+     * The guardian permission allows canceling operations that have been scheduled under the role.
+     */
+    function getRoleGuardian(uint64 roleId) external view returns (uint64);
+
+    /**
+     * @dev Get the role current grant delay.
+     *
+     * Its value may change at any point without an event emitted following a call to {setGrantDelay}.
+     * Changes to this value, including effect timepoint are notified in advance by the {RoleGrantDelayChanged} event.
+     */
+    function getRoleGrantDelay(uint64 roleId) external view returns (uint32);
+
+    /**
+     * @dev Get the access details for a given account for a given role. These details include the timepoint at which
+     * membership becomes active, and the delay applied to all operation by this user that requires this permission
+     * level.
+     *
+     * Returns:
+     * [0] Timestamp at which the account membership becomes valid. 0 means role is not granted.
+     * [1] Current execution delay for the account.
+     * [2] Pending execution delay for the account.
+     * [3] Timestamp at which the pending execution delay will become active. 0 means no delay update is scheduled.
+     */
+    function getAccess(uint64 roleId, address account) external view returns (uint48, uint32, uint32, uint48);
+
+    /**
+     * @dev Check if a given account currently has the permission level corresponding to a given role. Note that this
+     * permission might be associated with an execution delay. {getAccess} can provide more details.
+     */
+    function hasRole(uint64 roleId, address account) external view returns (bool, uint32);
+
+    /**
+     * @dev Give a label to a role, for improved role discoverability by UIs.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {RoleLabel} event.
+     */
+    function labelRole(uint64 roleId, string calldata label) external;
+
+    /**
+     * @dev Add `account` to `roleId`, or change its execution delay.
+     *
+     * This gives the account the authorization to call any function that is restricted to this role. An optional
+     * execution delay (in seconds) can be set. If that delay is non 0, the user is required to schedule any operation
+     * that is restricted to members of this role. The user will only be able to execute the operation after the delay has
+     * passed, before it has expired. During this period, admin and guardians can cancel the operation (see {cancel}).
+     *
+     * If the account has already been granted this role, the execution delay will be updated. This update is not
+     * immediate and follows the delay rules. For example, if a user currently has a delay of 3 hours, and this is
+     * called to reduce that delay to 1 hour, the new delay will take some time to take effect, enforcing that any
+     * operation executed in the 3 hours that follows this update was indeed scheduled before this update.
+     *
+     * Requirements:
+     *
+     * - the caller must be an admin for the role (see {getRoleAdmin})
+     * - granted role must not be the `PUBLIC_ROLE`
+     *
+     * Emits a {RoleGranted} event.
+     */
+    function grantRole(uint64 roleId, address account, uint32 executionDelay) external;
+
+    /**
+     * @dev Remove an account from a role, with immediate effect. If the account does not have the role, this call has
+     * no effect.
+     *
+     * Requirements:
+     *
+     * - the caller must be an admin for the role (see {getRoleAdmin})
+     * - revoked role must not be the `PUBLIC_ROLE`
+     *
+     * Emits a {RoleRevoked} event if the account had the role.
+     */
+    function revokeRole(uint64 roleId, address account) external;
+
+    /**
+     * @dev Renounce role permissions for the calling account with immediate effect. If the sender is not in
+     * the role this call has no effect.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     *
+     * Emits a {RoleRevoked} event if the account had the role.
+     */
+    function renounceRole(uint64 roleId, address callerConfirmation) external;
+
+    /**
+     * @dev Change admin role for a given role.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {RoleAdminChanged} event
+     */
+    function setRoleAdmin(uint64 roleId, uint64 admin) external;
+
+    /**
+     * @dev Change guardian role for a given role.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {RoleGuardianChanged} event
+     */
+    function setRoleGuardian(uint64 roleId, uint64 guardian) external;
+
+    /**
+     * @dev Update the delay for granting a `roleId`.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {RoleGrantDelayChanged} event.
+     */
+    function setGrantDelay(uint64 roleId, uint32 newDelay) external;
+
+    /**
+     * @dev Set the role required to call functions identified by the `selectors` in the `target` contract.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {TargetFunctionRoleUpdated} event per selector.
+     */
+    function setTargetFunctionRole(address target, bytes4[] calldata selectors, uint64 roleId) external;
+
+    /**
+     * @dev Set the delay for changing the configuration of a given target contract.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {TargetAdminDelayUpdated} event.
+     */
+    function setTargetAdminDelay(address target, uint32 newDelay) external;
+
+    /**
+     * @dev Set the closed flag for a contract.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     *
+     * Emits a {TargetClosed} event.
+     */
+    function setTargetClosed(address target, bool closed) external;
+
+    /**
+     * @dev Return the timepoint at which a scheduled operation will be ready for execution. This returns 0 if the
+     * operation is not yet scheduled, has expired, was executed, or was canceled.
+     */
+    function getSchedule(bytes32 id) external view returns (uint48);
+
+    /**
+     * @dev Return the nonce for the latest scheduled operation with a given id. Returns 0 if the operation has never
+     * been scheduled.
+     */
+    function getNonce(bytes32 id) external view returns (uint32);
+
+    /**
+     * @dev Schedule a delayed operation for future execution, and return the operation identifier. It is possible to
+     * choose the timestamp at which the operation becomes executable as long as it satisfies the execution delays
+     * required for the caller. The special value zero will automatically set the earliest possible time.
+     *
+     * Returns the `operationId` that was scheduled. Since this value is a hash of the parameters, it can reoccur when
+     * the same parameters are used; if this is relevant, the returned `nonce` can be used to uniquely identify this
+     * scheduled operation from other occurrences of the same `operationId` in invocations of {execute} and {cancel}.
+     *
+     * Emits a {OperationScheduled} event.
+     *
+     * NOTE: It is not possible to concurrently schedule more than one operation with the same `target` and `data`. If
+     * this is necessary, a random byte can be appended to `data` to act as a salt that will be ignored by the target
+     * contract if it is using standard Solidity ABI encoding.
+     */
+    function schedule(address target, bytes calldata data, uint48 when) external returns (bytes32, uint32);
+
+    /**
+     * @dev Execute a function that is delay restricted, provided it was properly scheduled beforehand, or the
+     * execution delay is 0.
+     *
+     * Returns the nonce that identifies the previously scheduled operation that is executed, or 0 if the
+     * operation wasn't previously scheduled (if the caller doesn't have an execution delay).
+     *
+     * Emits an {OperationExecuted} event only if the call was scheduled and delayed.
+     */
+    function execute(address target, bytes calldata data) external payable returns (uint32);
+
+    /**
+     * @dev Cancel a scheduled (delayed) operation. Returns the nonce that identifies the previously scheduled
+     * operation that is cancelled.
+     *
+     * Requirements:
+     *
+     * - the caller must be the proposer, a guardian of the targeted function, or a global admin
+     *
+     * Emits a {OperationCanceled} event.
+     */
+    function cancel(address caller, address target, bytes calldata data) external returns (uint32);
+
+    /**
+     * @dev Consume a scheduled operation targeting the caller. If such an operation exists, mark it as consumed
+     * (emit an {OperationExecuted} event and clean the state). Otherwise, throw an error.
+     *
+     * This is useful for contract that want to enforce that calls targeting them were scheduled on the manager,
+     * with all the verifications that it implies.
+     *
+     * Emit a {OperationExecuted} event.
+     */
+    function consumeScheduledOp(address caller, bytes calldata data) external;
+
+    /**
+     * @dev Hashing function for delayed operations.
+     */
+    function hashOperation(address caller, address target, bytes calldata data) external view returns (bytes32);
+
+    /**
+     * @dev Changes the authority of a target managed by this manager instance.
+     *
+     * Requirements:
+     *
+     * - the caller must be a global admin
+     */
+    function updateAuthority(address target, address newAuthority) external;
+}
+
+// node_modules/@openzeppelin/contracts/access/manager/AccessManaged.sol
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/manager/AccessManaged.sol)
+
+/**
+ * @dev This contract module makes available a {restricted} modifier. Functions decorated with this modifier will be
+ * permissioned according to an "authority": a contract like {AccessManager} that follows the {IAuthority} interface,
+ * implementing a policy that allows certain callers to access certain functions.
+ *
+ * IMPORTANT: The `restricted` modifier should never be used on `internal` functions, judiciously used in `public`
+ * functions, and ideally only used in `external` functions. See {restricted}.
+ */
+abstract contract AccessManaged is Context, IAccessManaged {
+    address private _authority;
+
+    bool private _consumingSchedule;
+
+    /**
+     * @dev Initializes the contract connected to an initial authority.
+     */
+    constructor(address initialAuthority) {
+        _setAuthority(initialAuthority);
+    }
+
+    /**
+     * @dev Restricts access to a function as defined by the connected Authority for this contract and the
+     * caller and selector of the function that entered the contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * In general, this modifier should only be used on `external` functions. It is okay to use it on `public`
+     * functions that are used as external entry points and are not called internally. Unless you know what you're
+     * doing, it should never be used on `internal` functions. Failure to follow these rules can have critical security
+     * implications! This is because the permissions are determined by the function that entered the contract, i.e. the
+     * function at the bottom of the call stack, and not the function where the modifier is visible in the source code.
+     * ====
+     *
+     * [WARNING]
+     * ====
+     * Avoid adding this modifier to the https://docs.soliditylang.org/en/v0.8.20/contracts.html#receive-ether-function[`receive()`]
+     * function or the https://docs.soliditylang.org/en/v0.8.20/contracts.html#fallback-function[`fallback()`]. These
+     * functions are the only execution paths where a function selector cannot be unambiguosly determined from the calldata
+     * since the selector defaults to `0x00000000` in the `receive()` function and similarly in the `fallback()` function
+     * if no calldata is provided. (See {_checkCanCall}).
+     *
+     * The `receive()` function will always panic whereas the `fallback()` may panic depending on the calldata length.
+     * ====
+     */
+    modifier restricted() {
+        _checkCanCall(_msgSender(), _msgData());
+        _;
+    }
+
+    /// @inheritdoc IAccessManaged
+    function authority() public view virtual returns (address) {
+        return _authority;
+    }
+
+    /// @inheritdoc IAccessManaged
+    function setAuthority(address newAuthority) public virtual {
+        address caller = _msgSender();
+        if (caller != authority()) {
+            revert AccessManagedUnauthorized(caller);
+        }
+        if (newAuthority.code.length == 0) {
+            revert AccessManagedInvalidAuthority(newAuthority);
+        }
+        _setAuthority(newAuthority);
+    }
+
+    /// @inheritdoc IAccessManaged
+    function isConsumingScheduledOp() public view returns (bytes4) {
+        return _consumingSchedule ? this.isConsumingScheduledOp.selector : bytes4(0);
+    }
+
+    /**
+     * @dev Transfers control to a new authority. Internal function with no access restriction. Allows bypassing the
+     * permissions set by the current authority.
+     */
+    function _setAuthority(address newAuthority) internal virtual {
+        _authority = newAuthority;
+        emit AuthorityUpdated(newAuthority);
+    }
+
+    /**
+     * @dev Reverts if the caller is not allowed to call the function identified by a selector. Panics if the calldata
+     * is less than 4 bytes long.
+     */
+    function _checkCanCall(address caller, bytes calldata data) internal virtual {
+        (bool immediate, uint32 delay) = AuthorityUtils.canCallWithDelay(
+            authority(),
+            caller,
+            address(this),
+            bytes4(data[0:4])
+        );
+        if (!immediate) {
+            if (delay > 0) {
+                _consumingSchedule = true;
+                IAccessManager(authority()).consumeScheduledOp(caller, data);
+                _consumingSchedule = false;
+            } else {
+                revert AccessManagedUnauthorized(caller);
+            }
+        }
+    }
+}
+
+// node_modules/rave/src/RAVE.sol
+
+/**
+ * @title RAVE
+ * @author PufferFinance
+ * @custom:security-contact security@puffer.fi
+ * @notice RAVe is a smart contract for verifying Remote Attestation evidence.
+ */
+contract RAVE is RAVEBase, JSONBuilder {
+    using BytesUtils for *;
+
+    constructor() { }
+
+    /**
+     * @inheritdoc RAVEBase
+     */
+    function verifyRemoteAttestation(
+        bytes calldata report,
+        bytes calldata sig,
+        bytes memory signingMod,
+        bytes memory signingExp,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) public view override returns (bytes memory payload) {
+        // Decode the encoded report JSON values to a Values struct and reconstruct the original JSON string
+        (Values memory reportValues, bytes memory reportBytes) = _buildReportBytes(report);
+
+        // Verify the report was signed by the SigningPK
+        if (!verifyReportSignature(reportBytes, sig, signingMod, signingExp)) {
+            revert BadReportSignature();
+        }
+
+        // Verify the report's contents match the expected
+        payload = _verifyReportContents(reportValues, mrenclave, mrsigner);
+    }
+
+    /**
+     * @inheritdoc RAVEBase
+     */
+    function rave(
+        bytes calldata report,
+        bytes calldata sig,
+        bytes memory leafX509Cert,
+        bytes memory signingMod,
+        bytes memory signingExp,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) public view override returns (bytes memory payload) {
+        // Verify the leafX509Cert was signed with signingMod and signingExp
+        (bytes memory leafCertModulus, bytes memory leafCertExponent) =
+            X509Verifier.verifySignedX509(leafX509Cert, signingMod, signingExp);
+
+        // Verify report has expected fields then extract its payload
+        payload = verifyRemoteAttestation(report, sig, leafCertModulus, leafCertExponent, mrenclave, mrsigner);
+    }
+
+    /*
+    * @dev Builds the JSON report string from the abi-encoded `encodedReportValues`. The assumption is that `isvEnclaveQuoteBody` value was previously base64 decoded off-chain and needs to be base64 encoded to produce the message-to-be-signed.
+    * @param encodedReportValues The values from the attestation evidence report JSON from IAS.
+    * @return reportValues The JSON values as a Values struct for easier processing downstream
+    * @return reportBytes The exact message-to-be-signed
+    */
+    function _buildReportBytes(bytes memory encodedReportValues)
+        internal
+        pure
+        returns (Values memory reportValues, bytes memory reportBytes)
+    {
+        // Decode the report JSON values
+        (
+            bytes memory id,
+            bytes memory timestamp,
+            bytes memory version,
+            bytes memory epidPseudonym,
+            bytes memory advisoryURL,
+            bytes memory advisoryIDs,
+            bytes memory isvEnclaveQuoteStatus,
+            bytes memory isvEnclaveQuoteBody
+        ) = abi.decode(encodedReportValues, (bytes, bytes, bytes, bytes, bytes, bytes, bytes, bytes));
+
+        // Assumes the quote body was already decoded off-chain
+        bytes memory encBody = bytes(Base64.encode(isvEnclaveQuoteBody));
+
+        // Pack values to struct
+        reportValues = JSONBuilder.Values(
+            id, timestamp, version, epidPseudonym, advisoryURL, advisoryIDs, isvEnclaveQuoteStatus, encBody
+        );
+
+        // Reconstruct the JSON report that was signed
+        reportBytes = bytes(buildJSON(reportValues));
+
+        // Pass on the decoded value for later processing
+        reportValues.isvEnclaveQuoteBody = isvEnclaveQuoteBody;
+    }
+
+    /*
+    * @dev Parses a report, verifies the fields are correctly set, and extracts the enclave' 64 byte commitment.
+    * @param reportValues The values from the attestation evidence report JSON from IAS.
+    * @param mrenclave The expected enclave measurement.
+    * @param mrsigner The expected enclave signer.
+    * @return The 64 byte payload if the mrenclave and mrsigner values were correctly set.
+    */
+    function _verifyReportContents(Values memory reportValues, bytes32 mrenclave, bytes32 mrsigner)
+        internal
+        pure
+        returns (bytes memory payload)
+    {
+        // check enclave status
+        bytes32 status = keccak256(reportValues.isvEnclaveQuoteStatus);
+        require(status == OK_STATUS || status == HARDENING_STATUS, "bad isvEnclaveQuoteStatus");
+
+        // quote body is already base64 decoded
+        bytes memory quoteBody = reportValues.isvEnclaveQuoteBody;
+        assert(quoteBody.length == QUOTE_BODY_LENGTH);
+
+        // Verify report's MRENCLAVE matches the expected
+        bytes32 mre = quoteBody.readBytes32(MRENCLAVE_OFFSET);
+        require(mre == mrenclave);
+
+        // Verify report's MRSIGNER matches the expected
+        bytes32 mrs = quoteBody.readBytes32(MRSIGNER_OFFSET);
+        require(mrs == mrsigner);
+
+        // Verify report's <= 64B payload matches the expected
+        payload = quoteBody.substring(PAYLOAD_OFFSET, PAYLOAD_SIZE);
+    }
+}
+
+// src/EnclaveVerifier.sol
+
+/**
+ * @title EnclaveVerifier
+ * @author Puffer Finance
+ * @custom:security-contact security@puffer.fi
+ */
+contract EnclaveVerifier is IEnclaveVerifier, AccessManaged, RAVE {
+    /**
+     * @dev RSA Public key for Intel: https://api.portal.trustedservices.intel.com/content/documentation.html
+     */
+    bytes internal constant _INTEL_RSA_MODULUS =
+        hex"9F3C647EB5773CBB512D2732C0D7415EBB55A0FA9EDE2E649199E6821DB910D53177370977466A6A5E4786CCD2DDEBD4149D6A2F6325529DD10CC98737B0779C1A07E29C47A1AE004948476C489F45A5A15D7AC8ECC6ACC645ADB43D87679DF59C093BC5A2E9696C5478541B979E754B573914BE55D32FF4C09DDF27219934CD990527B3F92ED78FBF29246ABECB71240EF39C2D7107B447545A7FFB10EB060A68A98580219E36910952683892D6A5E2A80803193E407531404E36B315623799AA825074409754A2DFE8F5AFD5FE631E1FC2AF3808906F28A790D9DD9FE060939B125790C5805D037DF56A99531B96DE69DE33ED226CC1207D1042B5C9AB7F404FC711C0FE4769FB9578B1DC0EC469EA1A25E0FF9914886EF2699B235BB4847DD6FF40B606E6170793C2FB98B314587F9CFD257362DFEAB10B3BD2D97673A1A4BD44C453AAF47FC1F2D3D0F384F74A06F89C089F0DA6CDB7FCEEE8C9821A8E54F25C0416D18C46839A5F8012FBDD3DC74D256279ADC2C0D55AFF6F0622425D1B";
+    bytes internal constant _INTEL_EXPONENT = hex"010001";
+
+    /**
+     * @notice Freshness number of blocks
+     */
+    uint256 public immutable FRESHNESS_BLOCKS;
+
+    /**
+     * @dev Mapping from keccak'd leaf x509 to RSA pub key components
+     * leafHash -> pubKey
+     */
+    mapping(bytes32 leafHash => RSAPubKey pubKey) internal _validLeafX509s;
+
+    constructor(uint256 freshnessBlocks, address accessManager) AccessManaged(accessManager) {
+        if (address(accessManager) == address(0)) {
+            revert InvalidAddress();
+        }
+        FRESHNESS_BLOCKS = freshnessBlocks;
+    }
+
+    /**
+     * @inheritdoc IEnclaveVerifier
+     */
+    function getIntelRootCAPubKey() external pure returns (RSAPubKey memory) {
+        return RSAPubKey({ modulus: _INTEL_RSA_MODULUS, exponent: _INTEL_EXPONENT });
+    }
+
+    /**
+     * @inheritdoc IEnclaveVerifier
+     */
+    function addLeafX509(bytes calldata leafX509Cert) external {
+        (bytes memory leafCertModulus, bytes memory leafCertExponent) =
+            X509Verifier.verifySignedX509(leafX509Cert, _INTEL_RSA_MODULUS, _INTEL_EXPONENT);
+
+        bytes32 hashedCert = keccak256(leafX509Cert);
+
+        _validLeafX509s[hashedCert] = RSAPubKey({ modulus: leafCertModulus, exponent: leafCertExponent });
+
+        emit AddedPubKey(hashedCert);
+    }
+
+    /**
+     * @notice Removes a whitelisted leaf x509 RSA public key
+     */
+    function removeLeafX509(bytes32 hashedCert) external restricted {
+        delete _validLeafX509s[hashedCert].modulus;
+        delete _validLeafX509s[hashedCert].exponent;
+        emit RemovedPubKey(hashedCert);
+    }
+
+    /**
+     * @inheritdoc IEnclaveVerifier
+     */
+    function verifyEvidence(
+        uint256 blockNumber,
+        bytes32 raveCommitment,
+        RaveEvidence calldata evidence,
+        bytes32 mrenclave,
+        bytes32 mrsigner
+    ) external view returns (bool) {
+        // Check for freshness
+        if ((block.number - blockNumber) > FRESHNESS_BLOCKS) {
+            revert StaleEvidence();
+        }
+
+        RSAPubKey memory leafX509 = _validLeafX509s[evidence.leafX509CertDigest];
+
+        // Recover a remote attestation payload if everything is valid
+        bytes memory recoveredPayload = verifyRemoteAttestation({
+            report: evidence.report,
+            sig: evidence.signature,
+            signingMod: leafX509.modulus,
+            signingExp: leafX509.exponent,
+            mrenclave: mrenclave,
+            mrsigner: mrsigner
+        });
+
+        // Remote attestation payloads are expected to be in the form (32B_Commitment || 32B_BlockHash)
+        bytes memory expectedPayload = abi.encode(raveCommitment, blockhash(blockNumber));
+
+        // Compare with the expected payload
+        return (keccak256(expectedPayload) == keccak256(recoveredPayload));
+    }
+}
+
+// src/interface/IGuardianModule.sol
+
+/**
+ * @title IGuardianModule interface
+ * @author Puffer Finance
+ */
+interface IGuardianModule {
+    /**
+     * @notice Thrown when the ECDSA public key is not valid
+     * @dev Signature "0xe3eece5a"
+     */
+    error InvalidECDSAPubKey();
+
+    /**
+     * @notice Thrown when the RAVE evidence is not valid
+     * @dev Signature "0x2b3c629b"
+     */
+    error InvalidRAVE();
+
+    /**
+     * @notice Thrown if the threshold value is not valid
+     * @dev Signature "0x651a749b"
+     */
+    error InvalidThreshold(uint256 threshold);
+
+    /**
+     * @notice Emitted when the ejection threshold is changed
+     * @param oldThreshold is the old threshold value
+     * @param newThreshold is the new threshold value
+     * @dev Signature "0x4ae5122a691bf14917d273c6a81956e1f521b3e39f2d0c6d963117bf9c820e83"
+     */
+    event EjectionThresholdChanged(uint256 oldThreshold, uint256 newThreshold);
+
+    /**
+     * @notice Emitted when the threshold value for guardian signatures is changed
+     * @param oldThreshold is the old threshold value
+     * @param newThreshold is the new threshold value
+     * @dev Signature "0x3164947cf0f49f08dd0cd80e671535b1e11590d347c55dcaa97ba3c24a96b33a"
+     */
+    event ThresholdChanged(uint256 oldThreshold, uint256 newThreshold);
+
+    /**
+     * @notice Emitted when a guardian is added to the module
+     * @param guardian The address of the guardian added
+     * @dev Signature "0x038596bb31e2e7d3d9f184d4c98b310103f6d7f5830e5eec32bffe6f1728f969"
+     */
+    event GuardianAdded(address guardian);
+
+    /**
+     * @notice Emitted when a guardian is removed from the module
+     * @param guardian The address of the guardian removed
+     * @dev Signature "0xb8107d0c6b40be480ce3172ee66ba6d64b71f6b1685a851340036e6e2e3e3c52"
+     */
+    event GuardianRemoved(address guardian);
+
+    /**
+     * @notice Emitted when the guardian changes guardian enclave address
+     * @param guardian is the address outside of the enclave
+     * @param guardianEnclave is the enclave address
+     * @param pubKey is the public key
+     * @dev Signature "0x14720919b20fceff2a396c4973d37c6087e4619d40c8f4003d8e44ee127461a2"
+     */
+    event RotatedGuardianKey(address guardian, address guardianEnclave, bytes pubKey);
+
+    /**
+     * @notice Emitted when the mrenclave value is changed
+     * @dev Signature "0x1ff2c57ef9a384cea0c482d61fec8d708967d266f03266e301c6786f7209904a"
+     */
+    event MrEnclaveChanged(bytes32 oldMrEnclave, bytes32 newMrEnclave);
+
+    /**
+     * @notice Emitted when the mrsigner value is changed
+     * @dev Signature "0x1a1fe271c5533136fccd1c6df515ca1f227d95822bfe78b9dd93debf3d709ae6"
+     */
+    event MrSignerChanged(bytes32 oldMrSigner, bytes32 newMrSigner);
+
+    /**
+     * @notice Returns the enclave address registered to `guardian`
+     */
+    function getGuardiansEnclaveAddress(address guardian) external view returns (address);
+
+    /**
+     * @notice Returns the ejection threshold ETH value
+     * @dev The ejection threshold is the minimum amount of ETH on the beacon chain required do the validation duties
+     * If it drops below this value, the validator will be ejected
+     * It is more likely that the validator will run out of Validator Tickets before its balance drops below this value
+     * @return The ejection threshold value
+     */
+    function getEjectionThreshold() external view returns (uint256);
+
+    /**
+     * @notice Sets the values for mrEnclave and mrSigner to `newMrenclave` and `newMrsigner`
+     */
+    function setGuardianEnclaveMeasurements(bytes32 newMrenclave, bytes32 newMrsigner) external;
+
+    /**
+     * @notice Validates the update of the number of validators
+     */
+    function validateTotalNumberOfValidators(
+        uint256 newNumberOfValidators,
+        uint256 epochNumber,
+        bytes[] calldata guardianEOASignatures
+    ) external view;
+
+    /**
+     * @notice Returns the enclave verifier
+     */
+    function ENCLAVE_VERIFIER() external view returns (IEnclaveVerifier);
+
+    /**
+     * @notice Validates the batch withdrawals calldata
+     * @dev The order of the signatures is important
+     * The order of the signatures MUST the same as the order of the validators in the validator module
+     * @param validatorInfos The information of the stopped validators
+     * @param guardianEOASignatures The guardian EOA signatures
+     */
+    function validateBatchWithdrawals(
+        StoppedValidatorInfo[] calldata validatorInfos,
+        bytes[] calldata guardianEOASignatures
+    ) external;
+
+    /**
+     * @notice Validates the node provisioning calldata
+     * @dev The order of the signatures is important
+     * The order of the signatures MUST the same as the order of the guardians in the guardian module
+     * @param pufferModuleIndex is the validator index in Puffer
+     * @param pubKey The public key
+     * @param signature The signature
+     * @param withdrawalCredentials The withdrawal credentials
+     * @param depositDataRoot The deposit data root
+     * @param guardianEnclaveSignatures The guardian enclave signatures
+     */
+    function validateProvisionNode(
+        uint256 pufferModuleIndex,
+        bytes memory pubKey,
+        bytes calldata signature,
+        bytes calldata withdrawalCredentials,
+        bytes32 depositDataRoot,
+        bytes[] calldata guardianEnclaveSignatures
+    ) external view;
+
+    /**
+     * @notice Validates the skipping of provisioning for a specific module
+     * @param moduleName The name of the module
+     * @param skippedIndex The index of the skipped provisioning
+     * @param guardianEOASignatures The guardian EOA signatures
+     */
+    function validateSkipProvisioning(bytes32 moduleName, uint256 skippedIndex, bytes[] calldata guardianEOASignatures)
+        external
+        view;
+
+    /**
+     * @notice Returns the threshold value for guardian signatures
+     * @dev The threshold value is the minimum number of guardian signatures required for a transaction to be considered valid
+     * @return The threshold value
+     */
+    function getThreshold() external view returns (uint256);
+
+    /**
+     * @notice Returns the list of guardians
+     * @dev This function returns an array of addresses representing the guardians
+     * @return An array of addresses representing the guardians
+     */
+    function getGuardians() external view returns (address[] memory);
+
+    /**
+     * @notice Adds a new guardian to the module
+     * @dev Restricted to the DAO
+     * @param newGuardian The address of the new guardian to add
+     */
+    function addGuardian(address newGuardian) external;
+
+    /**
+     * @notice Removes a guardian from the module
+     * @dev Restricted to the DAO
+     * @param guardian The address of the guardian to remove
+     */
+    function removeGuardian(address guardian) external;
+
+    /**
+     * @notice Changes the threshold value for the guardian signatures
+     * @dev Restricted to the DAO
+     * @param newThreshold The new threshold value
+     */
+    function setThreshold(uint256 newThreshold) external;
+
+    /**
+     * @notice Changes the ejection threshold value
+     * @dev Restricted to the DAO
+     * @param newThreshold The new threshold value
+     */
+    function setEjectionThreshold(uint256 newThreshold) external;
+
+    /**
+     * @dev Validates the signatures of the guardians' enclave signatures
+     * @param enclaveSignatures The array of enclave signatures
+     * @param signedMessageHash The hash of the signed message
+     * @return A boolean indicating whether the signatures are valid
+     */
+    function validateGuardiansEnclaveSignatures(bytes[] calldata enclaveSignatures, bytes32 signedMessageHash)
+        external
+        view
+        returns (bool);
+
+    /**
+     * @dev Validates the signatures of the guardians' EOAs.
+     * @param eoaSignatures The array of EOAs' signatures.
+     * @param signedMessageHash The hash of the signed message.
+     * @return A boolean indicating whether the signatures are valid.
+     */
+    function validateGuardiansEOASignatures(bytes[] calldata eoaSignatures, bytes32 signedMessageHash)
+        external
+        view
+        returns (bool);
+
+    /**
+     * @notice Rotates guardian's key
+     * @dev If he caller is not a valid guardian or if the RAVE evidence is not valid the tx will revert
+     * @param blockNumber is the block number
+     * @param pubKey is the public key of the new signature
+     * @param evidence is the RAVE evidence
+     */
+    function rotateGuardianKey(uint256 blockNumber, bytes calldata pubKey, RaveEvidence calldata evidence) external;
+
+    /**
+     * @notice Returns the guardians enclave addresses
+     */
+    function getGuardiansEnclaveAddresses() external view returns (address[] memory);
+
+    /**
+     * @notice Returns the guardians enclave public keys
+     */
+    function getGuardiansEnclavePubkeys() external view returns (bytes[] memory);
+
+    /**
+     * @notice Checks if an account is a guardian
+     * @param account The address to check
+     * @return A boolean indicating whether the account is a guardian
+     */
+    function isGuardian(address account) external view returns (bool);
+
+    /**
+     * @notice Returns the mrenclave value
+     */
+    function getMrenclave() external view returns (bytes32);
+
+    /**
+     * @notice Returns the mrsigner value
+     */
+    function getMrsigner() external view returns (bytes32);
+}
+
+// src/PufferOracleV2.sol
+
+/**
+ * @title PufferOracle
+ * @author Puffer Finance
+ * @custom:security-contact security@puffer.fi
+ */
+contract PufferOracleV2 is IPufferOracleV2, AccessManaged {
+    /**
+     * @dev Burst threshold
+     */
+    uint256 internal constant _BURST_THRESHOLD = 22;
+
+    /**
+     * @notice Guardian Module
+     */
+    IGuardianModule public immutable GUARDIAN_MODULE;
+
+    /**
+     * @notice Puffer Vault
+     */
+    address payable public immutable PUFFER_VAULT;
+
+    /**
+     * @dev Number of active Puffer validators
+     * Slot 0
+     */
+    uint256 internal _numberOfActivePufferValidators;
+
+    /**
+     * @dev Total number of Validators
+     * Slot 1
+     */
+    uint256 internal _totalNumberOfValidators;
+    /**
+     * @dev Epoch number of the update
+     * Slot 2
+     */
+    uint256 internal _epochNumber;
+
+    /**
+     * @dev Price in wei to mint one Validator Ticket
+     * Slot 3
+     */
+    uint256 internal _validatorTicketPrice;
+
+    constructor(IGuardianModule guardianModule, address payable vault, address accessManager)
+        AccessManaged(accessManager)
+    {
+        GUARDIAN_MODULE = guardianModule;
+        PUFFER_VAULT = vault;
+        _totalNumberOfValidators = 927122; // Oracle will be updated with the correct value
+        _epochNumber = 268828; // Oracle will be updated with the correct value
+        _setMintPrice(0.01 ether);
+    }
+
+    /**
+     * @notice Exits the validator from the Beacon chain
+     * @dev Restricted to PufferProtocol contract
+     */
+    function exitValidators(uint256 numberOfExits) public restricted {
+        _numberOfActivePufferValidators -= numberOfExits;
+        emit NumberOfActiveValidators(_numberOfActivePufferValidators);
+    }
+
+    /**
+     * @notice Increases the locked eth amount amount on the Oracle by 32 ETH
+     * It is called when the Beacon chain receives a new deposit from PufferProtocol
+     * The PufferVault balance is decreased by the same amount
+     * @dev Restricted to PufferProtocol contract
+     */
+    function provisionNode() external restricted {
+        unchecked {
+            ++_numberOfActivePufferValidators;
+        }
+        emit NumberOfActiveValidators(_numberOfActivePufferValidators);
+    }
+
+    /**
+     * @notice Updates the price to mint VT
+     * @param newPrice The new price to set for minting VT
+     * @dev Restricted to the DAO
+     */
+    function setMintPrice(uint256 newPrice) external restricted {
+        _setMintPrice(newPrice);
+    }
+
+    /**
+     * @notice Updates the total number of validators
+     * @param newTotalNumberOfValidators The new number of validators
+     */
+    function setTotalNumberOfValidators(
+        uint256 newTotalNumberOfValidators,
+        uint256 epochNumber,
+        bytes[] calldata guardianEOASignatures
+    ) external restricted {
+        if (epochNumber <= _epochNumber) {
+            revert InvalidUpdate();
+        }
+        GUARDIAN_MODULE.validateTotalNumberOfValidators(newTotalNumberOfValidators, epochNumber, guardianEOASignatures);
+        emit TotalNumberOfValidatorsUpdated(_totalNumberOfValidators, newTotalNumberOfValidators, epochNumber);
+        _totalNumberOfValidators = newTotalNumberOfValidators;
+        _epochNumber = epochNumber;
+    }
+
+    /**
+     * @inheritdoc IPufferOracle
+     */
+    function getLockedEthAmount() external view returns (uint256) {
+        return _numberOfActivePufferValidators * 32 ether;
+    }
+
+    /**
+     * @inheritdoc IPufferOracleV2
+     */
+    function getTotalNumberOfValidators() external view returns (uint256) {
+        return _totalNumberOfValidators;
+    }
+
+    /**
+     * @inheritdoc IPufferOracle
+     */
+    function isOverBurstThreshold() external view returns (bool) {
+        return ((_numberOfActivePufferValidators * 100 / _totalNumberOfValidators) > _BURST_THRESHOLD);
+    }
+
+    /**
+     * @inheritdoc IPufferOracle
+     */
+    function getValidatorTicketPrice() external view returns (uint256) {
+        return _validatorTicketPrice;
+    }
+
+    /**
+     * @inheritdoc IPufferOracleV2
+     */
+    function getNumberOfActiveValidators() external view returns (uint256) {
+        return _numberOfActivePufferValidators;
+    }
+
+    function _setMintPrice(uint256 newPrice) internal {
+        emit ValidatorTicketMintPriceUpdated(_validatorTicketPrice, newPrice);
+        _validatorTicketPrice = newPrice;
+    }
+}
+
+// src/ValidatorTicketPricer.sol
+
+/**
+ * @title Validator Ticket Pricer
+ * @notice This contract manages the pricing of validator tickets based on MEV payouts and consensus rewards.
+ * @dev Uses PufferOracleV2 for price updates and inherits access control from AccessManaged.
+ */
+contract ValidatorTicketPricer is AccessManaged, IValidatorTicketPricer {
+    uint256 internal constant _BPS_DECIMALS = 1e4; // 100%
+
+    PufferOracleV2 internal immutable _ORACLE;
+
+    // slot 0
+    uint16 internal _dailyMevPayoutsChangeToleranceBps; // max value 655%
+    uint16 internal _dailyConsensusRewardsChangeToleranceBps; // max value 655%
+    uint16 internal _discountRateBps;
+
+    uint104 internal _dailyMevPayouts; // max value is 20282409603651 ETH
+    uint104 internal _dailyConsensusRewards; // max value is 20282409603651 ETH
+
+    /**
+     * @notice Constructor sets the oracle and access manager
+     * @param oracle The PufferOracleV2 contract address
+     * @param accessManager The address of the access manager contract
+     */
+    constructor(PufferOracleV2 oracle, address accessManager) AccessManaged(accessManager) {
+        _ORACLE = oracle;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function setDailyMevPayoutsChangeToleranceBps(uint16 newValue) external restricted {
+        if (newValue > _BPS_DECIMALS) {
+            // only <= 100% allowed
+            revert InvalidValue();
+        }
+
+        emit DailyMevPayoutsChangeToleranceBPSUpdated(_dailyMevPayoutsChangeToleranceBps, newValue);
+
+        _dailyMevPayoutsChangeToleranceBps = newValue;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function setDailyConsensusRewardsChangeToleranceBps(uint16 newValue) external restricted {
+        if (newValue > _BPS_DECIMALS) {
+            // only <= 100% allowed
+            revert InvalidValue();
+        }
+
+        emit DailyConsensusRewardsChangeToleranceBPSUpdated(_dailyConsensusRewardsChangeToleranceBps, newValue);
+
+        _dailyConsensusRewardsChangeToleranceBps = newValue;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function setDiscountRate(uint16 newValue) external restricted {
+        if (newValue >= _BPS_DECIMALS) {
+            // only < 100% allowed
+            revert InvalidValue();
+        }
+
+        emit DiscountRateUpdated(_discountRateBps, newValue);
+
+        _discountRateBps = newValue;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function setDailyMevPayouts(uint104 newValue) external restricted {
+        _setDailyMevPayouts(newValue);
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function setDailyConsensusRewards(uint104 newValue) external restricted {
+        _setDailyConsensusRewards(newValue);
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function postMintPrice() external restricted {
+        _postMintPrice();
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function setDailyRewardsAndPostMintPrice(uint104 dailyMevPayouts, uint104 dailyConsensusRewards)
+        external
+        restricted
+    {
+        _setDailyMevPayouts(dailyMevPayouts);
+        _setDailyConsensusRewards(dailyConsensusRewards);
+        _postMintPrice();
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function getDailyMevPayoutsChangeToleranceBps() external view returns (uint16) {
+        return _dailyMevPayoutsChangeToleranceBps;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function getDailyConsensusRewardsChangeToleranceBps() external view returns (uint16) {
+        return _dailyConsensusRewardsChangeToleranceBps;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function getDiscountRateBps() external view returns (uint16) {
+        return _discountRateBps;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function getDailyMevPayouts() external view returns (uint104) {
+        return _dailyMevPayouts;
+    }
+
+    /**
+     * @inheritdoc IValidatorTicketPricer
+     */
+    function getDailyConsensusRewards() external view returns (uint104) {
+        return _dailyConsensusRewards;
+    }
+
+    /**
+     * @notice Checks if the new price is within the allowed range
+     * @param oldValue The old price
+     * @param newValue The new price to set for minting VT
+     * @param toleranceBps The allowed tolerance in basis points
+     * @return true if the new price is within the allowed range
+     */
+    function _isWithinRange(uint104 oldValue, uint104 newValue, uint16 toleranceBps) internal pure returns (bool) {
+        if (toleranceBps == 0) {
+            return true;
+        }
+
+        uint256 allowedDifference = (uint256(oldValue) * toleranceBps) / _BPS_DECIMALS;
+
+        if (newValue > oldValue) {
+            return newValue <= oldValue + allowedDifference;
+        }
+
+        return newValue >= oldValue - allowedDifference;
+    }
+
+    /**
+     * @notice Posts the mint price to the oracle
+     * @dev Calculates the new price based on MEV payouts and consensus rewards, applies the discount rate, and updates the oracle
+     */
+    function _postMintPrice() internal {
+        // casting _dailyMevPayouts + _dailyConsensusRewards so that the whole expression is converted to uint256
+        uint256 newPrice = (
+            (_BPS_DECIMALS - _discountRateBps) * (uint256(_dailyMevPayouts) + uint256(_dailyConsensusRewards))
+        ) / _BPS_DECIMALS;
+        if (newPrice == 0) {
+            revert InvalidValue();
+        }
+
+        _ORACLE.setMintPrice(newPrice);
+    }
+
+    /**
+     * @notice Sets the daily consensus rewards value
+     * @param newValue The new daily consensus rewards value to set
+     * @dev Checks if the new value is within the allowed range and emits an event
+     */
+    function _setDailyConsensusRewards(uint104 newValue) internal {
+        uint104 oldValue = _dailyConsensusRewards;
+
+        if (!_isWithinRange(oldValue, newValue, _dailyConsensusRewardsChangeToleranceBps)) {
+            revert InvalidValue();
+        }
+
+        emit DailyConsensusRewardsUpdated(oldValue, newValue);
+
+        _dailyConsensusRewards = newValue;
+    }
+
+    /**
+     * @notice Sets the daily MEV payouts value
+     * @param newValue The new daily MEV payouts value to set
+     * @dev Checks if the new value is within the allowed range and emits an event
+     */
+    function _setDailyMevPayouts(uint104 newValue) internal {
+        uint104 oldValue = _dailyMevPayouts;
+
+        if (!_isWithinRange(oldValue, newValue, _dailyMevPayoutsChangeToleranceBps)) {
+            revert InvalidValue();
+        }
+
+        emit DailyMevPayoutsUpdated(oldValue, newValue);
+
+        _dailyMevPayouts = newValue;
+    }
+}

@@ -1,0 +1,480 @@
+
+// File: contracts/EVMBridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.9;
+
+import "./interfaces/IERC20.sol";
+import "./utils/TransferHelper.sol";
+import "./libs/SafeMath.sol";
+import "./libs/SignedSafeMath.sol";
+
+/**
+ * @title EVMBridge
+ * @author Jeremy Guyet (@jguyet)
+ * @dev 
+ * Smart Contract for manage the transfers between two blockchains
+ * who respect the Ethereum Virtual Machine normal. This Smart contract
+ * contains the list of the chains accepted and list all transactions initialized
+ * with their hash proof from the destination chain. this smart contract is decentralized
+ * but managed by one wallet address (The owner wallet of the Graphlinq project).
+ * This contract is managed by API in Nodejs and we wait 100 block before transfer anything.
+ */
+contract EVMBridge {
+
+    using SafeMath for uint256;
+    using SignedSafeMath for int256;
+
+    address public token;
+    address public owner;
+    address public program;
+    string  public chain;
+
+    uint256 public feesInDollar;
+    uint256 public defaultFeesInETH;
+    uint256 public minimumTransferQuantity;
+
+    //event emitted when new transfer on GLQ bridge
+    event BridgeTransfer(
+        uint256 amount,
+        string  toChain
+    );
+
+    mapping(address => mapping(uint256 => bool)) transfers;
+
+    // Private dex information
+    address private dex_in;
+    address private dex_out;
+    address private dex_pool;
+
+    bool internal paused;
+    bool internal locked;
+
+    constructor(
+        string memory _bridgeChain,
+        address _token,
+        uint256 _feesInDollar,
+        uint256 _minimumTransferQuantity) {
+        require(msg.sender != address(0), "ABORT sender - address(0)");
+        token = _token;
+        owner = msg.sender;
+        program = msg.sender;
+        chain = _bridgeChain;
+        feesInDollar = _feesInDollar;
+        minimumTransferQuantity = _minimumTransferQuantity;
+        defaultFeesInETH = 0;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only the owner can do this action");
+        _;
+    }
+
+    modifier onlyProgramOrOwner() {
+        require(msg.sender == program || msg.sender == owner, "Only program or Owner");
+        _;
+    }
+
+    modifier activated() {
+        require(paused == false, "Bridge actually paused");
+        _;
+    }
+
+    modifier noReentrant() {
+        require(!locked, "No re-entrancy");
+        locked = true;
+        _;
+        locked = false;
+    }
+
+    function getFeesInDollar() public view returns (uint256) {
+        return feesInDollar;
+    }
+
+    function setFeesInDollar(uint256 cost) public onlyOwner {
+        feesInDollar = cost;
+    }
+
+    function setDefaultFeesInETH(uint256 cost) public onlyOwner {
+        defaultFeesInETH = cost;
+    }
+
+    function getFeesInETH() public view returns (uint256) {
+        if (dex_pool != address(0)) {
+            uint256 oneDollar = getTokenPriceOutFromPoolBalance(dex_in, dex_out, dex_pool);
+            return oneDollar.mul(1 ether).div(feesInDollar).mul(100); // multiplication 1 ether pour decaler les decimals.
+        }
+        return defaultFeesInETH;
+    }
+
+    function initTransfer(uint256 quantity, string calldata toChain) public payable noReentrant activated {
+        require(quantity >= minimumTransferQuantity,
+            "INSUFISANT_QUANTITY"
+        );
+        require(msg.value >= getFeesInETH().mul(90).div(100),
+            "PAYMENT_ABORT" // 90% of the fees minimum
+        );
+        require(IERC20(token).balanceOf(msg.sender) >= quantity, "INSUFISANT_BALANCE");
+        require(IERC20(token).allowance(msg.sender, address(this)) >= quantity, "INSUFISANT_ALLOWANCE");
+        TransferHelper.safeTransferFrom(token, msg.sender, address(this), quantity);
+        emit BridgeTransfer(quantity, toChain);
+    }
+
+    function deposit(address coin, uint256 quantity) public onlyOwner noReentrant {
+        require(IERC20(coin).balanceOf(msg.sender) >= quantity, "INSUFISANT_BALANCE");
+        require(IERC20(coin).allowance(msg.sender, address(this)) >= quantity, "INSUFISANT_ALLOWANCE");
+        TransferHelper.safeTransferFrom(coin, msg.sender, address(this), quantity);
+    }
+
+    function balance() public view returns (uint256){
+        return payable(address(this)).balance;
+    }
+
+    function getFees() public view returns (uint256) {
+        return balance();
+    }
+
+    function claimFees() public onlyOwner noReentrant {
+        (bool success,)=owner.call{value:balance()}("");
+        require(success, "BridgeTransfer failed!");
+    }
+
+    function setTransferProcessed(address sender, uint256 transferBn) private {
+        transfers[sender][transferBn] = true;
+    }
+
+    function isTransferProcessed(address sender, uint256 transferBn) public view returns (bool) {
+        return transfers[sender][transferBn];
+    }
+
+    function addTransferFrom(address to, uint256 amount, uint256 bn) public onlyProgramOrOwner {
+        require(isTransferProcessed(to, bn) == false, "Bridge request already processed.");
+
+        setTransferProcessed(to, bn);
+        TransferHelper.safeTransfer(token, to, amount);
+    }
+
+    function getDex() public view returns (address, address, address) {
+        return (dex_in, dex_out, dex_pool);
+    }
+
+    /**
+     * Only 18 decimals tokens.
+     */
+    function setDex(address _in, address _out, address _pool) public onlyOwner {
+        dex_in = _in;
+        dex_out = _out;
+        dex_pool = _pool;
+    }
+
+    function getTokenPriceOutFromPoolBalance(address _in, address _out, address _pool) public view returns (uint256) {
+        uint256 balanceIn = IERC20(_in).balanceOf(_pool);
+        uint256 balanceOut = IERC20(_out).balanceOf(_pool);
+        require(balanceOut > 0);
+        return balanceIn.mul(1 ether).div(balanceOut);
+        // ex: in=USDC,out=ETH = price of ETH in USDC
+        // ex: in=ETH,out=USDC = price of USDC in ETH
+    }
+
+    function updateTransferCost(uint256 _feesInDollar) public onlyOwner {
+        feesInDollar = _feesInDollar;
+    }
+
+    function isPaused() public view returns (bool) {
+        return paused;
+    }
+
+    function setPaused(bool p) public onlyOwner {
+        paused = p;
+    }
+
+    function setMinimumTransferQuantity(uint256 quantity) public onlyOwner {
+        minimumTransferQuantity = quantity;
+    }
+
+    function changeOwner(address newOwner) public onlyOwner {
+        require(newOwner != address(0), "No zero address");
+        owner = newOwner;
+    }
+
+    function changeProgram(address newProgram) public onlyOwner {
+        require(newProgram != address(0), "No zero address");
+        program = newProgram;
+    }
+
+    function _getHash(uint256 timestamp, uint256 nonce, address addr) private pure returns (bytes32) {
+        return keccak256(abi.encodePacked(timestamp, addr, nonce));
+    }
+}
+
+// File: contracts/interfaces/IERC20.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.9;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+// File: contracts/libs/SafeMath.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+/**
+ * @dev Wrappers over Solidity's arithmetic operations.
+ *
+ * NOTE: `SafeMath` is generally not needed starting with Solidity 0.8, since the compiler
+ * now has built in overflow checking.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a - b;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a * b;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator.
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a / b;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a % b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {trySub}.
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b <= a, errorMessage);
+            return a - b;
+        }
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a / b;
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting with custom message when dividing by zero.
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {tryMod}.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a % b;
+        }
+    }
+}
+
+// File: contracts/libs/SignedSafeMath.sol
+// SPDX-License-Identifier: MIT
+
+// OpenZeppelin Contracts v4.4.1 (utils/math/SignedSafeMath.sol)
+pragma solidity ^0.8.0;
+
+library SignedSafeMath {
+    function mul(int256 a, int256 b) internal pure returns (int256) {
+        return a * b;
+    }
+    function div(int256 a, int256 b) internal pure returns (int256) {
+        return a / b;
+    }
+    function sub(int256 a, int256 b) internal pure returns (int256) {
+        return a - b;
+    }
+    function add(int256 a, int256 b) internal pure returns (int256) {
+        return a + b;
+    }
+}
+
+// File: contracts/utils/TransferHelper.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.9;
+
+// helper methods for interacting with ERC20 tokens and sending ETH that do not consistently return true/false
+library TransferHelper {
+    function safeTransfer(address token, address to, uint value) internal {
+        // bytes4(keccak256(bytes('transfer(address,uint256)')));
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: TRANSFER_FAILED');
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint value) internal {
+        // bytes4(keccak256(bytes('transferFrom(address,address,uint256)')));
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: TRANSFER_FROM_FAILED');
+    }
+}

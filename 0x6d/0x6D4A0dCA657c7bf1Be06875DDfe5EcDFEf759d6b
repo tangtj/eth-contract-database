@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+
+contract ITFIRE {
+    using SafeMath for uint256;
+
+    string public constant name = "ITFIRE";
+    string public constant symbol = "ITF";
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply = 15000000000 * 10**uint256(decimals);
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => bool) public isFeeExempt;
+
+    uint256 public buyFeePercent;
+    uint256 public sellFeePercent;
+    address public taxWallet;
+    address public owner;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function.");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+        taxWallet = msg.sender;
+        balanceOf[msg.sender] = totalSupply;
+        emit Transfer(address(0), msg.sender, totalSupply);
+    }
+
+    function transfer(address to, uint256 value) public returns (bool) {
+        require(balanceOf[msg.sender] >= value, "Insufficient balance");
+        if (isFeeExempt[msg.sender] || isFeeExempt[to]) {
+            _transfer(msg.sender, to, value);
+        } else {
+            uint256 fee = 0;
+            if (msg.sender == owner) { // Buy transaction
+                fee = value.mul(buyFeePercent).div(100);
+            } else if (to == owner) { // Sell transaction
+                fee = value.mul(sellFeePercent).div(100);
+            }
+            uint256 amountAfterFee = value.sub(fee);
+            _transfer(msg.sender, to, amountAfterFee);
+            if (fee > 0) {
+                _transfer(msg.sender, taxWallet, fee);
+            }
+        }
+        return true;
+    }
+
+    function _transfer(address from, address to, uint256 value) internal {
+        require(to != address(0), "Transfer to the zero address");
+        balanceOf[from] = balanceOf[from].sub(value);
+        balanceOf[to] = balanceOf[to].add(value);
+        emit Transfer(from, to, value);
+    }
+
+    function approve(address spender, uint256 value) public returns (bool) {
+        require(spender != address(0), "Approve to the zero address");
+        allowance[msg.sender][spender] = value;
+        emit Approval(msg.sender, spender, value);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 value) public returns (bool) {
+        require(value <= balanceOf[from], "Insufficient balance");
+        require(value <= allowance[from][msg.sender], "Insufficient allowance");
+        allowance[from][msg.sender] = allowance[from][msg.sender].sub(value);
+        transfer(to, value);
+        return true;
+    }
+
+    function setBuyFee(uint256 _buyFeePercent) external onlyOwner {
+        require(_buyFeePercent <= 10, "Fee cannot exceed 10%");
+        buyFeePercent = _buyFeePercent;
+    }
+
+    function setSellFee(uint256 _sellFeePercent) external onlyOwner {
+        require(_sellFeePercent <= 10, "Fee cannot exceed 10%");
+        sellFeePercent = _sellFeePercent;
+    }
+
+    function setTaxWallet(address _taxWallet) external onlyOwner {
+        require(_taxWallet != address(0), "Tax wallet cannot be the zero address");
+        taxWallet = _taxWallet;
+    }
+
+    function excludeFromFee(address account) external onlyOwner {
+        isFeeExempt[account] = true;
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "New owner cannot be the zero address");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    // Allows the owner to withdraw tokens from the contract
+    function withdrawTokens(uint256 amount, address to) external onlyOwner {
+        require(balanceOf[address(this)] >= amount, "Insufficient tokens in the contract");
+        _transfer(address(this), to, amount);
+    }
+
+    // Allows the owner to withdraw BNB from the contract
+    function withdrawFunds(uint256 amount, address payable to) external onlyOwner {
+        require(address(this).balance >= amount, "Insufficient BNB balance in the contract");
+        to.transfer(amount);
+    }
+
+    receive() external payable {}  // Allows the contract to receive BNB directly
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        return c;
+    }
+}
