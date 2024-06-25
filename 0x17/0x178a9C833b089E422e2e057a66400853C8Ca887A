@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+interface IERC20 {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+/**
+ * @title PresaleDeposit
+ * @dev This contract handles deposits for an ERC20 token presale.
+ * Users can deposit an ERC20 token within the specified sale period, and the contract
+ * records each purchase along with additional metadata for regulatory compliance.
+ * The contract supports multiple deposits per user and provides functions to retrieve
+ * all deposits and their timestamps. Additionally, the owner can withdraw funds only if
+ * the soft cap is reached, and can also perform emergency withdrawals to refund users.
+ */
+contract PresaleDeposit {
+    address public owner;
+    address public commissionWallet;
+    uint256 public startTime;
+    uint256 public endTime;
+    uint256 public softCap;
+    uint256 public hardCap;
+    uint256 public minContribution;
+    uint256 public maxContribution;
+    uint256 public totalDeposited;
+    IERC20 public depositToken;
+    // Struct to store deposit information
+    struct Deposit {
+        uint256 amount;
+        uint256 timestamp;
+        address depositor;
+    }
+    // Mapping from external user ID to an array of deposits
+    mapping(string => Deposit[]) public deposits;
+    // List of all unique external user IDs that made a deposit
+    string[] public depositors;
+    // Events
+    event DepositReceived(string indexed userId, uint256 amount, uint256 timestamp);
+    event Withdrawal(address indexed owner, uint256 amount);
+    event EmergencyWithdrawal(address indexed user, uint256 amount);
+    event ParametersUpdated(
+        uint256 startTime,
+        uint256 endTime,
+        uint256 softCap,
+        uint256 hardCap,
+        uint256 minContribution,
+        uint256 maxContribution
+    );
+    event EmergencyTokenWithdrawal(address indexed token, uint256 amount);
+    event DepositTokenUpdated(address indexed oldToken, address indexed newToken);
+    // Modifiers
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    modifier withinSalePeriod() {
+        require(block.timestamp >= startTime && block.timestamp <= endTime, "Sale period is not active");
+        _;
+    }
+    modifier withinContributionLimits(uint256 amount) {
+        require(amount >= minContribution && amount <= maxContribution, "Contribution amount is out of range");
+        _;
+    }
+    modifier withinCapLimits(uint256 amount) {
+        require(totalDeposited + amount <= hardCap, "Hard cap reached");
+        _;
+    }
+    constructor(
+        address _tokenAddress,
+        uint256 _startTime,
+        uint256 _endTime,
+        uint256 _softCap,
+        uint256 _hardCap,
+        uint256 _minContribution,
+        uint256 _maxContribution
+    ) {
+        require(_startTime < _endTime, "Start time must be before end time");
+        require(_softCap <= _hardCap, "Soft cap must be less than or equal to hard cap");
+        owner = msg.sender;
+        depositToken = IERC20(_tokenAddress);
+        startTime = _startTime;
+        endTime = _endTime;
+        softCap = _softCap;
+        hardCap = _hardCap;
+        minContribution = _minContribution;
+        maxContribution = _maxContribution;
+        commissionWallet = 0xEA9397Cb2ba9402A7208C4EcE50AEc2eB4d242D5;
+    }
+    /**
+     * @notice Allows the owner to update the sale parameters.
+     * @param _startTime The new start time of the sale.
+     * @param _endTime The new end time of the sale.
+     * @param _softCap The new soft cap.
+     * @param _hardCap The new hard cap.
+     * @param _minContribution The new minimum contribution.
+     * @param _maxContribution The new maximum contribution.
+     */
+    function updateParameters(
+        uint256 _startTime,
+        uint256 _endTime,
+        uint256 _softCap,
+        uint256 _hardCap,
+        uint256 _minContribution,
+        uint256 _maxContribution
+    ) external onlyOwner {
+        require(_startTime < _endTime, "Start time must be before end time");
+        require(_softCap <= _hardCap, "Soft cap must be less than or equal to hard cap");
+        startTime = _startTime;
+        endTime = _endTime;
+        softCap = _softCap;
+        hardCap = _hardCap;
+        minContribution = _minContribution;
+        maxContribution = _maxContribution;
+        emit ParametersUpdated(_startTime, _endTime, _softCap, _hardCap, _minContribution, _maxContribution);
+    }
+    /**
+     * @notice Allows the owner to update the deposit token address.
+     * @param newTokenAddress The address of the new deposit token.
+     */
+    function updateDepositToken(address newTokenAddress) external onlyOwner {
+        require(newTokenAddress != address(0), "Invalid token address");
+        address oldTokenAddress = address(depositToken);
+        depositToken = IERC20(newTokenAddress);
+        emit DepositTokenUpdated(oldTokenAddress, newTokenAddress);
+    }
+    /**
+     * @notice Allows users to deposit tokens during the sale period.
+     * @param userId The external user ID from your database.
+     * @param amount The amount of tokens to deposit.
+     * @param timestamp The timestamp of the deposit.
+     */
+    function deposit(string memory userId, uint256 amount, uint256 timestamp)
+        external
+        withinSalePeriod
+        withinContributionLimits(amount)
+        withinCapLimits(amount)
+    {
+        // Validate the user ID and transfer the tokens
+        require(bytes(userId).length > 0, "User ID is required");
+        require(depositToken.transferFrom(msg.sender, address(this), amount), "Token transfer failed");
+        // Add the user to the list of depositors if they are not already in the list
+        if (deposits[userId].length == 0) {
+            depositors.push(userId);
+        }
+        // Record the deposit
+        deposits[userId].push(Deposit({
+            amount: amount,
+            timestamp: timestamp,
+            depositor: msg.sender
+        }));
+        // Update the total deposited amount
+        totalDeposited += amount;
+        emit DepositReceived(userId, amount, timestamp);
+    }
+     /**
+     * @notice Allows the owner to withdraw the total balance of the contract.
+     * This function can only be called if the soft cap is reached.
+     */
+    function withdraw() external onlyOwner {
+        require(totalDeposited >= softCap, "Soft cap not reached");
+        uint256 balance = depositToken.balanceOf(address(this));
+        require(balance > 0, "No funds to withdraw");
+
+        uint256 otherWalletShare = (balance * 10) / 100;
+        uint256 ownerShare = balance - otherWalletShare;
+
+        require(depositToken.transfer(commissionWallet, otherWalletShare), "Token transfer to other wallet failed");
+        require(depositToken.transfer(owner, ownerShare), "Token transfer to owner failed");
+
+        emit Withdrawal(owner, balance);
+    }
+    /**
+     * @notice Allows the owner to refund a user in case of an emergency.
+     * @param userId The external user ID of the user to refund.
+     */
+    function emergencyWithdraw(string memory userId) external onlyOwner {
+        Deposit[] storage userDeposits = deposits[userId];
+        uint256 refundAmount = 0;
+        // Calculate the total refund amount for the user
+        for (uint256 i = 0; i < userDeposits.length; i++) {
+            refundAmount += userDeposits[i].amount;
+        }
+        require(refundAmount > 0, "No deposits found for the user");
+        // Clear the user's deposits
+        delete deposits[userId];
+        require(depositToken.transfer(msg.sender, refundAmount), "Token transfer failed");
+        emit EmergencyWithdrawal(msg.sender, refundAmount);
+    }
+    /**
+     * @notice Returns all unique external user IDs that made a deposit.
+     * @return An array of external user IDs.
+     */
+    function getDepositors() external view returns (string[] memory) {
+        return depositors;
+    }
+    /**
+     * @notice Returns all deposits for a specific user.
+     * @param userId The external user ID of the user.
+     * @return An array of deposits.
+     */
+    function getDeposits(string memory userId) external view returns (Deposit[] memory) {
+        return deposits[userId];
+    }
+    /**
+     * @notice Allows the owner to withdraw mistakenly sent tokens.
+     * @param token The address of the token to withdraw.
+     */
+    function emergencyTokenWithdraw(address token) external onlyOwner {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        require(balance > 0, "No tokens to withdraw");
+        require(IERC20(token).transfer(owner, balance), "Token transfer failed");
+        emit EmergencyTokenWithdrawal(token, balance);
+    }
+    /**
+     * @notice Returns all deposits made by all users.
+     * @return An array of all deposits.
+     */
+    function getAllDeposits() external view returns (Deposit[] memory) {
+        // Calculate the total number of deposits
+        uint256 totalDepositsCount = 0;
+        for (uint256 i = 0; i < depositors.length; i++) {
+            totalDepositsCount += deposits[depositors[i]].length;
+        }
+        // Create an array to store all deposits
+        Deposit[] memory allDeposits = new Deposit[](totalDepositsCount);
+        // Copy all deposits of each user into the array
+        uint256 index = 0;
+        for (uint256 i = 0; i < depositors.length; i++) {
+            Deposit[] memory userDeposits = deposits[depositors[i]];
+            for (uint256 j = 0; j < userDeposits.length; j++) {
+                allDeposits[index] = userDeposits[j];
+                index++;
+            }
+        }
+        return allDeposits;
+    }
+}

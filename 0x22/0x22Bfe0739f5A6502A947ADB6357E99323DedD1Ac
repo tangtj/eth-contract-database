@@ -1,0 +1,47 @@
+pragma solidity >=0.6.2;
+
+interface IUniswapV2Pair {
+    function burn(address to) external returns (uint amount0, uint amount1);
+    function sync() external;
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+interface IERC20 {
+  function transfer(address to, uint256 value) external returns (bool);
+}
+
+
+contract v2DirectBurn {
+	address payable public owner;
+	
+	constructor() public payable{
+	    owner = msg.sender;
+	}
+	
+	modifier onlyOwner {
+	    require(msg.sender==owner,'not owner');
+	    _;
+	}
+	
+	function burnV2liquidity (address pair, uint256 LP) public payable {
+	    pair.call(abi.encodeWithSignature("sync()"));
+	    pair.call(abi.encodeWithSignature("transferFrom(address,address,uint256)",msg.sender, pair, LP));
+	    (bool success,) = pair.call(abi.encodeWithSignature("burn(address)",msg.sender));
+	    require(success, "burn failed");
+	}
+	
+	 //recover functions
+    function withdraw() public payable{
+        owner.transfer( address( this ).balance );
+    }
+    function toke(address _toke, uint amt) public payable{
+        require(msg.sender==owner);
+        IERC20(_toke).transfer(owner,amt);
+    }
+    
+    receive () external payable {}
+    fallback () external payable {}
+	
+	
+}

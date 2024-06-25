@@ -1,0 +1,473 @@
+// SPDX-License-Identifier: MIT
+
+/*
+
+BRC20 Tools and Portofolio Management Service on Telegram.
+
+Website link: https://ordible.bot
+Twitter: https://x.com/ordible_bot
+Medium: https://ordible.medium.com
+Youtube: https://youtube.com/@ordible
+Telegram: https://t.me/ordiblebot
+Other Useful links: https://linktr.ee/Ordible
+
+**/
+
+pragma solidity 0.8.19;
+
+/**
+ * @title Context
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, but through this contract instead.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+/**
+ * @title IERC20
+ * @dev Interface for the ERC20 standard token.
+ */
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+/**
+ * @title Ownable
+ * @dev Contract module that provides basic authorization control functions.
+ * Implements a modified version of the OpenZeppelin Ownable contract.
+ */
+contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor () {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+}
+
+/**
+ * @title IUniswapV2Factory
+ * @dev Interface for the Uniswap V2 Factory contract.
+ */
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+/**
+ * @title IUniswapV2Router02
+ * @dev Interface for the Uniswap V2 Router02 contract.
+ */
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+/**
+ * @title Ordible
+ * @dev ERC20 token contract with additional features for tax, liquidity, and ownership.
+ */
+contract Ordible is Context, IERC20, Ownable {
+    mapping (address => uint256) private _balances;
+    mapping (address => mapping (address => uint256)) private _allowances;
+    mapping (address => bool) private _isExcludedFromFee;
+
+    address payable private _taxWallet;
+    address private constant deadAddress = address(0xdead);
+    address private constant uniswapV2RouterAddress = address(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+
+    uint256 private initialBuyTaxRate  = 20;
+    uint256 private initialSellTaxRate = 25;
+    uint256 private finalBuyTaxRate  = 4;
+    uint256 private finalSellTaxRate = 4;
+    uint256 private buyTaxReductionThreshold  = 30;
+    uint256 private sellTaxReductionThreshold = 45;
+    uint256 private buyCountSwapThreshold = 40;
+    uint256 private totalBuysCount = 0;
+
+    string private constant _name = "Ordible";
+    string private constant _symbol = "ORB";
+    uint8 private constant _decimals = 9;
+    uint256 private constant _totalSupply = 100000000 * 10**_decimals;
+
+    uint256 public _maxTxAmount = 1000000 * 10**_decimals;
+    uint256 public _maxWalletSize = 1000000 * 10**_decimals;
+    uint256 public _taxSwapThreshold = 100000 * 10**_decimals;
+    uint256 public _maxTaxSwap = 1000000 * 10**_decimals;
+
+    IUniswapV2Router02 private uniswapV2Router;
+    address private uniswapV2Pair;
+
+    bool private tradingOpen;
+    bool private limitEffect = true;
+    bool private inSwap = false;
+    bool private swapEnabled = false;
+
+    modifier lockTheSwap {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor(address payable taxWalletAddress) {
+        _taxWallet = taxWalletAddress;
+        _balances[_msgSender()] = _totalSupply;
+        _isExcludedFromFee[owner()] = true;
+        _isExcludedFromFee[deadAddress] = true;
+        _isExcludedFromFee[address(this)] = true;
+        _isExcludedFromFee[_taxWallet] = true;
+        emit Transfer(address(0), _msgSender(), _totalSupply);
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     */
+    function decimals() public pure returns (uint8) {
+        return _decimals;
+    }
+
+    /**
+     * @dev Returns the total token supply.
+     */
+    function totalSupply() public pure override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev Returns the balance of the specified address.
+     * @param account The address to query the balance of.
+     */
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev Transfers `amount` tokens to `recipient`.
+     * @param recipient The address to transfer to.
+     * @param amount The amount to be transferred.
+     */
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through `transferFrom`. This is
+     * zero by default.
+     * @param owner The address which owns the funds.
+     * @param spender The address which will spend the funds.
+     */
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     * @param spender The address which will spend the funds.
+     * @param amount The amount of tokens to allow.
+     */
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` tokens from `sender` to `recipient` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     * @param sender The address which owns the funds.
+     * @param recipient The address which will receive the funds.
+     * @param amount The amount to be transferred.
+     */
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        require(_allowances[sender][_msgSender()] >= amount, "ERC20: transfer amount exceeds allowance");
+        _transfer(sender, recipient, amount);
+        _approve(sender, _msgSender(), _allowances[sender][_msgSender()] - amount);
+        return true;
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner`'s tokens.
+     * @param owner The address which owns the funds.
+     * @param spender The address which will spend the funds.
+     * @param amount The amount of tokens to allow.
+     */
+    function _approve(address owner, address spender, uint256 amount) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Moves tokens `amount` from `from` to `to`.
+     * @param from The address which owns the funds.
+     * @param to The address which will receive the funds.
+     * @param amount The amount to be transferred.
+     */
+    function _transfer(address from, address to, uint256 amount) private {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+
+        uint256 contractTokenBalance = balanceOf(address(this));
+        uint256 taxAmount = 0;
+        
+        if (from != owner() && to != owner()) {
+
+            if (!tradingOpen) {
+                require( 
+                  _isExcludedFromFee[from] || _isExcludedFromFee[to],
+                  "Trading is not yet open"
+                );
+            }
+
+        if (from == uniswapV2Pair) {
+            // This is a buy transaction
+            if (limitEffect && to != address(uniswapV2Router) && ! _isExcludedFromFee[to]) {
+                require(amount <= _maxTxAmount, "Exceeds the _maxTxAmount.");
+                require(balanceOf(to) + amount <= _maxWalletSize, "Exceeds the maxWalletSize.");
+            } 
+            taxAmount = calculateTax(amount, true, totalBuysCount > buyTaxReductionThreshold);
+            totalBuysCount++;
+        } else if (to == uniswapV2Pair) {
+            // This is a sell transaction
+            taxAmount = calculateTax(amount, false, totalBuysCount > sellTaxReductionThreshold);
+        }
+            if (taxAmount > 0) {
+                _balances[address(this)] += taxAmount;
+                emit Transfer(from, address(this), taxAmount);
+            }
+        }
+
+        _balances[from] -= amount;
+        _balances[to] += amount - taxAmount;
+        emit Transfer(from, to, amount - taxAmount);
+
+        if (contractTokenBalance > _taxSwapThreshold && to == uniswapV2Pair && !inSwap && swapEnabled && totalBuysCount > buyCountSwapThreshold) {
+            swapAndSendToFee();
+        }
+    }
+
+    /**
+     * @dev Calculates the tax amount based on the given amount and tax rate.
+     * @param amount The amount to calculate the tax for.
+     * @param reduced Whether the tax rate should be reduced or not.
+     * @return The calculated tax amount.
+     */
+    function calculateTax(uint256 amount, bool isBuy, bool reduced) private view returns (uint256) {
+        uint256 taxRate;
+        if (isBuy) {
+            taxRate = reduced ? finalBuyTaxRate : initialBuyTaxRate;
+        } else {
+            taxRate = reduced ? finalSellTaxRate : initialSellTaxRate;
+        }
+        return (amount * taxRate) / 100;
+    }
+
+
+    /**
+     * @dev Swaps tokens for ETH and sends the ETH to the tax wallet.
+     */
+    function swapAndSendToFee() private lockTheSwap {
+        uint256 contractTokenBalance = _balances[address(this)];
+        uint256 amountToSwap = min(contractTokenBalance, _maxTaxSwap);
+        swapTokensForEth(amountToSwap);
+        uint256 contractETHBalance = address(this).balance;
+        if (contractETHBalance > 0) {
+            _taxWallet.transfer(contractETHBalance);
+        }
+    }
+
+    /**
+     * @dev Returns the minimum of two numbers.
+     * @param a The first number.
+     * @param b The second number.
+     * @return The minimum of the two numbers.
+     */
+    function min(uint256 a, uint256 b) private pure returns (uint256) {
+        return (a > b) ? b : a;
+    }
+
+    /**
+     * @dev Swaps tokens for ETH using the Uniswap V2 Router.
+     * @param tokenAmount The amount of tokens to swap.
+     */
+    function swapTokensForEth(uint256 tokenAmount) private lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    /**
+     * @dev Initializes the contract by creating a Uniswap V2 pair and adding liquidity.
+     * Can only be called by the owner.
+     */
+    function initialize() external onlyOwner() {
+        require(!tradingOpen, "initialize is already added");
+
+        // Adjusted to use native Solidity arithmetic
+        uint256 tokenAmount = balanceOf(address(this)) - (_totalSupply * initialBuyTaxRate / 100);
+
+        uniswapV2Router = IUniswapV2Router02(uniswapV2RouterAddress);
+        _approve(address(this), address(uniswapV2Router), _totalSupply);
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(
+            address(this), 
+            uniswapV2Router.WETH()
+        );
+
+        uniswapV2Router.addLiquidityETH{value: address(this).balance} (
+            address(this),
+            tokenAmount,
+            0,  // min amount of token
+            0,  // min amount of ETH
+            owner(),
+            block.timestamp
+        );
+
+        IERC20(uniswapV2Pair).approve(address(uniswapV2Router), type(uint).max);
+    }
+
+    /**
+     * @dev Removes the limits on transaction amount and wallet size.
+     * Can only be called by the owner.
+     * @return A boolean indicating whether the limits were successfully removed.
+     */
+    function removeLimits() external onlyOwner returns (bool) {
+        limitEffect = false;
+        return true;
+    }
+    
+    /**
+     * @dev Reduces the tax rate for buying and selling.
+     * Can only be called by the owner.
+     * @param _value The new tax rate value.
+     * @return A boolean indicating whether the tax rate was successfully reduced.
+     */
+    function reduceTax(uint256 _value) external onlyOwner returns (bool) {
+        finalBuyTaxRate = _value;
+        finalSellTaxRate = _value;
+        require(_value <= 50);
+        return true;
+    }
+
+    /**
+     * @dev Opens trading by enabling swaps.
+     * Can only be called by the owner.
+     * @return A boolean indicating whether trading was successfully opened.
+     */
+    function openTrading() external onlyOwner returns (bool) {
+        require(!tradingOpen, "trading is already open");
+        swapEnabled = true;
+        tradingOpen = true;
+        return true;
+    }
+
+    /**
+     * @dev Clears any stuck ETH in the contract by transferring it to the tax wallet.
+     * @return A boolean indicating whether the stuck ETH was successfully cleared.
+     */
+    function clearstuckETH() external returns (bool) {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            _taxWallet.transfer(ethBalance);
+        }
+        return true;
+    }
+    
+    /**
+     * @dev Clears any stuck tokens in the contract by transferring them to the tax wallet.
+     * @param tokenAddress The address of the token to clear.
+     * @return A boolean indicating whether the stuck tokens were successfully cleared.
+     */
+    function clearstuckToken(address tokenAddress) external returns (bool) {
+        uint256 tokenBalance = IERC20(tokenAddress).balanceOf(address(this));
+        if (tokenBalance > 0) {
+            IERC20(tokenAddress).transfer(_taxWallet, tokenBalance);
+        }
+        return true;
+    }
+
+    /**
+     * @dev Fallback function to receive ETH.
+     */
+    receive() external payable {}
+}

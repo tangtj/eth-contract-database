@@ -1,0 +1,616 @@
+
+// File: /contracts/Multisig.sol
+// SPDX-License-Identifier: MIT
+// Tells the Solidity compiler to compile only from v0.8.13 to v0.9.0
+pragma solidity ^0.8.0;
+
+import "./AccessControl.sol";
+
+contract Multisig {
+
+    address[] public owners;
+    mapping (address => bool) public isOwner;
+    uint256 public requiredSignatures;
+    uint public timelock;
+    uint public maxTimeLock;
+    AccessControl accessControl;
+
+    event Approved(uint transactionId, uint8 operation);
+    event Executed(uint transactionId, uint8 operation);
+    event NewTransaction(uint transactionId, uint8 operation, bool add);
+
+    struct Custodian {
+        address[] newCustodianAddress;
+        uint8[] custodianCategories;
+        uint256 unlockTimestamp;
+        bool executed;
+        bool add; // true to add false to remove
+    }
+
+    struct Token {
+        address newTokenAddress;
+        uint256 unlockTimestamp;
+        bool executed;
+        bool add; // true to add false to remove
+    }
+
+    Custodian[] public CustodianTransactions;    
+    Token[] public TokenTransactions;    
+
+    mapping(uint => mapping(uint => mapping(address => bool))) public approved;
+
+    modifier onlyOwner(){
+        require(isOwner[msg.sender], "not owner");
+        _;
+    }
+
+    modifier txValid(uint _transactionId, uint8 _operation){
+        if (_operation == 1){
+            require (_transactionId < CustodianTransactions.length, "invalid tx id");
+            }
+        if (_operation == 2){
+            require (_transactionId < TokenTransactions.length, "invalid tx id");
+         }
+         _;
+    }
+
+    modifier txNotExecuted(uint _transactionId, uint8 _operation){
+        if (_operation == 1){
+            require (CustodianTransactions[_transactionId].executed == false, "tx already executed");
+        }
+        if (_operation == 2){
+            require (TokenTransactions[_transactionId].executed == false, "tx already executed");
+        }
+        _;
+    }
+
+    function _getTimestamp() private view returns (uint timestamp){
+        bool overflow= false;
+        (overflow, timestamp) = _tryAdd(block.number, timelock);
+        require (overflow, "timelock overflow");
+    }
+
+    function _checkTimelocks(uint proposedUnlockTime) private view { 
+        require (proposedUnlockTime < block.number, "timelock not met");
+        (bool overflow, uint staleTime) = _tryAdd(proposedUnlockTime, maxTimeLock);
+        require (overflow, "timelock overflow");
+        require (staleTime > block.number, "transaction staled");
+    }
+
+    constructor(address[] memory _owners, uint _requiredSignatures, address _accessControlAddress, uint _timelockInDays)
+    {
+        require(_owners.length > 0, "not valid owners");
+        require(_requiredSignatures > 0 && _requiredSignatures <= _owners.length, "invalid data");
+        require(_timelockInDays > 0, "invalid timelock");
+        _checkZeroAddress(_accessControlAddress);
+        accessControl = AccessControl(_accessControlAddress);
+
+        for (uint i=0; i< _owners.length; i++){
+            _checkZeroAddress(_owners[i]);
+            require(!isOwner[_owners[i]], "owner not unique");
+            isOwner[_owners[i]] = true;
+            owners.push(_owners[i]);
+        }
+
+        bool overflow = false;
+        bool overflow2 = false;
+
+        (overflow, timelock) = _tryMul(7200, _timelockInDays);
+        require (overflow, "timelock overflow");
+        (overflow2, maxTimeLock) = _tryMul(timelock, 2); //transaction goes stale after 3* timelock (1+2)
+        require (overflow2, "maxTimelock overflow");
+        requiredSignatures = _requiredSignatures;
+    }
+
+    function submitCustodiansAllowable(address[] memory _newCustodianAddresses, uint8[] memory _custodianCategories) public onlyOwner {
+        CustodianTransactions.push(Custodian({
+            newCustodianAddress: _newCustodianAddresses,
+            custodianCategories: _custodianCategories,
+            unlockTimestamp: _getTimestamp(),
+            executed: false,
+            add: true
+        }));
+        emit NewTransaction(CustodianTransactions.length -1, 1, true);
+    }
+
+    function submitCustodiansRemoved(address[] memory _newCustodianAddresses) public onlyOwner {
+        uint8[] memory emptyArray;
+        CustodianTransactions.push(Custodian({
+            newCustodianAddress: _newCustodianAddresses,
+            custodianCategories: emptyArray,
+            unlockTimestamp: _getTimestamp(),
+            executed: false,
+            add: false
+        }));
+        emit NewTransaction(CustodianTransactions.length -1, 1, false);
+    }
+
+    function submitTokenAllowed(address _newTokenAddress) public onlyOwner {
+        TokenTransactions.push(Token({
+            newTokenAddress: _newTokenAddress,
+            unlockTimestamp: _getTimestamp(),
+            executed: false,
+            add: true
+        }));
+        emit NewTransaction(TokenTransactions.length -1, 2, true);
+    }
+
+    function submitTokenRemoved(address _newTokenAddress) public onlyOwner {
+        TokenTransactions.push(Token({
+            newTokenAddress: _newTokenAddress,
+            unlockTimestamp: _getTimestamp(),
+            executed: false,
+            add: false
+        }));
+        emit NewTransaction(TokenTransactions.length -1, 2, false);
+    }
+
+    function approveTransaction(uint _transactionId, uint8 _operationType) public 
+        onlyOwner() 
+        txValid(_transactionId, _operationType)
+        txNotExecuted(_transactionId, _operationType) { // 1 for custodian 2 for token
+        require (!approved[_transactionId][_operationType][msg.sender], "tx already approved");
+        approved[_transactionId][_operationType][msg.sender] = true;
+        emit Approved(_transactionId, _operationType); 
+    }
+
+    function executeTransaction(uint _transactionId, uint8 _operationType) external
+    onlyOwner()
+    txValid(_transactionId, _operationType)
+    txNotExecuted(_transactionId, _operationType) {
+        require(_getApprovalCount(_transactionId, _operationType) >= requiredSignatures, "not enough approvals");
+        if (_operationType == 1){
+            Custodian storage custodian = CustodianTransactions[_transactionId];
+            _checkTimelocks(custodian.unlockTimestamp);
+            custodian.executed = true;
+            if (custodian.add){
+                accessControl.setMultipleCustodiansAllowable(custodian.newCustodianAddress, custodian.custodianCategories);
+            } else {
+                for (uint i = 0; i< custodian.newCustodianAddress.length; i++){
+                    accessControl.removeCustodianAllowable(custodian.newCustodianAddress[i]);
+                }
+            }
+        }
+        if (_operationType == 2){
+            Token storage token = TokenTransactions[_transactionId];
+            _checkTimelocks(token.unlockTimestamp);
+            token.executed = true;
+            if (token.add) {
+                accessControl.setTokenAllowable(token.newTokenAddress);
+            } else {
+                accessControl.removeTokenAllowable(token.newTokenAddress);
+            }
+        }
+        emit Executed(_transactionId, _operationType);
+    }
+
+    function _getApprovalCount(uint _transactionId, uint8 _operation) private view returns (uint count){
+        for (uint i = 0; i < owners.length; i++) {
+            if (approved[_transactionId][_operation][owners[i]]){
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    function getCustodianData(uint _transactionId) public view returns (address[] memory _custodians, uint8[] memory _category, 
+        uint256 _unlockBlock, bool _executed, bool _add){
+        Custodian memory data = CustodianTransactions[_transactionId];
+        _custodians = data.newCustodianAddress;
+        _category = data.custodianCategories;
+        _unlockBlock = data.unlockTimestamp;
+        _executed = data.executed;
+        _add = data.add;    
+    }
+
+
+    function _checkZeroAddress(address _address) internal pure {
+        require (_address != address(0), "Invalid address");
+    }
+
+    //OPPENZEPPELIN functions
+    function _tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+    function _tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+}
+
+// File: /contracts/AccessControl.sol
+// SPDX-License-Identifier: MIT
+// Tells the Solidity compiler to compile only from v0.8.13 to v0.9.0
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+contract AccessControl {    
+
+    address public owner;
+    address public auditor;
+    address public settlementContract;
+
+    bool public definedContract = false;
+
+    mapping(address => bool) private custodianAddresses; 
+    mapping(address => uint8) private custodianCategory; // 1 - Big custodians  2 - Individuals 10 - Marked as releasable
+    mapping(address => bool) private allowableTokens;
+
+    event CustodianAdded(address custodianAddress, uint8 custodianCategory);
+
+
+    constructor(address auditorAddress){
+        checkZeroAddress(auditorAddress);
+        auditor = auditorAddress;
+        owner = msg.sender;
+    }
+
+    function onlyOwner (address sentAddress) private view {
+        require(sentAddress == owner, "Not contract owner");
+        return;
+    }
+
+    function checkZeroAddress(address _address) internal pure {
+        require (_address != address(0), "Invalid address");
+    }
+
+    function onlySettlementAndAuditor(address settlementContractOrAuditorAddress) private view {
+        require((settlementContractOrAuditorAddress == auditor) || (settlementContractOrAuditorAddress == settlementContract), "No permission to release");
+        return;
+    }
+
+     function onlySettlement(address settlementContractOrAuditorAddress) private view {
+        require((settlementContractOrAuditorAddress == settlementContract), "No permission to lock");
+        return;
+    }
+
+    function onlyAllowed (address sentAddress) external view {
+        require(custodianAddresses[sentAddress] == true || sentAddress == auditor, "Address not allowed");
+        return;
+    }
+
+    function onlyAllowedToken(address tokenAddress) external view {
+        require(allowableTokens[tokenAddress] == true, "Token not allowed");
+        return;
+    }
+
+    function isAuditor(address auditorAddress) external view returns (bool) {
+        require(auditor == auditorAddress, "Address is not the auditor");
+        return true;
+    }
+
+    function markAsRelease(address custodianAddress) public {
+        onlySettlementAndAuditor(msg.sender);
+        require (custodianCategory[custodianAddress] == 2, "Wrong custodian category");
+        custodianCategory[custodianAddress] = 10;
+    }
+
+    function setMultipleCustodiansAllowable(address[] calldata newCustodianAddresses, uint8[] calldata custodianCategories) external {
+        require(newCustodianAddresses.length == custodianCategories.length);
+        onlyOwner(msg.sender);
+        for (uint8 i = 0; i< newCustodianAddresses.length; i++){
+            setCustodianAllowable(newCustodianAddresses[i], custodianCategories[i]);
+        }
+    }
+
+    function setCustodianAllowable(address custodianAddress, uint8 custodianCategoryValue) public {
+        onlyOwner(msg.sender);
+        checkZeroAddress(custodianAddress);
+        custodianAddresses[custodianAddress] = true;
+        custodianCategory[custodianAddress] = custodianCategoryValue;
+        emit CustodianAdded(custodianAddress, custodianCategoryValue);
+    }
+
+    function getCustodianAllowable(address custodianAddress) external view returns (bool, uint8) {
+        return (custodianAddresses[custodianAddress], custodianCategory[custodianAddress]);
+    }
+
+    function isVirtualCustodian(address custodianAddress) external view returns (bool) {
+        return 2 == custodianCategory[custodianAddress];
+    }
+    function isBrickAndMortar(address custodianAddress) external view returns (bool){
+        return 1 == custodianCategory[custodianAddress];
+    }
+
+    function isReleased(address custodianAddress) external view returns (bool) {
+        return 10 == custodianCategory[custodianAddress];
+    }
+
+    function relockForVC(address custodianAddress) external {
+        onlySettlement(msg.sender);
+        if(custodianCategory[custodianAddress] == 10) custodianCategory[custodianAddress] = 2; //relocks custodian after marked for release
+        require(custodianCategory[custodianAddress] == 2, "Custodian category cannot lock funds");
+        return;
+    }
+
+    function validateSettlement(address creditor, address debtor, bool releaseCreditor, bool releaseDebtor, address[] calldata tokenAddresses) external view{
+        require ((custodianAddresses[creditor] && custodianAddresses[debtor]), "Invalid creditor/debtor");
+        bool inconsistent = false;
+        if (releaseCreditor && custodianCategory[creditor]!= 2){
+            inconsistent = true;
+        }
+        if (releaseDebtor && custodianCategory[debtor]!= 2){
+            inconsistent = true;
+        }
+        require(!inconsistent, "Creditor/debtor is not a VC to be released");
+        for(uint index = 0; index < tokenAddresses.length; index++) {
+            require(allowableTokens[tokenAddresses[index]], "Invalid token used");
+        }        
+    }
+
+    function removeCustodianAllowable(address custodianAddress) external {
+        onlyOwner(msg.sender);
+        custodianAddresses[custodianAddress] = false;
+    }    
+
+    function setTokenAllowable(address tokenAddress) external {
+        onlyOwner(msg.sender);
+        allowableTokens[tokenAddress] = true;
+    }
+
+    function removeTokenAllowable(address tokenAddress) external {
+        onlyOwner(msg.sender);
+        allowableTokens[tokenAddress] = false;
+    }
+
+    function getTokenAllowable(address tokenAddress) public view returns (bool) {
+        return allowableTokens[tokenAddress];
+    }
+
+    function changeOwnership(address ownerAddress) external {
+        onlyOwner(msg.sender);
+        checkZeroAddress(ownerAddress);
+        owner = ownerAddress;
+    }
+
+    function addSettlementContractAddress(address settlementAddress) public {
+        onlyOwner(msg.sender);
+        require (definedContract == false, "Cannot redefine linked settlement contract");
+        checkZeroAddress(settlementAddress);
+        settlementContract = settlementAddress;
+        definedContract = true;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/math/SafeMath.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (utils/math/SafeMath.sol)
+
+pragma solidity ^0.8.0;
+
+// CAUTION
+// This version of SafeMath should only be used with Solidity 0.8 or later,
+// because it relies on the compiler's built in overflow checks.
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations.
+ *
+ * NOTE: `SafeMath` is generally not needed starting with Solidity 0.8, since the compiler
+ * now has built in overflow checking.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a - b;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a * b;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator.
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a / b;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a % b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {trySub}.
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        unchecked {
+            require(b <= a, errorMessage);
+            return a - b;
+        }
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a / b;
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting with custom message when dividing by zero.
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {tryMod}.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a % b;
+        }
+    }
+}
+

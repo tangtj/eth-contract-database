@@ -1,0 +1,937 @@
+
+// File: contracts/Governor.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {IGovernor} from "./interfaces/IGovernor.sol";
+import {ITimeLock} from "./interfaces/ITimeLock.sol";
+
+/// @title Governor
+/// @notice Extends Uniswap's timelock contract with batch queueing/execution and reworked permissions model where,
+///         instead of a single admin to perform all actions, there are multiple queue admins, a single veto admin,
+///         and permissionless execution (which can optionally be restricted to non-contract accounts to prevent
+///         unintended execution of governance proposals inside protocol functions)
+contract Governor is IGovernor {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    /// @inheritdoc IGovernor
+    address public immutable override timeLock;
+
+    /// @dev Set of queue admins
+    EnumerableSet.AddressSet internal _queueAdminsSet;
+
+    /// @inheritdoc IGovernor
+    address public override vetoAdmin;
+
+    /// @inheritdoc IGovernor
+    bool public isExecutionByContractsAllowed;
+
+    /// @inheritdoc IGovernor
+    mapping(uint256 => BatchInfo) public override batchInfo;
+
+    /// @inheritdoc IGovernor
+    mapping(bytes32 => BatchedTxInfo) public override batchedTxInfo;
+
+    /// @dev Ensures that function can only be called by the timelock contract
+    modifier timeLockOnly() {
+        if (msg.sender != timeLock) revert CallerNotTimelockException();
+        _;
+    }
+
+    /// @dev Ensures that function can only be called by one of queue admins
+    modifier queueAdminOnly() {
+        if (!_queueAdminsSet.contains(msg.sender)) revert CallerNotQueueAdminException();
+        _;
+    }
+
+    /// @dev Ensures that function can only be called by the veto admin
+    modifier vetoAdminOnly() {
+        if (msg.sender != vetoAdmin) revert CallerNotVetoAdminException();
+        _;
+    }
+
+    /// @dev Ensures that function can't be called by contracts unless explicitly allowed
+    modifier allowedCallerTypeOnly() {
+        if (!isExecutionByContractsAllowed && msg.sender != tx.origin) revert CallerMustNotBeContractException();
+        _;
+    }
+
+    /// @notice Constructs a new governor contract
+    /// @param _timeLock Timelock contract address
+    /// @param _queueAdmin Address to add as the first queue admin, can't be `address(0)`
+    /// @param _vetoAdmin Address to set as the veto admin, can't be `address(0)`
+    /// @param _allowExecutionByContracts Whether to allow transaction/batch execution by contracts
+    constructor(address _timeLock, address _queueAdmin, address _vetoAdmin, bool _allowExecutionByContracts) {
+        timeLock = _timeLock;
+        _addQueueAdmin(_queueAdmin);
+        _updateVetoAdmin(_vetoAdmin);
+
+        if (_allowExecutionByContracts) {
+            isExecutionByContractsAllowed = true;
+            emit AllowExecutionByContracts();
+        } else {
+            emit ForbidExecutionByContracts();
+        }
+    }
+
+    /// @inheritdoc IGovernor
+    function queueAdmins() external view override returns (address[] memory) {
+        return _queueAdminsSet.values();
+    }
+
+    // ------- //
+    // ACTIONS //
+    // ------- //
+
+    /// @inheritdoc IGovernor
+    function queueTransaction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta
+    ) external override queueAdminOnly returns (bytes32 txHash) {
+        txHash = _getTxHash(target, value, signature, data, eta);
+        if (ITimeLock(timeLock).queuedTransactions(txHash)) revert TransactionAlreadyQueuedException();
+
+        BatchInfo memory info = batchInfo[block.number];
+        if (info.initiator != address(0)) {
+            if (msg.sender != info.initiator) revert CallerNotBatchInitiatorException();
+            if (eta != info.eta) revert ETAMistmatchException();
+
+            batchedTxInfo[txHash] = BatchedTxInfo({batchBlock: uint64(block.number), index: info.length});
+            batchInfo[block.number].length = info.length + 1;
+        }
+
+        ITimeLock(timeLock).queueTransaction(target, value, signature, data, eta);
+    }
+
+    /// @inheritdoc IGovernor
+    function startBatch(uint80 eta) external override queueAdminOnly {
+        if (batchInfo[block.number].initiator != address(0)) revert BatchAlreadyStartedException();
+        batchInfo[block.number] = BatchInfo({initiator: msg.sender, length: 0, eta: eta});
+        emit QueueBatch(msg.sender, block.number);
+    }
+
+    /// @inheritdoc IGovernor
+    function executeTransaction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta
+    ) external payable override allowedCallerTypeOnly returns (bytes memory) {
+        return _transactionAction(target, value, signature, data, eta, TxAction.Execute);
+    }
+
+    /// @inheritdoc IGovernor
+    function executeBatch(TxParams[] calldata txs) external payable override allowedCallerTypeOnly {
+        uint256 batchBlock = _batchAction(txs, TxAction.Execute);
+        emit ExecuteBatch(msg.sender, batchBlock);
+    }
+
+    /// @inheritdoc IGovernor
+    function cancelTransaction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta
+    ) external override vetoAdminOnly {
+        _transactionAction(target, value, signature, data, eta, TxAction.Cancel);
+    }
+
+    /// @inheritdoc IGovernor
+    function cancelBatch(TxParams[] calldata txs) external override vetoAdminOnly {
+        uint256 batchBlock = _batchAction(txs, TxAction.Cancel);
+        emit CancelBatch(msg.sender, batchBlock);
+    }
+
+    // ------------- //
+    // CONFIGURATION //
+    // ------------- //
+
+    /// @inheritdoc IGovernor
+    function addQueueAdmin(address admin) external override timeLockOnly {
+        _addQueueAdmin(admin);
+    }
+
+    /// @inheritdoc IGovernor
+    function removeQueueAdmin(address admin) external override timeLockOnly {
+        if (_queueAdminsSet.contains(admin)) {
+            if (_queueAdminsSet.length() == 1) revert CantRemoveLastQueueAdminException();
+            _queueAdminsSet.remove(admin);
+            emit RemoveQueueAdmin(admin);
+        }
+    }
+
+    /// @inheritdoc IGovernor
+    function updateVetoAdmin(address admin) external override timeLockOnly {
+        _updateVetoAdmin(admin);
+    }
+
+    /// @inheritdoc IGovernor
+    function allowExecutionByContracts() external override timeLockOnly {
+        if (!isExecutionByContractsAllowed) {
+            isExecutionByContractsAllowed = true;
+            emit AllowExecutionByContracts();
+        }
+    }
+
+    /// @inheritdoc IGovernor
+    function forbidExecutionByContracts() external override timeLockOnly {
+        if (isExecutionByContractsAllowed) {
+            isExecutionByContractsAllowed = false;
+            emit ForbidExecutionByContracts();
+        }
+    }
+
+    /// @inheritdoc IGovernor
+    function claimTimeLockOwnership() external override queueAdminOnly {
+        ITimeLock(timeLock).acceptAdmin();
+    }
+
+    // --------- //
+    // INTERNALS //
+    // --------- //
+
+    /// @dev Executes or cancels a transaction, ensures that it is not part of any batch
+    function _transactionAction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta,
+        TxAction action
+    ) internal returns (bytes memory result) {
+        bytes32 txHash = _getTxHash(target, value, signature, data, eta);
+        if (batchedTxInfo[txHash].batchBlock != 0) revert CantPerformActionOutsideBatchException();
+        return _performAction(target, value, signature, data, eta, action);
+    }
+
+    /// @dev Executes or cancels a batch of transactions, ensures that all transactions are processed in the correct order
+    function _batchAction(TxParams[] calldata txs, TxAction action) internal returns (uint256 batchBlock) {
+        uint256 len = txs.length;
+        if (len == 0) revert IncorrectBatchException();
+
+        batchBlock = batchedTxInfo[_getTxHash(txs[0])].batchBlock;
+        if (batchBlock == 0) revert IncorrectBatchException();
+
+        if (len != batchInfo[batchBlock].length) revert IncorrectBatchException();
+
+        unchecked {
+            for (uint256 i; i < len; ++i) {
+                TxParams calldata tx_ = txs[i];
+                bytes32 txHash = _getTxHash(tx_);
+
+                BatchedTxInfo memory info = batchedTxInfo[txHash];
+                if (info.batchBlock != batchBlock || info.index != i) revert UnexpectedTransactionException(txHash);
+
+                _performAction(tx_.target, tx_.value, tx_.signature, tx_.data, tx_.eta, action);
+                delete batchedTxInfo[txHash];
+            }
+        }
+
+        delete batchInfo[batchBlock];
+    }
+
+    /// @dev Executes or cancels a transaction
+    function _performAction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta,
+        TxAction action
+    ) internal returns (bytes memory result) {
+        if (action == TxAction.Execute) {
+            result = ITimeLock(timeLock).executeTransaction{value: value}(target, value, signature, data, eta);
+        } else {
+            ITimeLock(timeLock).cancelTransaction(target, value, signature, data, eta);
+        }
+    }
+
+    /// @dev `addQueueAdmin` implementation
+    function _addQueueAdmin(address admin) internal {
+        if (admin == address(0)) revert AdminCantBeZeroAddressException();
+        if (!_queueAdminsSet.contains(admin)) {
+            _queueAdminsSet.add(admin);
+            emit AddQueueAdmin(admin);
+        }
+    }
+
+    /// @dev `updateVetoAdmin` implementation
+    function _updateVetoAdmin(address admin) internal {
+        if (admin == address(0)) revert AdminCantBeZeroAddressException();
+        if (vetoAdmin != admin) {
+            vetoAdmin = admin;
+            emit UpdateVetoAdmin(admin);
+        }
+    }
+
+    /// @dev Computes transaction hash
+    function _getTxHash(address target, uint256 value, string calldata signature, bytes calldata data, uint256 eta)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(target, value, signature, data, eta));
+    }
+
+    /// @dev Computes transaction hash
+    function _getTxHash(TxParams calldata tx_) internal pure returns (bytes32) {
+        return _getTxHash(tx_.target, tx_.value, tx_.signature, tx_.data, tx_.eta);
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position of the value in the `values` array, plus 1 because index 0
+        // means a value is not in the set.
+        mapping(bytes32 => uint256) _indexes;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._indexes[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We read and store the value's index to prevent multiple reads from the same storage slot
+        uint256 valueIndex = set._indexes[value];
+
+        if (valueIndex != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 toDeleteIndex = valueIndex - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (lastIndex != toDeleteIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the last value to the index where the value to delete is
+                set._values[toDeleteIndex] = lastValue;
+                // Update the index for the moved value
+                set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the index for the deleted slot
+            delete set._indexes[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._indexes[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: contracts/interfaces/IGovernor.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.0;
+
+/// @title Governor interface
+interface IGovernor {
+    // ----- //
+    // TYPES //
+    // ----- //
+
+    /// @notice Timelock contract transaction params packed in a struct
+    /// @param target Target contract to call
+    /// @param value Value to send in the call
+    /// @param signature Signature of the target contract's function to call
+    /// @param data ABI-encoded parameters to call the function with
+    /// @param eta Transaction ETA (timestamp after which it can be executed)
+    struct TxParams {
+        address target;
+        uint256 value;
+        string signature;
+        bytes data;
+        uint256 eta;
+    }
+
+    /// @notice Batch information
+    /// @param initiator Queue admin that initiated the batch
+    /// @param length Number of transactions in the batch
+    /// @param eta ETA of transactions in the batch
+    struct BatchInfo {
+        address initiator;
+        uint16 length;
+        uint80 eta;
+    }
+
+    /// @notice Batched transaction information
+    /// @param batchBlock Block the batch was initiated in
+    /// @param index Index of transaction within the batch
+    struct BatchedTxInfo {
+        uint64 batchBlock;
+        uint16 index;
+    }
+
+    /// @notice Action that can be performed with a queued transaction
+    enum TxAction {
+        Execute,
+        Cancel
+    }
+
+    // ------ //
+    // EVENTS //
+    // ------ //
+
+    /// @notice Emitted when `caller` initiates a batch in `batchBlock`
+    event QueueBatch(address indexed caller, uint256 indexed batchBlock);
+
+    /// @notice Emitted when `caller` executes a batch initiated in `batchBlock`
+    event ExecuteBatch(address indexed caller, uint256 indexed batchBlock);
+
+    /// @notice Emitted when `caller` cancels a batch initiated in `batchBlock`
+    event CancelBatch(address indexed caller, uint256 indexed batchBlock);
+
+    /// @notice Emitted when `admin` is added to the list of queue admins
+    event AddQueueAdmin(address indexed admin);
+
+    /// @notice Emitted when `admin` is removed from the list of queue admins
+    event RemoveQueueAdmin(address indexed admin);
+
+    /// @notice Emitted when `admin` is set as the new veto admin
+    event UpdateVetoAdmin(address indexed admin);
+
+    /// @notice Emitted when transaction/batch execution by contracts is allowed
+    event AllowExecutionByContracts();
+
+    /// @notice Emitted when transaction/batch execution by contracts is forbidden
+    event ForbidExecutionByContracts();
+
+    // ------ //
+    // ERRORS //
+    // ------ //
+
+    /// @notice Thrown when an account that is not a queue admin tries to queue a transaction or initiate a batch
+    error CallerNotQueueAdminException();
+
+    /// @notice Thrown when an account that is not the timelock contract tries to configure the governor
+    error CallerNotTimelockException();
+
+    /// @notice Thrown when an account that is not the veto admin tries to cancel a transaction or a batch
+    error CallerNotVetoAdminException();
+
+    /// @notice Thrown when trying to execute a trasaction or a batch from the contract when it's forbidden
+    error CallerMustNotBeContractException();
+
+    /// @notice Thrown when a queue admin tries to add transactions to the batch not initiated by themselves
+    error CallerNotBatchInitiatorException();
+
+    /// @notice Thrown when trying to queue a transaction that is already queued
+    error TransactionAlreadyQueuedException();
+
+    /// @notice Thrown when batched transaction's ETA differs from the batch ETA
+    error ETAMistmatchException();
+
+    /// @notice Thrown when trying to initiate a batch more than once in a block
+    error BatchAlreadyStartedException();
+
+    /// @notice Thrown when trying to execute or cancel a transaction individually while it's part of some batch
+    error CantPerformActionOutsideBatchException();
+
+    /// @notice Thrown when a passed list of transactions doesn't represent a valid queued batch
+    error IncorrectBatchException();
+
+    /// @notice Thrown when a passed list of transactions contains a transaction different from those in the queued batch
+    error UnexpectedTransactionException(bytes32 txHash);
+
+    /// @notice Thrown when trying to set zero address as a queue or veto admin
+    error AdminCantBeZeroAddressException();
+
+    /// @notice Thrown when trying to remove the last queue admin
+    error CantRemoveLastQueueAdminException();
+
+    // ----- //
+    // STATE //
+    // ----- //
+
+    /// @notice Returns an address of the timelock contract
+    function timeLock() external view returns (address);
+
+    /// @notice Returns an array of addresses of queue admins
+    function queueAdmins() external view returns (address[] memory);
+
+    /// @notice Returns an address of the veto admin
+    function vetoAdmin() external view returns (address);
+
+    /// @notice Whether transaction/batch execution by contracts is allowed
+    function isExecutionByContractsAllowed() external view returns (bool);
+
+    /// @notice Returns info for the batch initiated in `batchBlock`
+    /// @dev `initiator == address(0)` means that there was no batch initiated in that block
+    function batchInfo(uint256 batchBlock) external view returns (address initiator, uint16 length, uint80 eta);
+
+    /// @notice Returns batch info for the transaction with given `txHash`
+    /// @dev `batchBlock == 0` means that transaction is not part of any batch
+    function batchedTxInfo(bytes32 txHash) external view returns (uint64 batchBlock, uint16 index);
+
+    // ------- //
+    // ACTIONS //
+    // ------- //
+
+    /// @notice Queues a transaction in the timelock. Ensures that it's not already queued. When no batch is initiated,
+    ///         simply forwards the call to the timelock contract. Otherwise, appends the transaction to the batch after
+    ///         checking that caller is the account that initiated the batch and ETAs of all transactions are the same.
+    /// @dev See `TxParams` for params description
+    /// @dev Can only be called by queue admins
+    function queueTransaction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta
+    ) external returns (bytes32 txHash);
+
+    /// @notice Initiates a batch of transactions. All the transactions that are queued after this call in the same block
+    ///         will form a batch that can only be executed/cancelled as a whole. Typically, this will be the first call
+    ///         in a multicall that queues a batch, followed by multiple `queueTransaction` calls.
+    /// @param eta ETA of transactions in the batch
+    /// @dev Can only be called by queue admins
+    function startBatch(uint80 eta) external;
+
+    /// @notice Executes a queued transaction. Ensures that it is not part of any batch and forwards the call to the
+    ///         timelock contract.
+    /// @dev See `TxParams` for params description
+    /// @dev Can only be called by EOAs unless execution by contracts is allowed
+    function executeTransaction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta
+    ) external payable returns (bytes memory result);
+
+    /// @notice Executes a queued batch of transactions. Ensures that `txs` is the same ordered list of transactions as
+    ///         the one that was queued, and forwards all calls to the timelock contract.
+    /// @dev Can only be called by EOAs unless execution by contracts is allowed
+    function executeBatch(TxParams[] calldata txs) external payable;
+
+    /// @notice Cancels a queued transaction. Ensures that it is not part of any batch and forwards the call to the
+    ///         timelock contract.
+    /// @dev See `TxParams` for params description
+    /// @dev Can only be called by the veto admin
+    function cancelTransaction(
+        address target,
+        uint256 value,
+        string calldata signature,
+        bytes calldata data,
+        uint256 eta
+    ) external;
+
+    /// @notice Cancels a queued batch of transactions. Ensures that `txs` is the same ordered list of transactions as
+    ///         the one that was queued, and forwards all calls to the timelock contract.
+    /// @dev Can only be called by the veto admin
+    function cancelBatch(TxParams[] calldata txs) external;
+
+    // ------------- //
+    // CONFIGURATION //
+    // ------------- //
+
+    /// @notice Adds `admin` to the list of queue admins, ensures that it's not zero address
+    /// @dev Can only be called by the timelock contract
+    function addQueueAdmin(address admin) external;
+
+    /// @notice Removes `admin` from the list of queue admins, ensures that it's not the last admin
+    /// @dev Can only be called by the timelock contract
+    function removeQueueAdmin(address admin) external;
+
+    /// @notice Sets `admin` as the new veto admin, ensures that it's not zero address
+    /// @dev Can only be called by the timelock contract
+    /// @dev It's assumed that veto admin is a contract that has means to prevent it from blocking its' own update,
+    ///      for example, it might be a multisig that can remove malicious signers
+    function updateVetoAdmin(address admin) external;
+
+    /// @notice Allows transactions/batches to be executed by contracts
+    /// @dev Can only be called by the timelock contract
+    function allowExecutionByContracts() external;
+
+    /// @notice Forbids transactions/batches to be executed by contracts
+    /// @dev Can only be called by the timelock contract
+    function forbidExecutionByContracts() external;
+
+    /// @notice Claims ownership ower the `timeLock` contract
+    /// @dev Must be executed by the first queue admin after deploying this contract and setting it as timelock's owner
+    function claimTimeLockOwnership() external;
+}
+
+
+// File: contracts/interfaces/ITimeLock.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.0;
+
+/// @title Timelock interface
+interface ITimeLock {
+    function admin() external view returns (address);
+
+    function delay() external view returns (uint256);
+
+    function queuedTransactions(bytes32 txHash) external view returns (bool);
+
+    function queueTransaction(address target, uint256 value, string memory signature, bytes memory data, uint256 eta)
+        external
+        returns (bytes32 txHash);
+
+    function executeTransaction(address target, uint256 value, string memory signature, bytes memory data, uint256 eta)
+        external
+        payable
+        returns (bytes memory result);
+
+    function cancelTransaction(address target, uint256 value, string memory signature, bytes memory data, uint256 eta)
+        external;
+
+    function setPendingAdmin(address newPendingAdmin) external;
+
+    function acceptAdmin() external;
+}
+

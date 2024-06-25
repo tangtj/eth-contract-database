@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+/*
+ * @title Access Control Contract
+ * @dev Handles CEO address authorization for contracts that inherit from it
+ */
+contract AccessControl {
+    address payable public ceoAddress;
+
+    constructor() {
+        ceoAddress = payable(msg.sender);
+    }
+
+    modifier onlyCEO() {
+        require(msg.sender == ceoAddress, "Caller is not the CEO");
+        _;
+    }
+
+    function setCEO(address payable _newCEO) public onlyCEO {
+        require(_newCEO != address(0), "CEO address cannot be zero");
+        ceoAddress = _newCEO;
+    }
+}
+
+/*
+ * @title BlingETH Contract
+ * @dev Manages ETH to Bling token sales
+ * @author Steven Becerra
+ * @version 1.0
+ */
+contract BlingETH is AccessControl {
+    string public constant version = "1.0";
+    mapping(uint256 => uint256) public packages; // package Id to ETH amount
+    uint256[] private packageIds;
+
+    event Purchase(address indexed buyer, uint256 indexed ethSent, uint256 indexed packageId);
+    event Withdrawal(address indexed to, uint256 amount);
+    event PackageUpdated(uint256 indexed packageId, uint256 ethAmount, address indexed updatedBy);
+
+    constructor() {
+        // initialize bling packages and package Ids
+        packages[50] = 0.01 ether;
+        packages[100] = 0.02 ether;
+        packages[200] = 0.04 ether;
+        packages[500] = 0.1 ether;
+        packages[1000] = 0.2 ether;
+        packageIds = [50, 100, 200, 500, 1000];
+    }
+
+    // purchase bling token package
+    function buyBling(uint256 packageId) public payable {
+        uint256 packagePrice = packages[packageId];
+        require(packagePrice > 0, "Package does not exist");
+        require(msg.value == packagePrice, "Incorrect ETH amount");
+
+        emit Purchase(msg.sender, msg.value, packageId);
+    }
+
+    // withdraw accumulated funds
+    function withdrawFunds() public onlyCEO {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No funds available");
+        ceoAddress.transfer(balance);
+        
+        emit Withdrawal(ceoAddress, balance);
+    }
+
+    // add or update packages
+    function setPackage(uint256 tokenId, uint256 ethAmount) public onlyCEO {
+        require(ethAmount > 0, "ETH amount must be greater than zero");
+        if (packages[tokenId] == 0) {
+            packageIds.push(tokenId);
+        }
+        packages[tokenId] = ethAmount;
+
+        emit PackageUpdated(tokenId, ethAmount, msg.sender);
+    }
+
+    // return the current balance of the contract
+    function getContractBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function getPackageIds() public view returns (uint256[] memory) {
+        return packageIds;
+    }
+
+    function getAllPackages() public view returns (uint256[] memory, uint256[] memory) {
+        uint256[] memory ids = new uint256[](packageIds.length);
+        uint256[] memory values = new uint256[](packageIds.length);
+        for (uint i = 0; i < packageIds.length; i++) {
+            ids[i] = packageIds[i];
+            values[i] = packages[packageIds[i]];
+        }
+
+        return (ids, values);
+    }
+}

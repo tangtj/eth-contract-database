@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.26;
+
+struct Params2 {
+    uint256 amount;
+    address[] path;
+}
+
+struct Params3 {
+    address tokenIn;
+    address tokenOut;
+    uint24 fee;
+    address recipient;
+    uint256 deadline;
+    uint256 amountIn;
+    uint256 amountOutMinimum;
+    uint160 sqrtPriceLimitX96;
+}
+
+abstract contract Token {
+    function approve(address, uint256) public virtual;
+    function balanceOf(address) public virtual view returns (uint256);
+    function transfer(address, uint256) public virtual;
+    function withdraw(uint256) public virtual;
+}
+
+abstract contract Router {
+    function swapExactTokensForTokens(uint256, uint256, address[] calldata, address, uint256) public virtual;
+    function exactInputSingle(Params3 calldata) public virtual;
+}
+
+abstract contract Settle {
+    function settleOrders(bytes calldata) public virtual;
+}
+
+contract Maker {
+
+    address private constant owner = 0x290D6bd41bE8a04C4cD41C70A0278b52c14D7d8B;
+    address private constant inch = 0x1111111254EEB25477B68fb85Ed929f73A960582;
+
+    Token private constant WETH = Token(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    Token private constant USDT = Token(0xdAC17F958D2ee523a2206206994597C13D831ec7);
+
+    Settle private constant SETTLE = Settle(0xA88800CD213dA5Ae406ce248380802BD53b47647);
+    Router private constant ROUTER2 = Router(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+    Router private constant ROUTER3 = Router(0xE592427A0AEce92De3Edee1F18E0157C05861564);
+
+    function isValidSignature(bytes32, bytes calldata) public view returns (bytes4) {
+        require(tx.origin == owner);
+        return 0x1626ba7e;
+    }
+
+    function settleOrders(bytes[] calldata data) public {
+        require(msg.sender == owner);
+        for (uint256 i; i < data.length; i++) {
+            SETTLE.settleOrders(data[i]);
+        }
+    }
+
+    function resolveOrders(Params2[] calldata params2, Params3[] calldata params3) public {
+        require(msg.sender == owner);
+        for (uint256 i; i < params2.length; i++) {
+            Token(params2[i].path[0]).approve(address(ROUTER2), params2[i].amount);
+            ROUTER2.swapExactTokensForTokens(params2[i].amount, 0, params2[i].path, address(this), block.timestamp);
+        }
+        for (uint256 j; j < params3.length; j++) {
+            Token(params3[j].tokenIn).approve(address(ROUTER3), params3[j].amountIn);
+            ROUTER3.exactInputSingle(params3[j]);
+        }
+        WETH.withdraw(WETH.balanceOf(address(this)));
+        payable(msg.sender).transfer(address(this).balance);
+    }
+
+    function approveUSDT() public {
+        require(msg.sender == owner);
+        USDT.approve(inch, type(uint256).max);
+    }
+
+    function withdrawUSDT() public {
+        require(msg.sender == owner);
+        USDT.transfer(msg.sender, USDT.balanceOf(address(this)));
+    }
+
+    receive() external payable {}
+}
