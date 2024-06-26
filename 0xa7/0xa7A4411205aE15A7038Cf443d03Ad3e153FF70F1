@@ -1,0 +1,1500 @@
+
+// File: src/validators/ManagedValidator.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.25;
+
+import "../interfaces/validators/IManagedValidator.sol";
+
+import "../utils/DefaultAccessControl.sol";
+
+contract ManagedValidator is IManagedValidator {
+    /// @inheritdoc IManagedValidator
+    uint256 public constant ADMIN_ROLE_MASK = 1 << 255;
+    /// @inheritdoc IManagedValidator
+    bytes32 public constant STORAGE_POSITION =
+        keccak256("mellow.lrt.permissions.storage");
+
+    modifier authorized() {
+        requirePermission(msg.sender, address(this), msg.sig);
+        _;
+    }
+
+    constructor(address admin) {
+        Storage storage ds = _storage();
+        ds.userRoles[admin] = ADMIN_ROLE_MASK;
+    }
+
+    function _storage() internal pure returns (Storage storage ds) {
+        bytes32 position = STORAGE_POSITION;
+
+        assembly {
+            ds.slot := position
+        }
+    }
+
+    /// @inheritdoc IManagedValidator
+    function hasPermission(
+        address user,
+        address contractAddress,
+        bytes4 signature
+    ) public view returns (bool) {
+        Storage storage s = _storage();
+        uint256 roleSet = s.userRoles[user] | s.publicRoles;
+        if ((roleSet & ADMIN_ROLE_MASK) > 0) return true;
+        if ((roleSet & s.allowAllSignaturesRoles[contractAddress]) > 0)
+            return true;
+        if ((roleSet & s.allowSignatureRoles[contractAddress][signature]) > 0)
+            return true;
+        return false;
+    }
+
+    /// @inheritdoc IManagedValidator
+    function requirePermission(
+        address user,
+        address contractAddress,
+        bytes4 signature
+    ) public view {
+        if (!hasPermission(user, contractAddress, signature))
+            revert Forbidden();
+    }
+
+    /// @inheritdoc IManagedValidator
+    function grantPublicRole(uint8 role) external authorized {
+        _storage().publicRoles |= 1 << role;
+        emit PublicRoleGranted(role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function revokePublicRole(uint8 role) external authorized {
+        _storage().publicRoles &= ~(1 << role);
+        emit PublicRoleRevoked(role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function grantRole(address user, uint8 role) external authorized {
+        _storage().userRoles[user] |= 1 << role;
+        emit RoleGranted(user, role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function revokeRole(address user, uint8 role) external authorized {
+        _storage().userRoles[user] &= ~(1 << role);
+        emit RoleRevoked(user, role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function setCustomValidator(
+        address contractAddress,
+        address validator
+    ) external authorized {
+        if (validator == address(this)) revert Forbidden();
+        _storage().customValidator[contractAddress] = validator;
+        emit CustomValidatorSet(contractAddress, validator);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function grantContractRole(
+        address contractAddress,
+        uint8 role
+    ) external authorized {
+        _storage().allowAllSignaturesRoles[contractAddress] |= 1 << role;
+        emit ContractRoleGranted(contractAddress, role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function revokeContractRole(
+        address contractAddress,
+        uint8 role
+    ) external authorized {
+        _storage().allowAllSignaturesRoles[contractAddress] &= ~(1 << role);
+        emit ContractRoleRevoked(contractAddress, role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function grantContractSignatureRole(
+        address contractAddress,
+        bytes4 signature,
+        uint8 role
+    ) external authorized {
+        _storage().allowSignatureRoles[contractAddress][signature] |= 1 << role;
+        emit ContractSignatureRoleGranted(contractAddress, signature, role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function revokeContractSignatureRole(
+        address contractAddress,
+        bytes4 signature,
+        uint8 role
+    ) external authorized {
+        _storage().allowSignatureRoles[contractAddress][signature] &= ~(1 <<
+            role);
+        emit ContractSignatureRoleRevoked(contractAddress, signature, role);
+    }
+
+    /// @inheritdoc IManagedValidator
+    function customValidator(
+        address contractAddress
+    ) external view returns (address) {
+        return _storage().customValidator[contractAddress];
+    }
+
+    /// @inheritdoc IManagedValidator
+    function userRoles(address user) external view returns (uint256) {
+        return _storage().userRoles[user];
+    }
+
+    /// @inheritdoc IManagedValidator
+    function publicRoles() external view returns (uint256) {
+        return _storage().publicRoles;
+    }
+
+    /// @inheritdoc IManagedValidator
+    function allowAllSignaturesRoles(
+        address contractAddress
+    ) external view returns (uint256) {
+        return _storage().allowAllSignaturesRoles[contractAddress];
+    }
+
+    /// @inheritdoc IManagedValidator
+    function allowSignatureRoles(
+        address contractAddress,
+        bytes4 selector
+    ) external view returns (uint256) {
+        return _storage().allowSignatureRoles[contractAddress][selector];
+    }
+
+    /// @inheritdoc IValidator
+    function validate(
+        address from,
+        address to,
+        bytes calldata data
+    ) external view {
+        if (data.length < 0x4) revert InvalidData();
+        requirePermission(from, to, bytes4(data[:4]));
+        address validator = _storage().customValidator[to];
+        if (validator == address(0)) return;
+        IValidator(validator).validate(from, to, data);
+    }
+}
+
+
+// File: src/interfaces/validators/IManagedValidator.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.25;
+
+import "./IValidator.sol";
+
+/**
+ * @title ManagedValidator
+ * @notice A role-based validator that provides control over access permissions.
+ *         Allows role-based management of contract permissions and supports custom validation logic.
+ *
+ *         The primary validator contract of the system, used to check the access permissions of users to call contracts with specified selectors.
+ *         The main function of the contract is hasPermissions(from, to, selector), which checks whether the specified caller "from" has the right to make the call to.call(abi.encodeWithSelector(selector, someData)).
+ *
+ *         Bitwise masks are used to store roles, thus the maximum number of roles in the system is limited to 256 (0-255).
+ *         The system consists of 4 types of roles:
+ *             1. publicRoles - bitmask of public roles available to all users
+ *             2. userRoles - bitmask of roles for the calling user
+ *             3. allowAllSignaturesRoles - bitmask of roles for the called contract
+ *             4. allowSignatureRoles - bitmask of roles for the called contract and specific selector
+ *
+ *         Additionally, the system has a dedicated role - 255 - ADMIN_ROLE, which grants full access to all contract functions without additional checks.
+ *
+ *         Therefore, the hasPermissions algorithm looks like this:
+ *             1. Determine the set of roles possessed by the specified user (userRoles[from] | publicRoles)
+ *             2. If the user has the ADMIN_ROLE role, access is granted ((userRoles[from] | publicRoles) & ADMIN_ROLE_MASK != 0)
+ *             3. If the called contract has at least one role in its corresponding set that matches a role in the user's role set, access is granted (allowAllSignaturesRoles[to] & (publicRoles | userRoles[from]) != 0)
+ *             4. If the called contract with specified function selector have at least one role in their corresponding role sets that matches a role in the user's role set, access is granted (allowSignatureRoles[to][selector] & (publicRoles | userRoles[from]) != 0)
+ *             5. Otherwise, access is denied and the function returns false
+ *
+ *         For greater flexibility, it is possible to set a custom validator for the called contract, which will be used after the standard check of permissions.
+ *         Thus, the validate function checks the presence of permissions as follows:
+ *             1. If the data does not contain at least 4 bytes (required for the selector), the function reverts with an InvalidData error.
+ *             2. If the hasPermissions function returns false, the function reverts with a Forbidden error.
+ *             3. If a custom validator is set for the contract, the validate function of the custom validator is called.
+ */
+interface IManagedValidator is IValidator {
+    /// @dev Errors
+    error Forbidden();
+    error InvalidData();
+
+    /**
+     * @notice Storage structure used for maintaining role-based access control data.
+     */
+    struct Storage {
+        /// @dev Maps each user's address to their assigned roles using a bitmask.
+        mapping(address => uint256) userRoles;
+        /// @dev A bitmask representing public roles that are accessible by all users.
+        uint256 publicRoles;
+        /// @dev Maps each contract's address to a bitmask of roles that allow access to all functions on the contract.
+        mapping(address => uint256) allowAllSignaturesRoles;
+        /// @dev Maps each contract's address and function signature to a bitmask of roles that allow access to specific functions.
+        mapping(address => mapping(bytes4 => uint256)) allowSignatureRoles;
+        /// @dev Maps each contract's address to the address of a custom validator, if one is set.
+        mapping(address => address) customValidator;
+    }
+
+    /// @dev A constant representing the admin role bitmask.
+    function ADMIN_ROLE_MASK() external view returns (uint256);
+
+    /// @dev A constant representing the storage position for the role-based data.
+    function STORAGE_POSITION() external view returns (bytes32);
+
+    /**
+     * @notice Checks whether a user has permission for a specific function on a given contract.
+     * @param user The address of the user to check.
+     * @param contractAddress The address of the contract being accessed.
+     * @param signature The function signature being checked.
+     * @return `true` if the user has permission, otherwise `false`.
+     */
+    function hasPermission(
+        address user,
+        address contractAddress,
+        bytes4 signature
+    ) external view returns (bool);
+
+    /**
+     * @notice Ensures that a user has the necessary permissions for the specified function.
+     * @param user The address of the user being verified.
+     * @param contractAddress The address of the contract being accessed.
+     * @param signature The function signature being checked.
+     * @dev Reverts with `Forbidden` if the user lacks the required permissions.
+     */
+    function requirePermission(
+        address user,
+        address contractAddress,
+        bytes4 signature
+    ) external view;
+
+    /**
+     * @notice Grants a public role.
+     * @param role The bitmask index of the role to grant.
+     */
+    function grantPublicRole(uint8 role) external;
+
+    /**
+     * @notice Revokes a public role, preventing all users from accessing the specified functions.
+     * @param role The bitmask index of the role to revoke.
+     */
+    function revokePublicRole(uint8 role) external;
+
+    /**
+     * @notice Assigns a specific role to a given user.
+     * @param user The address of the user to assign the role to.
+     * @param role The bitmask index of the role to assign.
+     */
+    function grantRole(address user, uint8 role) external;
+
+    /**
+     * @notice Revokes a specific role from a given user.
+     * @param user The address of the user to revoke the role from.
+     * @param role The bitmask index of the role to revoke.
+     */
+    function revokeRole(address user, uint8 role) external;
+
+    /**
+     * @notice Sets a custom validator for a specified contract.
+     * @param contractAddress The address of the contract that will use the custom validator.
+     * @param validator The address of the custom validator.
+     * @dev Reverts with `Forbidden` if the validator is set to this contract.
+     */
+    function setCustomValidator(
+        address contractAddress,
+        address validator
+    ) external;
+
+    /**
+     * @notice Grants a role for a specified contract.
+     * @param contractAddress The address of the contract.
+     * @param role The bitmask index of the role to grant.
+     */
+    function grantContractRole(address contractAddress, uint8 role) external;
+
+    /**
+     * @notice Revokes a role from a specified contract.
+     * @param contractAddress The address of the contract.
+     * @param role The bitmask index of the role to revoke.
+     */
+    function revokeContractRole(address contractAddress, uint8 role) external;
+
+    /**
+     * @notice Grants a role for a specified pair contract-selector.
+     * @param contractAddress The address of the contract.
+     * @param signature The function signature.
+     * @param role The bitmask index of the role to grant.
+     */
+    function grantContractSignatureRole(
+        address contractAddress,
+        bytes4 signature,
+        uint8 role
+    ) external;
+
+    /**
+     * @notice Revokes a role from a specified pair contract-selector.
+     * @param contractAddress The address of the contract.
+     * @param signature The function signature.
+     * @param role The bitmask index of the role to revoke.
+     */
+    function revokeContractSignatureRole(
+        address contractAddress,
+        bytes4 signature,
+        uint8 role
+    ) external;
+
+    /**
+     * @notice Returns the custom validator assigned to a specified contract.
+     * @param contractAddress The address of the contract.
+     * @return address of the custom validator.
+     */
+    function customValidator(
+        address contractAddress
+    ) external view returns (address);
+
+    /**
+     * @notice Returns the bitmask representing the roles assigned to a given user.
+     * @param user The address of the user.
+     * @return uint256 The bitmask of roles assigned to the user.
+     */
+    function userRoles(address user) external view returns (uint256);
+
+    /**
+     * @notice Returns the bitmask representing the public roles accessible to all users.
+     * @return uint256 The bitmask of public roles.
+     */
+    function publicRoles() external view returns (uint256);
+
+    /**
+     * @notice Returns the bitmask representing roles that allow access to all functions on a specific contract.
+     * @param contractAddress The address of the contract.
+     * @return uint256 The bitmask of roles allowing access to all functions on the contract.
+     */
+    function allowAllSignaturesRoles(
+        address contractAddress
+    ) external view returns (uint256);
+
+    /**
+     * @notice Returns the bitmask representing roles that allow access to specific pair of contract-selector.
+     * @param contractAddress The address of the contract.
+     * @param selector The function signature.
+     * @return The bitmask of roles allowing access to the specified function on the contract.
+     */
+    function allowSignatureRoles(
+        address contractAddress,
+        bytes4 selector
+    ) external view returns (uint256);
+
+    /**
+     * @notice Validates access permissions for a user to execute a function on a target contract.
+     * @param from The address of the user attempting the action.
+     * @param to The address of the target contract.
+     * @param data The call data containing the function signature and arguments.
+     * @dev Reverts with `InvalidData` if the call data is too short.
+     *      Uses a custom validator if one is configured for the target contract.
+     */
+    function validate(
+        address from,
+        address to,
+        bytes calldata data
+    ) external view;
+
+    /**
+     * @notice Emitted when a public role is granted to a user in the Managed Validator contract.
+     * @param role The index of the public role.
+     */
+    event PublicRoleGranted(uint8 role);
+
+    /**
+     * @notice Emitted when a public role is revoked from a user in the Managed Validator contract.
+     * @param role The index of the public role.
+     */
+    event PublicRoleRevoked(uint8 role);
+
+    /**
+     * @notice Emitted when a role is granted to a user in the Managed Validator contract.
+     * @param user The address of the user.
+     * @param role The index of the role.
+     */
+    event RoleGranted(address indexed user, uint8 role);
+
+    /**
+     * @notice Emitted when a role is revoked from a user in the Managed Validator contract.
+     * @param user The address of the user.
+     * @param role The index of the role.
+     */
+    event RoleRevoked(address indexed user, uint8 role);
+
+    /**
+     * @notice Emitted when a custom validator is set for a contract in the Managed Validator contract.
+     * @param contractAddress The address of the contract.
+     * @param validator The address of the custom validator.
+     */
+    event CustomValidatorSet(
+        address indexed contractAddress,
+        address validator
+    );
+
+    /**
+     * @notice Emitted when a role is granted to a contract in the Managed Validator contract.
+     * @param contractAddress The address of the contract.
+     * @param role The index of the role.
+     */
+    event ContractRoleGranted(address indexed contractAddress, uint8 role);
+
+    /**
+     * @notice Emitted when a role is revoked from a contract in the Managed Validator contract.
+     * @param contractAddress The address of the contract.
+     * @param role The index of the role.
+     */
+    event ContractRoleRevoked(address indexed contractAddress, uint8 role);
+
+    /**
+     * @notice Emitted when a role is granted to a pair contract-selector in the Managed Validator contract.
+     * @param contractAddress The address of the contract.
+     * @param signature The function signature.
+     * @param role The index of the role.
+     */
+    event ContractSignatureRoleGranted(
+        address indexed contractAddress,
+        bytes4 signature,
+        uint8 role
+    );
+
+    /**
+     * @notice Emitted when a role is revoked from a pair contract-selector in the Managed Validator contract.
+     * @param contractAddress The address of the contract.
+     * @param signature The function signature.
+     * @param role The index of the role.
+     */
+    event ContractSignatureRoleRevoked(
+        address indexed contractAddress,
+        bytes4 signature,
+        uint8 role
+    );
+}
+
+
+// File: src/utils/DefaultAccessControl.sol
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/access/extensions/AccessControlEnumerable.sol";
+import "../interfaces/utils/IDefaultAccessControl.sol";
+
+contract DefaultAccessControl is
+    IDefaultAccessControl,
+    AccessControlEnumerable
+{
+    bytes32 public constant OPERATOR = keccak256("operator");
+    bytes32 public constant ADMIN_ROLE = keccak256("admin");
+    bytes32 public constant ADMIN_DELEGATE_ROLE = keccak256("admin_delegate");
+
+    /// @notice Creates a new contract.
+    /// @param admin Admin of the contract
+    constructor(address admin) {
+        if (admin == address(0)) revert AddressZero();
+
+        _grantRole(OPERATOR, admin);
+        _grantRole(ADMIN_ROLE, admin);
+
+        _setRoleAdmin(ADMIN_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(ADMIN_DELEGATE_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(OPERATOR, ADMIN_DELEGATE_ROLE);
+    }
+
+    /// @inheritdoc IDefaultAccessControl
+    function isAdmin(address sender) public view returns (bool) {
+        return
+            hasRole(ADMIN_ROLE, sender) || hasRole(ADMIN_DELEGATE_ROLE, sender);
+    }
+
+    /// @inheritdoc IDefaultAccessControl
+    function isOperator(address sender) public view returns (bool) {
+        return hasRole(OPERATOR, sender);
+    }
+
+    /// @inheritdoc IDefaultAccessControl
+    function requireAdmin(address sender) external view override {
+        _requireAdmin(sender);
+    }
+
+    /// @inheritdoc IDefaultAccessControl
+    function requireAtLeastOperator(address sender) external view override {
+        _requireAtLeastOperator(sender);
+    }
+
+    function _requireAdmin(address sender) internal view {
+        if (!isAdmin(sender)) revert Forbidden();
+    }
+
+    function _requireAtLeastOperator(address sender) internal view {
+        if (!isAdmin(sender) && !isOperator(sender)) revert Forbidden();
+    }
+
+    function _requireAdmin() internal view {
+        _requireAdmin(msg.sender);
+    }
+
+    function _requireAtLeastOperator() internal view {
+        _requireAtLeastOperator(msg.sender);
+    }
+}
+
+
+// File: src/interfaces/validators/IValidator.sol
+// SPDX-License-Identifier: BSL-1.1
+pragma solidity 0.8.25;
+
+/**
+ * @title IValidator
+ * @notice Interface defining a generic validator for transaction data.
+ */
+interface IValidator {
+    /**
+     * @notice Validates a transaction involving two addresses based on the provided calldata.
+     * @param from The address initiating the transaction.
+     * @param to The target address of the transaction.
+     * @param data The transaction data containing the function selector and any necessary parameters.
+     * @dev Implementers should validate that the transaction is authorized, properly formatted, and adheres to the required business logic.
+     *      Reverts if the transaction is invalid.
+     */
+    function validate(
+        address from,
+        address to,
+        bytes calldata data
+    ) external view;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/extensions/AccessControlEnumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/extensions/AccessControlEnumerable.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControlEnumerable} from "./IAccessControlEnumerable.sol";
+import {AccessControl} from "../AccessControl.sol";
+import {EnumerableSet} from "../../utils/structs/EnumerableSet.sol";
+
+/**
+ * @dev Extension of {AccessControl} that allows enumerating the members of each role.
+ */
+abstract contract AccessControlEnumerable is IAccessControlEnumerable, AccessControl {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    mapping(bytes32 role => EnumerableSet.AddressSet) private _roleMembers;
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControlEnumerable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns one of the accounts that have `role`. `index` must be a
+     * value between 0 and {getRoleMemberCount}, non-inclusive.
+     *
+     * Role bearers are not sorted in any particular way, and their ordering may
+     * change at any point.
+     *
+     * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+     * you perform all queries on the same block. See the following
+     * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+     * for more information.
+     */
+    function getRoleMember(bytes32 role, uint256 index) public view virtual returns (address) {
+        return _roleMembers[role].at(index);
+    }
+
+    /**
+     * @dev Returns the number of accounts that have `role`. Can be used
+     * together with {getRoleMember} to enumerate all bearers of a role.
+     */
+    function getRoleMemberCount(bytes32 role) public view virtual returns (uint256) {
+        return _roleMembers[role].length();
+    }
+
+    /**
+     * @dev Overload {AccessControl-_grantRole} to track enumerable memberships
+     */
+    function _grantRole(bytes32 role, address account) internal virtual override returns (bool) {
+        bool granted = super._grantRole(role, account);
+        if (granted) {
+            _roleMembers[role].add(account);
+        }
+        return granted;
+    }
+
+    /**
+     * @dev Overload {AccessControl-_revokeRole} to track enumerable memberships
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual override returns (bool) {
+        bool revoked = super._revokeRole(role, account);
+        if (revoked) {
+            _roleMembers[role].remove(account);
+        }
+        return revoked;
+    }
+}
+
+
+// File: src/interfaces/utils/IDefaultAccessControl.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/access/extensions/IAccessControlEnumerable.sol";
+
+/// @notice This is a default access control with 3 roles:
+///
+/// - ADMIN: allowed to do anything
+/// - ADMIN_DELEGATE: allowed to do anything except assigning ADMIN and ADMIN_DELEGATE roles
+/// - OPERATOR: low-privileged role, generally keeper or some other bot
+interface IDefaultAccessControl is IAccessControlEnumerable {
+    error Forbidden();
+    error AddressZero();
+
+    function OPERATOR() external view returns (bytes32);
+
+    function ADMIN_ROLE() external view returns (bytes32);
+
+    function ADMIN_DELEGATE_ROLE() external view returns (bytes32);
+
+    /// @notice Checks that the address is contract admin.
+    /// @param who Address to check
+    /// @return `true` if who is admin, `false` otherwise
+    function isAdmin(address who) external view returns (bool);
+
+    /// @notice Checks that the address is contract admin.
+    /// @param who Address to check
+    /// @return `true` if who is operator, `false` otherwise
+    function isOperator(address who) external view returns (bool);
+
+    /// @notice Checks that the address is contract admin.
+    /// @param who Address to check
+    /// @dev throws Forbbiden() if the sender does not have the admin or admin_delegate role
+    function requireAdmin(address who) external view;
+
+    /// @notice Checks that the address is contract admin.
+    /// @param who Address to check
+    /// @dev throws Forbbiden() if the sender has no roles
+    function requireAtLeastOperator(address who) external view;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/extensions/IAccessControlEnumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/extensions/IAccessControlEnumerable.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControl} from "../IAccessControl.sol";
+
+/**
+ * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.
+ */
+interface IAccessControlEnumerable is IAccessControl {
+    /**
+     * @dev Returns one of the accounts that have `role`. `index` must be a
+     * value between 0 and {getRoleMemberCount}, non-inclusive.
+     *
+     * Role bearers are not sorted in any particular way, and their ordering may
+     * change at any point.
+     *
+     * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure
+     * you perform all queries on the same block. See the following
+     * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]
+     * for more information.
+     */
+    function getRoleMember(bytes32 role, uint256 index) external view returns (address);
+
+    /**
+     * @dev Returns the number of accounts that have `role`. Can be used
+     * together with {getRoleMember} to enumerate all bearers of a role.
+     */
+    function getRoleMemberCount(bytes32 role) external view returns (uint256);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/AccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+import {IAccessControl} from "./IAccessControl.sol";
+import {Context} from "../utils/Context.sol";
+import {ERC165} from "../utils/introspection/ERC165.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```solidity
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```solidity
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it. We recommend using {AccessControlDefaultAdminRules}
+ * to enforce additional security measures for this role.
+ */
+abstract contract AccessControl is Context, IAccessControl, ERC165 {
+    struct RoleData {
+        mapping(address account => bool) hasRole;
+        bytes32 adminRole;
+    }
+
+    mapping(bytes32 role => RoleData) private _roles;
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    /**
+     * @dev Modifier that checks that an account has a specific role. Reverts
+     * with an {AccessControlUnauthorizedAccount} error including the required role.
+     */
+    modifier onlyRole(bytes32 role) {
+        _checkRole(role);
+        _;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControl).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) public view virtual returns (bool) {
+        return _roles[role].hasRole[account];
+    }
+
+    /**
+     * @dev Reverts with an {AccessControlUnauthorizedAccount} error if `_msgSender()`
+     * is missing `role`. Overriding this function changes the behavior of the {onlyRole} modifier.
+     */
+    function _checkRole(bytes32 role) internal view virtual {
+        _checkRole(role, _msgSender());
+    }
+
+    /**
+     * @dev Reverts with an {AccessControlUnauthorizedAccount} error if `account`
+     * is missing `role`.
+     */
+    function _checkRole(bytes32 role, address account) internal view virtual {
+        if (!hasRole(role, account)) {
+            revert AccessControlUnauthorizedAccount(account, role);
+        }
+    }
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) public view virtual returns (bytes32) {
+        return _roles[role].adminRole;
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function grantRole(bytes32 role, address account) public virtual onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function revokeRole(bytes32 role, address account) public virtual onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been revoked `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) public virtual {
+        if (callerConfirmation != _msgSender()) {
+            revert AccessControlBadConfirmation();
+        }
+
+        _revokeRole(role, callerConfirmation);
+    }
+
+    /**
+     * @dev Sets `adminRole` as ``role``'s admin role.
+     *
+     * Emits a {RoleAdminChanged} event.
+     */
+    function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+        bytes32 previousAdminRole = getRoleAdmin(role);
+        _roles[role].adminRole = adminRole;
+        emit RoleAdminChanged(role, previousAdminRole, adminRole);
+    }
+
+    /**
+     * @dev Attempts to grant `role` to `account` and returns a boolean indicating if `role` was granted.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function _grantRole(bytes32 role, address account) internal virtual returns (bool) {
+        if (!hasRole(role, account)) {
+            _roles[role].hasRole[account] = true;
+            emit RoleGranted(role, account, _msgSender());
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Attempts to revoke `role` to `account` and returns a boolean indicating if `role` was revoked.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual returns (bool) {
+        if (hasRole(role, account)) {
+            _roles[role].hasRole[account] = false;
+            emit RoleRevoked(role, account, _msgSender());
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position is the index of the value in the `values` array plus 1.
+        // Position 0 is used to mean a value is not in the set.
+        mapping(bytes32 value => uint256) _positions;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._positions[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We cache the value's position to prevent multiple reads from the same storage slot
+        uint256 position = set._positions[value];
+
+        if (position != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 valueIndex = position - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (valueIndex != lastIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the lastValue to the index where the value to delete is
+                set._values[valueIndex] = lastValue;
+                // Update the tracked position of the lastValue (that was just moved)
+                set._positions[lastValue] = position;
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the tracked position for the deleted slot
+            delete set._positions[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._positions[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/IAccessControl.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev The `account` is missing a role.
+     */
+    error AccessControlUnauthorizedAccount(address account, bytes32 neededRole);
+
+    /**
+     * @dev The caller of a function is not the expected one.
+     *
+     * NOTE: Don't confuse with {AccessControlUnauthorizedAccount}.
+     */
+    error AccessControlBadConfirmation();
+
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `callerConfirmation`.
+     */
+    function renounceRole(bytes32 role, address callerConfirmation) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/ERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "./IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ */
+abstract contract ERC165 is IERC165 {
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+

@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+contract PelepeToken {
+
+  string public constant name = "Pelepe";
+  string public constant symbol = "PLPE";
+  uint256 public constant decimals = 18;
+  uint256 private initialSupply = 1000000000000000000000000000;
+  uint256 public totalSupply = 0;
+  uint256 public lockUntil = 0;
+  
+  mapping(address => bool) public owners;
+  mapping(address => bool) public lockers;
+
+  event Transfer(address indexed from, address indexed to, uint256 value);
+  event Approval(address indexed owner, address indexed spender, uint256 value);
+
+  mapping (address => uint256) balances;
+  mapping (address => uint256) locked;
+  mapping (address => mapping (address => uint256)) internal allowed;
+
+  modifier onlyOwner() {
+    require(owners[msg.sender], "LizToken: no owner role");
+    _;
+  }
+
+  modifier onlyLocker() {
+    require(lockers[msg.sender], "LizToken: no locker role");
+    _;
+  }
+
+  constructor() {
+    totalSupply = initialSupply;
+    balances[msg.sender] = totalSupply;
+    owners[msg.sender] = true;
+  }
+
+  function setOwner(address _owner) external onlyOwner returns (bool) {
+    require(_owner != address(0), "LizToken: cannot set 0x0 as owner");
+    owners[_owner] = true;
+    return true;
+  }
+
+  function removeOwner(address _owner) external onlyOwner returns (bool) {
+    require(_owner != msg.sender, "LizToken: cannot remove yourself");
+    owners[_owner] = false;
+    return true;
+  }
+
+  function setLocker(address _locker) external onlyOwner returns (bool) {
+    require(_locker != address(0), "LizToken: cannot set 0x0 as locker");
+    lockers[_locker] = true;
+    return true;
+  }
+
+  function removeLocker(address _locker) external onlyOwner returns (bool) {
+    require(_locker != msg.sender, "LizToken: cannot remove yourself");
+    lockers[_locker] = false;
+    return true;
+  }
+
+  function setLockUntil(uint256 _time) external onlyOwner returns (bool) {
+    lockUntil = _time;
+    return true;
+  }
+
+  function transfer(address _to, uint256 _value) external returns (bool) {
+    require(_to != address(0), "LizToken: cannot transfer to zero address");
+    require(_value <= balances[msg.sender], "LizToken: insufficient balance");
+    require(block.timestamp > lockUntil || _value <= balances[msg.sender] - locked[msg.sender], "LizToken: your fund is locked");
+
+    balances[msg.sender] = balances[msg.sender] - _value;
+    balances[_to] = balances[_to] + _value;
+    emit Transfer(msg.sender, _to, _value);
+    return true;
+  }
+
+  function balanceOf(address _owner) public view returns (uint256 balance) {
+    return balances[_owner];
+  }
+
+  function lockedBalanceOf(address _owner) public view returns (uint256 lockedBalance) {
+    return locked[_owner];
+  }
+
+  function transferFrom(address _from, address _to, uint256 _value) external returns (bool) {
+    require(_to != address(0), "LizToken: cannot transfer to zero address");
+    require(_value <= balances[_from], "LizToken: insufficient balance");
+    require(_value <= allowed[_from][msg.sender], "LizToken: insufficient allowance");
+    require(block.timestamp > lockUntil || _value <= balances[msg.sender] - locked[msg.sender], "LizToken: your fund is locked");
+
+    balances[_from] = balances[_from] - _value;
+    balances[_to] = balances[_to] + _value;
+    allowed[_from][msg.sender] = allowed[_from][msg.sender] - _value;
+    emit Transfer(_from, _to, _value);
+    return true;
+  }
+
+  function transferFromWithLock(address _from, address _to, uint256 _value) external onlyLocker returns (bool) {
+    require(_to != address(0), "LizToken: cannot transfer to zero address");
+    require(_value <= balances[_from], "LizToken: insufficient balance");
+    require(_value <= allowed[_from][msg.sender], "LizToken: insufficient allowance");
+
+    balances[_from] = balances[_from] - _value;
+    balances[_to] = balances[_to] + _value;
+    allowed[_from][msg.sender] = allowed[_from][msg.sender] - _value;
+    locked[_to] = locked[_to] + _value;
+    emit Transfer(_from, _to, _value);
+    return true;
+  }
+
+  function approve(address _spender, uint256 _value) external returns (bool) {
+    allowed[msg.sender][_spender] = _value;
+    emit Approval(msg.sender, _spender, _value);
+    return true;
+  }
+
+  function allowance(address _owner, address _spender) external view returns (uint256) {
+    return allowed[_owner][_spender];
+  }
+  
+  function burn(uint256 _amount) external returns (bool) {
+    balances[msg.sender] = balances[msg.sender] - _amount;
+    totalSupply = totalSupply - _amount;
+    emit Transfer(msg.sender, address(0), _amount);
+    return true;
+  }
+}

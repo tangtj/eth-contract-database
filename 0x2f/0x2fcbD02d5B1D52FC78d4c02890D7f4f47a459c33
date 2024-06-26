@@ -1,0 +1,2973 @@
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/governance/GearStakingV3.sol
+// SPDX-License-Identifier: BUSL-1.1
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {SafeERC20} from "@1inch/solidity-utils/contracts/libraries/SafeERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+
+import {AP_GEAR_TOKEN, IAddressProviderV3, NO_VERSION_CONTROL} from "../interfaces/IAddressProviderV3.sol";
+import {IVotingContractV3} from "../interfaces/IVotingContractV3.sol";
+import {
+    IGearStakingV3,
+    UserVoteLockData,
+    WithdrawalData,
+    MultiVote,
+    VotingContractStatus,
+    EPOCHS_TO_WITHDRAW,
+    EPOCH_LENGTH
+} from "../interfaces/IGearStakingV3.sol";
+
+import {ACLNonReentrantTrait} from "../traits/ACLNonReentrantTrait.sol";
+
+// EXCEPTIONS
+import "../interfaces/IExceptions.sol";
+
+/// @title Gear staking V3
+contract GearStakingV3 is ACLNonReentrantTrait, IGearStakingV3 {
+    using SafeERC20 for IERC20;
+    using SafeCast for uint256;
+
+    /// @notice Contract version
+    uint256 public constant override version = 3_00;
+
+    /// @notice Address of the GEAR token
+    address public immutable override gear;
+
+    /// @notice Timestamp of the first epoch of voting
+    uint256 public immutable override firstEpochTimestamp;
+
+    /// @dev Mapping from user to their stake amount and tokens available for voting
+    mapping(address => UserVoteLockData) internal voteLockData;
+
+    /// @dev Mapping from user to their future withdrawal amounts
+    mapping(address => WithdrawalData) internal withdrawalData;
+
+    /// @notice Mapping from address to its status as allowed voting contract
+    mapping(address => VotingContractStatus) public allowedVotingContract;
+
+    /// @notice Address of a new staking contract that can be migrated to
+    address public override successor;
+
+    /// @notice Address of the previous staking contract that is migrated from
+    address public override migrator;
+
+    constructor(address _addressProvider, uint256 _firstEpochTimestamp) ACLNonReentrantTrait(_addressProvider) {
+        gear = IAddressProviderV3(_addressProvider).getAddressOrRevert(AP_GEAR_TOKEN, NO_VERSION_CONTROL); // U:[GS-01]
+        firstEpochTimestamp = _firstEpochTimestamp; // U:[GS-01]
+    }
+
+    /// @dev Ensures that function is called by migrator
+    modifier migratorOnly() {
+        if (msg.sender != migrator) revert CallerNotMigratorException();
+        _;
+    }
+
+    /// @notice Stakes given amount of GEAR, and, optionally, performs a sequence of votes
+    /// @param amount Amount of GEAR to stake
+    /// @param votes Sequence of votes to perform, see `MultiVote`
+    /// @dev Requires approval from `msg.sender` for GEAR to this contract
+    function deposit(uint96 amount, MultiVote[] calldata votes) external override nonReentrant {
+        _deposit(amount, msg.sender, votes); // U: [GS-02]
+    }
+
+    /// @notice Same as `deposit` but uses signed EIP-2612 permit message
+    /// @param amount Amount of GEAR to stake
+    /// @param votes Sequence of votes to perform, see `MultiVote`
+    /// @param deadline Permit deadline
+    /// @dev `v`, `r`, `s` must be a valid signature of the permit message from `msg.sender` for GEAR to this contract
+    function depositWithPermit(
+        uint96 amount,
+        MultiVote[] calldata votes,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external override nonReentrant {
+        try IERC20Permit(gear).permit(msg.sender, address(this), amount, deadline, v, r, s) {} catch {} // U:[GS-02]
+        _deposit(amount, msg.sender, votes); // U:[GS-02]
+    }
+
+    /// @dev Implementation of `deposit`
+    function _deposit(uint96 amount, address to, MultiVote[] calldata votes) internal {
+        IERC20(gear).safeTransferFrom(msg.sender, address(this), amount);
+
+        UserVoteLockData storage vld = voteLockData[to];
+
+        vld.totalStaked += amount;
+        vld.available += amount;
+
+        emit DepositGear(to, amount);
+
+        _multivote(to, votes);
+    }
+
+    /// @notice Performs a sequence of votes
+    /// @param votes Sequence of votes to perform, see `MultiVote`
+    function multivote(MultiVote[] calldata votes) external override nonReentrant {
+        _multivote(msg.sender, votes); // U: [GS-04]
+    }
+
+    /// @notice Unstakes GEAR and schedules withdrawal which can be claimed in 4 epochs, claims available withdrawals,
+    ///         and, optionally, performs a sequence of votes.
+    /// @param amount Amount of GEAR to unstake
+    /// @param to Address to send claimable GEAR, if any
+    /// @param votes Sequence of votes to perform, see `MultiVote`
+    function withdraw(uint96 amount, address to, MultiVote[] calldata votes) external override nonReentrant {
+        _multivote(msg.sender, votes); // U: [GS-03]
+
+        _processPendingWithdrawals(msg.sender, to);
+
+        UserVoteLockData storage vld = voteLockData[msg.sender];
+
+        if (vld.available < amount) revert InsufficientBalanceException();
+        unchecked {
+            vld.available -= amount; // U: [GS-03]
+        }
+
+        withdrawalData[msg.sender].withdrawalsPerEpoch[EPOCHS_TO_WITHDRAW - 1] += amount; // U: [GS-03]
+
+        emit ScheduleGearWithdrawal(msg.sender, amount); // U: [GS-03]
+    }
+
+    /// @notice Claims all caller's mature withdrawals
+    /// @param to Address to send claimable GEAR, if any
+    function claimWithdrawals(address to) external override nonReentrant {
+        _processPendingWithdrawals(msg.sender, to); // U: [GS-05]
+    }
+
+    /// @notice Migrates the user's staked GEAR to a successor staking contract, bypassing the withdrawal delay
+    /// @param amount Amount of staked GEAR to migrate
+    /// @param votesBefore Votes to apply before sending GEAR to the successor contract
+    /// @param votesBefore Sequence of votes to perform in this contract before sending GEAR to the successor
+    /// @param votesAfter Sequence of votes to perform in the successor contract after sending GEAR
+    function migrate(uint96 amount, MultiVote[] calldata votesBefore, MultiVote[] calldata votesAfter)
+        external
+        override
+        nonReentrant
+        nonZeroAddress(successor) // U: [GS-07]
+    {
+        _multivote(msg.sender, votesBefore); // U: [GS-07]
+
+        UserVoteLockData storage vld = voteLockData[msg.sender];
+
+        if (vld.available < amount) revert InsufficientBalanceException();
+        unchecked {
+            vld.available -= amount; // U: [GS-07]
+            vld.totalStaked -= amount; // U: [GS-07]
+        }
+
+        IERC20(gear).approve(successor, uint256(amount));
+        IGearStakingV3(successor).depositOnMigration(amount, msg.sender, votesAfter); // U: [GS-07]
+
+        emit MigrateGear(msg.sender, successor, amount); // U: [GS-07]
+    }
+
+    /// @notice Performs a deposit on user's behalf from the migrator (usually the previous staking contract)
+    /// @param amount Amount of GEAR to deposit
+    /// @param onBehalfOf User on whose behalf to deposit
+    /// @param votes Sequence of votes to perform after migration, see `MultiVote`
+    function depositOnMigration(uint96 amount, address onBehalfOf, MultiVote[] calldata votes)
+        external
+        override
+        nonReentrant
+        migratorOnly // U: [GS-07]
+    {
+        _deposit(amount, onBehalfOf, votes); // U: [GS-07]
+    }
+
+    /// @dev Refreshes the user's withdrawal struct, shifting the withdrawal amounts based on the number of epochs
+    ///      that passed since the last update. If there are any mature withdrawals, sends them to the user.
+    function _processPendingWithdrawals(address user, address to) internal {
+        uint16 epochNow = getCurrentEpoch();
+
+        if (epochNow > withdrawalData[user].epochLastUpdate) {
+            WithdrawalData memory wd = withdrawalData[user];
+
+            uint16 epochDiff = epochNow - wd.epochLastUpdate;
+            uint256 totalClaimable;
+
+            // Epochs one, two, three and four in the struct are always relative to epochLastUpdate, so the amounts
+            // are "shifted" by the number of epochs that passed since then. If some amount shifts beyond epoch one,
+            // it becomes mature and the GEAR is sent to the user.
+            unchecked {
+                for (uint256 i = 0; i < EPOCHS_TO_WITHDRAW; ++i) {
+                    if (i < epochDiff) {
+                        totalClaimable += wd.withdrawalsPerEpoch[i];
+                    }
+
+                    wd.withdrawalsPerEpoch[i] =
+                        (i + epochDiff < EPOCHS_TO_WITHDRAW) ? wd.withdrawalsPerEpoch[i + epochDiff] : 0;
+                }
+            }
+
+            if (totalClaimable != 0) {
+                IERC20(gear).safeTransfer(to, totalClaimable);
+
+                voteLockData[user].totalStaked -= totalClaimable.toUint96();
+
+                emit ClaimGearWithdrawal(user, to, totalClaimable);
+            }
+
+            wd.epochLastUpdate = epochNow;
+            withdrawalData[user] = wd;
+        }
+    }
+
+    /// @dev Implementation of `multivote`
+    function _multivote(address user, MultiVote[] calldata votes) internal {
+        uint256 len = votes.length;
+        if (len == 0) return;
+
+        UserVoteLockData storage vld = voteLockData[user];
+
+        for (uint256 i = 0; i < len;) {
+            MultiVote calldata currentVote = votes[i];
+
+            if (currentVote.isIncrease) {
+                if (allowedVotingContract[currentVote.votingContract] != VotingContractStatus.ALLOWED) {
+                    revert VotingContractNotAllowedException(); // U: [GS-04A]
+                }
+
+                if (vld.available < currentVote.voteAmount) revert InsufficientBalanceException();
+                unchecked {
+                    vld.available -= currentVote.voteAmount;
+                }
+
+                IVotingContractV3(currentVote.votingContract).vote(user, currentVote.voteAmount, currentVote.extraData);
+            } else {
+                if (allowedVotingContract[currentVote.votingContract] == VotingContractStatus.NOT_ALLOWED) {
+                    revert VotingContractNotAllowedException(); // U: [GS-04A]
+                }
+
+                IVotingContractV3(currentVote.votingContract).unvote(
+                    user, currentVote.voteAmount, currentVote.extraData
+                );
+                vld.available += currentVote.voteAmount;
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice Returns the current global voting epoch
+    function getCurrentEpoch() public view override returns (uint16) {
+        if (block.timestamp < firstEpochTimestamp) return 0; // U:[GS-01]
+        unchecked {
+            return uint16((block.timestamp - firstEpochTimestamp) / EPOCH_LENGTH) + 1; // U:[GS-01]
+        }
+    }
+
+    /// @notice Returns the total amount of user's staked GEAR
+    function balanceOf(address user) external view override returns (uint256) {
+        return voteLockData[user].totalStaked;
+    }
+
+    /// @notice Returns user's balance available for voting or unstaking
+    function availableBalance(address user) external view override returns (uint256) {
+        return voteLockData[user].available;
+    }
+
+    /// @notice Returns user's amounts withdrawable now and over the next 4 epochs
+    function getWithdrawableAmounts(address user)
+        external
+        view
+        override
+        returns (uint256 withdrawableNow, uint256[EPOCHS_TO_WITHDRAW] memory withdrawableInEpochs)
+    {
+        WithdrawalData storage wd = withdrawalData[user];
+
+        uint16 epochDiff = getCurrentEpoch() - wd.epochLastUpdate;
+        unchecked {
+            for (uint256 i = 0; i < EPOCHS_TO_WITHDRAW; ++i) {
+                if (i < epochDiff) {
+                    withdrawableNow += wd.withdrawalsPerEpoch[i];
+                }
+
+                withdrawableInEpochs[i] =
+                    (i + epochDiff < EPOCHS_TO_WITHDRAW) ? wd.withdrawalsPerEpoch[i + epochDiff] : 0;
+            }
+        }
+    }
+
+    // ------------- //
+    // CONFIGURATION //
+    // ------------- //
+
+    /// @notice Sets the status of contract as an allowed voting contract
+    /// @param votingContract Address to set the status for
+    /// @param status The new status of the contract, see `VotingContractStatus`
+    function setVotingContractStatus(address votingContract, VotingContractStatus status)
+        external
+        override
+        configuratorOnly
+    {
+        if (status == allowedVotingContract[votingContract]) return;
+        allowedVotingContract[votingContract] = status; // U: [GS-06]
+
+        emit SetVotingContractStatus(votingContract, status); // U: [GS-06]
+    }
+
+    /// @notice Sets a new successor contract
+    /// @dev Successor is a new staking contract where staked GEAR can be migrated, bypassing the withdrawal delay.
+    ///      This is used to upgrade staking contracts when new functionality is added.
+    ///      It must already have this contract set as migrator.
+    /// @param newSuccessor Address of the new successor contract
+    function setSuccessor(address newSuccessor) external override configuratorOnly {
+        if (successor != newSuccessor) {
+            if (IGearStakingV3(newSuccessor).migrator() != address(this)) {
+                revert IncompatibleSuccessorException(); // U: [GS-08]
+            }
+            successor = newSuccessor; // U: [GS-08]
+
+            emit SetSuccessor(newSuccessor); // U: [GS-08]
+        }
+    }
+
+    /// @notice Sets a new migrator contract
+    /// @dev Migrator is a contract (usually the previous staking contract) that can deposit GEAR on behalf of users
+    ///      during migration in order for them to move their staked GEAR, bypassing the withdrawal delay.
+    /// @param newMigrator Address of the new migrator contract
+    function setMigrator(address newMigrator) external override configuratorOnly {
+        if (migrator != newMigrator) {
+            migrator = newMigrator; // U: [GS-09]
+
+            emit SetMigrator(newMigrator); // U: [GS-09]
+        }
+    }
+}
+
+
+// File: node_modules/@1inch/solidity-utils/contracts/libraries/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol";
+import "../interfaces/IDaiLikePermit.sol";
+import "../interfaces/IPermit2.sol";
+import "../interfaces/IWETH.sol";
+import "../libraries/RevertReasonForwarder.sol";
+
+/// @title Implements efficient safe methods for ERC20 interface.
+library SafeERC20 {
+    error SafeTransferFailed();
+    error SafeTransferFromFailed();
+    error ForceApproveFailed();
+    error SafeIncreaseAllowanceFailed();
+    error SafeDecreaseAllowanceFailed();
+    error SafePermitBadLength();
+    error Permit2TransferAmountTooHigh();
+
+    address private constant _PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    bytes4 private constant _PERMIT_LENGTH_ERROR = 0x68275857;  // SafePermitBadLength.selector
+    uint256 private constant _RAW_CALL_GAS_LIMIT = 5000;
+
+    function safeBalanceOf(
+        IERC20 token,
+        address account
+    ) internal view returns(uint256 tokenBalance) {
+        bytes4 selector = IERC20.balanceOf.selector;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            mstore(0x00, selector)
+            mstore(0x04, account)
+            let success := staticcall(gas(), token, 0x00, 0x24, 0x00, 0x20)
+            tokenBalance := mload(0)
+
+            if or(iszero(success), lt(returndatasize(), 0x20)) {
+                let ptr := mload(0x40)
+                returndatacopy(ptr, 0, returndatasize())
+                revert(ptr, returndatasize())
+            }
+        }
+    }
+
+    /// @dev Ensures method do not revert or return boolean `true`, admits call to non-smart-contract.
+    function safeTransferFromUniversal(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount,
+        bool permit2
+    ) internal {
+        if (permit2) {
+            safeTransferFromPermit2(token, from, to, amount);
+        } else {
+            safeTransferFrom(token, from, to, amount);
+        }
+    }
+
+    /// @dev Ensures method do not revert or return boolean `true`, admits call to non-smart-contract.
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bytes4 selector = token.transferFrom.selector;
+        bool success;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), from)
+            mstore(add(data, 0x24), to)
+            mstore(add(data, 0x44), amount)
+            success := call(gas(), token, 0, data, 100, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+        if (!success) revert SafeTransferFromFailed();
+    }
+
+    /// @dev Permit2 version of safeTransferFrom above.
+    function safeTransferFromPermit2(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        if (amount > type(uint160).max) revert Permit2TransferAmountTooHigh();
+        bytes4 selector = IPermit2.transferFrom.selector;
+        bool success;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), from)
+            mstore(add(data, 0x24), to)
+            mstore(add(data, 0x44), amount)
+            mstore(add(data, 0x64), token)
+            success := call(gas(), _PERMIT2, 0, data, 0x84, 0x0, 0x0)
+            if success {
+                success := gt(extcodesize(_PERMIT2), 0)
+            }
+        }
+        if (!success) revert SafeTransferFromFailed();
+    }
+
+    /// @dev Ensures method do not revert or return boolean `true`, admits call to non-smart-contract.
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        if (!_makeCall(token, token.transfer.selector, to, value)) {
+            revert SafeTransferFailed();
+        }
+    }
+
+    /// @dev If `approve(from, to, amount)` fails, try to `approve(from, to, 0)` before retry.
+    function forceApprove(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        if (!_makeCall(token, token.approve.selector, spender, value)) {
+            if (
+                !_makeCall(token, token.approve.selector, spender, 0) ||
+                !_makeCall(token, token.approve.selector, spender, value)
+            ) {
+                revert ForceApproveFailed();
+            }
+        }
+    }
+
+    /// @dev Allowance increase with safe math check.
+    function safeIncreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (value > type(uint256).max - allowance) revert SafeIncreaseAllowanceFailed();
+        forceApprove(token, spender, allowance + value);
+    }
+
+    /// @dev Allowance decrease with safe math check.
+    function safeDecreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (value > allowance) revert SafeDecreaseAllowanceFailed();
+        forceApprove(token, spender, allowance - value);
+    }
+
+    function safePermit(IERC20 token, bytes calldata permit) internal {
+        if (!tryPermit(token, msg.sender, address(this), permit)) RevertReasonForwarder.reRevert();
+    }
+
+    function safePermit(IERC20 token, address owner, address spender, bytes calldata permit) internal {
+        if (!tryPermit(token, owner, spender, permit)) RevertReasonForwarder.reRevert();
+    }
+
+    function tryPermit(IERC20 token, bytes calldata permit) internal returns(bool success) {
+        return tryPermit(token, msg.sender, address(this), permit);
+    }
+
+    function tryPermit(IERC20 token, address owner, address spender, bytes calldata permit) internal returns(bool success) {
+        bytes4 permitSelector = IERC20Permit.permit.selector;
+        bytes4 daiPermitSelector = IDaiLikePermit.permit.selector;
+        bytes4 permit2Selector = IPermit2.permit.selector;
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let ptr := mload(0x40)
+            switch permit.length
+            case 100 {
+                mstore(ptr, permitSelector)
+                mstore(add(ptr, 0x04), owner)
+                mstore(add(ptr, 0x24), spender)
+
+                // Compact IERC20Permit.permit(uint256 value, uint32 deadline, uint256 r, uint256 vs)
+                {  // stack too deep
+                    let deadline := shr(224, calldataload(add(permit.offset, 0x20)))
+                    let vs := calldataload(add(permit.offset, 0x44))
+
+                    calldatacopy(add(ptr, 0x44), permit.offset, 0x20) // value
+                    mstore(add(ptr, 0x64), sub(deadline, 1))
+                    mstore(add(ptr, 0x84), add(27, shr(255, vs)))
+                    calldatacopy(add(ptr, 0xa4), add(permit.offset, 0x24), 0x20) // r
+                    mstore(add(ptr, 0xc4), shr(1, shl(1, vs)))
+                }
+                // IERC20Permit.permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0xe4, 0, 0)
+            }
+            case 72 {
+                mstore(ptr, daiPermitSelector)
+                mstore(add(ptr, 0x04), owner)
+                mstore(add(ptr, 0x24), spender)
+
+                // Compact IDaiLikePermit.permit(uint32 nonce, uint32 expiry, uint256 r, uint256 vs)
+                {  // stack too deep
+                    let expiry := shr(224, calldataload(add(permit.offset, 0x04)))
+                    let vs := calldataload(add(permit.offset, 0x28))
+
+                    mstore(add(ptr, 0x44), shr(224, calldataload(permit.offset)))
+                    mstore(add(ptr, 0x64), sub(expiry, 1))
+                    mstore(add(ptr, 0x84), true)
+                    mstore(add(ptr, 0xa4), add(27, shr(255, vs)))
+                    calldatacopy(add(ptr, 0xc4), add(permit.offset, 0x08), 0x20) // r
+                    mstore(add(ptr, 0xe4), shr(1, shl(1, vs)))
+                }
+                // IDaiLikePermit.permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0x104, 0, 0)
+            }
+            case 224 {
+                mstore(ptr, permitSelector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length)
+                // IERC20Permit.permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0xe4, 0, 0)
+            }
+            case 256 {
+                mstore(ptr, daiPermitSelector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length)
+                // IDaiLikePermit.permit(address holder, address spender, uint256 nonce, uint256 expiry, bool allowed, uint8 v, bytes32 r, bytes32 s)
+                success := call(gas(), token, 0, ptr, 0x104, 0, 0)
+            }
+            case 96 {
+                // Compact IPermit2.permit(uint160 amount, uint32 expiration, uint32 nonce, uint32 sigDeadline, uint256 r, uint256 vs)
+                mstore(ptr, permit2Selector)
+                mstore(add(ptr, 0x04), owner)
+                mstore(add(ptr, 0x24), token)
+                calldatacopy(add(ptr, 0x50), permit.offset, 0x14) // amount
+                mstore(add(ptr, 0x64), and(0xffffffffffff, sub(shr(224, calldataload(add(permit.offset, 0x14))), 1))) // expiration
+                mstore(add(ptr, 0x84), shr(224, calldataload(add(permit.offset, 0x18)))) // nonce
+                mstore(add(ptr, 0xa4), spender)
+                mstore(add(ptr, 0xc4), and(0xffffffffffff, sub(shr(224, calldataload(add(permit.offset, 0x1c))), 1))) // sigDeadline
+                mstore(add(ptr, 0xe4), 0x100)
+                mstore(add(ptr, 0x104), 0x40)
+                calldatacopy(add(ptr, 0x124), add(permit.offset, 0x20), 0x20) // r
+                calldatacopy(add(ptr, 0x144), add(permit.offset, 0x40), 0x20) // vs
+                // IPermit2.permit(address owner, PermitSingle calldata permitSingle, bytes calldata signature)
+                success := call(gas(), _PERMIT2, 0, ptr, 0x164, 0, 0)
+            }
+            case 352 {
+                mstore(ptr, permit2Selector)
+                calldatacopy(add(ptr, 0x04), permit.offset, permit.length)
+                // IPermit2.permit(address owner, PermitSingle calldata permitSingle, bytes calldata signature)
+                success := call(gas(), _PERMIT2, 0, ptr, 0x164, 0, 0)
+            }
+            default {
+                mstore(ptr, _PERMIT_LENGTH_ERROR)
+                revert(ptr, 4)
+            }
+        }
+    }
+
+    function _makeCall(
+        IERC20 token,
+        bytes4 selector,
+        address to,
+        uint256 amount
+    ) private returns (bool success) {
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let data := mload(0x40)
+
+            mstore(data, selector)
+            mstore(add(data, 0x04), to)
+            mstore(add(data, 0x24), amount)
+            success := call(gas(), token, 0, data, 0x44, 0x0, 0x20)
+            if success {
+                switch returndatasize()
+                case 0 {
+                    success := gt(extcodesize(token), 0)
+                }
+                default {
+                    success := and(gt(returndatasize(), 31), eq(mload(0), 1))
+                }
+            }
+        }
+    }
+
+    function safeDeposit(IWETH weth, uint256 amount) internal {
+        if (amount > 0) {
+            bytes4 selector = IWETH.deposit.selector;
+            assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+                mstore(0, selector)
+                if iszero(call(gas(), weth, amount, 0, 4, 0, 0)) {
+                    returndatacopy(0, 0, returndatasize())
+                    revert(0, returndatasize())
+                }
+            }
+        }
+    }
+
+    function safeWithdraw(IWETH weth, uint256 amount) internal {
+        bytes4 selector = IWETH.withdraw.selector;
+        assembly ("memory-safe") {  // solhint-disable-line no-inline-assembly
+            mstore(0, selector)
+            mstore(4, amount)
+            if iszero(call(gas(), weth, 0, 0, 0x24, 0, 0)) {
+                let ptr := mload(0x40)
+                returndatacopy(ptr, 0, returndatasize())
+                revert(ptr, returndatasize())
+            }
+        }
+    }
+
+    function safeWithdrawTo(IWETH weth, uint256 amount, address to) internal {
+        safeWithdraw(weth, amount);
+        if (to != address(this)) {
+            assembly ("memory-safe") {  // solhint-disable-line no-inline-assembly
+                if iszero(call(_RAW_CALL_GAS_LIMIT, to, amount, 0, 0, 0, 0)) {
+                    let ptr := mload(0x40)
+                    returndatacopy(ptr, 0, returndatasize())
+                    revert(ptr, returndatasize())
+                }
+            }
+        }
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/math/SafeCast.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/math/SafeCast.sol)
+// This file was procedurally generated from scripts/generate/templates/SafeCast.js.
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Wrappers over Solidity's uintXX/intXX casting operators with added overflow
+ * checks.
+ *
+ * Downcasting from uint256/int256 in Solidity does not revert on overflow. This can
+ * easily result in undesired exploitation or bugs, since developers usually
+ * assume that overflows raise errors. `SafeCast` restores this intuition by
+ * reverting the transaction when such an operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ *
+ * Can be combined with {SafeMath} and {SignedSafeMath} to extend it to smaller types, by performing
+ * all math on `uint256` and `int256` and then downcasting.
+ */
+library SafeCast {
+    /**
+     * @dev Returns the downcasted uint248 from uint256, reverting on
+     * overflow (when the input is greater than largest uint248).
+     *
+     * Counterpart to Solidity's `uint248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint248(uint256 value) internal pure returns (uint248) {
+        require(value <= type(uint248).max, "SafeCast: value doesn't fit in 248 bits");
+        return uint248(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint240 from uint256, reverting on
+     * overflow (when the input is greater than largest uint240).
+     *
+     * Counterpart to Solidity's `uint240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint240(uint256 value) internal pure returns (uint240) {
+        require(value <= type(uint240).max, "SafeCast: value doesn't fit in 240 bits");
+        return uint240(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint232 from uint256, reverting on
+     * overflow (when the input is greater than largest uint232).
+     *
+     * Counterpart to Solidity's `uint232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint232(uint256 value) internal pure returns (uint232) {
+        require(value <= type(uint232).max, "SafeCast: value doesn't fit in 232 bits");
+        return uint232(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint224 from uint256, reverting on
+     * overflow (when the input is greater than largest uint224).
+     *
+     * Counterpart to Solidity's `uint224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     *
+     * _Available since v4.2._
+     */
+    function toUint224(uint256 value) internal pure returns (uint224) {
+        require(value <= type(uint224).max, "SafeCast: value doesn't fit in 224 bits");
+        return uint224(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint216 from uint256, reverting on
+     * overflow (when the input is greater than largest uint216).
+     *
+     * Counterpart to Solidity's `uint216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint216(uint256 value) internal pure returns (uint216) {
+        require(value <= type(uint216).max, "SafeCast: value doesn't fit in 216 bits");
+        return uint216(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint208 from uint256, reverting on
+     * overflow (when the input is greater than largest uint208).
+     *
+     * Counterpart to Solidity's `uint208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint208(uint256 value) internal pure returns (uint208) {
+        require(value <= type(uint208).max, "SafeCast: value doesn't fit in 208 bits");
+        return uint208(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint200 from uint256, reverting on
+     * overflow (when the input is greater than largest uint200).
+     *
+     * Counterpart to Solidity's `uint200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint200(uint256 value) internal pure returns (uint200) {
+        require(value <= type(uint200).max, "SafeCast: value doesn't fit in 200 bits");
+        return uint200(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint192 from uint256, reverting on
+     * overflow (when the input is greater than largest uint192).
+     *
+     * Counterpart to Solidity's `uint192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint192(uint256 value) internal pure returns (uint192) {
+        require(value <= type(uint192).max, "SafeCast: value doesn't fit in 192 bits");
+        return uint192(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint184 from uint256, reverting on
+     * overflow (when the input is greater than largest uint184).
+     *
+     * Counterpart to Solidity's `uint184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint184(uint256 value) internal pure returns (uint184) {
+        require(value <= type(uint184).max, "SafeCast: value doesn't fit in 184 bits");
+        return uint184(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint176 from uint256, reverting on
+     * overflow (when the input is greater than largest uint176).
+     *
+     * Counterpart to Solidity's `uint176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint176(uint256 value) internal pure returns (uint176) {
+        require(value <= type(uint176).max, "SafeCast: value doesn't fit in 176 bits");
+        return uint176(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint168 from uint256, reverting on
+     * overflow (when the input is greater than largest uint168).
+     *
+     * Counterpart to Solidity's `uint168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint168(uint256 value) internal pure returns (uint168) {
+        require(value <= type(uint168).max, "SafeCast: value doesn't fit in 168 bits");
+        return uint168(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint160 from uint256, reverting on
+     * overflow (when the input is greater than largest uint160).
+     *
+     * Counterpart to Solidity's `uint160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint160(uint256 value) internal pure returns (uint160) {
+        require(value <= type(uint160).max, "SafeCast: value doesn't fit in 160 bits");
+        return uint160(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint152 from uint256, reverting on
+     * overflow (when the input is greater than largest uint152).
+     *
+     * Counterpart to Solidity's `uint152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint152(uint256 value) internal pure returns (uint152) {
+        require(value <= type(uint152).max, "SafeCast: value doesn't fit in 152 bits");
+        return uint152(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint144 from uint256, reverting on
+     * overflow (when the input is greater than largest uint144).
+     *
+     * Counterpart to Solidity's `uint144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint144(uint256 value) internal pure returns (uint144) {
+        require(value <= type(uint144).max, "SafeCast: value doesn't fit in 144 bits");
+        return uint144(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint136 from uint256, reverting on
+     * overflow (when the input is greater than largest uint136).
+     *
+     * Counterpart to Solidity's `uint136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint136(uint256 value) internal pure returns (uint136) {
+        require(value <= type(uint136).max, "SafeCast: value doesn't fit in 136 bits");
+        return uint136(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint128 from uint256, reverting on
+     * overflow (when the input is greater than largest uint128).
+     *
+     * Counterpart to Solidity's `uint128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint128(uint256 value) internal pure returns (uint128) {
+        require(value <= type(uint128).max, "SafeCast: value doesn't fit in 128 bits");
+        return uint128(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint120 from uint256, reverting on
+     * overflow (when the input is greater than largest uint120).
+     *
+     * Counterpart to Solidity's `uint120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint120(uint256 value) internal pure returns (uint120) {
+        require(value <= type(uint120).max, "SafeCast: value doesn't fit in 120 bits");
+        return uint120(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint112 from uint256, reverting on
+     * overflow (when the input is greater than largest uint112).
+     *
+     * Counterpart to Solidity's `uint112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint112(uint256 value) internal pure returns (uint112) {
+        require(value <= type(uint112).max, "SafeCast: value doesn't fit in 112 bits");
+        return uint112(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint104 from uint256, reverting on
+     * overflow (when the input is greater than largest uint104).
+     *
+     * Counterpart to Solidity's `uint104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint104(uint256 value) internal pure returns (uint104) {
+        require(value <= type(uint104).max, "SafeCast: value doesn't fit in 104 bits");
+        return uint104(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint96 from uint256, reverting on
+     * overflow (when the input is greater than largest uint96).
+     *
+     * Counterpart to Solidity's `uint96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     *
+     * _Available since v4.2._
+     */
+    function toUint96(uint256 value) internal pure returns (uint96) {
+        require(value <= type(uint96).max, "SafeCast: value doesn't fit in 96 bits");
+        return uint96(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint88 from uint256, reverting on
+     * overflow (when the input is greater than largest uint88).
+     *
+     * Counterpart to Solidity's `uint88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint88(uint256 value) internal pure returns (uint88) {
+        require(value <= type(uint88).max, "SafeCast: value doesn't fit in 88 bits");
+        return uint88(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint80 from uint256, reverting on
+     * overflow (when the input is greater than largest uint80).
+     *
+     * Counterpart to Solidity's `uint80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint80(uint256 value) internal pure returns (uint80) {
+        require(value <= type(uint80).max, "SafeCast: value doesn't fit in 80 bits");
+        return uint80(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint72 from uint256, reverting on
+     * overflow (when the input is greater than largest uint72).
+     *
+     * Counterpart to Solidity's `uint72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint72(uint256 value) internal pure returns (uint72) {
+        require(value <= type(uint72).max, "SafeCast: value doesn't fit in 72 bits");
+        return uint72(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint64 from uint256, reverting on
+     * overflow (when the input is greater than largest uint64).
+     *
+     * Counterpart to Solidity's `uint64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint64(uint256 value) internal pure returns (uint64) {
+        require(value <= type(uint64).max, "SafeCast: value doesn't fit in 64 bits");
+        return uint64(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint56 from uint256, reverting on
+     * overflow (when the input is greater than largest uint56).
+     *
+     * Counterpart to Solidity's `uint56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint56(uint256 value) internal pure returns (uint56) {
+        require(value <= type(uint56).max, "SafeCast: value doesn't fit in 56 bits");
+        return uint56(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint48 from uint256, reverting on
+     * overflow (when the input is greater than largest uint48).
+     *
+     * Counterpart to Solidity's `uint48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint48(uint256 value) internal pure returns (uint48) {
+        require(value <= type(uint48).max, "SafeCast: value doesn't fit in 48 bits");
+        return uint48(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint40 from uint256, reverting on
+     * overflow (when the input is greater than largest uint40).
+     *
+     * Counterpart to Solidity's `uint40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint40(uint256 value) internal pure returns (uint40) {
+        require(value <= type(uint40).max, "SafeCast: value doesn't fit in 40 bits");
+        return uint40(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint32 from uint256, reverting on
+     * overflow (when the input is greater than largest uint32).
+     *
+     * Counterpart to Solidity's `uint32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint32(uint256 value) internal pure returns (uint32) {
+        require(value <= type(uint32).max, "SafeCast: value doesn't fit in 32 bits");
+        return uint32(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint24 from uint256, reverting on
+     * overflow (when the input is greater than largest uint24).
+     *
+     * Counterpart to Solidity's `uint24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint24(uint256 value) internal pure returns (uint24) {
+        require(value <= type(uint24).max, "SafeCast: value doesn't fit in 24 bits");
+        return uint24(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint16 from uint256, reverting on
+     * overflow (when the input is greater than largest uint16).
+     *
+     * Counterpart to Solidity's `uint16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint16(uint256 value) internal pure returns (uint16) {
+        require(value <= type(uint16).max, "SafeCast: value doesn't fit in 16 bits");
+        return uint16(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint8 from uint256, reverting on
+     * overflow (when the input is greater than largest uint8).
+     *
+     * Counterpart to Solidity's `uint8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint8(uint256 value) internal pure returns (uint8) {
+        require(value <= type(uint8).max, "SafeCast: value doesn't fit in 8 bits");
+        return uint8(value);
+    }
+
+    /**
+     * @dev Converts a signed int256 into an unsigned uint256.
+     *
+     * Requirements:
+     *
+     * - input must be greater than or equal to 0.
+     *
+     * _Available since v3.0._
+     */
+    function toUint256(int256 value) internal pure returns (uint256) {
+        require(value >= 0, "SafeCast: value must be positive");
+        return uint256(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int248 from int256, reverting on
+     * overflow (when the input is less than smallest int248 or
+     * greater than largest int248).
+     *
+     * Counterpart to Solidity's `int248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt248(int256 value) internal pure returns (int248 downcasted) {
+        downcasted = int248(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 248 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int240 from int256, reverting on
+     * overflow (when the input is less than smallest int240 or
+     * greater than largest int240).
+     *
+     * Counterpart to Solidity's `int240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt240(int256 value) internal pure returns (int240 downcasted) {
+        downcasted = int240(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 240 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int232 from int256, reverting on
+     * overflow (when the input is less than smallest int232 or
+     * greater than largest int232).
+     *
+     * Counterpart to Solidity's `int232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt232(int256 value) internal pure returns (int232 downcasted) {
+        downcasted = int232(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 232 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int224 from int256, reverting on
+     * overflow (when the input is less than smallest int224 or
+     * greater than largest int224).
+     *
+     * Counterpart to Solidity's `int224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt224(int256 value) internal pure returns (int224 downcasted) {
+        downcasted = int224(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 224 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int216 from int256, reverting on
+     * overflow (when the input is less than smallest int216 or
+     * greater than largest int216).
+     *
+     * Counterpart to Solidity's `int216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt216(int256 value) internal pure returns (int216 downcasted) {
+        downcasted = int216(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 216 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int208 from int256, reverting on
+     * overflow (when the input is less than smallest int208 or
+     * greater than largest int208).
+     *
+     * Counterpart to Solidity's `int208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt208(int256 value) internal pure returns (int208 downcasted) {
+        downcasted = int208(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 208 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int200 from int256, reverting on
+     * overflow (when the input is less than smallest int200 or
+     * greater than largest int200).
+     *
+     * Counterpart to Solidity's `int200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt200(int256 value) internal pure returns (int200 downcasted) {
+        downcasted = int200(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 200 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int192 from int256, reverting on
+     * overflow (when the input is less than smallest int192 or
+     * greater than largest int192).
+     *
+     * Counterpart to Solidity's `int192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt192(int256 value) internal pure returns (int192 downcasted) {
+        downcasted = int192(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 192 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int184 from int256, reverting on
+     * overflow (when the input is less than smallest int184 or
+     * greater than largest int184).
+     *
+     * Counterpart to Solidity's `int184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt184(int256 value) internal pure returns (int184 downcasted) {
+        downcasted = int184(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 184 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int176 from int256, reverting on
+     * overflow (when the input is less than smallest int176 or
+     * greater than largest int176).
+     *
+     * Counterpart to Solidity's `int176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt176(int256 value) internal pure returns (int176 downcasted) {
+        downcasted = int176(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 176 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int168 from int256, reverting on
+     * overflow (when the input is less than smallest int168 or
+     * greater than largest int168).
+     *
+     * Counterpart to Solidity's `int168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt168(int256 value) internal pure returns (int168 downcasted) {
+        downcasted = int168(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 168 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int160 from int256, reverting on
+     * overflow (when the input is less than smallest int160 or
+     * greater than largest int160).
+     *
+     * Counterpart to Solidity's `int160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt160(int256 value) internal pure returns (int160 downcasted) {
+        downcasted = int160(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 160 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int152 from int256, reverting on
+     * overflow (when the input is less than smallest int152 or
+     * greater than largest int152).
+     *
+     * Counterpart to Solidity's `int152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt152(int256 value) internal pure returns (int152 downcasted) {
+        downcasted = int152(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 152 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int144 from int256, reverting on
+     * overflow (when the input is less than smallest int144 or
+     * greater than largest int144).
+     *
+     * Counterpart to Solidity's `int144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt144(int256 value) internal pure returns (int144 downcasted) {
+        downcasted = int144(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 144 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int136 from int256, reverting on
+     * overflow (when the input is less than smallest int136 or
+     * greater than largest int136).
+     *
+     * Counterpart to Solidity's `int136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt136(int256 value) internal pure returns (int136 downcasted) {
+        downcasted = int136(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 136 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int128 from int256, reverting on
+     * overflow (when the input is less than smallest int128 or
+     * greater than largest int128).
+     *
+     * Counterpart to Solidity's `int128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt128(int256 value) internal pure returns (int128 downcasted) {
+        downcasted = int128(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 128 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int120 from int256, reverting on
+     * overflow (when the input is less than smallest int120 or
+     * greater than largest int120).
+     *
+     * Counterpart to Solidity's `int120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt120(int256 value) internal pure returns (int120 downcasted) {
+        downcasted = int120(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 120 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int112 from int256, reverting on
+     * overflow (when the input is less than smallest int112 or
+     * greater than largest int112).
+     *
+     * Counterpart to Solidity's `int112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt112(int256 value) internal pure returns (int112 downcasted) {
+        downcasted = int112(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 112 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int104 from int256, reverting on
+     * overflow (when the input is less than smallest int104 or
+     * greater than largest int104).
+     *
+     * Counterpart to Solidity's `int104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt104(int256 value) internal pure returns (int104 downcasted) {
+        downcasted = int104(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 104 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int96 from int256, reverting on
+     * overflow (when the input is less than smallest int96 or
+     * greater than largest int96).
+     *
+     * Counterpart to Solidity's `int96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt96(int256 value) internal pure returns (int96 downcasted) {
+        downcasted = int96(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 96 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int88 from int256, reverting on
+     * overflow (when the input is less than smallest int88 or
+     * greater than largest int88).
+     *
+     * Counterpart to Solidity's `int88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt88(int256 value) internal pure returns (int88 downcasted) {
+        downcasted = int88(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 88 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int80 from int256, reverting on
+     * overflow (when the input is less than smallest int80 or
+     * greater than largest int80).
+     *
+     * Counterpart to Solidity's `int80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt80(int256 value) internal pure returns (int80 downcasted) {
+        downcasted = int80(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 80 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int72 from int256, reverting on
+     * overflow (when the input is less than smallest int72 or
+     * greater than largest int72).
+     *
+     * Counterpart to Solidity's `int72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt72(int256 value) internal pure returns (int72 downcasted) {
+        downcasted = int72(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 72 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int64 from int256, reverting on
+     * overflow (when the input is less than smallest int64 or
+     * greater than largest int64).
+     *
+     * Counterpart to Solidity's `int64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt64(int256 value) internal pure returns (int64 downcasted) {
+        downcasted = int64(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 64 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int56 from int256, reverting on
+     * overflow (when the input is less than smallest int56 or
+     * greater than largest int56).
+     *
+     * Counterpart to Solidity's `int56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt56(int256 value) internal pure returns (int56 downcasted) {
+        downcasted = int56(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 56 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int48 from int256, reverting on
+     * overflow (when the input is less than smallest int48 or
+     * greater than largest int48).
+     *
+     * Counterpart to Solidity's `int48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt48(int256 value) internal pure returns (int48 downcasted) {
+        downcasted = int48(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 48 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int40 from int256, reverting on
+     * overflow (when the input is less than smallest int40 or
+     * greater than largest int40).
+     *
+     * Counterpart to Solidity's `int40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt40(int256 value) internal pure returns (int40 downcasted) {
+        downcasted = int40(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 40 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int32 from int256, reverting on
+     * overflow (when the input is less than smallest int32 or
+     * greater than largest int32).
+     *
+     * Counterpart to Solidity's `int32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt32(int256 value) internal pure returns (int32 downcasted) {
+        downcasted = int32(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 32 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int24 from int256, reverting on
+     * overflow (when the input is less than smallest int24 or
+     * greater than largest int24).
+     *
+     * Counterpart to Solidity's `int24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt24(int256 value) internal pure returns (int24 downcasted) {
+        downcasted = int24(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 24 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int16 from int256, reverting on
+     * overflow (when the input is less than smallest int16 or
+     * greater than largest int16).
+     *
+     * Counterpart to Solidity's `int16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt16(int256 value) internal pure returns (int16 downcasted) {
+        downcasted = int16(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 16 bits");
+    }
+
+    /**
+     * @dev Returns the downcasted int8 from int256, reverting on
+     * overflow (when the input is less than smallest int8 or
+     * greater than largest int8).
+     *
+     * Counterpart to Solidity's `int8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt8(int256 value) internal pure returns (int8 downcasted) {
+        downcasted = int8(value);
+        require(downcasted == value, "SafeCast: value doesn't fit in 8 bits");
+    }
+
+    /**
+     * @dev Converts an unsigned uint256 into a signed int256.
+     *
+     * Requirements:
+     *
+     * - input must be less than or equal to maxInt256.
+     *
+     * _Available since v3.0._
+     */
+    function toInt256(uint256 value) internal pure returns (int256) {
+        // Note: Unsafe cast below is okay because `type(int256).max` is guaranteed to be positive
+        require(value <= uint256(type(int256).max), "SafeCast: value doesn't fit in an int256");
+        return int256(value);
+    }
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/interfaces/IAddressProviderV3.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {IVersion} from "@gearbox-protocol/core-v2/contracts/interfaces/IVersion.sol";
+
+uint256 constant NO_VERSION_CONTROL = 0;
+
+bytes32 constant AP_CONTRACTS_REGISTER = "CONTRACTS_REGISTER";
+bytes32 constant AP_ACL = "ACL";
+bytes32 constant AP_PRICE_ORACLE = "PRICE_ORACLE";
+bytes32 constant AP_ACCOUNT_FACTORY = "ACCOUNT_FACTORY";
+bytes32 constant AP_DATA_COMPRESSOR = "DATA_COMPRESSOR";
+bytes32 constant AP_TREASURY = "TREASURY";
+bytes32 constant AP_GEAR_TOKEN = "GEAR_TOKEN";
+bytes32 constant AP_WETH_TOKEN = "WETH_TOKEN";
+bytes32 constant AP_WETH_GATEWAY = "WETH_GATEWAY";
+bytes32 constant AP_ROUTER = "ROUTER";
+bytes32 constant AP_BOT_LIST = "BOT_LIST";
+bytes32 constant AP_GEAR_STAKING = "GEAR_STAKING";
+bytes32 constant AP_ZAPPER_REGISTER = "ZAPPER_REGISTER";
+
+interface IAddressProviderV3Events {
+    /// @notice Emitted when an address is set for a contract key
+    event SetAddress(bytes32 indexed key, address indexed value, uint256 indexed version);
+}
+
+/// @title Address provider V3 interface
+interface IAddressProviderV3 is IAddressProviderV3Events, IVersion {
+    function addresses(bytes32 key, uint256 _version) external view returns (address);
+
+    function getAddressOrRevert(bytes32 key, uint256 _version) external view returns (address result);
+
+    function setAddress(bytes32 key, address value, bool saveVersion) external;
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/interfaces/IVotingContractV3.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+interface IVotingContractV3 {
+    function vote(address user, uint96 votes, bytes calldata extraData) external;
+    function unvote(address user, uint96 votes, bytes calldata extraData) external;
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/interfaces/IGearStakingV3.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {IVersion} from "@gearbox-protocol/core-v2/contracts/interfaces/IVersion.sol";
+
+uint256 constant EPOCH_LENGTH = 7 days;
+
+uint256 constant EPOCHS_TO_WITHDRAW = 4;
+
+/// @notice Voting contract status
+///         * NOT_ALLOWED - cannot vote or unvote
+///         * ALLOWED - can both vote and unvote
+///         * UNVOTE_ONLY - can only unvote
+enum VotingContractStatus {
+    NOT_ALLOWED,
+    ALLOWED,
+    UNVOTE_ONLY
+}
+
+struct UserVoteLockData {
+    uint96 totalStaked;
+    uint96 available;
+}
+
+struct WithdrawalData {
+    uint96[EPOCHS_TO_WITHDRAW] withdrawalsPerEpoch;
+    uint16 epochLastUpdate;
+}
+
+/// @notice Multi vote
+/// @param votingContract Contract to submit a vote to
+/// @param voteAmount Amount of staked GEAR to vote with
+/// @param isIncrease Whether to add or remove votes
+/// @param extraData Data to pass to the voting contract
+struct MultiVote {
+    address votingContract;
+    uint96 voteAmount;
+    bool isIncrease;
+    bytes extraData;
+}
+
+interface IGearStakingV3Events {
+    /// @notice Emitted when the user deposits GEAR into staked GEAR
+    event DepositGear(address indexed user, uint256 amount);
+
+    /// @notice Emitted Emits when the user migrates GEAR into a successor contract
+    event MigrateGear(address indexed user, address indexed successor, uint256 amount);
+
+    /// @notice Emitted Emits when the user starts a withdrawal from staked GEAR
+    event ScheduleGearWithdrawal(address indexed user, uint256 amount);
+
+    /// @notice Emitted Emits when the user claims a mature withdrawal from staked GEAR
+    event ClaimGearWithdrawal(address indexed user, address to, uint256 amount);
+
+    /// @notice Emitted Emits when the configurator adds or removes a voting contract
+    event SetVotingContractStatus(address indexed votingContract, VotingContractStatus status);
+
+    /// @notice Emitted Emits when the new successor contract is set
+    event SetSuccessor(address indexed successor);
+
+    /// @notice Emitted Emits when the new migrator contract is set
+    event SetMigrator(address indexed migrator);
+}
+
+/// @title Gear staking V3 interface
+interface IGearStakingV3 is IGearStakingV3Events, IVersion {
+    function gear() external view returns (address);
+
+    function firstEpochTimestamp() external view returns (uint256);
+
+    function getCurrentEpoch() external view returns (uint16);
+
+    function balanceOf(address user) external view returns (uint256);
+
+    function availableBalance(address user) external view returns (uint256);
+
+    function getWithdrawableAmounts(address user)
+        external
+        view
+        returns (uint256 withdrawableNow, uint256[EPOCHS_TO_WITHDRAW] memory withdrawableInEpochs);
+
+    function deposit(uint96 amount, MultiVote[] calldata votes) external;
+
+    function depositWithPermit(
+        uint96 amount,
+        MultiVote[] calldata votes,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    function multivote(MultiVote[] calldata votes) external;
+
+    function withdraw(uint96 amount, address to, MultiVote[] calldata votes) external;
+
+    function claimWithdrawals(address to) external;
+
+    function migrate(uint96 amount, MultiVote[] calldata votesBefore, MultiVote[] calldata votesAfter) external;
+
+    function depositOnMigration(uint96 amount, address onBehalfOf, MultiVote[] calldata votes) external;
+
+    // ------------- //
+    // CONFIGURATION //
+    // ------------- //
+
+    function allowedVotingContract(address) external view returns (VotingContractStatus);
+
+    function setVotingContractStatus(address votingContract, VotingContractStatus status) external;
+
+    function successor() external view returns (address);
+
+    function setSuccessor(address newSuccessor) external;
+
+    function migrator() external view returns (address);
+
+    function setMigrator(address newMigrator) external;
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/traits/ACLNonReentrantTrait.sol
+// SPDX-License-Identifier: BUSL-1.1
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {Pausable} from "@openzeppelin/contracts/security/Pausable.sol";
+
+import {IACL} from "@gearbox-protocol/core-v2/contracts/interfaces/IACL.sol";
+import {
+    CallerNotControllerException,
+    CallerNotPausableAdminException,
+    CallerNotUnpausableAdminException
+} from "../interfaces/IExceptions.sol";
+
+import {ACLTrait} from "./ACLTrait.sol";
+import {ReentrancyGuardTrait} from "./ReentrancyGuardTrait.sol";
+
+/// @title ACL non-reentrant trait
+/// @notice Extended version of `ACLTrait` that implements pausable functionality,
+///         reentrancy protection and external controller role
+abstract contract ACLNonReentrantTrait is ACLTrait, Pausable, ReentrancyGuardTrait {
+    /// @notice Emitted when new external controller is set
+    event NewController(address indexed newController);
+
+    /// @notice External controller address
+    address public controller;
+
+    /// @dev Ensures that function caller is external controller or configurator
+    modifier controllerOnly() {
+        _ensureCallerIsControllerOrConfigurator();
+        _;
+    }
+
+    /// @dev Reverts if the caller is not controller or configurator
+    /// @dev Used to cut contract size on modifiers
+    function _ensureCallerIsControllerOrConfigurator() internal view {
+        if (msg.sender != controller && !_isConfigurator({account: msg.sender})) {
+            revert CallerNotControllerException();
+        }
+    }
+
+    /// @dev Ensures that function caller has pausable admin role
+    modifier pausableAdminsOnly() {
+        _ensureCallerIsPausableAdmin();
+        _;
+    }
+
+    /// @dev Reverts if the caller is not pausable admin
+    /// @dev Used to cut contract size on modifiers
+    function _ensureCallerIsPausableAdmin() internal view {
+        if (!_isPausableAdmin({account: msg.sender})) {
+            revert CallerNotPausableAdminException();
+        }
+    }
+
+    /// @dev Ensures that function caller has unpausable admin role
+    modifier unpausableAdminsOnly() {
+        _ensureCallerIsUnpausableAdmin();
+        _;
+    }
+
+    /// @dev Reverts if the caller is not unpausable admin
+    /// @dev Used to cut contract size on modifiers
+    function _ensureCallerIsUnpausableAdmin() internal view {
+        if (!_isUnpausableAdmin({account: msg.sender})) {
+            revert CallerNotUnpausableAdminException();
+        }
+    }
+
+    /// @notice Constructor
+    /// @param addressProvider Address provider contract address
+    constructor(address addressProvider) ACLTrait(addressProvider) {
+        controller = IACL(acl).owner();
+    }
+
+    /// @notice Pauses contract, can only be called by an account with pausable admin role
+    function pause() external virtual pausableAdminsOnly {
+        _pause();
+    }
+
+    /// @notice Unpauses contract, can only be called by an account with unpausable admin role
+    function unpause() external virtual unpausableAdminsOnly {
+        _unpause();
+    }
+
+    /// @notice Sets new external controller, can only be called by configurator
+    function setController(address newController) external configuratorOnly {
+        if (controller == newController) return;
+        controller = newController;
+        emit NewController(newController);
+    }
+
+    /// @dev Checks whether given account has pausable admin role
+    function _isPausableAdmin(address account) internal view returns (bool) {
+        return IACL(acl).isPausableAdmin(account);
+    }
+
+    /// @dev Checks whether given account has unpausable admin role
+    function _isUnpausableAdmin(address account) internal view returns (bool) {
+        return IACL(acl).isUnpausableAdmin(account);
+    }
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/interfaces/IExceptions.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+// ------- //
+// GENERAL //
+// ------- //
+
+/// @notice Thrown on attempting to set an important address to zero address
+error ZeroAddressException();
+
+/// @notice Thrown when attempting to pass a zero amount to a funding-related operation
+error AmountCantBeZeroException();
+
+/// @notice Thrown on incorrect input parameter
+error IncorrectParameterException();
+
+/// @notice Thrown when balance is insufficient to perform an operation
+error InsufficientBalanceException();
+
+/// @notice Thrown if parameter is out of range
+error ValueOutOfRangeException();
+
+/// @notice Thrown when trying to send ETH to a contract that is not allowed to receive ETH directly
+error ReceiveIsNotAllowedException();
+
+/// @notice Thrown on attempting to set an EOA as an important contract in the system
+error AddressIsNotContractException(address);
+
+/// @notice Thrown on attempting to receive a token that is not a collateral token or was forbidden
+error TokenNotAllowedException();
+
+/// @notice Thrown on attempting to add a token that is already in a collateral list
+error TokenAlreadyAddedException();
+
+/// @notice Thrown when attempting to use quota-related logic for a token that is not quoted in quota keeper
+error TokenIsNotQuotedException();
+
+/// @notice Thrown on attempting to interact with an address that is not a valid target contract
+error TargetContractNotAllowedException();
+
+/// @notice Thrown if function is not implemented
+error NotImplementedException();
+
+// ------------------ //
+// CONTRACTS REGISTER //
+// ------------------ //
+
+/// @notice Thrown when an address is expected to be a registered credit manager, but is not
+error RegisteredCreditManagerOnlyException();
+
+/// @notice Thrown when an address is expected to be a registered pool, but is not
+error RegisteredPoolOnlyException();
+
+// ---------------- //
+// ADDRESS PROVIDER //
+// ---------------- //
+
+/// @notice Reverts if address key isn't found in address provider
+error AddressNotFoundException();
+
+// ----------------- //
+// POOL, PQK, GAUGES //
+// ----------------- //
+
+/// @notice Thrown by pool-adjacent contracts when a credit manager being connected has a wrong pool address
+error IncompatibleCreditManagerException();
+
+/// @notice Thrown when attempting to set an incompatible successor staking contract
+error IncompatibleSuccessorException();
+
+/// @notice Thrown when attempting to vote in a non-approved contract
+error VotingContractNotAllowedException();
+
+/// @notice Thrown when attempting to unvote more votes than there are
+error InsufficientVotesException();
+
+/// @notice Thrown when attempting to borrow more than the second point on a two-point curve
+error BorrowingMoreThanU2ForbiddenException();
+
+/// @notice Thrown when a credit manager attempts to borrow more than its limit in the current block, or in general
+error CreditManagerCantBorrowException();
+
+/// @notice Thrown when attempting to connect a quota keeper to an incompatible pool
+error IncompatiblePoolQuotaKeeperException();
+
+/// @notice Thrown when the quota is outside of min/max bounds
+error QuotaIsOutOfBoundsException();
+
+// -------------- //
+// CREDIT MANAGER //
+// -------------- //
+
+/// @notice Thrown on failing a full collateral check after multicall
+error NotEnoughCollateralException();
+
+/// @notice Thrown if an attempt to approve a collateral token to adapter's target contract fails
+error AllowanceFailedException();
+
+/// @notice Thrown on attempting to perform an action for a credit account that does not exist
+error CreditAccountDoesNotExistException();
+
+/// @notice Thrown on configurator attempting to add more than 255 collateral tokens
+error TooManyTokensException();
+
+/// @notice Thrown if more than the maximum number of tokens were enabled on a credit account
+error TooManyEnabledTokensException();
+
+/// @notice Thrown when attempting to execute a protocol interaction without active credit account set
+error ActiveCreditAccountNotSetException();
+
+/// @notice Thrown when trying to update credit account's debt more than once in the same block
+error DebtUpdatedTwiceInOneBlockException();
+
+/// @notice Thrown when trying to repay all debt while having active quotas
+error DebtToZeroWithActiveQuotasException();
+
+/// @notice Thrown when a zero-debt account attempts to update quota
+error UpdateQuotaOnZeroDebtAccountException();
+
+/// @notice Thrown when attempting to close an account with non-zero debt
+error CloseAccountWithNonZeroDebtException();
+
+/// @notice Thrown when value of funds remaining on the account after liquidation is insufficient
+error InsufficientRemainingFundsException();
+
+/// @notice Thrown when Credit Facade tries to write over a non-zero active Credit Account
+error ActiveCreditAccountOverridenException();
+
+// ------------------- //
+// CREDIT CONFIGURATOR //
+// ------------------- //
+
+/// @notice Thrown on attempting to use a non-ERC20 contract or an EOA as a token
+error IncorrectTokenContractException();
+
+/// @notice Thrown if the newly set LT if zero or greater than the underlying's LT
+error IncorrectLiquidationThresholdException();
+
+/// @notice Thrown if borrowing limits are incorrect: minLimit > maxLimit or maxLimit > blockLimit
+error IncorrectLimitsException();
+
+/// @notice Thrown if the new expiration date is less than the current expiration date or current timestamp
+error IncorrectExpirationDateException();
+
+/// @notice Thrown if a contract returns a wrong credit manager or reverts when trying to retrieve it
+error IncompatibleContractException();
+
+/// @notice Thrown if attempting to forbid an adapter that is not registered in the credit manager
+error AdapterIsNotRegisteredException();
+
+/// @notice Thrown when trying to manually set total debt parameters in a credit facade that doesn't track them
+error TotalDebtNotTrackedException();
+
+// ------------- //
+// CREDIT FACADE //
+// ------------- //
+
+/// @notice Thrown when attempting to perform an action that is forbidden in whitelisted mode
+error ForbiddenInWhitelistedModeException();
+
+/// @notice Thrown if credit facade is not expirable, and attempted aciton requires expirability
+error NotAllowedWhenNotExpirableException();
+
+/// @notice Thrown if a selector that doesn't match any allowed function is passed to the credit facade in a multicall
+error UnknownMethodException();
+
+/// @notice Thrown when trying to close an account with enabled tokens
+error CloseAccountWithEnabledTokensException();
+
+/// @notice Thrown if a liquidator tries to liquidate an account with a health factor above 1
+error CreditAccountNotLiquidatableException();
+
+/// @notice Thrown if too much new debt was taken within a single block
+error BorrowedBlockLimitException();
+
+/// @notice Thrown if the new debt principal for a credit account falls outside of borrowing limits
+error BorrowAmountOutOfLimitsException();
+
+/// @notice Thrown if a user attempts to open an account via an expired credit facade
+error NotAllowedAfterExpirationException();
+
+/// @notice Thrown if expected balances are attempted to be set twice without performing a slippage check
+error ExpectedBalancesAlreadySetException();
+
+/// @notice Thrown if attempting to perform a slippage check when excepted balances are not set
+error ExpectedBalancesNotSetException();
+
+/// @notice Thrown if balance of at least one token is less than expected during a slippage check
+error BalanceLessThanExpectedException();
+
+/// @notice Thrown when trying to perform an action that is forbidden when credit account has enabled forbidden tokens
+error ForbiddenTokensException();
+
+/// @notice Thrown when new forbidden tokens are enabled during the multicall
+error ForbiddenTokenEnabledException();
+
+/// @notice Thrown when enabled forbidden token balance is increased during the multicall
+error ForbiddenTokenBalanceIncreasedException();
+
+/// @notice Thrown when the remaining token balance is increased during the liquidation
+error RemainingTokenBalanceIncreasedException();
+
+/// @notice Thrown if `botMulticall` is called by an address that is not approved by account owner or is forbidden
+error NotApprovedBotException();
+
+/// @notice Thrown when attempting to perform a multicall action with no permission for it
+error NoPermissionException(uint256 permission);
+
+/// @notice Thrown when attempting to give a bot unexpected permissions
+error UnexpectedPermissionsException();
+
+/// @notice Thrown when a custom HF parameter lower than 10000 is passed into the full collateral check
+error CustomHealthFactorTooLowException();
+
+/// @notice Thrown when submitted collateral hint is not a valid token mask
+error InvalidCollateralHintException();
+
+// ------ //
+// ACCESS //
+// ------ //
+
+/// @notice Thrown on attempting to call an access restricted function not as credit account owner
+error CallerNotCreditAccountOwnerException();
+
+/// @notice Thrown on attempting to call an access restricted function not as configurator
+error CallerNotConfiguratorException();
+
+/// @notice Thrown on attempting to call an access-restructed function not as account factory
+error CallerNotAccountFactoryException();
+
+/// @notice Thrown on attempting to call an access restricted function not as credit manager
+error CallerNotCreditManagerException();
+
+/// @notice Thrown on attempting to call an access restricted function not as credit facade
+error CallerNotCreditFacadeException();
+
+/// @notice Thrown on attempting to call an access restricted function not as controller or configurator
+error CallerNotControllerException();
+
+/// @notice Thrown on attempting to pause a contract without pausable admin rights
+error CallerNotPausableAdminException();
+
+/// @notice Thrown on attempting to unpause a contract without unpausable admin rights
+error CallerNotUnpausableAdminException();
+
+/// @notice Thrown on attempting to call an access restricted function not as gauge
+error CallerNotGaugeException();
+
+/// @notice Thrown on attempting to call an access restricted function not as quota keeper
+error CallerNotPoolQuotaKeeperException();
+
+/// @notice Thrown on attempting to call an access restricted function not as voter
+error CallerNotVoterException();
+
+/// @notice Thrown on attempting to call an access restricted function not as allowed adapter
+error CallerNotAdapterException();
+
+/// @notice Thrown on attempting to call an access restricted function not as migrator
+error CallerNotMigratorException();
+
+/// @notice Thrown when an address that is not the designated executor attempts to execute a transaction
+error CallerNotExecutorException();
+
+/// @notice Thrown on attempting to call an access restricted function not as veto admin
+error CallerNotVetoAdminException();
+
+// ------------------- //
+// CONTROLLER TIMELOCK //
+// ------------------- //
+
+/// @notice Thrown when the new parameter values do not satisfy required conditions
+error ParameterChecksFailedException();
+
+/// @notice Thrown when attempting to execute a non-queued transaction
+error TxNotQueuedException();
+
+/// @notice Thrown when attempting to execute a transaction that is either immature or stale
+error TxExecutedOutsideTimeWindowException();
+
+/// @notice Thrown when execution of a transaction fails
+error TxExecutionRevertedException();
+
+/// @notice Thrown when the value of a parameter on execution is different from the value on queue
+error ParameterChangedAfterQueuedTxException();
+
+// -------- //
+// BOT LIST //
+// -------- //
+
+/// @notice Thrown when attempting to set non-zero permissions for a forbidden or special bot
+error InvalidBotException();
+
+// --------------- //
+// ACCOUNT FACTORY //
+// --------------- //
+
+/// @notice Thrown when trying to deploy second master credit account for a credit manager
+error MasterCreditAccountAlreadyDeployedException();
+
+/// @notice Thrown when trying to rescue funds from a credit account that is currently in use
+error CreditAccountIsInUseException();
+
+// ------------ //
+// PRICE ORACLE //
+// ------------ //
+
+/// @notice Thrown on attempting to set a token price feed to an address that is not a correct price feed
+error IncorrectPriceFeedException();
+
+/// @notice Thrown on attempting to interact with a price feed for a token not added to the price oracle
+error PriceFeedDoesNotExistException();
+
+/// @notice Thrown when price feed returns incorrect price for a token
+error IncorrectPriceException();
+
+/// @notice Thrown when token's price feed becomes stale
+error StalePriceException();
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/draft-IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+// EIP-2612 is Final as of 2022-11-01. This file is deprecated.
+
+import "./IERC20Permit.sol";
+
+
+// File: node_modules/@1inch/solidity-utils/contracts/interfaces/IDaiLikePermit.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IDaiLikePermit {
+    function permit(
+        address holder,
+        address spender,
+        uint256 nonce,
+        uint256 expiry,
+        bool allowed,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
+
+// File: node_modules/@1inch/solidity-utils/contracts/interfaces/IPermit2.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IPermit2 {
+    struct PermitDetails {
+        // ERC20 token address
+        address token;
+        // the maximum amount allowed to spend
+        uint160 amount;
+        // timestamp at which a spender's token allowances become invalid
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+    /// @notice The permit message signed for a single token allownce
+    struct PermitSingle {
+        // the permit data for a single token alownce
+        PermitDetails details;
+        // address permissioned on the allowed tokens
+        address spender;
+        // deadline on the permit signature
+        uint256 sigDeadline;
+    }
+    /// @notice Packed allowance
+    struct PackedAllowance {
+        // amount allowed
+        uint160 amount;
+        // permission expiry
+        uint48 expiration;
+        // an incrementing value indexed per owner,token,and spender for each signature
+        uint48 nonce;
+    }
+
+    function transferFrom(address user, address spender, uint160 amount, address token) external;
+
+    function permit(address owner, PermitSingle memory permitSingle, bytes calldata signature) external;
+
+    function allowance(address user, address token, address spender) external view returns (PackedAllowance memory);
+}
+
+
+// File: node_modules/@1inch/solidity-utils/contracts/interfaces/IWETH.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+
+    function withdraw(uint256 amount) external;
+}
+
+
+// File: node_modules/@1inch/solidity-utils/contracts/libraries/RevertReasonForwarder.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+/// @title Revert reason forwarder.
+library RevertReasonForwarder {
+    /// @dev Forwards latest externall call revert.
+    function reRevert() internal pure {
+        // bubble up revert reason from latest external call
+        assembly ("memory-safe") { // solhint-disable-line no-inline-assembly
+            let ptr := mload(0x40)
+            returndatacopy(ptr, 0, returndatasize())
+            revert(ptr, returndatasize())
+        }
+    }
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v2/contracts/interfaces/IVersion.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Holdings, 2022
+pragma solidity ^0.8.10;
+
+/// @title Version interface
+/// @notice Defines contract version
+interface IVersion {
+    /// @notice Contract version
+    function version() external view returns (uint256);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/security/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (security/Pausable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    bool private _paused;
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        require(!paused(), "Pausable: paused");
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        require(paused(), "Pausable: not paused");
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v2/contracts/interfaces/IACL.sol
+// SPDX-License-Identifier: MIT
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Holdings, 2022
+pragma solidity ^0.8.10;
+import { IVersion } from "./IVersion.sol";
+
+interface IACLExceptions {
+    /// @dev Thrown when attempting to delete an address from a set that is not a pausable admin
+    error AddressNotPausableAdminException(address addr);
+
+    /// @dev Thrown when attempting to delete an address from a set that is not a unpausable admin
+    error AddressNotUnpausableAdminException(address addr);
+}
+
+interface IACLEvents {
+    /// @dev Emits when a new admin is added that can pause contracts
+    event PausableAdminAdded(address indexed newAdmin);
+
+    /// @dev Emits when a Pausable admin is removed
+    event PausableAdminRemoved(address indexed admin);
+
+    /// @dev Emits when a new admin is added that can unpause contracts
+    event UnpausableAdminAdded(address indexed newAdmin);
+
+    /// @dev Emits when an Unpausable admin is removed
+    event UnpausableAdminRemoved(address indexed admin);
+}
+
+/// @title ACL interface
+interface IACL is IACLEvents, IACLExceptions, IVersion {
+    /// @dev Returns true if the address is a pausable admin and false if not
+    /// @param addr Address to check
+    function isPausableAdmin(address addr) external view returns (bool);
+
+    /// @dev Returns true if the address is unpausable admin and false if not
+    /// @param addr Address to check
+    function isUnpausableAdmin(address addr) external view returns (bool);
+
+    /// @dev Returns true if an address has configurator rights
+    /// @param account Address to check
+    function isConfigurator(address account) external view returns (bool);
+
+    /// @dev Returns address of configurator
+    function owner() external view returns (address);
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/traits/ACLTrait.sol
+// SPDX-License-Identifier: BUSL-1.1
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {IACL} from "@gearbox-protocol/core-v2/contracts/interfaces/IACL.sol";
+
+import {AP_ACL, IAddressProviderV3, NO_VERSION_CONTROL} from "../interfaces/IAddressProviderV3.sol";
+import {CallerNotConfiguratorException} from "../interfaces/IExceptions.sol";
+
+import {SanityCheckTrait} from "./SanityCheckTrait.sol";
+
+/// @title ACL trait
+/// @notice Utility class for ACL (access-control list) consumers
+abstract contract ACLTrait is SanityCheckTrait {
+    /// @notice ACL contract address
+    address public immutable acl;
+
+    /// @notice Constructor
+    /// @param addressProvider Address provider contract address
+    constructor(address addressProvider) nonZeroAddress(addressProvider) {
+        acl = IAddressProviderV3(addressProvider).getAddressOrRevert(AP_ACL, NO_VERSION_CONTROL);
+    }
+
+    /// @dev Ensures that function caller has configurator role
+    modifier configuratorOnly() {
+        _ensureCallerIsConfigurator();
+        _;
+    }
+
+    /// @dev Reverts if the caller is not the configurator
+    /// @dev Used to cut contract size on modifiers
+    function _ensureCallerIsConfigurator() internal view {
+        if (!_isConfigurator({account: msg.sender})) {
+            revert CallerNotConfiguratorException();
+        }
+    }
+
+    /// @dev Checks whether given account has configurator role
+    function _isConfigurator(address account) internal view returns (bool) {
+        return IACL(acl).isConfigurator(account);
+    }
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/traits/ReentrancyGuardTrait.sol
+// SPDX-License-Identifier: BUSL-1.1
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+uint8 constant NOT_ENTERED = 1;
+uint8 constant ENTERED = 2;
+
+/// @title Reentrancy guard trait
+/// @notice Same as OpenZeppelin's `ReentrancyGuard` but only uses 1 byte of storage instead of 32
+abstract contract ReentrancyGuardTrait {
+    uint8 internal _reentrancyStatus = NOT_ENTERED;
+
+    /// @dev Prevents a contract from calling itself, directly or indirectly.
+    /// Calling a `nonReentrant` function from another `nonReentrant`
+    /// function is not supported. It is possible to prevent this from happening
+    /// by making the `nonReentrant` function external, and making it call a
+    /// `private` function that does the actual work.
+    modifier nonReentrant() {
+        // On the first call to nonReentrant, _notEntered will be true
+        _ensureNotEntered();
+
+        // Any calls to nonReentrant after this point will fail
+        _reentrancyStatus = ENTERED;
+
+        _;
+
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _reentrancyStatus = NOT_ENTERED;
+    }
+
+    /// @dev Reverts if the contract is currently entered
+    /// @dev Used to cut contract size on modifiers
+    function _ensureNotEntered() internal view {
+        require(_reentrancyStatus != ENTERED, "ReentrancyGuard: reentrant call");
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: node_modules/@gearbox-protocol/core-v3/contracts/traits/SanityCheckTrait.sol
+// SPDX-License-Identifier: BUSL-1.1
+// Gearbox Protocol. Generalized leverage for DeFi protocols
+// (c) Gearbox Foundation, 2023.
+pragma solidity ^0.8.17;
+
+import {ZeroAddressException} from "../interfaces/IExceptions.sol";
+
+/// @title Sanity check trait
+abstract contract SanityCheckTrait {
+    /// @dev Ensures that passed address is non-zero
+    modifier nonZeroAddress(address addr) {
+        _revertIfZeroAddress(addr);
+        _;
+    }
+
+    /// @dev Reverts if address is zero
+    function _revertIfZeroAddress(address addr) private pure {
+        if (addr == address(0)) revert ZeroAddressException();
+    }
+}
+

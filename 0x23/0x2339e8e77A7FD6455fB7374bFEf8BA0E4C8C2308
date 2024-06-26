@@ -1,0 +1,901 @@
+
+// File: solidity/contracts/CCIPxERC20Bridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import {CCIPReceiver} from '@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol';
+import {IRouterClient} from '@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol';
+import {Client} from '@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol';
+import {OwnerIsCreator} from '@chainlink/contracts-ccip/src/v0.8/shared/access/OwnerIsCreator.sol';
+import {IERC20} from
+  '@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.0/contracts/token/ERC20/IERC20.sol';
+import {IXERC20} from 'xERC20/solidity/interfaces/IXERC20.sol';
+import {IXERC20Lockbox} from 'xERC20/solidity/interfaces/IXERC20Lockbox.sol';
+
+/**
+ * THIS IS AN EXAMPLE CONTRACT THAT USES HARDCODED VALUES FOR CLARITY.
+ * THIS IS AN EXAMPLE CONTRACT THAT USES UN-AUDITED CODE.
+ * DO NOT USE THIS CODE IN PRODUCTION.
+ */
+
+/// @title - A simple messenger contract for sending/receving string data across chains.
+contract CCIPxERC20Bridge is CCIPReceiver, OwnerIsCreator {
+  // Custom errors to provide more descriptive revert messages.
+  error NotEnoughBalance(uint256 currentBalance, uint256 calculatedFees); // Used to make sure contract has enough balance.
+  error NothingToWithdraw(); // Used when trying to withdraw Ether but there's nothing to withdraw.
+  error FailedToWithdrawEth(address owner, address target, uint256 value); // Used when the withdrawal of Ether fails.
+  error SenderNotAllowlistedBySourceChain(uint64 sourceChainSelector, address sender); // Used when the sender has not been allowlisted by the contract owner.
+  error NoReceiverForDestinationChain(uint64 destinationChainSelector); // Used when the receiver has not been allowlisted by the contract owner.
+
+  // Event emitted when a message is sent to another chain.
+  event MessageSent( // The unique ID of the CCIP message.
+    bytes32 indexed messageId,
+    uint64 indexed destinationChainSelector,
+    address receiver,
+    address recipient,
+    uint256 amount,
+    address feeToken,
+    uint256 fees
+  );
+
+  // Event emitted when a message is received from another chain.
+  event MessageReceived( // The unique ID of the CCIP message.
+    // The chain selector of the source chain.
+    // The address of the sender from the source chain.
+    // The text that was received.
+  bytes32 indexed messageId, uint64 indexed sourceChainSelector, address sender, uint256 amount, address recipient);
+
+  bytes32 private _lastReceivedMessageId; // Store the last received messageId.
+  string private _lastReceivedText; // Store the last received text.
+
+  // Mapping to keep track of allowlisted senders by source chain.
+  mapping(uint64 => address) public bridgesByChain;
+
+  IERC20 public linkToken;
+  IXERC20 public xerc20;
+  IERC20 public erc20;
+  IXERC20Lockbox public lockbox;
+
+  mapping(uint32 => uint64) public chainIdToChainSelector;
+
+  uint256 public feeBps; // fee in basis pts, i.e. 10 = 0.1%
+
+  /// @notice Constructor initializes the contract with the router address.
+  /// @param _router The address of the router contract.
+  /// @param _link The address of the link contract.
+  constructor(
+    address _router,
+    address _link,
+    address _xerc20,
+    uint256 _feeBps,
+    address _lockbox,
+    address _erc20
+  ) CCIPReceiver(_router) {
+    linkToken = IERC20(_link);
+    xerc20 = IXERC20(_xerc20);
+    feeBps = _feeBps;
+    lockbox = IXERC20Lockbox(_lockbox);
+    erc20 = IERC20(_erc20);
+
+    // testnets
+    chainIdToChainSelector[11_155_111] = 16_015_286_601_757_825_753;
+    chainIdToChainSelector[421_614] = 3_478_487_238_524_512_106;
+    chainIdToChainSelector[80_001] = 12_532_609_583_862_916_517;
+
+    // mainnets
+    chainIdToChainSelector[1] = 5_009_297_550_715_157_269;
+    chainIdToChainSelector[10] = 3_734_403_246_176_062_136;
+    chainIdToChainSelector[56] = 11_344_663_589_394_136_015;
+    chainIdToChainSelector[137] = 4_051_577_828_743_386_545;
+    chainIdToChainSelector[8453] = 15_971_525_489_660_198_786;
+    chainIdToChainSelector[43_114] = 6_433_500_567_565_415_381;
+    chainIdToChainSelector[42_161] = 4_949_039_107_694_359_620;
+  }
+
+  /// @dev Modifier to make a function callable only when the sender is allowlisted by the contract owner.
+  modifier onlyAllowlistedSenderBySourceChain(uint64 _sourceChainSelector, address _sender) {
+    if (bridgesByChain[_sourceChainSelector] != _sender) {
+      revert SenderNotAllowlistedBySourceChain(_sourceChainSelector, _sender);
+    }
+    _;
+  }
+
+  modifier validReceiver(uint64 _destinationChainSelector) {
+    if (bridgesByChain[_destinationChainSelector] == address(0)) {
+      revert NoReceiverForDestinationChain(_destinationChainSelector);
+    }
+    _;
+  }
+
+  function addBridgeForChain(uint64 _chainSelector, address _bridge) external onlyOwner {
+    bridgesByChain[_chainSelector] = _bridge;
+  }
+
+  function addChainIdToChainSelector(uint32 _chainId, uint64 _chainSelector) external onlyOwner {
+    chainIdToChainSelector[_chainId] = _chainSelector;
+  }
+
+  function setFeeBps(uint256 _feeBps) external onlyOwner {
+    feeBps = _feeBps;
+  }
+
+  function getFee(uint32 _destinationChainId, uint256 _amount, bool _feeInLINK) external view returns (uint256) {
+    uint64 _destinationChainSelector = chainIdToChainSelector[_destinationChainId];
+    address _receiver = bridgesByChain[_destinationChainSelector];
+    IRouterClient router = IRouterClient(this.getRouter());
+    Client.EVM2AnyMessage memory evm2AnyMessage =
+      _buildCCIPMessage(_receiver, _amount, msg.sender, _feeInLINK ? address(linkToken) : address(0));
+    return router.getFee(_destinationChainSelector, evm2AnyMessage);
+  }
+
+  function bridgeTokens(
+    uint32 _destinationChainId,
+    address _receipient,
+    uint256 _amount
+  ) external payable returns (bytes32 messageId) {
+    return _bridgeTokens(_destinationChainId, _receipient, _amount, false);
+  }
+
+  function bridgeTokensWithLINK(
+    uint32 _destinationChainId,
+    address _receipient,
+    uint256 _amount
+  ) external returns (bytes32 messageId) {
+    return _bridgeTokens(_destinationChainId, _receipient, _amount, true);
+  }
+
+  function _bridgeTokens(
+    uint32 _destinationChainId,
+    address _receipient,
+    uint256 _amount,
+    bool _feeInLINK
+  ) internal validReceiver(chainIdToChainSelector[_destinationChainId]) returns (bytes32 messageId) {
+    uint64 _destinationChainSelector = chainIdToChainSelector[_destinationChainId];
+    address _receiver = bridgesByChain[_destinationChainSelector];
+
+    if (address(lockbox) == address(0)) {
+      // transfer to this address
+      IERC20(address(xerc20)).transferFrom(msg.sender, address(this), _amount);
+    } else {
+      // transfer erc20s here
+      erc20.transferFrom(msg.sender, address(this), _amount);
+      erc20.approve(address(lockbox), _amount);
+      // deposit to lockbox
+      lockbox.deposit(_amount);
+      // xerc20 will be minted to this contract
+    }
+
+    // Burn the tokens minus the fee
+    uint256 _bridgedAmount = _amount - ((_amount * feeBps) / 10_000);
+    xerc20.burn(address(this), _bridgedAmount);
+
+    address _feeToken = _feeInLINK ? address(linkToken) : address(0);
+
+    // Create an EVM2AnyMessage struct in memory with necessary information for sending a cross-chain message
+    Client.EVM2AnyMessage memory evm2AnyMessage = _buildCCIPMessage(_receiver, _bridgedAmount, _receipient, _feeToken);
+
+    // Initialize a router client instance to interact with cross-chain router
+    IRouterClient router = IRouterClient(this.getRouter());
+
+    // Get the fee required to send the CCIP message
+    uint256 fees = router.getFee(_destinationChainSelector, evm2AnyMessage);
+
+    if (_feeInLINK) {
+      linkToken.transferFrom(msg.sender, address(this), fees);
+      linkToken.approve(address(router), fees);
+    } else {
+      if (msg.value < fees) {
+        revert NotEnoughBalance(address(this).balance, fees);
+      }
+      uint256 _refund = msg.value - fees;
+      if (_refund > 0) {
+        payable(msg.sender).transfer(_refund);
+      }
+    }
+    // Send the CCIP message through the router and store the returned CCIP message ID
+    messageId = router.ccipSend{value: _feeInLINK ? 0 : fees}(_destinationChainSelector, evm2AnyMessage);
+
+    // Emit an event with message details
+    emit MessageSent(messageId, _destinationChainSelector, _receiver, _receipient, _bridgedAmount, _feeToken, fees);
+
+    // Return the CCIP message ID
+    return messageId;
+  }
+
+  /// handle a received message
+  function _ccipReceive(Client.Any2EVMMessage memory any2EvmMessage)
+    internal
+    override
+    onlyAllowlistedSenderBySourceChain(any2EvmMessage.sourceChainSelector, abi.decode(any2EvmMessage.sender, (address))) // Make sure source chain and sender are allowlisted
+  {
+    _lastReceivedMessageId = any2EvmMessage.messageId; // fetch the messageId
+    (uint256 _amount, address _recipient) = abi.decode(any2EvmMessage.data, (uint256, address)); // abi-decoding of the sent text
+
+    if (address(lockbox) == address(0)) {
+      // no lockbox, mint directly to recipient
+      xerc20.mint(_recipient, _amount);
+    } else {
+      // withdraw from lockbox
+      // mint to this contract
+      xerc20.mint(address(this), _amount);
+      // withdraw from lockbox, erc20 will be transferred to this contract
+      lockbox.withdraw(_amount);
+      // transfer erc20s to recipient
+      IERC20(address(erc20)).transfer(_recipient, _amount);
+    }
+
+    emit MessageReceived(
+      any2EvmMessage.messageId,
+      any2EvmMessage.sourceChainSelector, // fetch the source chain identifier (aka selector)
+      abi.decode(any2EvmMessage.sender, (address)), // abi-decoding of the sender address,
+      _amount,
+      _recipient
+    );
+  }
+
+  /// @notice Construct a CCIP message.
+  /// @dev This function will create an EVM2AnyMessage struct with all the necessary information for sending a text.
+  /// @param _receiver The address of the receiver on the destination chain.
+  /// @param _amount The amount of tokens to be transferred.
+  /// @param _receipient The address of the receipient on the destination chain.
+  /// @param _feeTokenAddress The address of the token to be used for paying fees.
+  function _buildCCIPMessage(
+    address _receiver,
+    uint256 _amount,
+    address _receipient,
+    address _feeTokenAddress
+  ) internal pure returns (Client.EVM2AnyMessage memory) {
+    // Create an EVM2AnyMessage struct in memory with necessary information for sending a cross-chain message
+    return Client.EVM2AnyMessage({
+      receiver: abi.encode(_receiver), // ABI-encoded receiver address
+      data: abi.encode(_amount, _receipient), // ABI-encoded string
+      tokenAmounts: new Client.EVMTokenAmount[](0), // Empty array aas no tokens are transferred
+      extraArgs: Client._argsToBytes(
+        // Additional arguments, setting gas limit
+        Client.EVMExtraArgsV1({gasLimit: 200_000})
+        ),
+      // Set the feeToken to a feeTokenAddress, indicating specific asset will be used for fees
+      feeToken: _feeTokenAddress
+    });
+  }
+
+  /// @notice Fetches the details of the last received message.
+  /// @return messageId The ID of the last received message.
+  /// @return text The last received text.
+  function getLastReceivedMessageDetails() external view returns (bytes32 messageId, string memory text) {
+    return (_lastReceivedMessageId, _lastReceivedText);
+  }
+
+  /// @notice Fallback function to allow the contract to receive Ether.
+  /// @dev This function has no function body, making it a default function for receiving Ether.
+  /// It is automatically called when Ether is sent to the contract without any data.
+  receive() external payable {}
+
+  /// @notice Allows the contract owner to withdraw the entire balance of Ether from the contract.
+  /// @dev This function reverts if there are no funds to withdraw or if the transfer fails.
+  /// It should only be callable by the owner of the contract.
+  /// @param _beneficiary The address to which the Ether should be sent.
+  function withdraw(address _beneficiary) public onlyOwner {
+    // Retrieve the balance of this contract
+    uint256 amount = address(this).balance;
+
+    // Revert if there is nothing to withdraw
+    if (amount == 0) revert NothingToWithdraw();
+
+    // Attempt to send the funds, capturing the success status and discarding any return data
+    (bool sent,) = _beneficiary.call{value: amount}('');
+
+    // Revert if the send failed, with information about the attempted transfer
+    if (!sent) revert FailedToWithdrawEth(msg.sender, _beneficiary, amount);
+  }
+
+  /// @notice Allows the owner of the contract to withdraw all tokens of a specific ERC20 token.
+  /// @dev This function reverts with a 'NothingToWithdraw' error if there are no tokens to withdraw.
+  /// @param _beneficiary The address to which the tokens will be sent.
+  /// @param _token The contract address of the ERC20 token to be withdrawn.
+  function withdrawToken(address _beneficiary, address _token) public onlyOwner {
+    // Retrieve the balance of this contract
+    uint256 amount = IERC20(_token).balanceOf(address(this));
+
+    // Revert if there is nothing to withdraw
+    if (amount == 0) revert NothingToWithdraw();
+
+    IERC20(_token).transfer(_beneficiary, amount);
+  }
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IAny2EVMMessageReceiver} from "../interfaces/IAny2EVMMessageReceiver.sol";
+
+import {Client} from "../libraries/Client.sol";
+
+import {IERC165} from "../../vendor/openzeppelin-solidity/v4.8.0/contracts/utils/introspection/IERC165.sol";
+
+/// @title CCIPReceiver - Base contract for CCIP applications that can receive messages.
+abstract contract CCIPReceiver is IAny2EVMMessageReceiver, IERC165 {
+  address internal immutable i_router;
+
+  constructor(address router) {
+    if (router == address(0)) revert InvalidRouter(address(0));
+    i_router = router;
+  }
+
+  /// @notice IERC165 supports an interfaceId
+  /// @param interfaceId The interfaceId to check
+  /// @return true if the interfaceId is supported
+  /// @dev Should indicate whether the contract implements IAny2EVMMessageReceiver
+  /// e.g. return interfaceId == type(IAny2EVMMessageReceiver).interfaceId || interfaceId == type(IERC165).interfaceId
+  /// This allows CCIP to check if ccipReceive is available before calling it.
+  /// If this returns false or reverts, only tokens are transferred to the receiver.
+  /// If this returns true, tokens are transferred and ccipReceive is called atomically.
+  /// Additionally, if the receiver address does not have code associated with
+  /// it at the time of execution (EXTCODESIZE returns 0), only tokens will be transferred.
+  function supportsInterface(bytes4 interfaceId) public pure virtual override returns (bool) {
+    return interfaceId == type(IAny2EVMMessageReceiver).interfaceId || interfaceId == type(IERC165).interfaceId;
+  }
+
+  /// @inheritdoc IAny2EVMMessageReceiver
+  function ccipReceive(Client.Any2EVMMessage calldata message) external virtual override onlyRouter {
+    _ccipReceive(message);
+  }
+
+  /// @notice Override this function in your implementation.
+  /// @param message Any2EVMMessage
+  function _ccipReceive(Client.Any2EVMMessage memory message) internal virtual;
+
+  /////////////////////////////////////////////////////////////////////
+  // Plumbing
+  /////////////////////////////////////////////////////////////////////
+
+  /// @notice Return the current router
+  /// @return i_router address
+  function getRouter() public view returns (address) {
+    return address(i_router);
+  }
+
+  error InvalidRouter(address router);
+
+  /// @dev only calls from the set router are accepted.
+  modifier onlyRouter() {
+    if (msg.sender != address(i_router)) revert InvalidRouter(msg.sender);
+    _;
+  }
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Client} from "../libraries/Client.sol";
+
+interface IRouterClient {
+  error UnsupportedDestinationChain(uint64 destChainSelector);
+  error InsufficientFeeTokenAmount();
+  error InvalidMsgValue();
+
+  /// @notice Checks if the given chain ID is supported for sending/receiving.
+  /// @param chainSelector The chain to check.
+  /// @return supported is true if it is supported, false if not.
+  function isChainSupported(uint64 chainSelector) external view returns (bool supported);
+
+  /// @notice Gets a list of all supported tokens which can be sent or received
+  /// to/from a given chain id.
+  /// @param chainSelector The chainSelector.
+  /// @return tokens The addresses of all tokens that are supported.
+  function getSupportedTokens(uint64 chainSelector) external view returns (address[] memory tokens);
+
+  /// @param destinationChainSelector The destination chainSelector
+  /// @param message The cross-chain CCIP message including data and/or tokens
+  /// @return fee returns execution fee for the message
+  /// delivery to destination chain, denominated in the feeToken specified in the message.
+  /// @dev Reverts with appropriate reason upon invalid message.
+  function getFee(
+    uint64 destinationChainSelector,
+    Client.EVM2AnyMessage memory message
+  ) external view returns (uint256 fee);
+
+  /// @notice Request a message to be sent to the destination chain
+  /// @param destinationChainSelector The destination chain ID
+  /// @param message The cross-chain CCIP message including data and/or tokens
+  /// @return messageId The message ID
+  /// @dev Note if msg.value is larger than the required fee (from getFee) we accept
+  /// the overpayment with no refund.
+  /// @dev Reverts with appropriate reason upon invalid message.
+  function ccipSend(
+    uint64 destinationChainSelector,
+    Client.EVM2AnyMessage calldata message
+  ) external payable returns (bytes32);
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// End consumer library.
+library Client {
+  /// @dev RMN depends on this struct, if changing, please notify the RMN maintainers.
+  struct EVMTokenAmount {
+    address token; // token address on the local chain.
+    uint256 amount; // Amount of tokens.
+  }
+
+  struct Any2EVMMessage {
+    bytes32 messageId; // MessageId corresponding to ccipSend on source.
+    uint64 sourceChainSelector; // Source chain selector.
+    bytes sender; // abi.decode(sender) if coming from an EVM chain.
+    bytes data; // payload sent in original message.
+    EVMTokenAmount[] destTokenAmounts; // Tokens and their amounts in their destination chain representation.
+  }
+
+  // If extraArgs is empty bytes, the default is 200k gas limit.
+  struct EVM2AnyMessage {
+    bytes receiver; // abi.encode(receiver address) for dest EVM chains
+    bytes data; // Data payload
+    EVMTokenAmount[] tokenAmounts; // Token transfers
+    address feeToken; // Address of feeToken. address(0) means you will send msg.value.
+    bytes extraArgs; // Populate this with _argsToBytes(EVMExtraArgsV1)
+  }
+
+  // bytes4(keccak256("CCIP EVMExtraArgsV1"));
+  bytes4 public constant EVM_EXTRA_ARGS_V1_TAG = 0x97a657c9;
+  struct EVMExtraArgsV1 {
+    uint256 gasLimit;
+  }
+
+  function _argsToBytes(EVMExtraArgsV1 memory extraArgs) internal pure returns (bytes memory bts) {
+    return abi.encodeWithSelector(EVM_EXTRA_ARGS_V1_TAG, extraArgs);
+  }
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/shared/access/OwnerIsCreator.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {ConfirmedOwner} from "./ConfirmedOwner.sol";
+
+/// @title The OwnerIsCreator contract
+/// @notice A contract with helpers for basic contract ownership.
+contract OwnerIsCreator is ConfirmedOwner {
+  constructor() ConfirmedOwner(msg.sender) {}
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.0/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+  /**
+   * @dev Emitted when `value` tokens are moved from one account (`from`) to
+   * another (`to`).
+   *
+   * Note that `value` may be zero.
+   */
+  event Transfer(address indexed from, address indexed to, uint256 value);
+
+  /**
+   * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+   * a call to {approve}. `value` is the new allowance.
+   */
+  event Approval(address indexed owner, address indexed spender, uint256 value);
+
+  /**
+   * @dev Returns the amount of tokens in existence.
+   */
+  function totalSupply() external view returns (uint256);
+
+  /**
+   * @dev Returns the amount of tokens owned by `account`.
+   */
+  function balanceOf(address account) external view returns (uint256);
+
+  /**
+   * @dev Moves `amount` tokens from the caller's account to `to`.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transfer(address to, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Returns the remaining number of tokens that `spender` will be
+   * allowed to spend on behalf of `owner` through {transferFrom}. This is
+   * zero by default.
+   *
+   * This value changes when {approve} or {transferFrom} are called.
+   */
+  function allowance(address owner, address spender) external view returns (uint256);
+
+  /**
+   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * IMPORTANT: Beware that changing an allowance with this method brings the risk
+   * that someone may use both the old and the new allowance by unfortunate
+   * transaction ordering. One possible solution to mitigate this race
+   * condition is to first reduce the spender's allowance to 0 and set the
+   * desired value afterwards:
+   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+   *
+   * Emits an {Approval} event.
+   */
+  function approve(address spender, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Moves `amount` tokens from `from` to `to` using the
+   * allowance mechanism. `amount` is then deducted from the caller's
+   * allowance.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: lib/xERC20/solidity/interfaces/IXERC20.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.8.4 <0.9.0;
+
+interface IXERC20 {
+  /**
+   * @notice Emits when a lockbox is set
+   *
+   * @param _lockbox The address of the lockbox
+   */
+
+  event LockboxSet(address _lockbox);
+
+  /**
+   * @notice Emits when a limit is set
+   *
+   * @param _mintingLimit The updated minting limit we are setting to the bridge
+   * @param _burningLimit The updated burning limit we are setting to the bridge
+   * @param _bridge The address of the bridge we are setting the limit too
+   */
+  event BridgeLimitsSet(uint256 _mintingLimit, uint256 _burningLimit, address indexed _bridge);
+
+  /**
+   * @notice Reverts when a user with too low of a limit tries to call mint/burn
+   */
+
+  error IXERC20_NotHighEnoughLimits();
+
+  /**
+   * @notice Reverts when caller is not the factory
+   */
+
+  error IXERC20_NotFactory();
+
+  struct Bridge {
+    BridgeParameters minterParams;
+    BridgeParameters burnerParams;
+  }
+
+  struct BridgeParameters {
+    uint256 timestamp;
+    uint256 ratePerSecond;
+    uint256 maxLimit;
+    uint256 currentLimit;
+  }
+
+  /**
+   * @notice Sets the lockbox address
+   *
+   * @param _lockbox The address of the lockbox
+   */
+
+  function setLockbox(address _lockbox) external;
+
+  /**
+   * @notice Updates the limits of any bridge
+   * @dev Can only be called by the owner
+   * @param _mintingLimit The updated minting limit we are setting to the bridge
+   * @param _burningLimit The updated burning limit we are setting to the bridge
+   * @param _bridge The address of the bridge we are setting the limits too
+   */
+  function setLimits(address _bridge, uint256 _mintingLimit, uint256 _burningLimit) external;
+
+  /**
+   * @notice Returns the max limit of a minter
+   *
+   * @param _minter The minter we are viewing the limits of
+   *  @return _limit The limit the minter has
+   */
+  function mintingMaxLimitOf(address _minter) external view returns (uint256 _limit);
+
+  /**
+   * @notice Returns the max limit of a bridge
+   *
+   * @param _bridge the bridge we are viewing the limits of
+   * @return _limit The limit the bridge has
+   */
+
+  function burningMaxLimitOf(address _bridge) external view returns (uint256 _limit);
+
+  /**
+   * @notice Returns the current limit of a minter
+   *
+   * @param _minter The minter we are viewing the limits of
+   * @return _limit The limit the minter has
+   */
+
+  function mintingCurrentLimitOf(address _minter) external view returns (uint256 _limit);
+
+  /**
+   * @notice Returns the current limit of a bridge
+   *
+   * @param _bridge the bridge we are viewing the limits of
+   * @return _limit The limit the bridge has
+   */
+
+  function burningCurrentLimitOf(address _bridge) external view returns (uint256 _limit);
+
+  /**
+   * @notice Mints tokens for a user
+   * @dev Can only be called by a minter
+   * @param _user The address of the user who needs tokens minted
+   * @param _amount The amount of tokens being minted
+   */
+
+  function mint(address _user, uint256 _amount) external;
+
+  /**
+   * @notice Burns tokens for a user
+   * @dev Can only be called by a minter
+   * @param _user The address of the user who needs tokens burned
+   * @param _amount The amount of tokens being burned
+   */
+
+  function burn(address _user, uint256 _amount) external;
+}
+
+
+// File: lib/xERC20/solidity/interfaces/IXERC20Lockbox.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.8.4 <0.9.0;
+
+interface IXERC20Lockbox {
+  /**
+   * @notice Emitted when tokens are deposited into the lockbox
+   */
+
+  event Deposit(address _sender, uint256 _amount);
+
+  /**
+   * @notice Emitted when tokens are withdrawn from the lockbox
+   */
+
+  event Withdraw(address _sender, uint256 _amount);
+
+  /**
+   * @notice Reverts when a user tries to deposit native tokens on a non-native lockbox
+   */
+
+  error IXERC20Lockbox_NotGasToken();
+
+  /**
+   * @notice Reverts when a user tries to deposit non-native tokens on a native lockbox
+   */
+
+  error IXERC20Lockbox_GasToken();
+
+  /**
+   * @notice Reverts when a user tries to withdraw and the call fails
+   */
+
+  error IXERC20Lockbox_WithdrawFailed();
+
+  /**
+   * @notice Deposit ERC20 tokens into the lockbox
+   *
+   * @param _amount The amount of tokens to deposit
+   */
+
+  function deposit(uint256 _amount) external;
+
+  /**
+   * @notice Deposit ERC20 tokens into the lockbox, and send the XERC20 to a user
+   *
+   * @param _user The user to send the XERC20 to
+   * @param _amount The amount of tokens to deposit
+   */
+
+  function depositTo(address _user, uint256 _amount) external;
+
+  /**
+   * @notice Deposit the native asset into the lockbox, and send the XERC20 to a user
+   *
+   * @param _user The user to send the XERC20 to
+   */
+
+  function depositGasTokenTo(address _user) external payable;
+
+  /**
+   * @notice Withdraw ERC20 tokens from the lockbox
+   *
+   * @param _amount The amount of tokens to withdraw
+   */
+
+  function withdraw(uint256 _amount) external;
+
+  /**
+   * @notice Withdraw ERC20 tokens from the lockbox
+   *
+   * @param _user The user to withdraw to
+   * @param _amount The amount of tokens to withdraw
+   */
+
+  function withdrawTo(address _user, uint256 _amount) external;
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IAny2EVMMessageReceiver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Client} from "../libraries/Client.sol";
+
+/// @notice Application contracts that intend to receive messages from
+/// the router should implement this interface.
+interface IAny2EVMMessageReceiver {
+  /// @notice Called by the Router to deliver a message.
+  /// If this reverts, any token transfers also revert. The message
+  /// will move to a FAILED state and become available for manual execution.
+  /// @param message CCIP Message
+  /// @dev Note ensure you check the msg.sender is the OffRampRouter
+  function ccipReceive(Client.Any2EVMMessage calldata message) external;
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.0/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/shared/access/ConfirmedOwner.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "./ConfirmedOwnerWithProposal.sol";
+
+/**
+ * @title The ConfirmedOwner contract
+ * @notice A contract with helpers for basic contract ownership.
+ */
+contract ConfirmedOwner is ConfirmedOwnerWithProposal {
+  constructor(address newOwner) ConfirmedOwnerWithProposal(newOwner, address(0)) {}
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/shared/access/ConfirmedOwnerWithProposal.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../interfaces/IOwnable.sol";
+
+/**
+ * @title The ConfirmedOwner contract
+ * @notice A contract with helpers for basic contract ownership.
+ */
+contract ConfirmedOwnerWithProposal is IOwnable {
+  address private s_owner;
+  address private s_pendingOwner;
+
+  event OwnershipTransferRequested(address indexed from, address indexed to);
+  event OwnershipTransferred(address indexed from, address indexed to);
+
+  constructor(address newOwner, address pendingOwner) {
+    require(newOwner != address(0), "Cannot set owner to zero");
+
+    s_owner = newOwner;
+    if (pendingOwner != address(0)) {
+      _transferOwnership(pendingOwner);
+    }
+  }
+
+  /**
+   * @notice Allows an owner to begin transferring ownership to a new address,
+   * pending.
+   */
+  function transferOwnership(address to) public override onlyOwner {
+    _transferOwnership(to);
+  }
+
+  /**
+   * @notice Allows an ownership transfer to be completed by the recipient.
+   */
+  function acceptOwnership() external override {
+    require(msg.sender == s_pendingOwner, "Must be proposed owner");
+
+    address oldOwner = s_owner;
+    s_owner = msg.sender;
+    s_pendingOwner = address(0);
+
+    emit OwnershipTransferred(oldOwner, msg.sender);
+  }
+
+  /**
+   * @notice Get the current owner
+   */
+  function owner() public view override returns (address) {
+    return s_owner;
+  }
+
+  /**
+   * @notice validate, transfer ownership, and emit relevant events
+   */
+  function _transferOwnership(address to) private {
+    require(to != msg.sender, "Cannot transfer to self");
+
+    s_pendingOwner = to;
+
+    emit OwnershipTransferRequested(s_owner, to);
+  }
+
+  /**
+   * @notice validate access
+   */
+  function _validateOwnership() internal view {
+    require(msg.sender == s_owner, "Only callable by owner");
+  }
+
+  /**
+   * @notice Reverts if called by anyone other than the contract owner.
+   */
+  modifier onlyOwner() {
+    _validateOwnership();
+    _;
+  }
+}
+
+
+// File: node_modules/@chainlink/contracts-ccip/src/v0.8/shared/interfaces/IOwnable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IOwnable {
+  function owner() external returns (address);
+
+  function transferOwnership(address recipient) external;
+
+  function acceptOwnership() external;
+}
+

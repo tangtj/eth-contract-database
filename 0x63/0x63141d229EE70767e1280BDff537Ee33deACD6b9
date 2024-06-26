@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+contract MultiTokenSender {
+    function sendMultiple(address token, address[] calldata recipients, uint256[] calldata amounts) external {
+        require(recipients.length == amounts.length, "Recipients and amounts array lengths must match");
+
+        IERC20 erc20 = IERC20(token);
+
+        for (uint256 i = 0; i < recipients.length; i++) {
+            require(erc20.transferFrom(msg.sender, recipients[i], amounts[i]), "Transfer failed");
+        }
+    }
+}

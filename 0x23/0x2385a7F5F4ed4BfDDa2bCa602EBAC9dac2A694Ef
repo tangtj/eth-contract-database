@@ -1,0 +1,3404 @@
+
+// File: contracts/helpers/Harvester.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity ^0.8.23;
+
+import { IERC20 } from "oz/interfaces/IERC20.sol";
+import { IERC4626 } from "interfaces/external/IERC4626.sol";
+import { SafeERC20 } from "oz/token/ERC20/utils/SafeERC20.sol";
+import { SafeCast } from "oz/utils/math/SafeCast.sol";
+
+import { ITransmuter } from "interfaces/ITransmuter.sol";
+
+import { AccessControl, IAccessControlManager } from "../utils/AccessControl.sol";
+import "../utils/Constants.sol";
+import "../utils/Errors.sol";
+
+import { RebalancerFlashloan } from "./RebalancerFlashloan.sol";
+
+struct CollatParams {
+    // Vault associated to the collateral
+    address vault;
+    // Target exposure to the collateral asset used in the vault
+    uint64 targetExposure;
+    // Maximum exposure within the Transmuter to the vault asset
+    uint64 maxExposureYieldAsset;
+    // Minimum exposure within the Transmuter to the vault asset
+    uint64 minExposureYieldAsset;
+    // Whether limit exposures should be overriden or read onchain through the Transmuter
+    // This value should be 1 to override exposures or 2 if these shouldn't be overriden
+    uint64 overrideExposures;
+}
+
+/// @title Harvester
+/// @author Angle Labs, Inc.
+/// @dev Contract for anyone to permissionlessly adjust the reserves of Angle Transmuter through
+/// the RebalancerFlashloan contract
+contract Harvester is AccessControl {
+    using SafeERC20 for IERC20;
+    using SafeCast for uint256;
+
+    /// @notice Reference to the `transmuter` implementation this contract aims at rebalancing
+    ITransmuter public immutable TRANSMUTER;
+    /// @notice Permissioned rebalancer contract
+    RebalancerFlashloan public rebalancer;
+    /// @notice Max slippage when dealing with the Transmuter
+    uint96 public maxSlippage;
+    /// @notice Data associated to a collateral
+    mapping(address => CollatParams) public collateralData;
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                    INITIALIZATION                                                  
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    constructor(
+        address _rebalancer,
+        address vault,
+        uint64 targetExposure,
+        uint64 overrideExposures,
+        uint64 maxExposureYieldAsset,
+        uint64 minExposureYieldAsset,
+        uint96 _maxSlippage
+    ) {
+        ITransmuter transmuter = RebalancerFlashloan(_rebalancer).TRANSMUTER();
+        TRANSMUTER = transmuter;
+        rebalancer = RebalancerFlashloan(_rebalancer);
+        accessControlManager = IAccessControlManager(transmuter.accessControlManager());
+        _setCollateralData(vault, targetExposure, minExposureYieldAsset, maxExposureYieldAsset, overrideExposures);
+        _setMaxSlippage(_maxSlippage);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                        HARVEST                                                     
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Invests or divests from the yield asset associated to `collateral` based on the current exposure to this
+    /// collateral
+    /// @dev This transaction either reduces the exposure to `collateral` in the Transmuter or frees up some collateral
+    /// that can then be used for people looking to burn stablecoins
+    /// @dev Due to potential transaction fees within the Transmuter, this function doesn't exactly bring `collateral`
+    /// to the target exposure
+    /// @dev The `harvest` possibility shouldn't be implemented for assets with a manipulable price (like ERC4626)
+    /// contracts on which the `previewRedeem` values can be easily moved by creating a loss or a profit
+    function harvest(address collateral) external {
+        (uint256 stablecoinsFromCollateral, uint256 stablecoinsIssued) = TRANSMUTER.getIssuedByCollateral(collateral);
+        CollatParams memory collatInfo = collateralData[collateral];
+        (uint256 stablecoinsFromVault, ) = TRANSMUTER.getIssuedByCollateral(collatInfo.vault);
+        uint8 increase;
+        uint256 amount;
+        uint256 targetExposureScaled = collatInfo.targetExposure * stablecoinsIssued;
+        if (stablecoinsFromCollateral * 1e9 > targetExposureScaled) {
+            // Need to increase exposure to yield bearing asset
+            increase = 1;
+            amount = stablecoinsFromCollateral - targetExposureScaled / 1e9;
+            uint256 maxValueScaled = collatInfo.maxExposureYieldAsset * stablecoinsIssued;
+            // These checks assume that there are no transaction fees on the stablecoin->collateral conversion and so
+            // it's still possible that exposure goes above the max exposure in some rare cases
+            if (stablecoinsFromVault * 1e9 > maxValueScaled) amount = 0;
+            else if ((stablecoinsFromVault + amount) * 1e9 > maxValueScaled)
+                amount = maxValueScaled / 1e9 - stablecoinsFromVault;
+        } else {
+            // In this case, exposure after the operation might remain slightly below the targetExposure as less
+            // collateral may be obtained by burning stablecoins for the yield asset and unwrapping it
+            amount = targetExposureScaled / 1e9 - stablecoinsFromCollateral;
+            uint256 minValueScaled = collatInfo.minExposureYieldAsset * stablecoinsIssued;
+            if (stablecoinsFromVault * 1e9 < minValueScaled) amount = 0;
+            else if (stablecoinsFromVault * 1e9 < minValueScaled + amount * 1e9)
+                amount = stablecoinsFromVault - minValueScaled / 1e9;
+        }
+        if (amount > 0) {
+            try TRANSMUTER.updateOracle(collatInfo.vault) {} catch {}
+
+            rebalancer.adjustYieldExposure(
+                amount,
+                increase,
+                collateral,
+                collatInfo.vault,
+                (amount * (1e9 - maxSlippage)) / 1e9
+            );
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                        SETTERS                                                     
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    function setRebalancer(address _newRebalancer) external onlyGuardian {
+        if (_newRebalancer == address(0)) revert ZeroAddress();
+        rebalancer = RebalancerFlashloan(_newRebalancer);
+    }
+
+    /// @dev This function shouldn't be called for a vault (e.g an ERC4626 token) which price can be easily moved
+    /// by creating a loss or a profit, at the risk of depleting the reserves available in the Rebalancer
+    function setCollateralData(
+        address vault,
+        uint64 targetExposure,
+        uint64 minExposureYieldAsset,
+        uint64 maxExposureYieldAsset,
+        uint64 overrideExposures
+    ) external onlyGuardian {
+        _setCollateralData(vault, targetExposure, minExposureYieldAsset, maxExposureYieldAsset, overrideExposures);
+    }
+
+    function setMaxSlippage(uint96 _maxSlippage) external onlyGuardian {
+        _setMaxSlippage(_maxSlippage);
+    }
+
+    function updateLimitExposuresYieldAsset(address collateral) external {
+        CollatParams storage collatInfo = collateralData[collateral];
+        if (collatInfo.overrideExposures == 2) _updateLimitExposuresYieldAsset(collatInfo);
+    }
+
+    function _setMaxSlippage(uint96 _maxSlippage) internal {
+        if (_maxSlippage > 1e9) revert InvalidParam();
+        maxSlippage = _maxSlippage;
+    }
+
+    function _setCollateralData(
+        address vault,
+        uint64 targetExposure,
+        uint64 minExposureYieldAsset,
+        uint64 maxExposureYieldAsset,
+        uint64 overrideExposures
+    ) internal {
+        address collateral = address(IERC4626(vault).asset());
+        CollatParams storage collatInfo = collateralData[collateral];
+        collatInfo.vault = vault;
+        if (targetExposure >= 1e9) revert InvalidParam();
+        collatInfo.targetExposure = targetExposure;
+        collatInfo.overrideExposures = overrideExposures;
+        if (overrideExposures == 1) {
+            if (maxExposureYieldAsset >= 1e9 || minExposureYieldAsset >= maxExposureYieldAsset) revert InvalidParam();
+            collatInfo.maxExposureYieldAsset = maxExposureYieldAsset;
+            collatInfo.minExposureYieldAsset = minExposureYieldAsset;
+        } else {
+            collatInfo.overrideExposures = 2;
+            _updateLimitExposuresYieldAsset(collatInfo);
+        }
+    }
+
+    function _updateLimitExposuresYieldAsset(CollatParams storage collatInfo) internal {
+        uint64[] memory xFeeMint;
+        (xFeeMint, ) = TRANSMUTER.getCollateralMintFees(collatInfo.vault);
+        uint256 length = xFeeMint.length;
+        if (length <= 1) collatInfo.maxExposureYieldAsset = 1e9;
+        else collatInfo.maxExposureYieldAsset = xFeeMint[length - 2];
+
+        uint64[] memory xFeeBurn;
+        (xFeeBurn, ) = TRANSMUTER.getCollateralBurnFees(collatInfo.vault);
+        length = xFeeBurn.length;
+        if (length <= 1) collatInfo.minExposureYieldAsset = 0;
+        else collatInfo.minExposureYieldAsset = xFeeBurn[length - 2];
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (interfaces/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../token/ERC20/IERC20.sol";
+
+
+// File: contracts/interfaces/external/IERC4626.sol
+// SPDX-License-Identifier: GPL-3.0
+
+// OpenZeppelin Contracts (last updated v4.7.0) (interfaces/IERC4626.sol)
+
+pragma solidity >=0.5.0;
+
+/// @notice ERC4626 interface
+/// @author OpenZeppelin
+/// @dev In this implementation, the interface only contains the functions that the IERC4626 interface adds on top of
+/// the IERC20 interface
+interface IERC4626 {
+    /**
+     * @dev Returns the address of the underlying token used for the Vault for accounting, depositing, and withdrawing.
+     *
+     * - MUST be an ERC-20 token contract.
+     * - MUST NOT revert.
+     */
+    function asset() external view returns (address assetTokenAddress);
+
+    /**
+     * @dev Returns the total amount of the underlying asset that is “managed” by Vault.
+     *
+     * - SHOULD include any compounding that occurs from yield.
+     * - MUST be inclusive of any fees that are charged against assets in the Vault.
+     * - MUST NOT revert.
+     */
+    function totalAssets() external view returns (uint256 totalManagedAssets);
+
+    /**
+     * @dev Returns the amount of shares that the Vault would exchange for the amount of assets provided, in an ideal
+     * scenario where all the conditions are met.
+     *
+     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.
+     * - MUST NOT show any variations depending on the caller.
+     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.
+     * - MUST NOT revert.
+     *
+     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the
+     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and
+     * from.
+     */
+    function convertToShares(uint256 assets) external view returns (uint256 shares);
+
+    /**
+     * @dev Returns the amount of assets that the Vault would exchange for the amount of shares provided, in an ideal
+     * scenario where all the conditions are met.
+     *
+     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.
+     * - MUST NOT show any variations depending on the caller.
+     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.
+     * - MUST NOT revert.
+     *
+     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the
+     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and
+     * from.
+     */
+    function convertToAssets(uint256 shares) external view returns (uint256 assets);
+
+    /**
+     * @dev Returns the maximum amount of the underlying asset that can be deposited into the Vault for the receiver,
+     * through a deposit call.
+     *
+     * - MUST return a limited value if receiver is subject to some deposit limit.
+     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of assets that may be deposited.
+     * - MUST NOT revert.
+     */
+    function maxDeposit(address receiver) external view returns (uint256 maxAssets);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their deposit at the current block, given
+     * current on-chain conditions.
+     *
+     * - MUST return as close to and no more than the exact amount of Vault shares that would be minted in a deposit
+     *   call in the same transaction. I.e. deposit should return the same or more shares as previewDeposit if called
+     *   in the same transaction.
+     * - MUST NOT account for deposit limits like those returned from maxDeposit and should always act as though the
+     *   deposit would be accepted, regardless if the user has enough tokens approved, etc.
+     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToShares and previewDeposit SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by depositing.
+     */
+    function previewDeposit(uint256 assets) external view returns (uint256 shares);
+
+    /**
+     * @dev Mints shares Vault shares to receiver by depositing exactly amount of underlying tokens.
+     *
+     * - MUST emit the Deposit event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+     *   deposit execution, and are accounted for during deposit.
+     * - MUST revert if all of assets cannot be deposited (due to deposit limit being reached, slippage, the user not
+     *   approving enough underlying tokens to the Vault contract, etc).
+     *
+     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.
+     */
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+
+    /**
+     * @dev Returns the maximum amount of the Vault shares that can be minted for the receiver, through a mint call.
+     * - MUST return a limited value if receiver is subject to some mint limit.
+     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of shares that may be minted.
+     * - MUST NOT revert.
+     */
+    function maxMint(address receiver) external view returns (uint256 maxShares);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their mint at the current block, given
+     * current on-chain conditions.
+     *
+     * - MUST return as close to and no fewer than the exact amount of assets that would be deposited in a mint call
+     *   in the same transaction. I.e. mint should return the same or fewer assets as previewMint if called in the
+     *   same transaction.
+     * - MUST NOT account for mint limits like those returned from maxMint and should always act as though the mint
+     *   would be accepted, regardless if the user has enough tokens approved, etc.
+     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToAssets and previewMint SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by minting.
+     */
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+
+    /**
+     * @dev Mints exactly shares Vault shares to receiver by depositing amount of underlying tokens.
+     *
+     * - MUST emit the Deposit event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the mint
+     *   execution, and are accounted for during mint.
+     * - MUST revert if all of shares cannot be minted (due to deposit limit being reached, slippage, the user not
+     *   approving enough underlying tokens to the Vault contract, etc).
+     *
+     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.
+     */
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+
+    /**
+     * @dev Returns the maximum amount of the underlying asset that can be withdrawn from the owner balance in the
+     * Vault, through a withdraw call.
+     *
+     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.
+     * - MUST NOT revert.
+     */
+    function maxWithdraw(address owner) external view returns (uint256 maxAssets);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their withdrawal at the current block,
+     * given current on-chain conditions.
+     *
+     * - MUST return as close to and no fewer than the exact amount of Vault shares that would be burned in a withdraw
+     *   call in the same transaction. I.e. withdraw should return the same or fewer shares as previewWithdraw if
+     *   called
+     *   in the same transaction.
+     * - MUST NOT account for withdrawal limits like those returned from maxWithdraw and should always act as though
+     *   the withdrawal would be accepted, regardless if the user has enough shares, etc.
+     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToShares and previewWithdraw SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by depositing.
+     */
+    function previewWithdraw(uint256 assets) external view returns (uint256 shares);
+
+    /**
+     * @dev Burns shares from owner and sends exactly assets of underlying tokens to receiver.
+     *
+     * - MUST emit the Withdraw event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+     *   withdraw execution, and are accounted for during withdraw.
+     * - MUST revert if all of assets cannot be withdrawn (due to withdrawal limit being reached, slippage, the owner
+     *   not having enough shares, etc).
+     *
+     * Note that some implementations will require pre-requesting to the Vault before a withdrawal may be performed.
+     * Those methods should be performed separately.
+     */
+    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+
+    /**
+     * @dev Returns the maximum amount of Vault shares that can be redeemed from the owner balance in the Vault,
+     * through a redeem call.
+     *
+     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.
+     * - MUST return balanceOf(owner) if owner is not subject to any withdrawal limit or timelock.
+     * - MUST NOT revert.
+     */
+    function maxRedeem(address owner) external view returns (uint256 maxShares);
+
+    /**
+     * @dev Allows an on-chain or off-chain user to simulate the effects of their redeemption at the current block,
+     * given current on-chain conditions.
+     *
+     * - MUST return as close to and no more than the exact amount of assets that would be withdrawn in a redeem call
+     *   in the same transaction. I.e. redeem should return the same or more assets as previewRedeem if called in the
+     *   same transaction.
+     * - MUST NOT account for redemption limits like those returned from maxRedeem and should always act as though the
+     *   redemption would be accepted, regardless if the user has enough shares, etc.
+     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.
+     * - MUST NOT revert.
+     *
+     * NOTE: any unfavorable discrepancy between convertToAssets and previewRedeem SHOULD be considered slippage in
+     * share price or some other type of condition, meaning the depositor will lose assets by redeeming.
+     */
+    function previewRedeem(uint256 shares) external view returns (uint256 assets);
+
+    /**
+     * @dev Burns exactly shares from owner and sends assets of underlying tokens to receiver.
+     *
+     * - MUST emit the Withdraw event.
+     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the
+     *   redeem execution, and are accounted for during redeem.
+     * - MUST revert if all of shares cannot be redeemed (due to withdrawal limit being reached, slippage, the owner
+     *   not having enough shares, etc).
+     *
+     * NOTE: some implementations will require pre-requesting to the Vault before a withdrawal may be performed.
+     * Those methods should be performed separately.
+     */
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../extensions/draft-IERC20Permit.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    function safeIncreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 newAllowance = token.allowance(address(this), spender) + value;
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+    }
+
+    function safeDecreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            uint256 newAllowance = oldAllowance - value;
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+        }
+    }
+
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address.functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/math/SafeCast.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Wrappers over Solidity's uintXX/intXX casting operators with added overflow
+ * checks.
+ *
+ * Downcasting from uint256/int256 in Solidity does not revert on overflow. This can
+ * easily result in undesired exploitation or bugs, since developers usually
+ * assume that overflows raise errors. `SafeCast` restores this intuition by
+ * reverting the transaction when such an operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ *
+ * Can be combined with {SafeMath} and {SignedSafeMath} to extend it to smaller types, by performing
+ * all math on `uint256` and `int256` and then downcasting.
+ */
+library SafeCast {
+    /**
+     * @dev Returns the downcasted uint248 from uint256, reverting on
+     * overflow (when the input is greater than largest uint248).
+     *
+     * Counterpart to Solidity's `uint248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint248(uint256 value) internal pure returns (uint248) {
+        require(value <= type(uint248).max, "SafeCast: value doesn't fit in 248 bits");
+        return uint248(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint240 from uint256, reverting on
+     * overflow (when the input is greater than largest uint240).
+     *
+     * Counterpart to Solidity's `uint240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint240(uint256 value) internal pure returns (uint240) {
+        require(value <= type(uint240).max, "SafeCast: value doesn't fit in 240 bits");
+        return uint240(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint232 from uint256, reverting on
+     * overflow (when the input is greater than largest uint232).
+     *
+     * Counterpart to Solidity's `uint232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint232(uint256 value) internal pure returns (uint232) {
+        require(value <= type(uint232).max, "SafeCast: value doesn't fit in 232 bits");
+        return uint232(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint224 from uint256, reverting on
+     * overflow (when the input is greater than largest uint224).
+     *
+     * Counterpart to Solidity's `uint224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     *
+     * _Available since v4.2._
+     */
+    function toUint224(uint256 value) internal pure returns (uint224) {
+        require(value <= type(uint224).max, "SafeCast: value doesn't fit in 224 bits");
+        return uint224(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint216 from uint256, reverting on
+     * overflow (when the input is greater than largest uint216).
+     *
+     * Counterpart to Solidity's `uint216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint216(uint256 value) internal pure returns (uint216) {
+        require(value <= type(uint216).max, "SafeCast: value doesn't fit in 216 bits");
+        return uint216(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint208 from uint256, reverting on
+     * overflow (when the input is greater than largest uint208).
+     *
+     * Counterpart to Solidity's `uint208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint208(uint256 value) internal pure returns (uint208) {
+        require(value <= type(uint208).max, "SafeCast: value doesn't fit in 208 bits");
+        return uint208(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint200 from uint256, reverting on
+     * overflow (when the input is greater than largest uint200).
+     *
+     * Counterpart to Solidity's `uint200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint200(uint256 value) internal pure returns (uint200) {
+        require(value <= type(uint200).max, "SafeCast: value doesn't fit in 200 bits");
+        return uint200(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint192 from uint256, reverting on
+     * overflow (when the input is greater than largest uint192).
+     *
+     * Counterpart to Solidity's `uint192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint192(uint256 value) internal pure returns (uint192) {
+        require(value <= type(uint192).max, "SafeCast: value doesn't fit in 192 bits");
+        return uint192(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint184 from uint256, reverting on
+     * overflow (when the input is greater than largest uint184).
+     *
+     * Counterpart to Solidity's `uint184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint184(uint256 value) internal pure returns (uint184) {
+        require(value <= type(uint184).max, "SafeCast: value doesn't fit in 184 bits");
+        return uint184(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint176 from uint256, reverting on
+     * overflow (when the input is greater than largest uint176).
+     *
+     * Counterpart to Solidity's `uint176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint176(uint256 value) internal pure returns (uint176) {
+        require(value <= type(uint176).max, "SafeCast: value doesn't fit in 176 bits");
+        return uint176(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint168 from uint256, reverting on
+     * overflow (when the input is greater than largest uint168).
+     *
+     * Counterpart to Solidity's `uint168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint168(uint256 value) internal pure returns (uint168) {
+        require(value <= type(uint168).max, "SafeCast: value doesn't fit in 168 bits");
+        return uint168(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint160 from uint256, reverting on
+     * overflow (when the input is greater than largest uint160).
+     *
+     * Counterpart to Solidity's `uint160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint160(uint256 value) internal pure returns (uint160) {
+        require(value <= type(uint160).max, "SafeCast: value doesn't fit in 160 bits");
+        return uint160(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint152 from uint256, reverting on
+     * overflow (when the input is greater than largest uint152).
+     *
+     * Counterpart to Solidity's `uint152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint152(uint256 value) internal pure returns (uint152) {
+        require(value <= type(uint152).max, "SafeCast: value doesn't fit in 152 bits");
+        return uint152(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint144 from uint256, reverting on
+     * overflow (when the input is greater than largest uint144).
+     *
+     * Counterpart to Solidity's `uint144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint144(uint256 value) internal pure returns (uint144) {
+        require(value <= type(uint144).max, "SafeCast: value doesn't fit in 144 bits");
+        return uint144(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint136 from uint256, reverting on
+     * overflow (when the input is greater than largest uint136).
+     *
+     * Counterpart to Solidity's `uint136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint136(uint256 value) internal pure returns (uint136) {
+        require(value <= type(uint136).max, "SafeCast: value doesn't fit in 136 bits");
+        return uint136(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint128 from uint256, reverting on
+     * overflow (when the input is greater than largest uint128).
+     *
+     * Counterpart to Solidity's `uint128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint128(uint256 value) internal pure returns (uint128) {
+        require(value <= type(uint128).max, "SafeCast: value doesn't fit in 128 bits");
+        return uint128(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint120 from uint256, reverting on
+     * overflow (when the input is greater than largest uint120).
+     *
+     * Counterpart to Solidity's `uint120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint120(uint256 value) internal pure returns (uint120) {
+        require(value <= type(uint120).max, "SafeCast: value doesn't fit in 120 bits");
+        return uint120(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint112 from uint256, reverting on
+     * overflow (when the input is greater than largest uint112).
+     *
+     * Counterpart to Solidity's `uint112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint112(uint256 value) internal pure returns (uint112) {
+        require(value <= type(uint112).max, "SafeCast: value doesn't fit in 112 bits");
+        return uint112(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint104 from uint256, reverting on
+     * overflow (when the input is greater than largest uint104).
+     *
+     * Counterpart to Solidity's `uint104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint104(uint256 value) internal pure returns (uint104) {
+        require(value <= type(uint104).max, "SafeCast: value doesn't fit in 104 bits");
+        return uint104(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint96 from uint256, reverting on
+     * overflow (when the input is greater than largest uint96).
+     *
+     * Counterpart to Solidity's `uint96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     *
+     * _Available since v4.2._
+     */
+    function toUint96(uint256 value) internal pure returns (uint96) {
+        require(value <= type(uint96).max, "SafeCast: value doesn't fit in 96 bits");
+        return uint96(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint88 from uint256, reverting on
+     * overflow (when the input is greater than largest uint88).
+     *
+     * Counterpart to Solidity's `uint88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint88(uint256 value) internal pure returns (uint88) {
+        require(value <= type(uint88).max, "SafeCast: value doesn't fit in 88 bits");
+        return uint88(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint80 from uint256, reverting on
+     * overflow (when the input is greater than largest uint80).
+     *
+     * Counterpart to Solidity's `uint80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint80(uint256 value) internal pure returns (uint80) {
+        require(value <= type(uint80).max, "SafeCast: value doesn't fit in 80 bits");
+        return uint80(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint72 from uint256, reverting on
+     * overflow (when the input is greater than largest uint72).
+     *
+     * Counterpart to Solidity's `uint72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint72(uint256 value) internal pure returns (uint72) {
+        require(value <= type(uint72).max, "SafeCast: value doesn't fit in 72 bits");
+        return uint72(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint64 from uint256, reverting on
+     * overflow (when the input is greater than largest uint64).
+     *
+     * Counterpart to Solidity's `uint64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint64(uint256 value) internal pure returns (uint64) {
+        require(value <= type(uint64).max, "SafeCast: value doesn't fit in 64 bits");
+        return uint64(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint56 from uint256, reverting on
+     * overflow (when the input is greater than largest uint56).
+     *
+     * Counterpart to Solidity's `uint56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint56(uint256 value) internal pure returns (uint56) {
+        require(value <= type(uint56).max, "SafeCast: value doesn't fit in 56 bits");
+        return uint56(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint48 from uint256, reverting on
+     * overflow (when the input is greater than largest uint48).
+     *
+     * Counterpart to Solidity's `uint48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint48(uint256 value) internal pure returns (uint48) {
+        require(value <= type(uint48).max, "SafeCast: value doesn't fit in 48 bits");
+        return uint48(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint40 from uint256, reverting on
+     * overflow (when the input is greater than largest uint40).
+     *
+     * Counterpart to Solidity's `uint40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint40(uint256 value) internal pure returns (uint40) {
+        require(value <= type(uint40).max, "SafeCast: value doesn't fit in 40 bits");
+        return uint40(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint32 from uint256, reverting on
+     * overflow (when the input is greater than largest uint32).
+     *
+     * Counterpart to Solidity's `uint32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint32(uint256 value) internal pure returns (uint32) {
+        require(value <= type(uint32).max, "SafeCast: value doesn't fit in 32 bits");
+        return uint32(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint24 from uint256, reverting on
+     * overflow (when the input is greater than largest uint24).
+     *
+     * Counterpart to Solidity's `uint24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint24(uint256 value) internal pure returns (uint24) {
+        require(value <= type(uint24).max, "SafeCast: value doesn't fit in 24 bits");
+        return uint24(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint16 from uint256, reverting on
+     * overflow (when the input is greater than largest uint16).
+     *
+     * Counterpart to Solidity's `uint16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint16(uint256 value) internal pure returns (uint16) {
+        require(value <= type(uint16).max, "SafeCast: value doesn't fit in 16 bits");
+        return uint16(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint8 from uint256, reverting on
+     * overflow (when the input is greater than largest uint8).
+     *
+     * Counterpart to Solidity's `uint8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint8(uint256 value) internal pure returns (uint8) {
+        require(value <= type(uint8).max, "SafeCast: value doesn't fit in 8 bits");
+        return uint8(value);
+    }
+
+    /**
+     * @dev Converts a signed int256 into an unsigned uint256.
+     *
+     * Requirements:
+     *
+     * - input must be greater than or equal to 0.
+     *
+     * _Available since v3.0._
+     */
+    function toUint256(int256 value) internal pure returns (uint256) {
+        require(value >= 0, "SafeCast: value must be positive");
+        return uint256(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int248 from int256, reverting on
+     * overflow (when the input is less than smallest int248 or
+     * greater than largest int248).
+     *
+     * Counterpart to Solidity's `int248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt248(int256 value) internal pure returns (int248) {
+        require(value >= type(int248).min && value <= type(int248).max, "SafeCast: value doesn't fit in 248 bits");
+        return int248(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int240 from int256, reverting on
+     * overflow (when the input is less than smallest int240 or
+     * greater than largest int240).
+     *
+     * Counterpart to Solidity's `int240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt240(int256 value) internal pure returns (int240) {
+        require(value >= type(int240).min && value <= type(int240).max, "SafeCast: value doesn't fit in 240 bits");
+        return int240(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int232 from int256, reverting on
+     * overflow (when the input is less than smallest int232 or
+     * greater than largest int232).
+     *
+     * Counterpart to Solidity's `int232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt232(int256 value) internal pure returns (int232) {
+        require(value >= type(int232).min && value <= type(int232).max, "SafeCast: value doesn't fit in 232 bits");
+        return int232(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int224 from int256, reverting on
+     * overflow (when the input is less than smallest int224 or
+     * greater than largest int224).
+     *
+     * Counterpart to Solidity's `int224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt224(int256 value) internal pure returns (int224) {
+        require(value >= type(int224).min && value <= type(int224).max, "SafeCast: value doesn't fit in 224 bits");
+        return int224(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int216 from int256, reverting on
+     * overflow (when the input is less than smallest int216 or
+     * greater than largest int216).
+     *
+     * Counterpart to Solidity's `int216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt216(int256 value) internal pure returns (int216) {
+        require(value >= type(int216).min && value <= type(int216).max, "SafeCast: value doesn't fit in 216 bits");
+        return int216(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int208 from int256, reverting on
+     * overflow (when the input is less than smallest int208 or
+     * greater than largest int208).
+     *
+     * Counterpart to Solidity's `int208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt208(int256 value) internal pure returns (int208) {
+        require(value >= type(int208).min && value <= type(int208).max, "SafeCast: value doesn't fit in 208 bits");
+        return int208(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int200 from int256, reverting on
+     * overflow (when the input is less than smallest int200 or
+     * greater than largest int200).
+     *
+     * Counterpart to Solidity's `int200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt200(int256 value) internal pure returns (int200) {
+        require(value >= type(int200).min && value <= type(int200).max, "SafeCast: value doesn't fit in 200 bits");
+        return int200(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int192 from int256, reverting on
+     * overflow (when the input is less than smallest int192 or
+     * greater than largest int192).
+     *
+     * Counterpart to Solidity's `int192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt192(int256 value) internal pure returns (int192) {
+        require(value >= type(int192).min && value <= type(int192).max, "SafeCast: value doesn't fit in 192 bits");
+        return int192(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int184 from int256, reverting on
+     * overflow (when the input is less than smallest int184 or
+     * greater than largest int184).
+     *
+     * Counterpart to Solidity's `int184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt184(int256 value) internal pure returns (int184) {
+        require(value >= type(int184).min && value <= type(int184).max, "SafeCast: value doesn't fit in 184 bits");
+        return int184(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int176 from int256, reverting on
+     * overflow (when the input is less than smallest int176 or
+     * greater than largest int176).
+     *
+     * Counterpart to Solidity's `int176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt176(int256 value) internal pure returns (int176) {
+        require(value >= type(int176).min && value <= type(int176).max, "SafeCast: value doesn't fit in 176 bits");
+        return int176(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int168 from int256, reverting on
+     * overflow (when the input is less than smallest int168 or
+     * greater than largest int168).
+     *
+     * Counterpart to Solidity's `int168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt168(int256 value) internal pure returns (int168) {
+        require(value >= type(int168).min && value <= type(int168).max, "SafeCast: value doesn't fit in 168 bits");
+        return int168(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int160 from int256, reverting on
+     * overflow (when the input is less than smallest int160 or
+     * greater than largest int160).
+     *
+     * Counterpart to Solidity's `int160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt160(int256 value) internal pure returns (int160) {
+        require(value >= type(int160).min && value <= type(int160).max, "SafeCast: value doesn't fit in 160 bits");
+        return int160(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int152 from int256, reverting on
+     * overflow (when the input is less than smallest int152 or
+     * greater than largest int152).
+     *
+     * Counterpart to Solidity's `int152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt152(int256 value) internal pure returns (int152) {
+        require(value >= type(int152).min && value <= type(int152).max, "SafeCast: value doesn't fit in 152 bits");
+        return int152(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int144 from int256, reverting on
+     * overflow (when the input is less than smallest int144 or
+     * greater than largest int144).
+     *
+     * Counterpart to Solidity's `int144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt144(int256 value) internal pure returns (int144) {
+        require(value >= type(int144).min && value <= type(int144).max, "SafeCast: value doesn't fit in 144 bits");
+        return int144(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int136 from int256, reverting on
+     * overflow (when the input is less than smallest int136 or
+     * greater than largest int136).
+     *
+     * Counterpart to Solidity's `int136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt136(int256 value) internal pure returns (int136) {
+        require(value >= type(int136).min && value <= type(int136).max, "SafeCast: value doesn't fit in 136 bits");
+        return int136(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int128 from int256, reverting on
+     * overflow (when the input is less than smallest int128 or
+     * greater than largest int128).
+     *
+     * Counterpart to Solidity's `int128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt128(int256 value) internal pure returns (int128) {
+        require(value >= type(int128).min && value <= type(int128).max, "SafeCast: value doesn't fit in 128 bits");
+        return int128(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int120 from int256, reverting on
+     * overflow (when the input is less than smallest int120 or
+     * greater than largest int120).
+     *
+     * Counterpart to Solidity's `int120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt120(int256 value) internal pure returns (int120) {
+        require(value >= type(int120).min && value <= type(int120).max, "SafeCast: value doesn't fit in 120 bits");
+        return int120(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int112 from int256, reverting on
+     * overflow (when the input is less than smallest int112 or
+     * greater than largest int112).
+     *
+     * Counterpart to Solidity's `int112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt112(int256 value) internal pure returns (int112) {
+        require(value >= type(int112).min && value <= type(int112).max, "SafeCast: value doesn't fit in 112 bits");
+        return int112(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int104 from int256, reverting on
+     * overflow (when the input is less than smallest int104 or
+     * greater than largest int104).
+     *
+     * Counterpart to Solidity's `int104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt104(int256 value) internal pure returns (int104) {
+        require(value >= type(int104).min && value <= type(int104).max, "SafeCast: value doesn't fit in 104 bits");
+        return int104(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int96 from int256, reverting on
+     * overflow (when the input is less than smallest int96 or
+     * greater than largest int96).
+     *
+     * Counterpart to Solidity's `int96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt96(int256 value) internal pure returns (int96) {
+        require(value >= type(int96).min && value <= type(int96).max, "SafeCast: value doesn't fit in 96 bits");
+        return int96(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int88 from int256, reverting on
+     * overflow (when the input is less than smallest int88 or
+     * greater than largest int88).
+     *
+     * Counterpart to Solidity's `int88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt88(int256 value) internal pure returns (int88) {
+        require(value >= type(int88).min && value <= type(int88).max, "SafeCast: value doesn't fit in 88 bits");
+        return int88(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int80 from int256, reverting on
+     * overflow (when the input is less than smallest int80 or
+     * greater than largest int80).
+     *
+     * Counterpart to Solidity's `int80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt80(int256 value) internal pure returns (int80) {
+        require(value >= type(int80).min && value <= type(int80).max, "SafeCast: value doesn't fit in 80 bits");
+        return int80(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int72 from int256, reverting on
+     * overflow (when the input is less than smallest int72 or
+     * greater than largest int72).
+     *
+     * Counterpart to Solidity's `int72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt72(int256 value) internal pure returns (int72) {
+        require(value >= type(int72).min && value <= type(int72).max, "SafeCast: value doesn't fit in 72 bits");
+        return int72(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int64 from int256, reverting on
+     * overflow (when the input is less than smallest int64 or
+     * greater than largest int64).
+     *
+     * Counterpart to Solidity's `int64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt64(int256 value) internal pure returns (int64) {
+        require(value >= type(int64).min && value <= type(int64).max, "SafeCast: value doesn't fit in 64 bits");
+        return int64(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int56 from int256, reverting on
+     * overflow (when the input is less than smallest int56 or
+     * greater than largest int56).
+     *
+     * Counterpart to Solidity's `int56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt56(int256 value) internal pure returns (int56) {
+        require(value >= type(int56).min && value <= type(int56).max, "SafeCast: value doesn't fit in 56 bits");
+        return int56(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int48 from int256, reverting on
+     * overflow (when the input is less than smallest int48 or
+     * greater than largest int48).
+     *
+     * Counterpart to Solidity's `int48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt48(int256 value) internal pure returns (int48) {
+        require(value >= type(int48).min && value <= type(int48).max, "SafeCast: value doesn't fit in 48 bits");
+        return int48(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int40 from int256, reverting on
+     * overflow (when the input is less than smallest int40 or
+     * greater than largest int40).
+     *
+     * Counterpart to Solidity's `int40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt40(int256 value) internal pure returns (int40) {
+        require(value >= type(int40).min && value <= type(int40).max, "SafeCast: value doesn't fit in 40 bits");
+        return int40(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int32 from int256, reverting on
+     * overflow (when the input is less than smallest int32 or
+     * greater than largest int32).
+     *
+     * Counterpart to Solidity's `int32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt32(int256 value) internal pure returns (int32) {
+        require(value >= type(int32).min && value <= type(int32).max, "SafeCast: value doesn't fit in 32 bits");
+        return int32(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int24 from int256, reverting on
+     * overflow (when the input is less than smallest int24 or
+     * greater than largest int24).
+     *
+     * Counterpart to Solidity's `int24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt24(int256 value) internal pure returns (int24) {
+        require(value >= type(int24).min && value <= type(int24).max, "SafeCast: value doesn't fit in 24 bits");
+        return int24(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int16 from int256, reverting on
+     * overflow (when the input is less than smallest int16 or
+     * greater than largest int16).
+     *
+     * Counterpart to Solidity's `int16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt16(int256 value) internal pure returns (int16) {
+        require(value >= type(int16).min && value <= type(int16).max, "SafeCast: value doesn't fit in 16 bits");
+        return int16(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int8 from int256, reverting on
+     * overflow (when the input is less than smallest int8 or
+     * greater than largest int8).
+     *
+     * Counterpart to Solidity's `int8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt8(int256 value) internal pure returns (int8) {
+        require(value >= type(int8).min && value <= type(int8).max, "SafeCast: value doesn't fit in 8 bits");
+        return int8(value);
+    }
+
+    /**
+     * @dev Converts an unsigned uint256 into a signed int256.
+     *
+     * Requirements:
+     *
+     * - input must be less than or equal to maxInt256.
+     *
+     * _Available since v3.0._
+     */
+    function toInt256(uint256 value) internal pure returns (int256) {
+        // Note: Unsafe cast below is okay because `type(int256).max` is guaranteed to be positive
+        require(value <= uint256(type(int256).max), "SafeCast: value doesn't fit in an int256");
+        return int256(value);
+    }
+}
+
+
+// File: contracts/interfaces/ITransmuter.sol
+// SPDX-License-Identifier: GPL-3.0
+
+/*
+                      *                                                  █                              
+                    *****                                               ▓▓▓                             
+                      *                                               ▓▓▓▓▓▓▓                         
+                                       *            ///.           ▓▓▓▓▓▓▓▓▓▓▓▓▓                       
+                                     *****        ////////            ▓▓▓▓▓▓▓                          
+                                       *       /////////////            ▓▓▓                             
+                         ▓▓                  //////////////////          █         ▓▓                   
+                       ▓▓  ▓▓             ///////////////////////                ▓▓   ▓▓                
+                     ▓▓       ▓▓        ////////////////////////////           ▓▓        ▓▓              
+                  ▓▓            ▓▓    /////////▓▓▓///////▓▓▓/////////       ▓▓             ▓▓            
+                ▓▓                ,////////////////////////////////////// ▓▓                 ▓▓         
+              ▓▓                 //////////////////////////////////////////                     ▓▓      
+            ▓▓                //////////////////////▓▓▓▓/////////////////////                          
+                           ,////////////////////////////////////////////////////                        
+                        .//////////////////////////////////////////////////////////                     
+                         .//////////////////////////██.,//////////////////////////█                     
+                           .//////////////////////████..,./////////////////////██                       
+                            ...////////////////███████.....,.////////////////███                        
+                              ,.,////////////████████ ........,///////////████                          
+                                .,.,//////█████████      ,.......///////████                            
+                                   ,..//████████           ........./████                               
+                                     ..,██████                .....,███                                 
+                                        .██                     ,.,█                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                   ▓▓            ▓▓▓▓▓▓▓▓▓▓       ▓▓▓▓▓▓▓▓▓▓        ▓▓               ▓▓▓▓▓▓▓▓▓▓          
+                 ▓▓▓▓▓▓          ▓▓▓    ▓▓▓       ▓▓▓               ▓▓               ▓▓   ▓▓▓▓         
+               ▓▓▓    ▓▓▓        ▓▓▓    ▓▓▓       ▓▓▓    ▓▓▓        ▓▓               ▓▓▓▓▓             
+              ▓▓▓        ▓▓      ▓▓▓    ▓▓▓       ▓▓▓▓▓▓▓▓▓▓        ▓▓▓▓▓▓▓▓▓▓       ▓▓▓▓▓▓▓▓▓▓          
+*/
+
+pragma solidity >=0.5.0;
+
+import { IDiamondCut } from "./IDiamondCut.sol";
+import { IDiamondEtherscan } from "./IDiamondEtherscan.sol";
+import { IDiamondLoupe } from "./IDiamondLoupe.sol";
+import { IGetters } from "./IGetters.sol";
+import { IRedeemer } from "./IRedeemer.sol";
+import { IRewardHandler } from "./IRewardHandler.sol";
+import { ISettersGovernor, ISettersGuardian } from "./ISetters.sol";
+import { ISwapper } from "./ISwapper.sol";
+
+/// @title ITransmuter
+/// @author Angle Labs, Inc.
+interface ITransmuter is
+    IDiamondCut,
+    IDiamondEtherscan,
+    IDiamondLoupe,
+    IGetters,
+    IRedeemer,
+    IRewardHandler,
+    ISettersGovernor,
+    ISettersGuardian,
+    ISwapper
+{
+
+}
+
+
+// File: contracts/utils/AccessControl.sol
+// SPDX-License-Identifier: BUSL-1.1
+
+pragma solidity ^0.8.19;
+
+import { IAccessControlManager } from "interfaces/IAccessControlManager.sol";
+
+import "../utils/Errors.sol";
+
+/// @title AccessControl
+/// @author Angle Labs, Inc.
+contract AccessControl {
+    /// @notice `accessControlManager` used to check roles
+    IAccessControlManager public accessControlManager;
+
+    uint256[49] private __gapAccessControl;
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                       MODIFIERS                                                    
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Checks whether the `msg.sender` has the governor role
+    modifier onlyGovernor() {
+        if (!accessControlManager.isGovernor(msg.sender)) revert NotGovernor();
+        _;
+    }
+
+    /// @notice Checks whether the `msg.sender` has the guardian role
+    modifier onlyGuardian() {
+        if (!accessControlManager.isGovernorOrGuardian(msg.sender)) revert NotGovernorOrGuardian();
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                       FUNCTIONS                                                    
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Checks whether `admin` has the governor role
+    function isGovernor(address admin) external view returns (bool) {
+        return accessControlManager.isGovernor(admin);
+    }
+
+    /// @notice Checks whether `admin` has the guardian role
+    function isGovernorOrGuardian(address admin) external view returns (bool) {
+        return accessControlManager.isGovernorOrGuardian(admin);
+    }
+}
+
+
+// File: contracts/utils/Constants.sol
+// SPDX-License-Identifier: BUSL-1.1
+
+pragma solidity >=0.5.0;
+
+import { ICbETH } from "interfaces/external/coinbase/ICbETH.sol";
+import { ISfrxETH } from "interfaces/external/frax/ISfrxETH.sol";
+import { IStETH } from "interfaces/external/lido/IStETH.sol";
+import { IRETH } from "interfaces/external/rocketPool/IRETH.sol";
+
+/*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                 STORAGE SLOTS                                                  
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+/// @dev Storage position of `DiamondStorage` structure
+/// @dev Equals `keccak256("diamond.standard.diamond.storage") - 1`
+bytes32 constant DIAMOND_STORAGE_POSITION = 0xc8fcad8db84d3cc18b4c41d551ea0ee66dd599cde068d998e57d5e09332c131b;
+
+/// @dev Storage position of `TransmuterStorage` structure
+/// @dev Equals `keccak256("diamond.standard.transmuter.storage") - 1`
+bytes32 constant TRANSMUTER_STORAGE_POSITION = 0xc1f2f38dde3351ac0a64934139e816326caa800303a1235dc53707d0de05d8bd;
+
+/// @dev Storage position of `ImplementationStorage` structure
+/// @dev Equals `keccak256("eip1967.proxy.implementation") - 1`
+bytes32 constant IMPLEMENTATION_STORAGE_POSITION = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+/*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                     MATHS                                                      
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+uint256 constant BASE_6 = 1e6;
+uint256 constant BASE_8 = 1e8;
+uint256 constant BASE_9 = 1e9;
+uint256 constant BASE_12 = 1e12;
+uint256 constant BPS = 1e14;
+uint256 constant BASE_18 = 1e18;
+uint256 constant HALF_BASE_27 = 1e27 / 2;
+uint256 constant BASE_27 = 1e27;
+uint256 constant BASE_36 = 1e36;
+uint256 constant MAX_BURN_FEE = 999_000_000;
+uint256 constant MAX_MINT_FEE = BASE_12 - 1;
+
+/*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                     REENTRANT                                                      
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+// The values being non-zero value makes deployment a bit more expensive,
+// but in exchange the refund on every call to nonReentrant will be lower in
+// amount. Since refunds are capped to a percentage of the total
+// transaction's gas, it is best to keep them low in cases like this one, to
+// increase the likelihood of the full refund coming into effect.
+uint8 constant NOT_ENTERED = 1;
+uint8 constant ENTERED = 2;
+
+/*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                               COMMON ADDRESSES                                                 
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+address constant PERMIT_2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+address constant ONE_INCH_ROUTER = 0x1111111254EEB25477B68fb85Ed929f73A960582;
+address constant AGEUR = 0x1a7e4e63778B4f12a199C062f3eFdD288afCBce8;
+ICbETH constant CBETH = ICbETH(0xBe9895146f7AF43049ca1c1AE358B0541Ea49704);
+IRETH constant RETH = IRETH(0xae78736Cd615f374D3085123A210448E74Fc6393);
+IStETH constant STETH = IStETH(0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84);
+ISfrxETH constant SFRXETH = ISfrxETH(0xac3E018457B222d93114458476f3E3416Abbe38F);
+
+
+// File: contracts/utils/Errors.sol
+// SPDX-License-Identifier: BUSL-1.1
+
+pragma solidity ^0.8.19;
+
+error AlreadyAdded();
+error CannotAddFunctionToDiamondThatAlreadyExists(bytes4 _selector);
+error CannotAddSelectorsToZeroAddress(bytes4[] _selectors);
+error CannotRemoveFunctionThatDoesNotExist(bytes4 _selector);
+error CannotRemoveImmutableFunction(bytes4 _selector);
+error CannotReplaceFunctionsFromFacetWithZeroAddress(bytes4[] _selectors);
+error CannotReplaceFunctionThatDoesNotExists(bytes4 _selector);
+error CannotReplaceFunctionWithTheSameFunctionFromTheSameFacet(bytes4 _selector);
+error CannotReplaceImmutableFunction(bytes4 _selector);
+error ContractHasNoCode();
+error FunctionNotFound(bytes4 _functionSelector);
+error IncorrectFacetCutAction(uint8 _action);
+error InitializationFunctionReverted(address _initializationContractAddress, bytes _calldata);
+error InvalidChainlinkRate();
+error InvalidLengths();
+error InvalidNegativeFees();
+error InvalidOracleType();
+error InvalidParam();
+error InvalidParams();
+error InvalidRate();
+error InvalidSwap();
+error InvalidTokens();
+error ManagerHasAssets();
+error NoSelectorsProvidedForFacetForCut(address _facetAddress);
+error NotAllowed();
+error NotCollateral();
+error NotGovernor();
+error NotGovernorOrGuardian();
+error NotTrusted();
+error NotWhitelisted();
+error OneInchSwapFailed();
+error OracleUpdateFailed();
+error Paused();
+error ReentrantCall();
+error RemoveFacetAddressMustBeZeroAddress(address _facetAddress);
+error TooBigAmountIn();
+error TooLate();
+error TooSmallAmountOut();
+error ZeroAddress();
+error ZeroAmount();
+
+
+// File: contracts/helpers/RebalancerFlashloan.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity ^0.8.19;
+
+import "./Rebalancer.sol";
+import { IERC4626 } from "interfaces/external/IERC4626.sol";
+import { IERC3156FlashBorrower } from "oz/interfaces/IERC3156FlashBorrower.sol";
+import { IERC3156FlashLender } from "oz/interfaces/IERC3156FlashLender.sol";
+
+/// @title RebalancerFlashloan
+/// @author Angle Labs, Inc.
+/// @dev Rebalancer contract for a Transmuter with as collaterals a liquid stablecoin and an ERC4626 token
+/// using this liquid stablecoin as an asset
+contract RebalancerFlashloan is Rebalancer, IERC3156FlashBorrower {
+    using SafeERC20 for IERC20;
+    using SafeCast for uint256;
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
+
+    /// @notice Angle stablecoin flashloan contract
+    IERC3156FlashLender public immutable FLASHLOAN;
+
+    constructor(
+        IAccessControlManager _accessControlManager,
+        ITransmuter _transmuter,
+        IERC3156FlashLender _flashloan
+    ) Rebalancer(_accessControlManager, _transmuter) {
+        if (address(_flashloan) == address(0)) revert ZeroAddress();
+        FLASHLOAN = _flashloan;
+        IERC20(AGTOKEN).safeApprove(address(_flashloan), type(uint256).max);
+    }
+
+    /// @notice Burns `amountStablecoins` for one collateral asset and mints stablecoins from the proceeds of the
+    /// first burn
+    /// @dev If `increase` is 1, then the system tries to increase its exposure to the yield bearing asset which means
+    /// burning stablecoin for the liquid asset, depositing into the ERC4626 vault, then minting the stablecoin
+    /// @dev This function reverts if the second stablecoin mint gives less than `minAmountOut` of stablecoins
+    function adjustYieldExposure(
+        uint256 amountStablecoins,
+        uint8 increase,
+        address collateral,
+        address vault,
+        uint256 minAmountOut
+    ) external {
+        if (!TRANSMUTER.isTrustedSeller(msg.sender)) revert NotTrusted();
+        FLASHLOAN.flashLoan(
+            IERC3156FlashBorrower(address(this)),
+            address(AGTOKEN),
+            amountStablecoins,
+            abi.encode(increase, collateral, vault, minAmountOut)
+        );
+    }
+
+    /// @inheritdoc IERC3156FlashBorrower
+    function onFlashLoan(
+        address initiator,
+        address,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external returns (bytes32) {
+        if (msg.sender != address(FLASHLOAN) || initiator != address(this) || fee != 0) revert NotTrusted();
+        (uint256 typeAction, address collateral, address vault, uint256 minAmountOut) = abi.decode(
+            data,
+            (uint256, address, address, uint256)
+        );
+        address tokenOut;
+        address tokenIn;
+        if (typeAction == 1) {
+            // Increase yield exposure action: we bring in the ERC4626 token
+            tokenOut = collateral;
+            tokenIn = vault;
+        } else {
+            // Decrease yield exposure action: we bring in the liquid asset
+            tokenIn = collateral;
+            tokenOut = vault;
+        }
+        uint256 amountOut = TRANSMUTER.swapExactInput(amount, 0, AGTOKEN, tokenOut, address(this), block.timestamp);
+        if (typeAction == 1) {
+            // Granting allowance with the collateral for the vault asset
+            _adjustAllowance(collateral, vault, amountOut);
+            amountOut = IERC4626(vault).deposit(amountOut, address(this));
+        } else amountOut = IERC4626(vault).redeem(amountOut, address(this), address(this));
+        _adjustAllowance(tokenIn, address(TRANSMUTER), amountOut);
+        uint256 amountStableOut = TRANSMUTER.swapExactInput(
+            amountOut,
+            minAmountOut,
+            tokenIn,
+            AGTOKEN,
+            address(this),
+            block.timestamp
+        );
+        if (amount > amountStableOut) {
+            uint256 subsidy = amount - amountStableOut;
+            orders[tokenIn][tokenOut].subsidyBudget -= subsidy.toUint112();
+            budget -= subsidy;
+            emit SubsidyPaid(tokenIn, tokenOut, subsidy);
+        }
+        return CALLBACK_SUCCESS;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/extensions/draft-IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCall(target, data, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        require(isContract(target), "Address: call to non-contract");
+
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        require(isContract(target), "Address: static call to non-contract");
+
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(isContract(target), "Address: delegate call to non-contract");
+
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            // Look for revert reason and bubble it up if present
+            if (returndata.length > 0) {
+                // The easiest way to bubble the revert reason is using memory via assembly
+                /// @solidity memory-safe-assembly
+                assembly {
+                    let returndata_size := mload(returndata)
+                    revert(add(32, returndata), returndata_size)
+                }
+            } else {
+                revert(errorMessage);
+            }
+        }
+    }
+}
+
+
+// File: contracts/interfaces/IDiamondCut.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity >=0.5.0;
+
+import "../transmuter/Storage.sol";
+
+/// @title IDiamondCut
+/// @author Angle Labs, Inc.
+/// @dev Reference: EIP-2535 Diamonds
+/// @dev Forked from https://github.com/mudgen/diamond-3/blob/master/contracts/interfaces/IDiamondCut.sol by mudgen
+interface IDiamondCut {
+    /// @notice Add/replace/remove any number of functions and optionally execute a function with delegatecall
+    /// @param _diamondCut Contains the facet addresses and function selectors
+    /// @param _init The address of the contract or facet to execute _calldata
+    /// @param _calldata A function call, including function selector and arguments, executed with delegatecall on _init
+    function diamondCut(FacetCut[] calldata _diamondCut, address _init, bytes calldata _calldata) external;
+}
+
+
+// File: contracts/interfaces/IDiamondEtherscan.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity >=0.5.0;
+
+/// @title IDiamondEtherscan
+/// @author Angle Labs, Inc.
+interface IDiamondEtherscan {
+    /// @notice Sets a dummy implementation with the same layout at the diamond proxy contract with all its facets
+    function setDummyImplementation(address _implementation) external;
+
+    /// @notice Address of the dummy implementation used to make the DiamondProxy contract interpretable by Etherscan
+    function implementation() external view returns (address);
+}
+
+
+// File: contracts/interfaces/IDiamondLoupe.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity >=0.5.0;
+
+import "../transmuter/Storage.sol";
+
+/// @notice IDiamondLoupe
+/// @author Angle Labs, Inc.
+/// @dev Reference: EIP-2535 Diamonds
+/// @dev Forked from https://github.com/mudgen/diamond-3/blob/master/contracts/interfaces/IDiamondLoupe.sol by mudgen
+
+interface IDiamondLoupe {
+    /// @notice Gets all facet addresses and their four byte function selectors.
+    /// @return facets_ Facet
+    function facets() external view returns (Facet[] memory facets_);
+
+    /// @notice Gets all the function selectors supported by a specific facet.
+    /// @param _facet The facet address.
+    /// @return facetFunctionSelectors_
+    function facetFunctionSelectors(address _facet) external view returns (bytes4[] memory facetFunctionSelectors_);
+
+    /// @notice Get all the facet addresses used by a diamond.
+    /// @return facetAddresses_
+    function facetAddresses() external view returns (address[] memory facetAddresses_);
+
+    /// @notice Gets the facet that supports the given selector.
+    /// @dev If facet is not found return address(0).
+    /// @param _functionSelector The function selector.
+    /// @return facetAddress_ The facet address.
+    function facetAddress(bytes4 _functionSelector) external view returns (address facetAddress_);
+}
+
+
+// File: contracts/interfaces/IGetters.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+import { IAccessControlManager } from "interfaces/IAccessControlManager.sol";
+import { IAgToken } from "interfaces/IAgToken.sol";
+
+import "../transmuter/Storage.sol";
+
+/// @title IGetters
+/// @author Angle Labs, Inc.
+interface IGetters {
+    /// @notice Checks whether a given `selector` is actually a valid selector corresponding to a function in one of the
+    /// facets of the proxy
+    function isValidSelector(bytes4 selector) external view returns (bool);
+
+    /// @notice Reference to the `accessControlManager` contract of the system
+    function accessControlManager() external view returns (IAccessControlManager);
+
+    /// @notice Stablecoin minted by transmuter
+    function agToken() external view returns (IAgToken);
+
+    /// @notice Returns the list of collateral assets supported by the system
+    function getCollateralList() external view returns (address[] memory);
+
+    /// @notice Returns all the info in storage associated to a `collateral`
+    function getCollateralInfo(address collateral) external view returns (Collateral memory);
+
+    /// @notice Returns the decimals of a given `collateral`
+    function getCollateralDecimals(address collateral) external view returns (uint8);
+
+    /// @notice Returns the `xFee` and `yFee` arrays from which fees are computed when coming to mint
+    /// with `collateral`
+    function getCollateralMintFees(address collateral) external view returns (uint64[] memory, int64[] memory);
+
+    /// @notice Returns the `xFee` and `yFee` arrays from which fees are computed when coming to burn
+    /// for `collateral`
+    function getCollateralBurnFees(address collateral) external view returns (uint64[] memory, int64[] memory);
+
+    /// @notice Returns the `xFee` and `yFee` arrays used to compute the penalty factor depending on the collateral
+    /// ratio when users come to redeem
+    function getRedemptionFees() external view returns (uint64[] memory, int64[] memory);
+
+    /// @notice Returns the collateral ratio of Transmuter in base `10**9` and a rounded version of the total amount
+    /// of stablecoins issued
+    function getCollateralRatio() external view returns (uint64 collatRatio, uint256 stablecoinsIssued);
+
+    /// @notice Returns the total amount of stablecoins issued through Transmuter
+    function getTotalIssued() external view returns (uint256 stablecoinsIssued);
+
+    /// @notice Returns the amount of stablecoins issued from `collateral` and the total amount of stablecoins issued
+    /// through Transmuter
+    function getIssuedByCollateral(
+        address collateral
+    ) external view returns (uint256 stablecoinsFromCollateral, uint256 stablecoinsIssued);
+
+    /// @notice Returns if a collateral is "managed" and the associated manager configuration
+    function getManagerData(
+        address collateral
+    ) external view returns (bool isManaged, IERC20[] memory subCollaterals, bytes memory config);
+
+    /// @notice Returns the oracle values associated to `collateral`
+    /// @return mint Oracle value to be used for a mint transaction with `collateral`
+    /// @return burn Oracle value that will be used for `collateral` for a burn transaction. This value
+    /// is then used along with oracle values for all other collateral assets to get a global burn value for the oracle
+    /// @return ratio Ratio, in base `10**18` between the oracle value of the `collateral` and its target price.
+    /// This value is 10**18 if the oracle is greater than the collateral price
+    /// @return minRatio Minimum ratio across all collateral assets between a collateral burn price and its target
+    /// price. This value is independent of `collateral` and is used to normalize the burn oracle value for burn
+    /// transactions.
+    /// @return redemption Oracle value that would be used to price `collateral` when computing the collateral ratio
+    /// during a redemption
+    function getOracleValues(
+        address collateral
+    ) external view returns (uint256 mint, uint256 burn, uint256 ratio, uint256 minRatio, uint256 redemption);
+
+    /// @notice Returns the data used to compute oracle values for `collateral`
+    /// @return oracleType Type of oracle (Chainlink, external smart contract, ...)
+    /// @return targetType Type passed to read the value of the target price
+    /// @return oracleData Extra data needed to read the oracle. For Chainlink oracles, this data is supposed to give
+    /// the addresses of the Chainlink feeds to read, the stale periods for each feed, ...
+    /// @return targetData Extra data needed to read the target price of the asset
+    function getOracle(
+        address collateral
+    )
+        external
+        view
+        returns (
+            OracleReadType oracleType,
+            OracleReadType targetType,
+            bytes memory oracleData,
+            bytes memory targetData,
+            bytes memory hyperparameters
+        );
+
+    /// @notice Returns if the associated functionality is paused or not
+    function isPaused(address collateral, ActionType action) external view returns (bool);
+
+    /// @notice Returns if `sender` is trusted to update normalizers
+    function isTrusted(address sender) external view returns (bool);
+
+    /// @notice Returns if `sender` is trusted to update sell rewards
+    function isTrustedSeller(address sender) external view returns (bool);
+
+    /// @notice Checks whether `sender` has a non null entry in the `isWhitelistedForType` storage mapping
+    /// @dev Note that ultimately whitelisting may depend as well on external providers
+    function isWhitelistedForType(WhitelistType whitelistType, address sender) external view returns (bool);
+
+    /// @notice Checks whether `sender` can deal with `collateral` during burns and redemptions
+    function isWhitelistedForCollateral(address collateral, address sender) external returns (bool);
+
+    /// @notice Checks whether only whitelisted address can deal with `collateral` during burns and redemptions
+    function isWhitelistedCollateral(address collateral) external view returns (bool);
+
+    /// @notice Gets the data needed to deal with whitelists for `collateral`
+    function getCollateralWhitelistData(address collateral) external view returns (bytes memory);
+}
+
+
+// File: contracts/interfaces/IRedeemer.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title IRedeemer
+/// @author Angle Labs, Inc.
+interface IRedeemer {
+    /// @notice Redeems `amount` of stablecoins from the system
+    /// @param receiver Address which should be receiving the output tokens
+    /// @param deadline Timestamp before which the redemption should have occured
+    /// @param minAmountOuts Minimum amount of each token given back in the redemption to obtain
+    /// @return tokens List of tokens returned
+    /// @return amounts Amount given for each token in the `tokens` array
+    function redeem(
+        uint256 amount,
+        address receiver,
+        uint256 deadline,
+        uint256[] memory minAmountOuts
+    ) external returns (address[] memory tokens, uint256[] memory amounts);
+
+    /// @notice Same as the redeem function above with the additional feature to specify a list of `forfeitTokens` for
+    /// which the Transmuter system will not try to do a transfer to `receiver`.
+    function redeemWithForfeit(
+        uint256 amount,
+        address receiver,
+        uint256 deadline,
+        uint256[] memory minAmountOuts,
+        address[] memory forfeitTokens
+    ) external returns (address[] memory tokens, uint256[] memory amounts);
+
+    /// @notice Simulate the exact output that a redemption of `amount` of stablecoins would give at a given block
+    /// @return tokens List of tokens that would be given
+    /// @return amounts Amount that would be obtained for each token in the `tokens` array
+    function quoteRedemptionCurve(
+        uint256 amount
+    ) external view returns (address[] memory tokens, uint256[] memory amounts);
+
+    /// @notice Updates the normalizer variable by `amount`
+    function updateNormalizer(uint256 amount, bool increase) external returns (uint256);
+}
+
+
+// File: contracts/interfaces/IRewardHandler.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title IRewardHandler
+/// @author Angle Labs, Inc.
+interface IRewardHandler {
+    /// @notice Sells some external tokens through a 1inch call
+    /// @param minAmountOut Minimum amount of the outToken to get
+    /// @param payload Payload to pass to 1inch
+    /// @return amountOut Amount obtained of the outToken
+    function sellRewards(uint256 minAmountOut, bytes memory payload) external returns (uint256 amountOut);
+}
+
+
+// File: contracts/interfaces/ISetters.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+import { IERC20 } from "oz/interfaces/IERC20.sol";
+
+import "../transmuter/Storage.sol";
+
+/// @title ISettersGovernor
+/// @author Angle Labs, Inc.
+interface ISettersGovernor {
+    /// @notice Recovers `amount` of `token` from the Transmuter contract
+    function recoverERC20(address collateral, IERC20 token, address to, uint256 amount) external;
+
+    /// @notice Sets a new access control manager address
+    function setAccessControlManager(address _newAccessControlManager) external;
+
+    /// @notice Sets (or unsets) a collateral manager  `collateral`
+    function setCollateralManager(address collateral, ManagerStorage memory managerData) external;
+
+    /// @notice Sets the allowance of the contract on `token` for `spender` to `amount`
+    function changeAllowance(IERC20 token, address spender, uint256 amount) external;
+
+    /// @notice Changes the trusted status for `sender` when for selling rewards or updating the normalizer
+    function toggleTrusted(address sender, TrustedType t) external;
+
+    /// @notice Changes whether a `collateral` can only be handled during burns and redemptions by whitelisted addresses
+    /// and sets the data used to read into the whitelist
+    function setWhitelistStatus(address collateral, uint8 whitelistStatus, bytes memory whitelistData) external;
+
+    /// @notice Add `collateral` as a supported collateral in the system
+    function addCollateral(address collateral) external;
+
+    /// @notice Adjusts the amount of stablecoins issued from `collateral` by `amount`
+    function adjustStablecoins(address collateral, uint128 amount, bool increase) external;
+
+    /// @notice Revokes `collateral` from the system
+    function revokeCollateral(address collateral) external;
+
+    /// @notice Sets the `oracleConfig` used to read the value of `collateral` for the mint, burn and redemption
+    /// operations
+    function setOracle(address collateral, bytes memory oracleConfig) external;
+
+    /// @notice Update oracle data for a given `collateral`
+    function updateOracle(address collateral) external;
+}
+
+/// @title ISettersGovernor
+/// @author Angle Labs, Inc.
+interface ISettersGuardian {
+    /// @notice Changes the pause status for mint or burn transactions for `collateral`
+    function togglePause(address collateral, ActionType action) external;
+
+    /// @notice Sets the mint or burn fees for `collateral`
+    function setFees(address collateral, uint64[] memory xFee, int64[] memory yFee, bool mint) external;
+
+    /// @notice Sets the parameters for the redemption curve
+    function setRedemptionCurveParams(uint64[] memory xFee, int64[] memory yFee) external;
+
+    /// @notice Changes the whitelist status for a collateral with `whitelistType` for an address `who`
+    function toggleWhitelist(WhitelistType whitelistType, address who) external;
+}
+
+
+// File: contracts/interfaces/ISwapper.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title ISwapper
+/// @author Angle Labs, Inc.
+interface ISwapper {
+    /// @notice Swaps (that is to say mints or burns) an exact amount of `tokenIn` for an amount of `tokenOut`
+    /// @param amountIn Amount of `tokenIn` to bring
+    /// @param amountOutMin Minimum amount of `tokenOut` to get: if `amountOut` is inferior to this amount, the
+    /// function will revert
+    /// @param tokenIn Token to bring for the swap
+    /// @param tokenOut Token to get out of the swap
+    /// @param to Address to which `tokenOut` must be sent
+    /// @param deadline Timestamp before which the transaction must be executed
+    /// @return amountOut Amount of `tokenOut` obtained through the swap
+    function swapExactInput(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address tokenOut,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountOut);
+
+    /// @notice Same as `swapExactInput`, but using Permit2 signatures for `tokenIn`
+    /// @dev Can only be used to mint, hence `tokenOut` is not needed
+    function swapExactInputWithPermit(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address to,
+        uint256 deadline,
+        bytes calldata permitData
+    ) external returns (uint256 amountOut);
+
+    /// @notice Swaps (that is to say mints or burns) an amount of `tokenIn` for an exact amount of `tokenOut`
+    /// @param amountOut Amount of `tokenOut` to obtain from the swap
+    /// @param amountInMax Maximum amount of `tokenIn` to bring in order to get `amountOut` of `tokenOut`
+    /// @param tokenIn Token to bring for the swap
+    /// @param tokenOut Token to get out of the swap
+    /// @param to Address to which `tokenOut` must be sent
+    /// @param deadline Timestamp before which the transaction must be executed
+    /// @return amountIn Amount of `tokenIn` used to perform the swap
+    function swapExactOutput(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address tokenIn,
+        address tokenOut,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountIn);
+
+    /// @notice Same as `swapExactOutput`, but using Permit2 signatures for `tokenIn`
+    /// @dev Can only be used to mint, hence `tokenOut` is not needed
+    function swapExactOutputWithPermit(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address tokenIn,
+        address to,
+        uint256 deadline,
+        bytes calldata permitData
+    ) external returns (uint256 amountIn);
+
+    /// @notice Simulates what a call to `swapExactInput` with `amountIn` of `tokenIn` for `tokenOut` would give.
+    /// If called right before and at the same block, the `amountOut` outputted by this function is exactly the
+    /// amount that will be obtained with `swapExactInput`
+    function quoteIn(uint256 amountIn, address tokenIn, address tokenOut) external view returns (uint256 amountOut);
+
+    /// @notice Simulates what a call to `swapExactOutput` for `amountOut` of `tokenOut` with `tokenIn` would give.
+    /// If called right before and at the same block, the `amountIn` outputted by this function is exactly the
+    /// amount that will be obtained with `swapExactOutput`
+    function quoteOut(uint256 amountOut, address tokenIn, address tokenOut) external view returns (uint256 amountIn);
+}
+
+
+// File: contracts/interfaces/IAccessControlManager.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title IAccessControlManager
+/// @author Angle Labs, Inc.
+interface IAccessControlManager {
+    /// @notice Checks whether an address is governor of the Angle Protocol or not
+    /// @param admin Address to check
+    /// @return Whether the address has the `GOVERNOR_ROLE` or not
+    function isGovernor(address admin) external view returns (bool);
+
+    /// @notice Checks whether an address is governor or a guardian of the Angle Protocol or not
+    /// @param admin Address to check
+    /// @return Whether the address has the `GUARDIAN_ROLE` or not
+    /// @dev Governance should make sure when adding a governor to also give this governor the guardian
+    /// role by calling the `addGovernor` function
+    function isGovernorOrGuardian(address admin) external view returns (bool);
+}
+
+
+// File: contracts/interfaces/external/coinbase/ICbETH.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title ICbETH
+/// @notice Interface for the `cbETH` contract
+interface ICbETH {
+    function exchangeRate() external view returns (uint256);
+}
+
+
+// File: contracts/interfaces/external/frax/ISfrxETH.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title ISfrxETH
+/// @notice Interface for the `sfrxETH` contract
+interface ISfrxETH {
+    function pricePerShare() external view returns (uint256);
+}
+
+
+// File: contracts/interfaces/external/lido/IStETH.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title IStETH
+/// @notice Interface for the `StETH` contract
+interface IStETH {
+    function getPooledEthByShares(uint256 _sharesAmount) external view returns (uint256);
+
+    function submit(address) external payable returns (uint256);
+
+    function getSharesByPooledEth(uint256 _ethAmount) external view returns (uint256);
+}
+
+
+// File: contracts/interfaces/external/rocketPool/IRETH.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+/// @title IRETH
+/// @notice Interface for the `rETH` contract
+interface IRETH {
+    function getExchangeRate() external view returns (uint256);
+}
+
+
+// File: contracts/helpers/Rebalancer.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity ^0.8.19;
+
+import { IERC20 } from "oz/interfaces/IERC20.sol";
+import { SafeERC20 } from "oz/token/ERC20/utils/SafeERC20.sol";
+import { SafeCast } from "oz/utils/math/SafeCast.sol";
+
+import { ITransmuter } from "interfaces/ITransmuter.sol";
+import { Order, IRebalancer } from "interfaces/IRebalancer.sol";
+
+import { AccessControl, IAccessControlManager } from "../utils/AccessControl.sol";
+import "../utils/Constants.sol";
+import "../utils/Errors.sol";
+
+/// @title Rebalancer
+/// @author Angle Labs, Inc.
+/// @notice Contract built to subsidize rebalances between collateral tokens
+/// @dev This contract is meant to "wrap" the Transmuter contract and provide a way for governance to
+/// subsidize rebalances between collateral tokens. Rebalances are done through 2 swaps collateral <> agToken.
+/// @dev This contract is not meant to hold any transient funds aside from the rebalancing budget
+contract Rebalancer is IRebalancer, AccessControl {
+    event OrderSet(address indexed tokenIn, address indexed tokenOut, uint256 subsidyBudget, uint256 guaranteedRate);
+    event SubsidyPaid(address indexed tokenIn, address indexed tokenOut, uint256 subsidy);
+
+    using SafeERC20 for IERC20;
+    using SafeCast for uint256;
+
+    /// @notice Reference to the `transmuter` implementation this contract aims at rebalancing
+    ITransmuter public immutable TRANSMUTER;
+    /// @notice AgToken handled by the `transmuter` of interest
+    address public immutable AGTOKEN;
+    /// @notice Maps a `(tokenIn,tokenOut)` pair to details about the subsidy potentially provided on
+    /// `tokenIn` to `tokenOut` rebalances
+    mapping(address tokenIn => mapping(address tokenOut => Order)) public orders;
+    /// @notice Gives the total subsidy budget
+    uint256 public budget;
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                    INITIALIZATION                                                  
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Initializes the immutable variables of the contract: `accessControlManager`, `transmuter` and `agToken`
+    constructor(IAccessControlManager _accessControlManager, ITransmuter _transmuter) {
+        if (address(_accessControlManager) == address(0)) revert ZeroAddress();
+        accessControlManager = _accessControlManager;
+        TRANSMUTER = _transmuter;
+        AGTOKEN = address(_transmuter.agToken());
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                 REBALANCING FUNCTIONS                                              
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IRebalancer
+    /// @dev Contrarily to what is done in the Transmuter contract, here neither of `tokenIn` or `tokenOut`
+    /// should be an `agToken`
+    /// @dev Can be used even if the subsidy budget is 0, in which case it'll just do 2 Transmuter swaps
+    /// @dev The invariant should be that `msg.sender` injects `amountIn` in the transmuter and either the
+    /// subsidy is 0 either they receive a subsidy from this contract on top of the output Transmuter up to
+    /// the guaranteed amount out
+    function swapExactInput(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address tokenOut,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountOut) {
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        // First, dealing with the allowance of the rebalancer to the Transmuter: this allowance is made infinite
+        // by default
+        _adjustAllowance(tokenIn, address(TRANSMUTER), amountIn);
+        // Mint agToken from `tokenIn`
+        uint256 amountAgToken = TRANSMUTER.swapExactInput(
+            amountIn,
+            0,
+            tokenIn,
+            AGTOKEN,
+            address(this),
+            block.timestamp
+        );
+        // Computing if a potential subsidy must be included in the agToken amount to burn
+        uint256 subsidy = _getSubsidyAmount(tokenIn, tokenOut, amountAgToken, amountIn);
+        if (subsidy > 0) {
+            orders[tokenIn][tokenOut].subsidyBudget -= subsidy.toUint112();
+            budget -= subsidy;
+            amountAgToken += subsidy;
+
+            emit SubsidyPaid(tokenIn, tokenOut, subsidy);
+        }
+        amountOut = TRANSMUTER.swapExactInput(amountAgToken, amountOutMin, AGTOKEN, tokenOut, to, deadline);
+    }
+
+    /// @inheritdoc IRebalancer
+    /// @dev This function returns an approximation and not an exact value as the first mint to compute `amountAgToken`
+    /// might change the state of the fees slope within the Transmuter that will then be taken into account when
+    /// burning the minted agToken.
+    function quoteIn(uint256 amountIn, address tokenIn, address tokenOut) external view returns (uint256 amountOut) {
+        uint256 amountAgToken = TRANSMUTER.quoteIn(amountIn, tokenIn, AGTOKEN);
+        amountAgToken += _getSubsidyAmount(tokenIn, tokenOut, amountAgToken, amountIn);
+        amountOut = TRANSMUTER.quoteIn(amountAgToken, AGTOKEN, tokenOut);
+    }
+
+    /// @inheritdoc IRebalancer
+    /// @dev Note that this minimum amount is guaranteed up to the subsidy budget, and if for a swap the subsidy budget
+    /// is not big enough to provide this guaranteed amount out, then less will actually be obtained
+    function getGuaranteedAmountOut(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external view returns (uint256) {
+        Order storage order = orders[tokenIn][tokenOut];
+        return _getGuaranteedAmountOut(amountIn, order.guaranteedRate, order.decimalsIn, order.decimalsOut);
+    }
+
+    /// @notice Internal version of `_getGuaranteedAmountOut`
+    function _getGuaranteedAmountOut(
+        uint256 amountIn,
+        uint256 guaranteedRate,
+        uint8 decimalsIn,
+        uint8 decimalsOut
+    ) internal pure returns (uint256 amountOut) {
+        return (amountIn * guaranteedRate * (10 ** decimalsOut)) / (BASE_18 * (10 ** decimalsIn));
+    }
+
+    /// @notice Computes the additional subsidy amount in agToken that must be added during the process of a swap
+    /// of `amountIn` of `tokenIn` to `tokenOut`
+    function _getSubsidyAmount(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountAgToken,
+        uint256 amountIn
+    ) internal view returns (uint256 subsidy) {
+        Order storage order = orders[tokenIn][tokenOut];
+        uint256 guaranteedAmountOut = _getGuaranteedAmountOut(
+            amountIn,
+            order.guaranteedRate,
+            order.decimalsIn,
+            order.decimalsOut
+        );
+        // Computing the amount of agToken that must be burnt to get the amountOut guaranteed
+        if (guaranteedAmountOut > 0) {
+            uint256 amountAgTokenNeeded = TRANSMUTER.quoteOut(guaranteedAmountOut, AGTOKEN, tokenOut);
+            // If more agTokens than what has been obtained through the first mint must be burnt to get to the
+            // guaranteed amountOut, we're taking it from the subsidy budget set
+            if (amountAgToken < amountAgTokenNeeded) {
+                subsidy = amountAgTokenNeeded - amountAgToken;
+
+                // In the case where the subsidy budget is too small, we may not be able to provide the guaranteed
+                // amountOut to the user
+                if (subsidy > order.subsidyBudget) subsidy = order.subsidyBudget;
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                      GOVERNANCE                                                    
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IRebalancer
+    /// @dev Before calling this function, governance must make sure that there are enough `agToken` idle
+    /// in the contract to sponsor the swaps
+    /// @dev This function can be used to decrease an order by overriding it
+    function setOrder(
+        address tokenIn,
+        address tokenOut,
+        uint256 subsidyBudget,
+        uint256 guaranteedRate
+    ) external onlyGuardian {
+        Order storage order = orders[tokenIn][tokenOut];
+        uint8 decimalsIn = order.decimalsIn;
+        uint8 decimalsOut = order.decimalsOut;
+        if (decimalsIn == 0) {
+            decimalsIn = TRANSMUTER.getCollateralDecimals(tokenIn);
+            order.decimalsIn = decimalsIn;
+        }
+        if (decimalsOut == 0) {
+            decimalsOut = TRANSMUTER.getCollateralDecimals(tokenOut);
+            order.decimalsOut = decimalsOut;
+        }
+        // If a token has 0 decimals on the Transmuter, then it's not an actual collateral of the Transmuter
+        if (decimalsIn == 0 || decimalsOut == 0) revert NotCollateral();
+        uint256 newBudget = budget + subsidyBudget - order.subsidyBudget;
+        if (IERC20(AGTOKEN).balanceOf(address(this)) < newBudget) revert InvalidParam();
+        budget = newBudget;
+        order.subsidyBudget = subsidyBudget.toUint112();
+        order.guaranteedRate = guaranteedRate.toUint128();
+
+        emit OrderSet(tokenIn, tokenOut, subsidyBudget, guaranteedRate);
+    }
+
+    /// @inheritdoc IRebalancer
+    /// @dev This function checks if too much is not being recovered with respect to currently available budgets
+    function recover(address token, uint256 amount, address to) external onlyGuardian {
+        if (token == address(AGTOKEN) && IERC20(token).balanceOf(address(this)) < budget + amount)
+            revert InvalidParam();
+        IERC20(token).safeTransfer(to, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                        HELPER                                                      
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    function _adjustAllowance(address token, address sender, uint256 amountIn) internal {
+        uint256 allowance = IERC20(token).allowance(address(this), sender);
+        if (allowance < amountIn) IERC20(token).safeIncreaseAllowance(sender, type(uint256).max - allowance);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/interfaces/IERC3156FlashBorrower.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (interfaces/IERC3156FlashBorrower.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC3156 FlashBorrower, as defined in
+ * https://eips.ethereum.org/EIPS/eip-3156[ERC-3156].
+ *
+ * _Available since v4.1._
+ */
+interface IERC3156FlashBorrower {
+    /**
+     * @dev Receive a flash loan.
+     * @param initiator The initiator of the loan.
+     * @param token The loan currency.
+     * @param amount The amount of tokens lent.
+     * @param fee The additional amount of tokens to repay.
+     * @param data Arbitrary data structure, intended to contain user-defined parameters.
+     * @return The keccak256 hash of "IERC3156FlashBorrower.onFlashLoan"
+     */
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external returns (bytes32);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/interfaces/IERC3156FlashLender.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (interfaces/IERC3156FlashLender.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC3156FlashBorrower.sol";
+
+/**
+ * @dev Interface of the ERC3156 FlashLender, as defined in
+ * https://eips.ethereum.org/EIPS/eip-3156[ERC-3156].
+ *
+ * _Available since v4.1._
+ */
+interface IERC3156FlashLender {
+    /**
+     * @dev The amount of currency available to be lended.
+     * @param token The loan currency.
+     * @return The amount of `token` that can be borrowed.
+     */
+    function maxFlashLoan(address token) external view returns (uint256);
+
+    /**
+     * @dev The fee to be charged for a given loan.
+     * @param token The loan currency.
+     * @param amount The amount of tokens lent.
+     * @return The amount of `token` to be charged for the loan, on top of the returned principal.
+     */
+    function flashFee(address token, uint256 amount) external view returns (uint256);
+
+    /**
+     * @dev Initiate a flash loan.
+     * @param receiver The receiver of the tokens in the loan, and the receiver of the callback.
+     * @param token The loan currency.
+     * @param amount The amount of tokens lent.
+     * @param data Arbitrary data structure, intended to contain user-defined parameters.
+     */
+    function flashLoan(
+        IERC3156FlashBorrower receiver,
+        address token,
+        uint256 amount,
+        bytes calldata data
+    ) external returns (bool);
+}
+
+
+// File: contracts/transmuter/Storage.sol
+// SPDX-License-Identifier: BUSL-1.1
+
+pragma solidity ^0.8.19;
+
+import { IERC20 } from "oz/token/ERC20/IERC20.sol";
+import { IAccessControlManager } from "interfaces/IAccessControlManager.sol";
+import { IAgToken } from "interfaces/IAgToken.sol";
+
+/*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                        ENUMS                                                      
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+enum FacetCutAction {
+    Add,
+    Replace,
+    Remove
+}
+
+enum ManagerType {
+    EXTERNAL
+}
+
+enum ActionType {
+    Mint,
+    Burn,
+    Redeem
+}
+
+enum TrustedType {
+    Updater,
+    Seller
+}
+
+enum QuoteType {
+    MintExactInput,
+    MintExactOutput,
+    BurnExactInput,
+    BurnExactOutput
+}
+
+enum OracleReadType {
+    CHAINLINK_FEEDS,
+    EXTERNAL,
+    NO_ORACLE,
+    STABLE,
+    WSTETH,
+    CBETH,
+    RETH,
+    SFRXETH,
+    PYTH,
+    MAX,
+    MORPHO_ORACLE
+}
+
+enum OracleQuoteType {
+    UNIT,
+    TARGET
+}
+
+enum WhitelistType {
+    BACKED
+}
+
+/*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                    STRUCTS                                                     
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+struct Permit2Details {
+    address to; // Address that will receive the funds
+    uint256 nonce; // Nonce of the transaction
+    bytes signature; // Permit signature of the user
+}
+
+struct FacetCut {
+    address facetAddress; // Facet contract address
+    FacetCutAction action; // Can be add, remove or replace
+    bytes4[] functionSelectors; // Ex. bytes4(keccak256("transfer(address,uint256)"))
+}
+
+struct Facet {
+    address facetAddress; // Facet contract address
+    bytes4[] functionSelectors; // Ex. bytes4(keccak256("transfer(address,uint256)"))
+}
+
+struct FacetInfo {
+    address facetAddress; // Facet contract address
+    uint16 selectorPosition; // Position in the list of all selectors
+}
+
+struct DiamondStorage {
+    bytes4[] selectors; // List of all available selectors
+    mapping(bytes4 => FacetInfo) selectorInfo; // Selector to (address, position in list)
+    IAccessControlManager accessControlManager; // Contract handling access control
+}
+
+struct ImplementationStorage {
+    address implementation; // Dummy implementation address for Etherscan usability
+}
+
+struct ManagerStorage {
+    IERC20[] subCollaterals; // Subtokens handled by the manager or strategies
+    bytes config; // Additional configuration data
+}
+
+struct Collateral {
+    uint8 isManaged; // If the collateral is managed through external strategies
+    uint8 isMintLive; // If minting from this asset is unpaused
+    uint8 isBurnLive; // If burning to this asset is unpaused
+    uint8 decimals; // IERC20Metadata(collateral).decimals()
+    uint8 onlyWhitelisted; // If only whitelisted addresses can burn or redeem for this token
+    uint216 normalizedStables; // Normalized amount of stablecoins issued from this collateral
+    uint64[] xFeeMint; // Increasing exposures in [0,BASE_9[
+    int64[] yFeeMint; // Mint fees at the exposures specified in `xFeeMint`
+    uint64[] xFeeBurn; // Decreasing exposures in ]0,BASE_9]
+    int64[] yFeeBurn; // Burn fees at the exposures specified in `xFeeBurn`
+    bytes oracleConfig; // Data about the oracle used for the collateral
+    bytes whitelistData; // For whitelisted collateral, data used to verify whitelists
+    ManagerStorage managerData; // For managed collateral, data used to handle the strategies
+}
+
+struct TransmuterStorage {
+    IAgToken agToken; // agToken handled by the system
+    uint8 isRedemptionLive; // If redemption is unpaused
+    uint8 statusReentrant; // If call is reentrant or not
+    uint128 normalizedStables; // Normalized amount of stablecoins issued by the system
+    uint128 normalizer; // To reconcile `normalizedStables` values with the actual amount
+    address[] collateralList; // List of collateral assets supported by the system
+    uint64[] xRedemptionCurve; // Increasing collateral ratios > 0
+    int64[] yRedemptionCurve; // Value of the redemption fees at `xRedemptionCurve`
+    mapping(address => Collateral) collaterals; // Maps a collateral asset to its parameters
+    mapping(address => uint256) isTrusted; // If an address is trusted to update the normalizer value
+    mapping(address => uint256) isSellerTrusted; // If an address is trusted to sell accruing reward tokens or to run keeper jobs on oracles
+    mapping(WhitelistType => mapping(address => uint256)) isWhitelistedForType;
+    // Whether an address is whitelisted for a specific whitelist type
+}
+
+
+// File: contracts/interfaces/IAgToken.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+import { IERC20 } from "oz/token/ERC20/IERC20.sol";
+
+/// @title IAgToken
+/// @author Angle Labs, Inc.
+/// @notice Interface for the stablecoins `AgToken` contracts
+interface IAgToken is IERC20 {
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                              MINTER ROLE ONLY FUNCTIONS                                            
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Lets a whitelisted contract mint agTokens
+    /// @param account Address to mint to
+    /// @param amount Amount to mint
+    function mint(address account, uint256 amount) external;
+
+    /// @notice Burns `amount` tokens from a `burner` address after being asked to by `sender`
+    /// @param amount Amount of tokens to burn
+    /// @param burner Address to burn from
+    /// @param sender Address which requested the burn from `burner`
+    /// @dev This method is to be called by a contract with the minter right after being requested
+    /// to do so by a `sender` address willing to burn tokens from another `burner` address
+    /// @dev The method checks the allowance between the `sender` and the `burner`
+    function burnFrom(uint256 amount, address burner, address sender) external;
+
+    /// @notice Burns `amount` tokens from a `burner` address
+    /// @param amount Amount of tokens to burn
+    /// @param burner Address to burn from
+    /// @dev This method is to be called by a contract with a minter right on the AgToken after being
+    /// requested to do so by an address willing to burn tokens from its address
+    function burnSelf(uint256 amount, address burner) external;
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                TREASURY ONLY FUNCTIONS                                             
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Adds a minter in the contract
+    /// @param minter Minter address to add
+    /// @dev Zero address checks are performed directly in the `Treasury` contract
+    function addMinter(address minter) external;
+
+    /// @notice Removes a minter from the contract
+    /// @param minter Minter address to remove
+    /// @dev This function can also be called by a minter wishing to revoke itself
+    function removeMinter(address minter) external;
+
+    /// @notice Sets a new treasury contract
+    /// @param _treasury New treasury address
+    function setTreasury(address _treasury) external;
+
+    /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                                                  EXTERNAL FUNCTIONS                                                
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Checks whether an address has the right to mint agTokens
+    /// @param minter Address for which the minting right should be checked
+    /// @return Whether the address has the right to mint agTokens or not
+    function isMinter(address minter) external view returns (bool);
+
+    /// @notice Amount of decimals of the stablecoin
+    function decimals() external view returns (uint8);
+}
+
+
+// File: contracts/interfaces/IRebalancer.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0;
+
+struct Order {
+    // Total agToken budget allocated to subsidize the swaps between the tokens associated to the order
+    uint112 subsidyBudget;
+    // Decimals of the `tokenIn` associated to the order
+    uint8 decimalsIn;
+    // Decimals of the `tokenOut` associated to the order
+    uint8 decimalsOut;
+    // Guaranteed exchange rate in `BASE_18` for the swaps between the `tokenIn` and `tokenOut` associated to
+    // the order. This rate is a minimum rate guaranteed up to when the `subsidyBudget` is fully consumed
+    uint128 guaranteedRate;
+}
+
+/// @title IRebalancer
+/// @author Angle Labs, Inc.
+interface IRebalancer {
+    /// @notice Swaps `tokenIn` for `tokenOut` through an intermediary agToken mint from `tokenIn` and
+    /// burn to `tokenOut`. Eventually, this transaction may be sponsored and yield an amount of `tokenOut`
+    /// higher than what would be obtained through a mint and burn directly on the `transmuter`
+    /// @param amountIn Amount of `tokenIn` to bring for the rebalancing
+    /// @param amountOutMin Minimum amount of `tokenOut` that must be obtained from the swap
+    /// @param to Address to which `tokenOut` must be sent
+    /// @param deadline Timestamp before which this transaction must be included
+    /// @return amountOut Amount of outToken obtained
+    function swapExactInput(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address tokenOut,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountOut);
+
+    /// @notice Approximates how much a call to `swapExactInput` with the same parameters would yield in terms
+    /// of `amountOut`
+    function quoteIn(uint256 amountIn, address tokenIn, address tokenOut) external view returns (uint256 amountOut);
+
+    /// @notice Helper to compute the minimum guaranteed amount out that would be obtained from a swap of `amountIn`
+    /// of `tokenIn` to `tokenOut`
+    function getGuaranteedAmountOut(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external view returns (uint256);
+
+    /// @notice Lets governance set an order to subsidize rebalances between `tokenIn` and `tokenOut`
+    function setOrder(address tokenIn, address tokenOut, uint256 subsidyBudget, uint256 guaranteedRate) external;
+
+    /// @notice Recovers `amount` of `token` to the `to` address
+    /// @dev This function checks if too much is not being recovered with respect to currently available budgets
+    function recover(address token, uint256 amount, address to) external;
+}
+
