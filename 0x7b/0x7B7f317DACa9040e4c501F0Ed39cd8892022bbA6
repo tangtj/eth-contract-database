@@ -1,0 +1,1300 @@
+
+// File: contracts/unstable/vaults/base/StakedEthVault.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "contracts/unstable/interfaces/InUSD.sol";
+import "contracts/unstable/interfaces/IConfigurator.sol";
+import "contracts/unstable/interfaces/IZkOracle.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract StakedEthVault is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    InUSD public immutable nUSD;
+    IERC20 public immutable collateralAsset;
+    IConfigurator public immutable configurator;
+
+    uint256 public poolTotalCirculation;
+
+    // Maybe using struct packing would save some gas on critical functions
+    mapping(address => uint256) public depositedAsset;
+    mapping(address => uint256) public borrowed;
+    mapping(address => uint256) public feeStored;
+    mapping(address => uint256) public feeUpdatedAt;
+
+    event DepositEther(address indexed onBehalfOf, address asset, uint256 etherAmount, uint256 assetAmount, uint256 timestamp);
+
+    event DepositAsset(address indexed onBehalfOf, address asset, uint256 amount, uint256 timestamp);
+    event WithdrawAsset(address indexed sponsor, address asset, address indexed onBehalfOf, uint256 amount, uint256 timestamp);
+    event Mint(address indexed sponsor, address indexed onBehalfOf, uint256 amount, uint256 originationFee, uint256 timestamp);
+    event Burn(address indexed sponsor, address indexed onBehalfOf, uint256 amount, uint256 timestamp);
+    event LiquidationRecord(address indexed provider, address indexed keeper, address indexed debtor, uint256 nusdAmount, uint256 LiquidateAssetAmount, uint256 keeperReward, bool superLiquidation);
+    event Redemption(address indexed caller, address indexed debtor, uint256 nusdToProtocol, uint256 nusdToRepay, uint256 collateralReceived);
+
+    // MultiRewards farming functionality
+    struct Reward {
+        uint256 rewardsDuration;
+        uint256 periodFinish;
+        uint256 rewardRate;
+        uint256 lastUpdateTime;
+        uint256 rewardPerTokenStored;
+    }
+
+    mapping(address => Reward) public rewardData;
+    address[] public rewardTokens;
+
+    mapping(address => mapping(address => uint256)) public userRewardPerTokenPaid;
+    mapping(address => mapping(address => uint256)) public rewards;
+
+    event RewardAdded(uint256 reward);
+    event RewardPaid(address indexed user, address indexed rewardsToken, uint256 reward);
+    event RewardsDurationUpdated(address token, uint256 newDuration);
+    event Recovered(address token, uint256 amount);
+
+    //constructor
+    constructor(address _collateral, address _configurator) {
+        collateralAsset = IERC20(_collateral);
+        configurator = IConfigurator(_configurator);
+        nUSD = InUSD(configurator.nUSD());
+    }
+
+    function totalDepositedAsset() public view virtual returns (uint256) {
+        return collateralAsset.balanceOf(address(this));
+    }
+
+    /**
+     * @notice Deposit staked ETH, update the interest distribution, can mint nUSD directly
+     * Emits a `DepositAsset` event.
+     *
+     * Requirements:
+     * - `assetAmount` Must be higher than 0.
+     * - `mintAmount` Send 0 if deposit only, no mint of nUSD
+     */
+    function depositAssetToMint(uint256 assetAmount, uint256 mintAmount) external updateReward(msg.sender) nonReentrant virtual {
+        require(assetAmount > 0, "Deposit should be > 0");
+        collateralAsset.safeTransferFrom(msg.sender, address(this), assetAmount);
+
+        depositedAsset[msg.sender] += assetAmount;
+        if (mintAmount > 0) {
+            _mintnUSD(msg.sender, msg.sender, mintAmount);
+        }
+        emit DepositAsset(msg.sender, address(collateralAsset), assetAmount, block.timestamp);
+    }
+
+    /**
+     * @notice Withdraw collateral assets to an address
+     * Emits a `WithdrawAsset` event.
+     *
+     * Requirements:
+     * - `onBehalfOf` cannot be the zero address.
+     * - `amount` Must be higher than 0.
+     *
+     * @dev Withdraw collateral. Check user’s collateral ratio after withdrawal, should be higher than `safeCollateralRatio`
+     */
+    function withdraw(address onBehalfOf, uint256 amount) external updateReward(msg.sender) nonReentrant virtual {
+        require(onBehalfOf != address(0), "to zero address");
+        require(amount != 0, "zero amount");
+        _withdraw(msg.sender, onBehalfOf, amount);
+    }
+
+    /**
+     * @notice The mint amount number of nUSD is minted to the address
+     * Emits a `Mint` event.
+     *
+     * Requirements:
+     * - `onBehalfOf` cannot be the zero address.
+     */
+    function mint(address onBehalfOf, uint256 amount) external nonReentrant virtual {
+        require(onBehalfOf != address(0), "to zero address");
+        require(amount != 0, "zero amount");
+        _mintnUSD(msg.sender, onBehalfOf, amount);
+    }
+
+    /**
+     * @notice Burn the amount of nUSD and payback the amount of minted nUSD
+     * Emits a `Burn` event.
+     * Requirements:
+     * - `onBehalfOf` cannot be the zero address.
+     * - `amount` Must be higher than 0.
+     * @dev Calling the internal`_repay`function.
+     */
+    function burn(address onBehalfOf, uint256 amount) external nonReentrant virtual {
+        require(onBehalfOf != address(0), "to zero address");
+        require(amount != 0, "zero amount");
+        _repay(msg.sender, onBehalfOf, amount);
+    }
+
+    /**
+     * @notice Keeper liquidates borrowers whose collateral ratio is below badCollateralRatio, using nUSD provided by Liquidation Provider.
+     *
+     * Requirements:
+     * - onBehalfOf Collateral Ratio should be below badCollateralRatio
+     * - assetAmount should be less than 50% of collateral - If liquidating 50% of the collateral doesn't bring the position to health, you should allow a full liquidation.
+     * - provider should authorize Unstable to utilize nUSD
+     * @dev After liquidation, borrower's debt is reduced by assetAmount * assetPrice, providers and keepers can receive up to an additional 10% liquidation reward.
+     */
+    //TODO: logic for full liquidation in case 50% doesn't bring to health
+    function liquidation(address provider, address debtor, uint256 assetAmount) external updateReward(debtor) nonReentrant virtual {
+        uint256 assetPrice = getAssetPrice();
+        uint256 debtorCollateralRatio = getCollateralRatio(debtor);
+        require(debtorCollateralRatio < configurator.getBadCollateralRatio(address(this)), "Borrowers collateral ratio should below badCollateralRatio");
+        require(assetAmount * 2 <= depositedAsset[debtor], "a max of 50% collateral can be liquidated");
+        require(nUSD.allowance(provider, address(this)) != 0 || msg.sender == provider, "provider should authorize to provide liquidation nUSD");
+        uint256 nusdAmount = assetAmount * assetPrice / 1e18;
+
+        _repay(provider, debtor, nusdAmount);
+        uint256 reducedAsset = assetAmount;
+        //If collateralRatio is 100-110%, liquidator bonus is less than 10%
+        if(debtorCollateralRatio > 100_00 && debtorCollateralRatio < 110_00) {
+            reducedAsset = assetAmount * debtorCollateralRatio / 100_00;
+        }
+        //If collateralRatio is more than 110%, 10% liquidation bonus
+        if(debtorCollateralRatio >= 110_00) {
+            reducedAsset = assetAmount * 11 / 10; //10% bonus
+        }
+        depositedAsset[debtor] -= reducedAsset;
+        uint256 rewardToKeeper;
+        //Send keeper reward <- Which is taken from the liquidator payment.
+        uint256 keeperReward = configurator.getKeeperReward(address(this));
+        if (msg.sender != provider && debtorCollateralRatio >= 100_00 + keeperReward) {
+            rewardToKeeper = assetAmount * keeperReward / 100_00;
+            collateralAsset.safeTransfer(msg.sender, rewardToKeeper);
+        }
+        collateralAsset.safeTransfer(provider, reducedAsset - rewardToKeeper);
+        emit LiquidationRecord(provider, msg.sender, debtor, nusdAmount, reducedAsset, rewardToKeeper, false);
+    }
+
+    /**
+     * @notice Choose a Redemption Provider, redeem `nusdAmount` of nUSD and get 1:1 value of collateral minus fees
+     * Emits a `Redemption` event.
+     *
+     * *Requirements:
+     * - `debtor`debt must equal to or above`nusdAmount`
+     * - `debtor` must be eligible, use `calculateRedemption` to check
+     */
+    function redemption(address debtor, uint256 nusdAmount, uint256 minReceiveAmount) external updateReward(debtor) nonReentrant virtual {
+        require(debtor != msg.sender, "no self redeem"); //TODO: is this necessary?
+        (, , uint256 nusdToProtocol, uint256 nusdToRepay, , uint256 collateralReceived) = calculateRedemption(debtor, nusdAmount);
+        require(collateralReceived >= minReceiveAmount, "Collateral amount is less than minReceiveAmount");
+        if(nusdToProtocol > 0) {
+            nUSD.transferFrom(msg.sender, address(configurator), nusdToProtocol);
+        }
+        _repay(msg.sender, debtor, nusdToRepay);
+        depositedAsset[debtor] -= collateralReceived;
+        collateralAsset.safeTransfer(msg.sender, collateralReceived);
+        emit Redemption(msg.sender, debtor, nusdToProtocol, nusdToRepay, collateralReceived);
+    }
+
+    /**
+     * @notice Calculate redemption for a provider and nusdAmount
+     */
+    function calculateRedemption(address debtor, uint256 nusdAmount) public view returns
+    (uint256 providerFee, uint256 protocolFee, uint256 nusdToProtocol, uint256 nusdToRepay, uint256 nusdToConvert, uint256 collateralReceived) {
+        // providerFee, protocolFee and nusdToConvert are never used.
+        require(nusdAmount > 0, "redemption should be > 0");
+        require(getBorrowedOf(debtor) >= nusdAmount, "nusdAmount cannot surpass providers debt");
+        uint256 assetPrice = getAssetPrice();
+        uint256 providerCollateralRatio = (depositedAsset[debtor] * assetPrice * 10_000) / getBorrowedOf(debtor) / 1e18;
+        (providerFee, protocolFee) = configurator.getRedemptionFee(address(this), providerCollateralRatio);
+        nusdToProtocol = nusdAmount * protocolFee / 10_000;
+        nusdToRepay = nusdAmount - nusdToProtocol;
+        nusdToConvert = nusdToRepay * (10_000 - providerFee) / 10_000;
+        collateralReceived = nusdToConvert * 1e18 / assetPrice;
+    }
+
+    /**
+     * @notice Get the maximum amount of nUSD that can be redeemed from a specified provider
+     */
+    function getRedeemableAmount(address provider) public view returns(uint256) {
+        IConfigurator.RedemptionConfig memory config = configurator.getRedemptionConfig(address(this));
+        if(!config.enabled) return 0;
+        if(getBorrowedOf(provider) == 0) return 0;
+        if(getCollateralRatio(provider) > config.maxCollateralRatio || getCollateralRatio(provider) < 10_000) return 0;
+        return getBorrowedOf(provider);
+    }
+
+    /**
+     * @dev Refresh accrued interest fee before adding totalSupply. Check providers collateralRatio cannot below `safeCollateralRatio`after minting. Collect origination fee.
+     */
+    function _mintnUSD(address _provider, address _onBehalfOf, uint256 _mintAmount) internal virtual {
+        require(!isDepegged(), "Collateral is depegged, minting paused");
+        require(poolTotalCirculation + _mintAmount <= configurator.mintVaultMaxSupply(address(this)), "exceeds cap");
+        _updateFee(_provider);
+
+        borrowed[_provider] += _mintAmount;
+        uint256 originationFee = getOriginationFee(_mintAmount);
+        nUSD.mint(address(configurator), originationFee);
+        nUSD.mint(_onBehalfOf, _mintAmount - originationFee);
+        poolTotalCirculation += _mintAmount;
+        require(_checkHealth(_provider), "user is unhealthy after mint");
+        emit Mint(_provider, _onBehalfOf, _mintAmount, originationFee, block.timestamp);
+    }
+
+    /**
+     * @dev Calculate origination fee based on pool utilization.
+     */
+    function getOriginationFee(uint256 _mintAmount) public view returns(uint256) {
+        (uint256 minOriginationFee, uint256 maxOriginationFee) = configurator.getOriginationFee(address(this));
+        uint256 poolUtilization = (poolTotalCirculation + _mintAmount) * 1e18 / configurator.mintVaultMaxSupply(address(this));
+        return (maxOriginationFee - minOriginationFee) * poolUtilization * _mintAmount / 1e18 / 10000;
+    }
+
+    /**
+     * @notice Burn _provideramount nUSD to payback minted nUSD for _onBehalfOf.
+     * @dev Refresh accrued interest fee before reducing nUSDCirculation.
+     */
+    function _repay(address _provider, address _onBehalfOf, uint256 _amount) internal virtual {
+        // _amount can be more than the amount owed, and the excess will be ignored.
+        _updateFee(_onBehalfOf);
+        uint256 _feeStored = feeStored[_onBehalfOf];
+        uint256 _toRepay = _min(borrowed[_onBehalfOf] + _feeStored, _amount);
+
+        if(_toRepay > _feeStored) {
+            if(_feeStored > 0) {
+                nUSD.transferFrom(_provider, address(configurator), _feeStored);
+                feeStored[_onBehalfOf] = 0;
+            }
+            // First we repay the fees, then principal with the rest
+            nUSD.burn(_provider, _toRepay - _feeStored);
+            borrowed[_onBehalfOf] -= _toRepay - _feeStored;
+            poolTotalCirculation -= _toRepay - _feeStored;
+        } else {
+            // The user provided an amount to repay below the fees owed, so we only repay fees and no principal.
+            nUSD.transferFrom(_provider, address(configurator), _toRepay);
+            feeStored[_onBehalfOf] = _feeStored - _toRepay;
+        }
+        emit Burn(_provider, _onBehalfOf, _toRepay, block.timestamp);
+    }
+
+    function _withdraw(address _provider, address _onBehalfOf, uint256 _amount) internal virtual {
+        require(depositedAsset[_provider] >= _amount, "Withdraw amount exceeds deposited amount.");
+        depositedAsset[_provider] -= _amount;
+        collateralAsset.safeTransfer(_onBehalfOf, _amount);
+        if (getBorrowedOf(_provider) > 0) {
+            require(_checkHealth(_provider), "User is unhealthy after withdraw");
+        }
+        emit WithdrawAsset(_provider, address(collateralAsset), _onBehalfOf, _amount, block.timestamp);
+    }
+
+    /**
+     * @param user The address of the user.
+     * @dev Get USD value of current collateral asset and minted nUSD through price oracle / Collateral asset USD value must higher than safe Collateral Ratio.
+     * @return true if the user is healthy, false otherwise.
+     */
+    function _checkHealth(address user) internal view returns(bool) {
+        uint256 price = getAssetPrice();
+        if ((depositedAsset[user] * price * 10_000) < (getBorrowedOf(user) * configurator.getSafeCollateralRatio(address(this)) * 1e18 / 10_000)) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    function _updateFee(address user) internal {
+        if (block.timestamp > feeUpdatedAt[user]) {
+            feeStored[user] += _newFee(user);
+            feeUpdatedAt[user] = block.timestamp;
+        }
+    }
+
+    function _newFee(address user) internal view returns (uint256) {
+        uint256 secondsInYear = 86_400 * 365;
+        uint256 secondsSinceLastFee = block.timestamp - feeUpdatedAt[user];
+        return borrowed[user] * configurator.borrowApr(address(this)) * secondsSinceLastFee / secondsInYear / 10_000;
+    }
+
+    /**
+    * @dev Return configured oracle address
+    */
+    function getZkOracle() public view returns (address) {
+        return configurator.zkOracleAddress(address(collateralAsset));
+    }
+
+    /**
+     * @dev Return rate of collateral asset in ETH terms through zkOracle.
+     */
+    function getMarketRate() public view returns (uint256) {
+        IZkOracle zkOracle = IZkOracle(getZkOracle());
+        return zkOracle.getMarketRate();
+    }
+
+    /**
+     * @dev Return redemption rate of collateral asset in ETH terms through zkOracle.
+     */
+    function getRedemptionRate() public view returns (uint256) {
+        IZkOracle zkOracle = IZkOracle(getZkOracle());
+        return zkOracle.getRedemptionRate();
+    }
+
+    /**
+     * @dev Return value of collateral asset in underlying terms through zkOracle.
+     * @notice This will have a market rate and also redemption rate
+     */
+    function getAssetToUnderlyingRate() public view returns (uint256) {
+        uint256 redemptionRate = getRedemptionRate();
+
+        if(configurator.useMarketRate(address(this))) {
+            uint256 marketRate = getMarketRate();
+            if(marketRate == 0) {
+                return redemptionRate; //In case market price oracle is broken, default to redemptionRate
+            } else { // If chainlink prices flash crash below minAnswer, you will get stale prices. I'm not sure you can do much about that.
+                return _min(marketRate, redemptionRate); //even if marketRate is toggled, don't allow over-peg valuation
+            }
+        } else {
+            return redemptionRate;
+        }
+    }
+
+    /**
+     * @dev Check if the collateral asset is depegged according to threshold set in configurator
+     */
+    function isDepegged() public view returns (bool) {
+        uint256 marketRate = getMarketRate();
+        if(marketRate == 0) {
+            return false; //if market rate oracle is zero, presume market rate is not configured and take no action
+        }
+        uint256 redemptionRate = getRedemptionRate();
+        uint256 minMarketRate = redemptionRate * (10_000 - configurator.getDepegThreshold(address(this))) / 10_000;
+        return marketRate < minMarketRate;
+    }
+
+    /**
+     * @dev Return value of underlying asset in USD terms.
+     * @notice This *should* only be market rate, returns chainlink ETH price as default
+     */
+    function getUnderlyingToUsdPrice() public view returns (uint256) {
+        (,int price, , , ) = AggregatorV3Interface(configurator.etherOracle()).latestRoundData();
+        return uint256(price) * 1e10;
+    }
+
+    /**
+     * @dev Get USD value of collateral asset
+     */
+    function getAssetPrice() public view returns (uint256) {
+        return getAssetToUnderlyingRate() * getUnderlyingToUsdPrice() / 1e18;
+    }
+
+    /**
+     * @dev Returns the current borrowing amount for the user, including borrowed shares and accumulated fees.
+     * @param user The address of the user.
+     * @return The total borrowing amount for the user.
+     */
+    function getBorrowedOf(address user) public view returns (uint256) {
+        return borrowed[user] + feeStored[user] + _newFee(user);
+    }
+
+    function getPoolTotalCirculation() public view returns (uint256) {
+        return poolTotalCirculation;
+    }
+
+    function getAsset() external view returns (address) {
+        return address(collateralAsset);
+    }
+
+    //View functions - frontend friendly
+    function getCollateralRatio(address user) public view returns (uint256) {
+        if (getBorrowedOf(user) == 0) return 10_000 * 1e18; //really big number
+        return (depositedAsset[user] * getAssetPrice() * 10_000) / getBorrowedOf(user) / 1e18;
+    }
+
+    function isHealthy(address user) external view returns(bool) {
+        return _checkHealth(user);
+    }
+
+    function getOverallCollateralRatio() public view returns (uint256) {
+        return (totalDepositedAsset() * getAssetPrice() * 10_000) / poolTotalCirculation / 1e18;
+    }
+
+    function getLiquidateableAmount(address user) public view returns (uint256 collateralAmount, uint256 nUsdAmount) {
+        if (getCollateralRatio(user) > configurator.getSafeCollateralRatio(address(this))) return (0, 0);
+        collateralAmount = depositedAsset[user] / 2;
+        nUsdAmount = collateralAmount * getAssetPrice() / 1e18;
+    }
+
+    function getLiquidateFund(address user) public view returns (uint256 nusdAmount) {
+        InUSD token = InUSD(configurator.nUSD());
+        uint256 approval = token.allowance(user, address(this));
+        if (approval == 0) return 0;
+        uint256 bal = token.balanceOf(user);
+        nusdAmount = approval > bal ? bal : approval; // You have a _min function
+    }
+
+    function getWithdrawableAmount(address user) public view returns (uint256) {
+        if (getBorrowedOf(user) == 0)
+            return depositedAsset[user];
+        uint256 safeCollateralRatio = configurator.getSafeCollateralRatio(address(this));
+        if (getCollateralRatio(user) <= safeCollateralRatio) return 0;
+        return depositedAsset[user] * (getCollateralRatio(user) - safeCollateralRatio) / getCollateralRatio(user);
+    }
+
+    function roomToCap() public view returns (uint256) {
+        if(poolTotalCirculation >= configurator.mintVaultMaxSupply(address(this))) return 0; //deal with case where it's above cap
+        return configurator.mintVaultMaxSupply(address(this)) - poolTotalCirculation;
+    }
+
+    function getMaxMintableAmountWithDeposit(address user, uint256 deposit) public view returns (uint256 nusdAmount) {
+        uint256 newDepositedAmount = depositedAsset[user] + deposit;
+        uint256 safeCollateralRatio = configurator.getSafeCollateralRatio(address(this));
+        uint256 userBorrow = getBorrowedOf(user);
+        uint256 cap = configurator.mintVaultMaxSupply(address(this));
+        uint256 maxBorrowAtSafeRatio = newDepositedAmount * getAssetPrice() * 10_000 / safeCollateralRatio / 1e18;
+        uint256 effectiveMax = _min(maxBorrowAtSafeRatio, cap);
+
+        if(userBorrow >= effectiveMax) {
+            return 0; //if user has already borrowed more than the max, then no mintable amount
+        } else {
+            uint256 mintMax = effectiveMax - userBorrow;
+            return mintMax - getOriginationFee(mintMax);
+        }
+    }
+
+    function getTVL() public view returns (uint256) {
+        return totalDepositedAsset() * getAssetPrice() / 1e18;
+    }
+
+    function _min(uint256 _a, uint256 _b) private pure returns (uint256) {
+        return _a < _b ? _a : _b;
+    }
+
+    //MultiRewards farming functionality
+    //Modified from https://github.com/curvefi/multi-rewards
+    //staked asset is replaced with deposited collateral (depositedOf[user])
+    //access control is managed via rewardManager as specified in configurator
+
+    //views for multirewards
+    function lastTimeRewardApplicable(address _rewardsToken) public view returns (uint256) {
+        return _min(block.timestamp, rewardData[_rewardsToken].periodFinish);
+    }
+
+    //total balance of collateral asset
+    function _totalSupply() internal view returns(uint256) {
+        return totalDepositedAsset();
+    }
+
+    function rewardPerToken(address _rewardsToken) public view returns (uint256) {
+        if (_totalSupply() == 0) {
+            return rewardData[_rewardsToken].rewardPerTokenStored;
+        }
+        return rewardData[_rewardsToken].rewardPerTokenStored +
+            (lastTimeRewardApplicable(_rewardsToken) - rewardData[_rewardsToken].lastUpdateTime) *
+            rewardData[_rewardsToken].rewardRate * 1e18 / _totalSupply();
+    }
+
+    function earned(address account, address _rewardsToken) public view returns (uint256) {
+        return (depositedAsset[account] * (rewardPerToken(_rewardsToken) - userRewardPerTokenPaid[account][_rewardsToken])) /
+        1e18 + rewards[account][_rewardsToken];
+    }
+
+    function getRewardTokens() external view returns (address[] memory) {
+        return rewardTokens;
+    }
+
+    function getRewardForDuration(address _rewardsToken) external view returns (uint256) {
+        return rewardData[_rewardsToken].rewardRate * rewardData[_rewardsToken].rewardsDuration;
+    }
+
+    //multiRewards restricted functions
+    function addReward(address _rewardsToken, uint256 _rewardsDuration) public onlyRewardManager {
+        require(_rewardsToken != address(collateralAsset) && _rewardsToken != address(nUSD), "Reward cannot be collateral asset or nUSD");
+        require(_rewardsDuration > 0, "Reward duration must be non-zero");
+        require(rewardData[_rewardsToken].rewardsDuration == 0, "Reward already exists");
+        rewardTokens.push(_rewardsToken);
+        rewardData[_rewardsToken].rewardsDuration = _rewardsDuration;
+    }
+
+    function notifyRewardAmount(address _rewardsToken, uint256 reward) external onlyRewardManager updateReward(address(0)) {
+        require(rewardData[_rewardsToken].rewardsDuration != 0, "Reward does not exist, addReward first");
+        IERC20(_rewardsToken).safeTransferFrom(msg.sender, address(this), reward);
+        if (block.timestamp >= rewardData[_rewardsToken].periodFinish) {
+            rewardData[_rewardsToken].rewardRate = reward / rewardData[_rewardsToken].rewardsDuration;
+        } else {
+            uint256 remaining = rewardData[_rewardsToken].periodFinish - block.timestamp;
+            uint256 leftover = remaining * rewardData[_rewardsToken].rewardRate;
+            rewardData[_rewardsToken].rewardRate = (reward + leftover) / rewardData[_rewardsToken].rewardsDuration;
+        }
+        rewardData[_rewardsToken].lastUpdateTime = block.timestamp;
+        rewardData[_rewardsToken].periodFinish = block.timestamp + rewardData[_rewardsToken].rewardsDuration;
+        emit RewardAdded(reward);
+    }
+
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyRewardManager {
+        require(tokenAddress != address(collateralAsset) && tokenAddress != address(nUSD), "Cannot withdraw collateral asset or nUSD");
+        require(rewardData[tokenAddress].lastUpdateTime == 0, "Cannot withdraw reward token");
+        IERC20(tokenAddress).safeTransfer(msg.sender, tokenAmount);
+        emit Recovered(tokenAddress, tokenAmount);
+    }
+
+    function setRewardsDuration(address _rewardsToken, uint256 _rewardsDuration) external onlyRewardManager {
+        require(block.timestamp > rewardData[_rewardsToken].periodFinish, "Reward period still active");
+        require(_rewardsDuration > 0, "Reward duration must be non-zero");
+        rewardData[_rewardsToken].rewardsDuration = _rewardsDuration;
+        emit RewardsDurationUpdated(_rewardsToken, rewardData[_rewardsToken].rewardsDuration);
+    }
+
+    //modifier
+    modifier updateReward(address account) {
+        for (uint256 i = 0; i < rewardTokens.length; ) {
+            address token = rewardTokens[i];
+            rewardData[token].rewardPerTokenStored = rewardPerToken(token);
+            rewardData[token].lastUpdateTime = lastTimeRewardApplicable(token);
+            if (account != address(0)) {
+                rewards[account][token] = earned(account, token);
+                userRewardPerTokenPaid[account][token] = rewardData[token].rewardPerTokenStored;
+            }
+            unchecked {i = i+1;}
+        }
+        _;
+    }
+
+    modifier onlyRewardManager() {
+        require(configurator.isRewardManager(msg.sender), "Not reward manager");
+        _;
+    }
+
+    //multirewards mutative functions
+    function getReward() public nonReentrant updateReward(msg.sender) {
+        for (uint256 i = 0; i < rewardTokens.length; ) {
+            address _rewardsToken = rewardTokens[i];
+            uint256 reward = rewards[msg.sender][_rewardsToken];
+            if (reward > 0) {
+                rewards[msg.sender][_rewardsToken] = 0;
+                IERC20(_rewardsToken).safeTransfer(msg.sender, reward);
+                emit RewardPaid(msg.sender, _rewardsToken, reward);
+            }
+            unchecked { i = i+1; }
+        }
+    }
+}
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.3) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../extensions/IERC20Permit.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20 token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && Address.isContract(address(token));
+    }
+}
+
+
+// File: contracts/unstable/interfaces/InUSD.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+interface InUSD {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function mint(
+        address to,
+        uint256 amount
+    ) external returns (bool);
+    function burn(
+        address account,
+        uint256 amount
+    ) external returns (bool);
+}
+
+// File: contracts/unstable/interfaces/IConfigurator.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+interface IConfigurator {
+    struct OriginationFeeConfig {
+        uint16 minOriginationFee; // fee at 0% utilization
+        uint16 maxOriginationFee; // fee at 100% utilization
+    }
+
+    struct RedemptionConfig {
+        bool enabled; //whether a vault can redeem
+        uint16 baseFee; // base fee for redemption
+        uint16 maxMultiplier; // fee for redemption
+        uint16 maxCollateralRatio; // collateral ratio for max fee multiplier
+        uint16 providerShare; // share of redemption fee that goes to provider
+    }
+
+    function zkOracleAddress(address vault) external view returns(address);
+    function vaultEnabled(address vault) external view returns(bool);
+    function vaultMintPaused(address vault) external view returns(bool);
+    function vaultBurnPaused(address vault) external view returns(bool);
+    function mintVaultMaxSupply(address vault) external view returns(uint256);
+    function getBadCollateralRatio(address vault) external view returns(uint256);
+    function getSafeCollateralRatio(address vault) external view returns(uint256);
+    function borrowApr(address vault) external view returns(uint256);
+    function getKeeperReward(address vault) external view returns(uint256);
+    function getOriginationFee(address vault) external view returns(uint256, uint256);
+    function getRedemptionFee(address vault, uint256 collateralRatio) external view returns(uint256, uint256);
+    function getRedemptionConfig(address vault) external view returns(RedemptionConfig memory);
+    function getDepegThreshold(address vault) external view returns(uint256);
+    function useMarketRate(address vault) external view returns(bool);
+
+    function treasury() external view returns(address);
+    function flashloanFee() external view returns(uint256);
+    function owner() external view returns (address);
+    function admin() external view returns(address);
+    function nUSD() external view returns(address);
+    function etherOracle() external view returns(address);
+    function getAllVaults() external view returns(address[] memory);
+    function getAllCollaterals() external view returns(address[] memory);
+    function isRewardManager(address user) external view returns(bool);
+}
+
+// File: contracts/unstable/interfaces/IZkOracle.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+interface IZkOracle {
+    //@notice returns the address of the asset
+    function assetAddress() external view returns (address);
+    //@notice returns the market rate of the collateral in terms of underlying
+    function getMarketRate() external view returns (uint256);
+    //@notice returns the backing or redemption rate of the collateral in terms of underlying
+    function getRedemptionRate() external view returns (uint256);
+}
+
+// File: node_modules/@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface AggregatorV3Interface {
+  function decimals() external view returns (uint8);
+
+  function description() external view returns (string memory);
+
+  function version() external view returns (uint256);
+
+  function getRoundData(uint80 _roundId)
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+  function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+}
+
+
+// File: node_modules/@openzeppelin/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: node_modules/@openzeppelin/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+

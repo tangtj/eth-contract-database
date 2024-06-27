@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract DoYouLikeYourSon {
+        
+    event DoYouLikeYourSON(uint8 isTrue_1_OrFalse_0);
+
+    function doYouLikeYourSON(uint8 _isTrue_1_OrFalse_0) public {
+        emit DoYouLikeYourSON(_isTrue_1_OrFalse_0);
+    }
+
+
+}

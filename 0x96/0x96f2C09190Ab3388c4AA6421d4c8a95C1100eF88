@@ -1,0 +1,486 @@
+
+// File: src/SignatureMint.sol
+// SPDX-License-Identifier: AGPL-3.0-only+VPL
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+import "./libraries/EIP712.sol";
+import "./interfaces/IYAYOMintable.sol";
+
+/*
+  It saves bytecode to revert on custom errors instead of using require
+  statements. We are just declaring these errors for reverting with upon various
+  conditions later in this contract.
+*/
+error CannotMintExpiredSignature ();
+error CannotMintInvalidSignature ();
+error MintArrayLengthMismatch ();
+error SignerCannotBeZero ();
+
+/**
+  @custom:benediction DEVS BENEDICAT ET PROTEGAT CONTRACTVS MEAM
+  @title A contract which accepts signatures from a trusted signer to mint an
+    ERC-721 item.
+  @author Tim Clancy <tim-clancy.eth>
+  @author cheb <evmcheb.eth>
+
+  This token contract allows for the implementation of off-chain systems that
+  mint items to callers using entirely off-chain data.
+
+  @custom:date May 24th, 2023
+*/
+contract SignatureMint is EIP712, Ownable, ReentrancyGuard {
+
+  /**
+    A constant hash of the mint operation's signature.
+  
+    @dev _minter The address of the minter for the signed-for item. This must
+      be the address of the caller.
+    @dev _expiry The expiry time after which this signature cannot execute.
+    @dev _tokenId The ID of the specific token being minted.
+  */
+  bytes32 public constant MINT_TYPEHASH = keccak256(
+    "mint(address _minter,uint256 _expiry,uint256 _tokenId)"
+  );
+
+  /// The name of this minter.
+  string public name;
+
+  /// The address permitted to sign claim signatures.
+  address public signer;
+
+  /// The address of the YAYO contract to mint new items into.
+  address public immutable yayo;
+
+  /**
+    An event emitted when a caller mints a new item.
+
+    @param caller The caller who claimed the tokens.
+    @param id The ID of the specific item within the ERC-721 `item` contract.
+  */
+  event Minted (
+    address indexed caller,
+    uint256 id
+  );
+
+  /**
+    Construct a new minter by providing it a permissioned claim signer which may
+    issue claims and claim amounts, and the item to mint in.
+
+    @param _name The name of the minter, used in EIP-712 domain separation.
+    @param _signer The address permitted to sign claim signatures.
+    @param _yayo The address of the YAYO NFT contract that items are minted into.
+  */
+  constructor (
+    string memory _name,
+    address _signer,
+    address _yayo
+  ) EIP712 (_name, "1") {
+    if (_signer == address(0)) { revert SignerCannotBeZero(); }
+    name = _name;
+    signer = _signer;
+    yayo = _yayo;
+  }
+
+  /**
+    A private helper function to validate a signature supplied for item mints.
+    This function constructs a digest and verifies that the signature signer was
+    the authorized address we expect.
+
+    @param _minter The address of the minter for the signed-for item. This must
+      be the address of the caller.
+    @param _expiry The expiry time after which this signature cannot execute.
+    @param _tokenId The specific ID of the item to mint.
+    @param _v The recovery byte of the signature.
+    @param _r Half of the ECDSA signature pair.
+    @param _s Half of the ECDSA signature pair.
+  */
+  function validMint (
+    address _minter,
+    uint256 _expiry,
+    uint256 _tokenId,
+    uint8 _v,
+    bytes32 _r,
+    bytes32 _s
+  ) private view returns (bool) {
+    bytes32 digest = keccak256(
+      abi.encodePacked(
+        "\x19\x01",
+        DOMAIN_SEPARATOR,
+        keccak256(
+          abi.encode(MINT_TYPEHASH, _minter, _expiry, _tokenId)
+        )
+      )
+    );
+
+    // The claim is validated if it was signed by our authorized signer.
+    return ecrecover(digest, _v, _r, _s) == signer;
+  }
+
+  /**
+    Allow a caller to mint a new item if
+      1. the mint is backed by a valid signature from the trusted `signer`.
+      2. the signature is not expired.
+
+    @param _minter The address of the minter for the signed-for item. This does
+      not have to be the address of the caller, allowing for meta-transaction
+      style minting.
+    @param _expiry The expiry time after which this signature cannot execute.
+    @param _tokenId The specific ID of the item to mint.
+    @param _v The recovery byte of the signature.
+    @param _r Half of the ECDSA signature pair.
+    @param _s Half of the ECDSA signature pair.
+  */
+  function _mint (
+    address _minter,
+    uint256 _expiry,
+    uint256 _tokenId,
+    uint8 _v,
+    bytes32 _r,
+    bytes32 _s
+  ) internal nonReentrant {
+
+    // Validate the expiration time.
+    if (_expiry < block.timestamp) { revert CannotMintExpiredSignature(); }
+
+    // Validiate that the claim was provided by our trusted `signer`.
+    bool validSignature = validMint(_minter, _expiry, _tokenId, _v, _r, _s);
+    if (!validSignature) {
+      revert CannotMintInvalidSignature();
+    }
+
+    // Mint the new item.
+    IYAYOMintable yayoContract = IYAYOMintable(yayo);
+    yayoContract.mint(_minter, _tokenId);
+
+    // Emit an event.
+    emit Minted(_minter, _tokenId);
+  }
+
+  /**
+    Allow a caller to mint any new items in an array if, for each item
+      1. the mint is backed by a valid signature from the trusted `signer`.
+      2. the signature is not expired.
+
+    @param _minters Addresses of the minters for the signed-for item. This
+      does not have to be the address of the caller, allowing for
+      meta-transaction style minting.
+    @param _expiries The expiry times after which a signature cannot execute.
+    @param _tokenIds The specific IDs of the items to mint.
+    @param _v The recovery bytes of the signature.
+    @param _r Halves of the ECDSA signature pair.
+    @param _s Halves of the ECDSA signature pair.
+  */
+  function mint (
+    address[] memory _minters,
+    uint256[] memory _expiries,
+    uint256[] memory _tokenIds,
+    uint8[] memory _v,
+    bytes32[] memory _r,
+    bytes32[] memory _s
+  ) external {
+    if (
+      _minters.length != _expiries.length || 
+      _minters.length != _tokenIds.length || 
+      _minters.length != _v.length ||
+      _minters.length != _r.length ||
+      _minters.length != _s.length
+    ) {
+      revert MintArrayLengthMismatch();
+    }
+
+    // Mint each item.
+    for (uint256 i = 0; i < _minters.length; i++) {
+      _mint(_minters[i], _expiries[i], _tokenIds[i], _v[i], _r[i], _s[i]);
+    }
+  }
+
+  /**
+    An administrative function to change the signer address. This may be used to
+    rotate the signer address routinely or in the event of a key compromise.
+    The zero address is used to disable the signer entirely.
+
+    @param _newSigner The address of the new address permitted to sign claim
+      signatures.
+  */
+  function setSigner (
+    address _newSigner
+  ) external onlyOwner {
+    if (_newSigner == address(0)) {
+      revert SignerCannotBeZero();
+    }
+    signer = _newSigner;
+  }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+}
+
+
+// File: src/libraries/EIP712.sol
+pragma solidity ^0.8.11;
+
+abstract contract EIP712 {
+    struct EIP712Domain {
+        string name;
+        string version;
+        uint256 chainId;
+        address verifyingContract;
+    }
+
+    bytes32 constant EIP712DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    bytes internal personalSignPrefix = "\x19Ethereum Signed Message:\n";
+
+    bytes32 public immutable DOMAIN_SEPARATOR;
+
+    constructor(string memory name, string memory version) {
+        uint256 chainId_;
+        assembly {
+            chainId_ := chainid()
+        }
+        DOMAIN_SEPARATOR =
+            hash(EIP712Domain({name: name, version: version, chainId: chainId_, verifyingContract: address(this)}));
+    }
+
+    function hash(EIP712Domain memory eip712Domain) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                EIP712DOMAIN_TYPEHASH,
+                keccak256(bytes(eip712Domain.name)),
+                keccak256(bytes(eip712Domain.version)),
+                eip712Domain.chainId,
+                eip712Domain.verifyingContract
+            )
+        );
+    }
+
+    function parseSignature(bytes memory signature) internal pure returns (uint8 v, bytes32 r, bytes32 s) {
+        // ecrecover takes the signature parameters, and the only way to get them
+        // currently is to use assembly.
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            r := mload(add(signature, 0x20))
+            s := mload(add(signature, 0x40))
+            v := byte(0, mload(add(signature, 0x60)))
+        }
+        return (v, r, s);
+    }
+}
+
+
+// File: src/interfaces/IYAYOMintable.sol
+// SPDX-License-Identifier: AGPL-3.0-only+VPL
+pragma solidity ^0.8.19;
+
+/**
+  @custom:benediction DEVS BENEDICAT ET PROTEGAT CONTRACTVS MEAM
+  @title A contract for minting new Ethereum-side YAYO tokens.
+  @author cheb <evmcheb.eth>
+  @author Tim Clancy <tim-clancy.eth>
+  
+  This token contract allows for privileged callers to mint new YAYO.
+
+  @custom:date May 24th, 2023
+*/
+interface IYAYOMintable {
+
+  /**
+    A permissioned minting function. This function may only be called by the
+    admin-specified minter.
+
+    @param _to The recipient of the minted item.
+    @param _tokenId The ID of the item to mint.
+  */
+  function mint (
+    address _to,
+    uint256 _tokenId
+  ) external;
+}
+
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+

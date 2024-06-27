@@ -1,0 +1,1205 @@
+
+// File: contracts/StrategyProxy.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "contracts/token/ERC20/IERC20.sol";
+import "contracts/utils/Address.sol";
+import "contracts/token/ERC20/utils/SafeERC20.sol";
+
+import {IEscrow, IGauge, IFeeDistribution, IMetaRegistry, IGaugeController} from "contracts/interfaces/Curve.sol";
+import {IProxy, SafeProxy} from "contracts/interfaces/IProxy.sol";
+
+contract StrategyProxy {
+    using SafeERC20 for IERC20;
+    using Address for address;
+    using SafeProxy for IProxy;
+
+    uint constant WEEK = 1 weeks;
+
+    /// @notice Yearn's voter proxy. Typically referred to as "voter".
+    IProxy public constant proxy =
+        IProxy(0xF147b8125d2ef93FB6965Db97D6746952a133934);
+
+    /// @notice Curve's token minter.
+    address public constant mintr = 0xd061D61a4d941c39E5453435B6345Dc261C2fcE0;
+
+    /// @notice Curve's CRV token address.
+    address public constant crv = 0xD533a949740bb3306d119CC777fa900bA034cd52;
+
+    /// @notice Curve's crvUSD address (weekly fees paid in this token).
+    IERC20 public constant crvUSD =
+        IERC20(0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E);
+
+    /// @notice Curve's fee distributor contract.
+    IFeeDistribution public constant feeDistribution =
+        IFeeDistribution(0xD16d5eC345Dd86Fb63C6a9C43c517210F1027914);
+
+    /// @notice Curve's vote-escrowed Curve address.
+    IEscrow public constant veCRV =
+        IEscrow(0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2);
+
+    /// @notice Curve's meta-registry. Can pull data from the many existing curve registries.
+    IMetaRegistry public constant metaRegistry =
+        IMetaRegistry(0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC);
+
+    /// @notice Curve's gauge controller.
+    IGaugeController public constant gaugeController =
+        IGaugeController(0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB);
+
+    /// @notice Look up the strategy approved for a given Curve gauge.
+    mapping(address => address) public strategies;
+
+    /// @notice Check if a gauge reward token is approved for claiming.
+    mapping(address => bool) public rewardTokenApproved;
+
+    /// @notice Check if an address is an approved voter for gauge weights.
+    mapping(address => bool) public voters;
+
+    /// @notice Check if an address is an approved locker of CRV tokens.
+    mapping(address => bool) public lockers;
+
+    /// @notice Check if an address is an approved admin fee claimer.
+    address public adminFeeRecipient;
+
+    /// @notice Current governance address.
+    address public governance;
+
+    /// @notice Check if an address is an approved factory for deploying Curve voter strategies.
+    mapping(address => bool) public approvedFactories;
+
+    // Events so that indexers can keep track of key actions
+    event GovernanceSet(address indexed governance);
+    event AdminFeeRecipientSet(address indexed recipient);
+    event StrategyApproved(address indexed gauge, address indexed strategy);
+    event StrategyRevoked(address indexed gauge, address indexed strategy);
+    event VoterApprovalSet(address indexed voter, bool indexed approved);
+    event LockerApprovalSet(address indexed locker, bool indexed approved);
+    event RewardTokenApprovalSet(address indexed token, bool indexed approved);
+    event FactoryApproved(address indexed factory, bool indexed approved);
+    event TokenClaimed(
+        address indexed token,
+        address indexed recipient,
+        uint balance
+    );
+
+    constructor(address _adminFeeRecipient) {
+        require(_adminFeeRecipient != address(0), "Empty admin fee recipient");
+        governance = msg.sender;
+        adminFeeRecipient = _adminFeeRecipient;
+    }
+
+    /**
+     * @notice Approve curve vault factory addresses.
+     * @dev Must be called by governance. Multiple factories possible (Curve LP, Curve Lend).
+     * @param _factory Address to set as a curve vault factory.
+     * @param _approved Whether the address is allowed factory permissions (to approve strategies).
+     */
+    function approveFactory(address _factory, bool _approved) external {
+        require(msg.sender == governance, "!governance");
+        approvedFactories[_factory] = _approved;
+        emit FactoryApproved(_factory, _approved);
+    }
+
+    /**
+     * @notice Set governance address.
+     * @dev Must be called by current governance.
+     * @param _governance Address to set as governance.
+     */
+    function setGovernance(address _governance) external {
+        require(msg.sender == governance, "!governance");
+        require(_governance != governance, "already set");
+        governance = _governance;
+        emit GovernanceSet(_governance);
+    }
+
+    /**
+     * @notice Set recipient of weekly crvUSD admin fees.
+     * @dev Only a single address can be approved at any time. Must be called by governance.
+     * @param _recipient Address to approve for fees.
+     */
+    function setAdminFeeRecipient(address _recipient) external {
+        require(msg.sender == governance, "!governance");
+        require(_recipient != address(0), "zero address");
+        adminFeeRecipient = _recipient;
+        emit AdminFeeRecipientSet(_recipient);
+    }
+
+    /**
+     * @notice Add strategy to a gauge.
+     * @dev Must be called by governance or factory.
+     * @param _gauge Gauge to permit strategy on.
+     * @param _strategy Strategy to approve on gauge.
+     */
+    function approveStrategy(address _gauge, address _strategy) external {
+        require(
+            msg.sender == governance || approvedFactories[msg.sender],
+            "!access"
+        );
+        require(_strategy != address(0), "disallow zero");
+        require(strategies[_gauge] != _strategy, "already approved");
+        // @dev The following call should fail gracefully on older gauges that don't implement this interface.
+        proxy.execute(
+            _gauge,
+            0,
+            abi.encodeWithSignature("set_rewards_receiver(address)", _strategy)
+        );
+        strategies[_gauge] = _strategy;
+        emit StrategyApproved(_gauge, _strategy);
+    }
+
+    /**
+     * @notice Clear any previously approved strategy to a gauge.
+     * @dev Must be called by governance.
+     * @param _gauge Gauge from which to remove strategy.
+     */
+    function revokeStrategy(address _gauge) external {
+        require(msg.sender == governance, "!governance");
+        address _strategy = strategies[_gauge];
+        require(_strategy != address(0), "already revoked");
+        // @dev The following call should fail gracefully on older gauges that don't implement this interface.
+        proxy.execute(
+            _gauge,
+            0,
+            abi.encodeWithSignature("set_rewards_receiver(address)", address(0))
+        );
+        strategies[_gauge] = address(0);
+        emit StrategyRevoked(_gauge, _strategy);
+    }
+
+    /**
+     * @notice Approve an address for voting on gauge weights.
+     * @dev Must be called by governance.
+     * @param _voter Voter to add.
+     * @param _approved Whether the address is allowed to vote.
+     */
+    function approveVoter(address _voter, bool _approved) external {
+        require(msg.sender == governance, "!governance");
+        voters[_voter] = _approved;
+        emit VoterApprovalSet(_voter, _approved);
+    }
+
+    /**
+     * @notice Approve an address for locking CRV.
+     * @dev Must be called by governance.
+     * @param _locker Locker to add.
+     * @param _approved Whether the address is allowed to lock.
+     */
+    function approveLocker(address _locker, bool _approved) external {
+        require(msg.sender == governance, "!governance");
+        lockers[_locker] = _approved;
+        emit LockerApprovalSet(_locker, _approved);
+    }
+
+    /**
+     * @notice Lock CRV into veCRV contract.
+     * @dev Must be called by governance or locker.
+     */
+    function lock() external {
+        require(msg.sender == governance || lockers[msg.sender], "!locker");
+        uint256 amount = IERC20(crv).balanceOf(address(proxy));
+        if (amount > 0) proxy.increaseAmount(amount);
+    }
+
+    /**
+     * @notice Extend veCRV lock time to maximum amount of 4 years.
+     * @dev Must be called by governance or locker.
+     */
+    function maxLock() external {
+        require(msg.sender == governance || lockers[msg.sender], "!locker");
+        uint max = block.timestamp + (365 days * 4);
+        uint lock_end = veCRV.locked__end(address(proxy));
+        if (lock_end < (max / WEEK) * WEEK) {
+            proxy.safeExecute(
+                address(veCRV),
+                0,
+                abi.encodeWithSignature("increase_unlock_time(uint256)", max)
+            );
+        }
+    }
+
+    /**
+     * @notice Vote on a gauge.
+     * @dev Must be called by governance or voter.
+     * @param _gauge The gauge to vote on.
+     * @param _weight Weight to vote with.
+     */
+    function vote(address _gauge, uint256 _weight) external {
+        require(msg.sender == governance || voters[msg.sender], "!voter");
+        _vote(_gauge, _weight);
+    }
+
+    /**
+     * @notice Vote on a multiple gauges.
+     * @dev Must be called by governance or voter.
+     * @param _gauges List of gauges to vote on.
+     * @param _weights List of weight to vote with.
+     */
+    function voteMany(
+        address[] calldata _gauges,
+        uint256[] calldata _weights
+    ) external {
+        require(msg.sender == governance || voters[msg.sender], "!voter");
+        require(_gauges.length == _weights.length, "!mismatch");
+        for (uint256 i = 0; i < _gauges.length; i++) {
+            _vote(_gauges[i], _weights[i]);
+        }
+    }
+
+    function _vote(address _gauge, uint256 _weight) internal {
+        proxy.safeExecute(
+            address(gaugeController),
+            0,
+            abi.encodeWithSignature(
+                "vote_for_gauge_weights(address,uint256)",
+                _gauge,
+                _weight
+            )
+        );
+    }
+
+    /**
+     * @notice Withdraw exact amount of LPs from gauge.
+     * @dev Must be called by the strategy approved for the given gauge.
+     * @param _gauge The gauge from which to withdraw.
+     * @param _token The LP token to withdraw from gauge.
+     * @param _amount The exact amount of LPs with withdraw.
+     */
+    function withdraw(
+        address _gauge,
+        address _token,
+        uint256 _amount
+    ) public returns (uint256) {
+        require(strategies[_gauge] == msg.sender, "!strategy");
+        uint256 _balance = IERC20(_token).balanceOf(address(proxy));
+        proxy.safeExecute(
+            _gauge,
+            0,
+            abi.encodeWithSignature("withdraw(uint256)", _amount)
+        );
+        _balance = IERC20(_token).balanceOf(address(proxy)) - _balance;
+        proxy.safeExecute(
+            _token,
+            0,
+            abi.encodeWithSignature(
+                "transfer(address,uint256)",
+                msg.sender,
+                _balance
+            )
+        );
+        return _balance;
+    }
+
+    /**
+     * @notice Find Yearn voter's full balance within a given gauge.
+     * @param _gauge The gauge from which to check balance.
+     */
+    function balanceOf(address _gauge) public view returns (uint256) {
+        return IERC20(_gauge).balanceOf(address(proxy));
+    }
+
+    /**
+     * @notice Withdraw full balance of voter's LPs from gauge.
+     * @param _gauge The gauge from which to withdraw.
+     * @param _token The LP token to withdraw from gauge.
+     */
+    function withdrawAll(
+        address _gauge,
+        address _token
+    ) external returns (uint256) {
+        return withdraw(_gauge, _token, balanceOf(_gauge));
+    }
+
+    /**
+     * @notice Takes care of depositing Curve LPs into gauge.
+     * @dev Strategy must first transfer LPs to this contract prior to calling.
+     *   Must be called by strategy approved for this gauge.
+     * @param _gauge The gauge to deposit LP token into.
+     * @param _token The LP token to deposit into gauge.
+     */
+    function deposit(address _gauge, address _token) external {
+        require(strategies[_gauge] == msg.sender, "!strategy");
+        uint256 _balance = IERC20(_token).balanceOf(address(this));
+        IERC20(_token).safeTransfer(address(proxy), _balance);
+        _balance = IERC20(_token).balanceOf(address(proxy));
+
+        proxy.safeExecute(
+            _token,
+            0,
+            abi.encodeWithSignature("approve(address,uint256)", _gauge, 0)
+        );
+        proxy.safeExecute(
+            _token,
+            0,
+            abi.encodeWithSignature(
+                "approve(address,uint256)",
+                _gauge,
+                _balance
+            )
+        );
+        proxy.safeExecute(
+            _gauge,
+            0,
+            abi.encodeWithSignature("deposit(uint256)", _balance)
+        );
+    }
+
+    /**
+     * @notice Abstracts the CRV minting and transfers to an approved strategy with CRV earnings.
+     * @dev Designed to be called within the harvest function of a strategy.
+     * @param _gauge The gauge which this strategy is claiming CRV from.
+     */
+    function harvest(address _gauge) external {
+        require(strategies[_gauge] == msg.sender, "!strategy");
+        uint256 _balance = IERC20(crv).balanceOf(address(proxy));
+        proxy.safeExecute(
+            mintr,
+            0,
+            abi.encodeWithSignature("mint(address)", _gauge)
+        );
+        _balance = IERC20(crv).balanceOf(address(proxy)) - _balance;
+        proxy.safeExecute(
+            crv,
+            0,
+            abi.encodeWithSignature(
+                "transfer(address,uint256)",
+                msg.sender,
+                _balance
+            )
+        );
+    }
+
+    /**
+     * @notice Claim share of weekly admin fees from Curve fee distributor.
+     * @dev Admin fees become available every Thursday at 00:00 UTC
+     * @return Amount of crvUSD claimed.
+     */
+    function claimAdminFees() external returns (uint) {
+        require(msg.sender == adminFeeRecipient, "!authorized");
+        return _claimAdminFees(adminFeeRecipient);
+    }
+
+    /**
+     * @notice Allow governance to claim weekly admin fees from Curve fee distributor.
+     * @param _recipient Where to send the crvUSD.
+     * @return Amount of crvUSD claimed.
+     */
+    function claimAdminFeesTo(address _recipient) external returns (uint) {
+        require(msg.sender == governance, "!governance");
+        return _claimAdminFees(_recipient);
+    }
+
+    function _claimAdminFees(address _recipient) internal returns (uint) {
+        address p = address(proxy);
+        uint balance = crvUSD.balanceOf(p);
+        if (!canClaim()) {
+            return balance > 1e18 ? _transferBalance(crvUSD, _recipient) : 0;
+        }
+
+        for (uint i; i < 10; i++) {
+            // @dev max 10 tries is up to 500 weeks of history.
+            feeDistribution.claim(p);
+            if (crvUSD.balanceOf(p) > balance) break;
+        }
+        return _transferBalance(crvUSD, _recipient);
+    }
+
+    /**
+     * @notice Cast a DAO vote
+     * @dev Allows for casting a vote in either the admin or parameter DAO.
+     * @param _target The address of the DAO contract
+     * @param _voteId Vote identifier
+     * @param _support true/false
+     */
+    function dao_vote(
+        address _target,
+        uint _voteId,
+        bool _support
+    ) external returns (uint amount) {
+        require(voters[msg.sender] || msg.sender == governance, "!voter");
+        require(
+            _target == 0xE478de485ad2fe566d49342Cbd03E49ed7DB3356 ||
+                _target == 0xBCfF8B0b9419b9A88c44546519b1e909cF330399,
+            "invalid dao contract"
+        );
+        bytes memory data = abi.encodeWithSignature(
+            "vote(uint256,bool,bool)",
+            _voteId,
+            _support,
+            false
+        );
+        proxy.safeExecute(_target, 0, data);
+    }
+
+    /**
+     * @notice Check if any admin fees are available for claim.
+     * @return Whether admin fees are claimable.
+     */
+    function canClaim() public view returns (bool) {
+        uint weekStart = (block.timestamp / WEEK) * WEEK;
+        uint lastClaimWeek = feeDistribution.time_cursor_of(address(proxy));
+        uint lastCheckpoint = feeDistribution.last_token_time();
+        if (
+            block.timestamp > lastClaimWeek + WEEK && lastCheckpoint > weekStart
+        ) return true;
+        return false;
+    }
+
+    /**
+     * @notice Claim non-CRV token incentives from the gauge and transfer to strategy.
+     * @dev There are two claim methods:
+     *  - new (preferred): strategy is set as recipient in gauge contract. Rewards are forwarded directly to strategy.
+     *  - legacy: fallback method for old gauges that do not support rewards_receiver interface. In this case, reward
+     *    tokens are sent to voter and then swept to strategy.
+     * @param _gauge The gauge which this strategy is claiming rewards.
+     * @param _token The token to be claimed to the approved strategy.
+     */
+    function claimRewards(address _gauge, address _token) external {
+        if (_claimRewards(_gauge)) return;
+        address[] memory tokens = new address[](1);
+        tokens[0] = _token;
+        _legacyClaimRewards(_gauge, tokens);
+    }
+
+    /**
+     * @notice Claim non-CRV token incentives from the gauge and transfer to strategy.
+     * @dev Must be called by the strategy approved for the given gauge.
+     * @param _gauge The gauge which this strategy is claiming rewards.
+     * @param _tokens The token(s) to be claimed to the approved strategy.
+     */
+    function claimManyRewards(
+        address _gauge,
+        address[] memory _tokens
+    ) external {
+        if (_claimRewards(_gauge)) return;
+        _legacyClaimRewards(_gauge, _tokens);
+    }
+
+    // use this internal function to eliminate the need for transfers when claiming extra rewards
+    function _claimRewards(address _gauge) internal returns (bool) {
+        require(strategies[_gauge] == msg.sender, "!strategy");
+        IGauge(_gauge).claim_rewards(address(proxy));
+        try IGauge(_gauge).rewards_receiver(address(proxy)) returns (
+            address receiver
+        ) {
+            require(receiver == msg.sender, "strategy not reward receiver"); // Reverts txn if fails.
+        } catch {
+            return false;
+        }
+        return true;
+    }
+
+    function _legacyClaimRewards(
+        address _gauge,
+        address[] memory _tokens
+    ) internal {
+        for (uint256 i; i < _tokens.length; ++i) {
+            require(rewardTokenApproved[_tokens[i]], "!approvedToken");
+            _transferBalance(IERC20(_tokens[i]), msg.sender);
+        }
+    }
+
+    /**
+     * @notice Approve reward tokens to be claimed by strategies.
+     * @dev Must be called by governance. Only required for legacy gauges without rewards_receiver interface.
+     * @param _token The token to be claimed.
+     * @param _approved Whether a reward token is approved to be claimed.
+     */
+    function approveRewardToken(address _token, bool _approved) external {
+        require(msg.sender == governance, "!governance");
+        if (_approved) require(_isSafeToken(_token), "!safeToken");
+        require(rewardTokenApproved[_token] != _approved, "No approval change");
+        rewardTokenApproved[_token] = _approved;
+        emit RewardTokenApprovalSet(_token, _approved);
+    }
+
+    // make sure a strategy can't yoink gauge or LP tokens.
+    function _isSafeToken(address _token) internal view returns (bool) {
+        if (_token == crv || _token == address(crvUSD)) return false;
+        try gaugeController.gauge_types(_token) {
+            return false;
+        } catch {} // @dev: Since we expect try should fail, proceed without any catch logic error here.
+        address pool = metaRegistry.get_pool_from_lp_token(_token);
+        if (pool != address(0)) return false;
+        return true;
+    }
+
+    function _transferBalance(
+        IERC20 _token,
+        address _recipient
+    ) internal returns (uint) {
+        uint balance = _token.balanceOf(address(proxy));
+        if (balance == 0) return 0;
+        proxy.safeExecute(
+            address(_token),
+            0,
+            abi.encodeWithSignature(
+                "transfer(address,uint256)",
+                _recipient,
+                balance
+            )
+        );
+        return balance;
+    }
+}
+
+
+// File: contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.3) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/token/ERC20/IERC20.sol";
+import "contracts/token/ERC20/extensions/IERC20Permit.sol";
+import "contracts/utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20 token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && Address.isContract(address(token));
+    }
+}
+
+
+// File: contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: contracts/interfaces/Curve.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface ICurveFi {
+    function get_virtual_price() external view returns (uint256);
+
+    function add_liquidity(
+        // EURs
+        uint256[2] calldata amounts,
+        uint256 min_mint_amount
+    ) external;
+
+    function add_liquidity(
+        // sBTC pool
+        uint256[3] calldata amounts,
+        uint256 min_mint_amount
+    ) external;
+
+    function add_liquidity(
+        // bUSD pool
+        uint256[4] calldata amounts,
+        uint256 min_mint_amount
+    ) external;
+
+    function remove_liquidity_imbalance(uint256[4] calldata amounts, uint256 max_burn_amount) external;
+
+    function remove_liquidity(uint256 _amount, uint256[4] calldata amounts) external;
+
+    function remove_liquidity_one_coin(
+        uint256 _token_amount,
+        int128 i,
+        uint256 min_amount
+    ) external;
+
+    function exchange(
+        int128 from,
+        int128 to,
+        uint256 _from_amount,
+        uint256 _min_to_amount
+    ) external;
+
+    function exchange_underlying(
+        int128 from,
+        int128 to,
+        uint256 _from_amount,
+        uint256 _min_to_amount
+    ) external;
+
+    function balances(int128) external view returns (uint256);
+
+    function get_dy(
+        int128 from,
+        int128 to,
+        uint256 _from_amount
+    ) external view returns (uint256);
+}
+
+interface Zap {
+    function remove_liquidity_one_coin(
+        uint256,
+        int128,
+        uint256
+    ) external;
+}
+
+interface IGauge {
+    function deposit(uint256) external;
+    function balanceOf(address) external view returns (uint256);
+    function withdraw(uint256) external;
+    function claim_rewards(address) external;
+    function reward_tokens(uint256) external view returns (address);
+    function rewards_receiver(address) external view returns (address);
+}
+
+interface IFeeDistribution {
+    function claim(address) external returns (uint);
+    function claim_many(address[20] calldata) external returns (bool);
+    function last_token_time() external view returns (uint256);
+    function time_cursor() external view returns (uint256);
+    function time_cursor_of(address) external view returns (uint256);
+}
+
+interface IEscrow {
+    function increase_unlock_time(uint256 _time) external;
+    function locked__end(address user) external returns (uint);
+}
+
+interface IMetaRegistry {
+    function get_pool_from_lp_token(address _lp) external view returns (address);
+}
+
+interface IGaugeController {
+    function gauge_types(address _gauge) external view returns (int128);
+}
+
+// File: contracts/interfaces/IProxy.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IProxy {
+    function execute(
+        address to,
+        uint256 value,
+        bytes calldata data
+    ) external returns (bool, bytes memory);
+
+    function increaseAmount(uint256) external;
+}
+
+library SafeProxy {
+    function safeExecute(
+        IProxy proxy,
+        address to,
+        uint256 value,
+        bytes memory data
+    ) internal {
+        (bool success, ) = proxy.execute(to, value, data);
+        require(success);
+    }
+}
+

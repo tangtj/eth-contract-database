@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity 0.8.0;
+
+contract HowMuchYouLikeWeb3 {
+
+    event HowMuchYouLikeWEB3(uint8 Between_0_And_255);
+
+    function howMuchYouLikeWEB3(uint8 _Between_0_And_255) public {
+        emit HowMuchYouLikeWEB3(_Between_0_And_255);
+    }
+
+}

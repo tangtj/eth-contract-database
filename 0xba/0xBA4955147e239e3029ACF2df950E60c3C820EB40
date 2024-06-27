@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+pragma solidity ^0.8.9;
+
+contract WhichNumIsYourLuckyOne {
+        
+    event WhichNUMIsYourLuckyOne(uint8 _between0And255);
+
+    function whichNUMIsYourLuckyOne(uint8 between0And255) public {
+        emit WhichNUMIsYourLuckyOne(between0And255);
+    }
+
+
+}
