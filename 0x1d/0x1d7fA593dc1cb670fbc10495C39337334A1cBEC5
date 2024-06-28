@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.10;
+
+contract AreYouLovingBitCOIN {
+        
+    event AreYouLovingBitCoin(bool num_1forTrueAnd0forFalse);
+
+    function areYouLovingBitCoin(bool _1forTrueAnd0forFalse) public {
+        emit AreYouLovingBitCoin(_1forTrueAnd0forFalse);
+    }
+
+
+}

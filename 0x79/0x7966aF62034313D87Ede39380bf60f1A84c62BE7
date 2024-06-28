@@ -1,0 +1,2413 @@
+
+// File: src/Settler.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {IERC20, IERC20Meta} from "./IERC20.sol";
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+
+import {Permit2Payment} from "./core/Permit2Payment.sol";
+import {Basic} from "./core/Basic.sol";
+import {OtcOrderSettlement} from "./core/OtcOrderSettlement.sol";
+import {UniswapV3} from "./core/UniswapV3.sol";
+import {UniswapV2} from "./core/UniswapV2.sol";
+import {IPSM, MakerPSM} from "./core/MakerPSM.sol";
+
+import {SafeTransferLib} from "./vendor/SafeTransferLib.sol";
+import {UnsafeMath} from "./utils/UnsafeMath.sol";
+import {FullMath} from "./vendor/FullMath.sol";
+import {FreeMemory} from "./utils/FreeMemory.sol";
+
+import {ISettlerActions} from "./ISettlerActions.sol";
+import {TooMuchSlippage} from "./core/SettlerErrors.sol";
+
+/// @dev This library omits index bounds/overflow checking when accessing calldata arrays for gas efficiency, but still includes checks against `calldatasize()` for safety.
+library CalldataDecoder {
+    function decodeCall(bytes[] calldata data, uint256 i)
+        internal
+        pure
+        returns (bytes4 selector, bytes calldata args)
+    {
+        assembly ("memory-safe") {
+            // helper functions
+            function panic(code) {
+                mstore(0x00, 0x4e487b71) // keccak256("Panic(uint256)")[:4]
+                mstore(0x20, code)
+                revert(0x1c, 0x24)
+            }
+            function overflow() {
+                panic(0x11) // 0x11 -> arithmetic under-/over- flow
+            }
+            function bad_calldata() {
+                revert(0x00, 0x00) // empty reason for malformed calldata
+            }
+
+            // initially, we set `args.offset` to the pointer to the length. this is 32 bytes before the actual start of data
+            args.offset :=
+                add(
+                    data.offset,
+                    calldataload(
+                        add(shl(5, i), data.offset) // can't overflow; we assume `i` is in-bounds
+                    )
+                )
+            // because the offset to `args` stored in `data` is arbitrary, we have to check it
+            if lt(args.offset, add(shl(5, data.length), data.offset)) { overflow() }
+            if iszero(lt(args.offset, calldatasize())) { bad_calldata() }
+            // now we load `args.length` and set `args.offset` to the start of data
+            args.length := calldataload(args.offset)
+            args.offset := add(args.offset, 0x20) // can't overflow; calldata can't be that long
+            {
+                // check that the end of `args` is in-bounds
+                let end := add(args.offset, args.length)
+                if lt(end, args.offset) { overflow() }
+                if gt(end, calldatasize()) { bad_calldata() }
+            }
+            // slice off the first 4 bytes of `args` as the selector
+            if lt(args.length, 4) {
+                // loading selector results in out-of-bounds read
+                panic(0x32) // 0x32 -> out-of-bounds array access
+            }
+            selector := calldataload(args.offset) // solidity cleans dirty bits automatically
+            args.length := sub(args.length, 4) // can't underflow; checked above
+            args.offset := add(args.offset, 4) // can't overflow/oob; we already checked `end`
+        }
+    }
+}
+
+/// @custom:security-contact security@0x.org
+contract Settler is Permit2Payment, Basic, OtcOrderSettlement, UniswapV3, UniswapV2, MakerPSM, FreeMemory {
+    using SafeTransferLib for IERC20;
+    using SafeTransferLib for address payable;
+    using UnsafeMath for uint256;
+    using FullMath for uint256;
+    using CalldataDecoder for bytes[];
+
+    error ActionInvalid(uint256 i, bytes4 action, bytes data);
+
+    receive() external payable {}
+
+    // When you change this, you must make corresponding changes to
+    // `sh/deploy_new_chain.sh` to set `constructor_args`.
+    constructor(address uniFactory, bytes32 poolInitCodeHash, address dai)
+        Permit2Payment()
+        Basic()
+        OtcOrderSettlement()
+        UniswapV3(uniFactory, poolInitCodeHash)
+        UniswapV2()
+        MakerPSM(dai)
+    {}
+
+    struct AllowedSlippage {
+        address buyToken;
+        address recipient;
+        uint256 minAmountOut;
+    }
+
+    function _checkSlippageAndTransfer(AllowedSlippage calldata slippage) internal {
+        // This final slippage check effectively prohibits custody optimization on the
+        // final hop of every swap. This is gas-inefficient. This is on purpose. Because
+        // ISettlerActions.BASIC_SELL could interact with an intents-based settlement
+        // mechanism, we must ensure that the user's want token increase is coming
+        // directly from us instead of from some other form of exchange of value.
+        (address buyToken, address recipient, uint256 minAmountOut) =
+            (slippage.buyToken, slippage.recipient, slippage.minAmountOut);
+        if (minAmountOut != 0 || buyToken != address(0)) {
+            if (buyToken == ETH_ADDRESS) {
+                uint256 amountOut = address(this).balance;
+                if (amountOut < minAmountOut) {
+                    revert TooMuchSlippage(buyToken, minAmountOut, amountOut);
+                }
+                payable(recipient).safeTransferETH(amountOut);
+            } else {
+                uint256 amountOut = IERC20(buyToken).balanceOf(address(this));
+                if (amountOut < minAmountOut) {
+                    revert TooMuchSlippage(buyToken, minAmountOut, amountOut);
+                }
+                IERC20(buyToken).safeTransfer(recipient, amountOut);
+            }
+        }
+    }
+
+    function _otcVIP(bytes calldata data) internal DANGEROUS_freeMemory {
+        (
+            address recipient,
+            ISignatureTransfer.PermitTransferFrom memory makerPermit,
+            address maker,
+            bytes memory makerSig,
+            ISignatureTransfer.PermitTransferFrom memory takerPermit,
+            bytes memory takerSig
+        ) = abi.decode(
+            data,
+            (
+                address,
+                ISignatureTransfer.PermitTransferFrom,
+                address,
+                bytes,
+                ISignatureTransfer.PermitTransferFrom,
+                bytes
+            )
+        );
+
+        fillOtcOrder(recipient, makerPermit, maker, makerSig, takerPermit, takerSig);
+    }
+
+    function _uniV3VIP(bytes calldata data) internal DANGEROUS_freeMemory {
+        (
+            address recipient,
+            uint256 amountIn,
+            uint256 amountOutMin,
+            bytes memory path,
+            ISignatureTransfer.PermitTransferFrom memory permit,
+            bytes memory sig
+        ) = abi.decode(data, (address, uint256, uint256, bytes, ISignatureTransfer.PermitTransferFrom, bytes));
+
+        sellTokenForTokenToUniswapV3VIP(recipient, path, amountIn, amountOutMin, permit, sig);
+    }
+
+    function execute(bytes[] calldata actions, AllowedSlippage calldata slippage) public payable {
+        if (actions.length != 0) {
+            (bytes4 action, bytes calldata data) = actions.decodeCall(0);
+            if (action == ISettlerActions.SETTLER_OTC_PERMIT2.selector) {
+                _otcVIP(data);
+            } else if (action == ISettlerActions.UNISWAPV3_PERMIT2_SWAP_EXACT_IN.selector) {
+                _uniV3VIP(data);
+            } else {
+                _dispatch(0, action, data, _msgSender());
+            }
+        }
+
+        for (uint256 i = 1; i < actions.length; i = i.unsafeInc()) {
+            (bytes4 action, bytes calldata data) = actions.decodeCall(i);
+            _dispatch(i, action, data, _msgSender());
+        }
+
+        _checkSlippageAndTransfer(slippage);
+    }
+
+    function _hashArrayOfBytes(bytes[] calldata actions) internal pure returns (bytes32 result) {
+        // This function deliberately does no bounds checking on `actions` for
+        // gas efficiency. We assume that `actions` will get used elsewhere in
+        // this context and any OOB or other malformed calldata will result in a
+        // revert later.
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            let hashesLength := shl(5, actions.length)
+            for {
+                let i := actions.offset
+                let dst := ptr
+                let end := add(i, hashesLength)
+            } lt(i, end) {
+                i := add(i, 0x20)
+                dst := add(dst, 0x20)
+            } {
+                let src := add(actions.offset, calldataload(i))
+                let length := calldataload(src)
+                calldatacopy(dst, add(src, 0x20), length)
+                mstore(dst, keccak256(dst, length))
+            }
+            result := keccak256(ptr, hashesLength)
+        }
+    }
+
+    function _hashActionsAndSlippage(bytes[] calldata actions, AllowedSlippage calldata slippage)
+        internal
+        pure
+        returns (bytes32 result)
+    {
+        // This function does not check for or clean any dirty bits that might
+        // exist in `slippage`. We assume that `slippage` will be used elsewhere
+        // in this context and that if there are dirty bits it will result in a
+        // revert later.
+        bytes32 arrayOfBytesHash = _hashArrayOfBytes(actions);
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, ACTIONS_AND_SLIPPAGE_TYPEHASH)
+            calldatacopy(add(ptr, 0x20), slippage, 0x60)
+            mstore(add(ptr, 0x80), arrayOfBytesHash)
+            result := keccak256(ptr, 0xa0)
+        }
+    }
+
+    function _metaTxnOtcVIP(bytes calldata data, address msgSender, bytes calldata sig) internal DANGEROUS_freeMemory {
+        // An optimized path involving a maker/taker in a single trade
+        // The OTC order is signed by both maker and taker, validation is
+        // performed inside the OtcOrderSettlement so there is no need to
+        // validate `sig` against `actions` here
+        (
+            address recipient,
+            ISignatureTransfer.PermitTransferFrom memory makerPermit,
+            address maker,
+            bytes memory makerSig,
+            ISignatureTransfer.PermitTransferFrom memory takerPermit
+        ) = abi.decode(
+            data,
+            (address, ISignatureTransfer.PermitTransferFrom, address, bytes, ISignatureTransfer.PermitTransferFrom)
+        );
+        fillOtcOrderMetaTxn(recipient, makerPermit, maker, makerSig, takerPermit, msgSender, sig);
+    }
+
+    function _metaTxnTransferFrom(bytes calldata data, address msgSender, bytes calldata sig)
+        internal
+        DANGEROUS_freeMemory
+    {
+        (address recipient, ISignatureTransfer.PermitTransferFrom memory permit) =
+            abi.decode(data, (address, ISignatureTransfer.PermitTransferFrom));
+        (ISignatureTransfer.SignatureTransferDetails memory transferDetails,,) =
+            _permitToTransferDetails(permit, recipient);
+
+        // We simultaneously transfer-in the taker's tokens and authenticate the
+        // metatransaction.
+        _transferFrom(permit, transferDetails, msgSender, sig);
+    }
+
+    function _metaTxnUniV3VIP(bytes calldata data, address msgSender, bytes calldata sig)
+        internal
+        DANGEROUS_freeMemory
+    {
+        (
+            address recipient,
+            uint256 amountIn,
+            uint256 amountOutMin,
+            bytes memory path,
+            ISignatureTransfer.PermitTransferFrom memory permit
+        ) = abi.decode(data, (address, uint256, uint256, bytes, ISignatureTransfer.PermitTransferFrom));
+        sellTokenForTokenToUniswapV3MetaTxn(recipient, path, amountIn, amountOutMin, msgSender, permit, sig);
+    }
+
+    function executeMetaTxn(
+        bytes[] calldata actions,
+        AllowedSlippage calldata slippage,
+        address msgSender,
+        bytes calldata sig
+    ) public metaTx(msgSender, _hashActionsAndSlippage(actions, slippage)) {
+        if (actions.length != 0) {
+            (bytes4 action, bytes calldata data) = actions.decodeCall(0);
+
+            // By forcing the first action to be one of the witness-aware
+            // actions, we ensure that the entire sequence of actions is
+            // authorized. `msgSender` is the signer of the metatransaction.
+
+            if (action == ISettlerActions.METATXN_SETTLER_OTC_PERMIT2.selector) {
+                _metaTxnOtcVIP(data, msgSender, sig);
+            } else if (action == ISettlerActions.METATXN_PERMIT2_TRANSFER_FROM.selector) {
+                _metaTxnTransferFrom(data, msgSender, sig);
+            } else if (action == ISettlerActions.METATXN_UNISWAPV3_PERMIT2_SWAP_EXACT_IN.selector) {
+                _metaTxnUniV3VIP(data, msgSender, sig);
+            } else {
+                revert ActionInvalid({i: 0, action: action, data: data});
+            }
+        }
+
+        for (uint256 i = 1; i < actions.length; i = i.unsafeInc()) {
+            (bytes4 action, bytes calldata data) = actions.decodeCall(i);
+            _dispatch(i, action, data, msgSender);
+        }
+
+        _checkSlippageAndTransfer(slippage);
+    }
+
+    function _dispatch(uint256 i, bytes4 action, bytes calldata data, address msgSender)
+        internal
+        DANGEROUS_freeMemory
+    {
+        if (action == ISettlerActions.PERMIT2_TRANSFER_FROM.selector) {
+            (address recipient, ISignatureTransfer.PermitTransferFrom memory permit, bytes memory sig) =
+                abi.decode(data, (address, ISignatureTransfer.PermitTransferFrom, bytes));
+            (ISignatureTransfer.SignatureTransferDetails memory transferDetails,,) =
+                _permitToTransferDetails(permit, recipient);
+            _transferFrom(permit, transferDetails, msgSender, sig);
+        } else if (action == ISettlerActions.SETTLER_OTC_SELF_FUNDED.selector) {
+            (
+                address recipient,
+                ISignatureTransfer.PermitTransferFrom memory permit,
+                address maker,
+                bytes memory makerSig,
+                IERC20 takerToken,
+                uint256 maxTakerAmount
+            ) = abi.decode(data, (address, ISignatureTransfer.PermitTransferFrom, address, bytes, IERC20, uint256));
+
+            fillOtcOrderSelfFunded(recipient, permit, maker, makerSig, takerToken, maxTakerAmount, msgSender);
+        } else if (action == ISettlerActions.UNISWAPV3_SWAP_EXACT_IN.selector) {
+            (address recipient, uint256 bips, uint256 amountOutMin, bytes memory path) =
+                abi.decode(data, (address, uint256, uint256, bytes));
+
+            sellTokenForTokenToUniswapV3(recipient, path, bips, amountOutMin);
+        } else if (action == ISettlerActions.UNISWAPV2_SWAP.selector) {
+            (address recipient, address sellToken, address pool, uint8 swapInfo, uint256 bips, uint256 amountOutMin) =
+                abi.decode(data, (address, address, address, uint8, uint256, uint256));
+
+            sellToUniswapV2(recipient, sellToken, pool, swapInfo, bips, amountOutMin);
+        } else if (action == ISettlerActions.MAKER_PSM_SELL_GEM.selector) {
+            (address recipient, uint256 bips, IPSM psm, IERC20Meta gemToken) =
+                abi.decode(data, (address, uint256, IPSM, IERC20Meta));
+
+            makerPsmSellGem(recipient, bips, psm, gemToken);
+        } else if (action == ISettlerActions.MAKER_PSM_BUY_GEM.selector) {
+            (address recipient, uint256 bips, IPSM psm, IERC20Meta gemToken) =
+                abi.decode(data, (address, uint256, IPSM, IERC20Meta));
+
+            makerPsmBuyGem(recipient, bips, psm, gemToken);
+        } else if (action == ISettlerActions.BASIC_SELL.selector) {
+            (address pool, IERC20 sellToken, uint256 proportion, uint256 offset, bytes memory _data) =
+                abi.decode(data, (address, IERC20, uint256, uint256, bytes));
+
+            basicSellToPool(pool, sellToken, proportion, offset, _data);
+        } else if (action == ISettlerActions.POSITIVE_SLIPPAGE.selector) {
+            (address recipient, IERC20 token, uint256 expectedAmount) = abi.decode(data, (address, IERC20, uint256));
+            if (token == IERC20(ETH_ADDRESS)) {
+                uint256 balance = address(this).balance;
+                if (balance > expectedAmount) {
+                    unchecked {
+                        payable(recipient).safeTransferETH(balance - expectedAmount);
+                    }
+                }
+            } else {
+                uint256 balance = token.balanceOf(address(this));
+                if (balance > expectedAmount) {
+                    unchecked {
+                        token.safeTransfer(recipient, balance - expectedAmount);
+                    }
+                }
+            }
+        } else {
+            revert ActionInvalid({i: i, action: action, data: data});
+        }
+    }
+}
+
+
+// File: src/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address) external view returns (uint256);
+    function transfer(address, uint256) external returns (bool);
+    function transferFrom(address, address, uint256) external returns (bool);
+    function approve(address, uint256) external returns (bool);
+    function allowance(address, address) external view returns (uint256);
+
+    event Transfer(address indexed, address indexed, uint256);
+    event Approval(address indexed, address indexed, uint256);
+}
+
+interface IERC20Meta is IERC20 {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+}
+
+
+// File: lib/permit2/src/interfaces/ISignatureTransfer.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import {IEIP712} from "./IEIP712.sol";
+
+/// @title SignatureTransfer
+/// @notice Handles ERC20 token transfers through signature based actions
+/// @dev Requires user's token approval on the Permit2 contract
+interface ISignatureTransfer is IEIP712 {
+    /// @notice Thrown when the requested amount for a transfer is larger than the permissioned amount
+    /// @param maxAmount The maximum amount a spender can request to transfer
+    error InvalidAmount(uint256 maxAmount);
+
+    /// @notice Thrown when the number of tokens permissioned to a spender does not match the number of tokens being transferred
+    /// @dev If the spender does not need to transfer the number of tokens permitted, the spender can request amount 0 to be transferred
+    error LengthMismatch();
+
+    /// @notice Emits an event when the owner successfully invalidates an unordered nonce.
+    event UnorderedNonceInvalidation(address indexed owner, uint256 word, uint256 mask);
+
+    /// @notice The token and amount details for a transfer signed in the permit transfer signature
+    struct TokenPermissions {
+        // ERC20 token address
+        address token;
+        // the maximum amount that can be spent
+        uint256 amount;
+    }
+
+    /// @notice The signed permit message for a single token transfer
+    struct PermitTransferFrom {
+        TokenPermissions permitted;
+        // a unique value for every token owner's signature to prevent signature replays
+        uint256 nonce;
+        // deadline on the permit signature
+        uint256 deadline;
+    }
+
+    /// @notice Specifies the recipient address and amount for batched transfers.
+    /// @dev Recipients and amounts correspond to the index of the signed token permissions array.
+    /// @dev Reverts if the requested amount is greater than the permitted signed amount.
+    struct SignatureTransferDetails {
+        // recipient address
+        address to;
+        // spender requested amount
+        uint256 requestedAmount;
+    }
+
+    /// @notice Used to reconstruct the signed permit message for multiple token transfers
+    /// @dev Do not need to pass in spender address as it is required that it is msg.sender
+    /// @dev Note that a user still signs over a spender address
+    struct PermitBatchTransferFrom {
+        // the tokens and corresponding amounts permitted for a transfer
+        TokenPermissions[] permitted;
+        // a unique value for every token owner's signature to prevent signature replays
+        uint256 nonce;
+        // deadline on the permit signature
+        uint256 deadline;
+    }
+
+    /// @notice A map from token owner address and a caller specified word index to a bitmap. Used to set bits in the bitmap to prevent against signature replay protection
+    /// @dev Uses unordered nonces so that permit messages do not need to be spent in a certain order
+    /// @dev The mapping is indexed first by the token owner, then by an index specified in the nonce
+    /// @dev It returns a uint256 bitmap
+    /// @dev The index, or wordPosition is capped at type(uint248).max
+    function nonceBitmap(address, uint256) external view returns (uint256);
+
+    /// @notice Transfers a token using a signed permit message
+    /// @dev Reverts if the requested amount is greater than the permitted signed amount
+    /// @param permit The permit data signed over by the owner
+    /// @param owner The owner of the tokens to transfer
+    /// @param transferDetails The spender's requested transfer details for the permitted token
+    /// @param signature The signature to verify
+    function permitTransferFrom(
+        PermitTransferFrom memory permit,
+        SignatureTransferDetails calldata transferDetails,
+        address owner,
+        bytes calldata signature
+    ) external;
+
+    /// @notice Transfers a token using a signed permit message
+    /// @notice Includes extra data provided by the caller to verify signature over
+    /// @dev The witness type string must follow EIP712 ordering of nested structs and must include the TokenPermissions type definition
+    /// @dev Reverts if the requested amount is greater than the permitted signed amount
+    /// @param permit The permit data signed over by the owner
+    /// @param owner The owner of the tokens to transfer
+    /// @param transferDetails The spender's requested transfer details for the permitted token
+    /// @param witness Extra data to include when checking the user signature
+    /// @param witnessTypeString The EIP-712 type definition for remaining string stub of the typehash
+    /// @param signature The signature to verify
+    function permitWitnessTransferFrom(
+        PermitTransferFrom memory permit,
+        SignatureTransferDetails calldata transferDetails,
+        address owner,
+        bytes32 witness,
+        string calldata witnessTypeString,
+        bytes calldata signature
+    ) external;
+
+    /// @notice Transfers multiple tokens using a signed permit message
+    /// @param permit The permit data signed over by the owner
+    /// @param owner The owner of the tokens to transfer
+    /// @param transferDetails Specifies the recipient and requested amount for the token transfer
+    /// @param signature The signature to verify
+    function permitTransferFrom(
+        PermitBatchTransferFrom memory permit,
+        SignatureTransferDetails[] calldata transferDetails,
+        address owner,
+        bytes calldata signature
+    ) external;
+
+    /// @notice Transfers multiple tokens using a signed permit message
+    /// @dev The witness type string must follow EIP712 ordering of nested structs and must include the TokenPermissions type definition
+    /// @notice Includes extra data provided by the caller to verify signature over
+    /// @param permit The permit data signed over by the owner
+    /// @param owner The owner of the tokens to transfer
+    /// @param transferDetails Specifies the recipient and requested amount for the token transfer
+    /// @param witness Extra data to include when checking the user signature
+    /// @param witnessTypeString The EIP-712 type definition for remaining string stub of the typehash
+    /// @param signature The signature to verify
+    function permitWitnessTransferFrom(
+        PermitBatchTransferFrom memory permit,
+        SignatureTransferDetails[] calldata transferDetails,
+        address owner,
+        bytes32 witness,
+        string calldata witnessTypeString,
+        bytes calldata signature
+    ) external;
+
+    /// @notice Invalidates the bits specified in mask for the bitmap at the word position
+    /// @dev The wordPos is maxed at type(uint248).max
+    /// @param wordPos A number to index the nonceBitmap at
+    /// @param mask A bitmap masked against msg.sender's current bitmap at the word position
+    function invalidateUnorderedNonces(uint256 wordPos, uint256 mask) external;
+}
+
+
+// File: src/core/Permit2Payment.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {ForwarderNotAllowed, InvalidSignatureLen, ConfusedDeputy} from "./SettlerErrors.sol";
+import {AllowanceHolderContext} from "../allowanceholder/AllowanceHolderContext.sol";
+import {SettlerAbstract} from "../SettlerAbstract.sol";
+
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+import {Revert} from "../utils/Revert.sol";
+
+library TransientStorage {
+    // bytes32(uint256(keccak256("operator slot")) - 1)
+    bytes32 private constant _OPERATOR_SLOT = 0x009355806b743562f351db2e3726091207f49fa1cdccd5c65a7d4860ce3abbe9;
+    // bytes32(uint256(keccak256("witness slot")) - 1)
+    bytes32 private constant _WITNESS_SLOT = 0x1643bf8e9fdaef48c4abf5a998de359be44a235ac7aebfbc05485e093720deaa;
+    // bytes32(uint256(keccak256("metatx signer slot")) - 1)
+    bytes32 private constant _METATX_SIGNER_SLOT = 0xfc7be34027b4062d13b31d75182f37b703b5ad960f0e73236593535549bb277d;
+
+    error ReentrantCallback(address oldOperator);
+
+    function setOperator(address operator) internal {
+        address currentSigner;
+        assembly ("memory-safe") {
+            currentSigner := tload(_METATX_SIGNER_SLOT)
+        }
+        if (operator == currentSigner) {
+            revert ConfusedDeputy();
+        }
+        address currentOperator;
+        assembly ("memory-safe") {
+            currentOperator := tload(_OPERATOR_SLOT)
+        }
+        if (currentOperator != address(0) && msg.sender != currentOperator) {
+            revert ReentrantCallback(currentOperator);
+        }
+        assembly ("memory-safe") {
+            tstore(_OPERATOR_SLOT, and(0xffffffffffffffffffffffffffffffffffffffff, operator))
+        }
+    }
+
+    error OperatorNotSpent(address oldOperator);
+
+    function checkSpentOperator() internal view {
+        address currentOperator;
+        assembly ("memory-safe") {
+            currentOperator := tload(_OPERATOR_SLOT)
+        }
+        if (currentOperator != address(0)) {
+            revert OperatorNotSpent(currentOperator);
+        }
+    }
+
+    function getAndClearOperator() internal returns (address operator) {
+        assembly ("memory-safe") {
+            operator := tload(_OPERATOR_SLOT)
+            if operator { tstore(_OPERATOR_SLOT, 0) }
+        }
+    }
+
+    error ReentrantMetatransaction(bytes32 oldWitness);
+
+    function setWitness(bytes32 newWitness, address signer) internal {
+        bytes32 currentWitness;
+        assembly ("memory-safe") {
+            currentWitness := tload(_WITNESS_SLOT)
+        }
+        if (currentWitness != bytes32(0)) {
+            revert ReentrantMetatransaction(currentWitness);
+        }
+        assembly ("memory-safe") {
+            tstore(_WITNESS_SLOT, newWitness)
+            tstore(_METATX_SIGNER_SLOT, and(0xffffffffffffffffffffffffffffffffffffffff, signer))
+        }
+    }
+
+    error WitnessNotSpent(bytes32 oldWitness);
+
+    function checkSpentWitness() internal view {
+        bytes32 currentWitness;
+        assembly ("memory-safe") {
+            currentWitness := tload(_WITNESS_SLOT)
+        }
+        if (currentWitness != bytes32(0)) {
+            revert WitnessNotSpent(currentWitness);
+        }
+    }
+
+    function getAndClearWitness() internal returns (bytes32 witness, address signer) {
+        assembly ("memory-safe") {
+            witness := tload(_WITNESS_SLOT)
+            if witness {
+                signer := tload(_METATX_SIGNER_SLOT)
+                tstore(_METATX_SIGNER_SLOT, 0)
+                tstore(_WITNESS_SLOT, 0)
+            }
+        }
+    }
+}
+
+abstract contract Permit2PaymentBase is AllowanceHolderContext, SettlerAbstract {
+    using Revert for bool;
+
+    /// @dev Permit2 address
+    ISignatureTransfer internal constant _PERMIT2 = ISignatureTransfer(0x000000000022D473030F116dDEE9F6B43aC78BA3);
+
+    function isRestrictedTarget(address target) internal pure override returns (bool) {
+        return target == address(_PERMIT2) || target == address(_ALLOWANCE_HOLDER);
+    }
+
+    function _setOperatorAndCall(address payable target, uint256 value, bytes memory data)
+        internal
+        override
+        returns (bytes memory)
+    {
+        TransientStorage.setOperator(target);
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        success.maybeRevert(returndata);
+        TransientStorage.checkSpentOperator();
+        return returndata;
+    }
+
+    function _setOperatorAndCall(address target, bytes memory data) internal override returns (bytes memory) {
+        return _setOperatorAndCall(payable(target), 0, data);
+    }
+
+    modifier metaTx(address msgSender, bytes32 witness) override {
+        TransientStorage.setWitness(witness, msgSender);
+        TransientStorage.setOperator(_msgSender());
+        _;
+        TransientStorage.checkSpentOperator();
+        TransientStorage.checkSpentWitness();
+    }
+}
+
+abstract contract Permit2Payment is Permit2PaymentBase {
+    // `string.concat` isn't recognized by solc as compile-time constant, but `abi.encodePacked` is
+    // This is defined here as `private` and not in `SettlerAbstract` as `internal` because no other
+    // contract/file should reference it. The *ONLY* approved way to make a transfer using this
+    // witness string is by setting the witness with `_setWitness`
+    string private constant _ACTIONS_AND_SLIPPAGE_WITNESS = string(
+        abi.encodePacked("ActionsAndSlippage actionsAndSlippage)", ACTIONS_AND_SLIPPAGE_TYPE, TOKEN_PERMISSIONS_TYPE)
+    );
+
+    function _permitToTransferDetails(ISignatureTransfer.PermitTransferFrom memory permit, address recipient)
+        internal
+        pure
+        override
+        returns (ISignatureTransfer.SignatureTransferDetails memory transferDetails, address token, uint256 amount)
+    {
+        transferDetails.to = recipient;
+        transferDetails.requestedAmount = amount = permit.permitted.amount;
+        token = permit.permitted.token;
+    }
+
+    // This function is provided *EXCLUSIVELY* for use here and in OtcOrderSettlement. Any other use
+    // of this function is forbidden. You must use the overload that does *NOT* take a `witness`
+    // argument.
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes32 witness,
+        string memory witnessTypeString,
+        bytes memory sig,
+        bool isForwarded
+    ) internal override {
+        if (isForwarded) revert ForwarderNotAllowed();
+        _PERMIT2.permitWitnessTransferFrom(permit, transferDetails, from, witness, witnessTypeString, sig);
+    }
+
+    // See comment in above overload
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes32 witness,
+        string memory witnessTypeString,
+        bytes memory sig
+    ) internal override {
+        _transferFrom(permit, transferDetails, from, witness, witnessTypeString, sig, _isForwarded());
+    }
+
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes memory sig,
+        bool isForwarded
+    ) internal override {
+        if (from != _msgSender() && msg.sender != TransientStorage.getAndClearOperator()) {
+            revert ConfusedDeputy();
+        }
+        {
+            (bytes32 witness, address signer) = TransientStorage.getAndClearWitness();
+            if (witness != bytes32(0)) {
+                if (from != signer) {
+                    revert ConfusedDeputy();
+                }
+                return _transferFrom(
+                    permit, transferDetails, from, witness, _ACTIONS_AND_SLIPPAGE_WITNESS, sig, isForwarded
+                );
+            }
+        }
+        if (isForwarded) {
+            if (sig.length != 0) revert InvalidSignatureLen();
+            _ALLOWANCE_HOLDER.transferFrom(
+                permit.permitted.token, from, transferDetails.to, transferDetails.requestedAmount
+            );
+        } else {
+            _PERMIT2.permitTransferFrom(permit, transferDetails, from, sig);
+        }
+    }
+
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes memory sig
+    ) internal override {
+        _transferFrom(permit, transferDetails, from, sig, _isForwarded());
+    }
+}
+
+
+// File: src/core/Basic.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {SettlerAbstract} from "../SettlerAbstract.sol";
+import {InvalidOffset, ConfusedDeputy, InvalidTarget} from "./SettlerErrors.sol";
+
+import {IERC20} from "../IERC20.sol";
+import {SafeTransferLib} from "../vendor/SafeTransferLib.sol";
+import {FullMath} from "../vendor/FullMath.sol";
+import {Panic} from "../utils/Panic.sol";
+import {Revert} from "../utils/Revert.sol";
+
+abstract contract Basic is SettlerAbstract {
+    using SafeTransferLib for IERC20;
+    using FullMath for uint256;
+    using Revert for bool;
+
+    address internal constant ETH_ADDRESS = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+
+    /// @dev Sell to a pool with a generic approval, transferFrom interaction.
+    /// offset in the calldata is used to update the sellAmount given a proportion of the sellToken balance
+    function basicSellToPool(address pool, IERC20 sellToken, uint256 bips, uint256 offset, bytes memory data)
+        internal
+    {
+        if (isRestrictedTarget(pool)) {
+            revert ConfusedDeputy();
+        }
+
+        bool success;
+        bytes memory returnData;
+        uint256 value;
+        if (sellToken == IERC20(ETH_ADDRESS)) {
+            value = address(this).balance.mulDiv(bips, 10_000);
+            if (data.length == 0) {
+                if (offset != 0) revert InvalidOffset();
+                (success, returnData) = payable(pool).call{value: value}("");
+                success.maybeRevert(returnData);
+                return;
+            } else {
+                if ((offset += 32) > data.length) {
+                    Panic.panic(Panic.ARRAY_OUT_OF_BOUNDS);
+                }
+                assembly ("memory-safe") {
+                    mstore(add(data, offset), value)
+                }
+            }
+        } else if (address(sellToken) == address(0)) {
+            if (offset != 0) revert InvalidOffset();
+        } else {
+            uint256 amount = sellToken.balanceOf(address(this)).mulDiv(bips, 10_000);
+            if ((offset += 32) > data.length) {
+                Panic.panic(Panic.ARRAY_OUT_OF_BOUNDS);
+            }
+            assembly ("memory-safe") {
+                mstore(add(data, offset), amount)
+            }
+            if (address(sellToken) != pool) {
+                sellToken.safeApproveIfBelow(pool, amount);
+            }
+        }
+        (success, returnData) = payable(pool).call{value: value}(data);
+        success.maybeRevert(returnData);
+        // forbid sending data to EOAs
+        if (returnData.length == 0 && pool.code.length == 0) revert InvalidTarget();
+    }
+}
+
+
+// File: src/core/OtcOrderSettlement.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {IERC20} from "../IERC20.sol";
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+import {SettlerAbstract} from "../SettlerAbstract.sol";
+
+import {SafeTransferLib} from "../vendor/SafeTransferLib.sol";
+import {FullMath} from "../vendor/FullMath.sol";
+
+abstract contract OtcOrderSettlement is SettlerAbstract {
+    using SafeTransferLib for IERC20;
+    using FullMath for uint256;
+
+    struct Consideration {
+        address token;
+        uint256 amount;
+        address counterparty;
+        bool partialFillAllowed;
+    }
+
+    string internal constant CONSIDERATION_TYPE =
+        "Consideration(address token,uint256 amount,address counterparty,bool partialFillAllowed)";
+    // `string.concat` isn't recognized by solc as compile-time constant, but `abi.encodePacked` is
+    string internal constant CONSIDERATION_WITNESS =
+        string(abi.encodePacked("Consideration consideration)", CONSIDERATION_TYPE, TOKEN_PERMISSIONS_TYPE));
+    bytes32 internal constant CONSIDERATION_TYPEHASH =
+        0x7d806873084f389a66fd0315dead7adaad8ae6e8b6cf9fb0d3db61e5a91c3ffa;
+
+    string internal constant OTC_ORDER_TYPE =
+        "OtcOrder(Consideration makerConsideration,Consideration takerConsideration)";
+    string internal constant OTC_ORDER_TYPE_RECURSIVE = string(abi.encodePacked(OTC_ORDER_TYPE, CONSIDERATION_TYPE));
+    bytes32 internal constant OTC_ORDER_TYPEHASH = 0x4efcac36537dd5721596376472101aec5ff380b23b286c66cdfe70a509c0cef3;
+
+    function _hashConsideration(Consideration memory consideration) internal pure returns (bytes32 result) {
+        assembly ("memory-safe") {
+            let ptr := sub(consideration, 0x20)
+            let oldValue := mload(ptr)
+            mstore(ptr, CONSIDERATION_TYPEHASH)
+            result := keccak256(ptr, 0xa0)
+            mstore(ptr, oldValue)
+        }
+    }
+
+    function _logOtcOrder(bytes32 makerConsiderationHash, bytes32 takerConsiderationHash, uint128 makerFilledAmount)
+        private
+    {
+        assembly ("memory-safe") {
+            mstore(0x00, OTC_ORDER_TYPEHASH)
+            mstore(0x20, makerConsiderationHash)
+            let ptr := mload(0x40)
+            mstore(0x40, takerConsiderationHash)
+            let orderHash := keccak256(0x00, 0x60)
+            mstore(0x40, ptr)
+            mstore(0x10, makerFilledAmount)
+            mstore(0x00, orderHash)
+            log0(0x00, 0x30)
+        }
+    }
+
+    constructor() {
+        assert(CONSIDERATION_TYPEHASH == keccak256(bytes(CONSIDERATION_TYPE)));
+        assert(OTC_ORDER_TYPEHASH == keccak256(bytes(OTC_ORDER_TYPE_RECURSIVE)));
+    }
+
+    /// @dev Settle an OtcOrder between maker and taker transferring funds directly between
+    /// the counterparties. Either two Permit2 signatures are consumed, with the maker Permit2 containing
+    /// a witness of the OtcOrder, or AllowanceHolder is supported for the taker payment.
+    function fillOtcOrder(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory makerPermit,
+        address maker,
+        bytes memory makerSig,
+        ISignatureTransfer.PermitTransferFrom memory takerPermit,
+        bytes memory takerSig
+    ) internal {
+        return fillOtcOrderMetaTxn(recipient, makerPermit, maker, makerSig, takerPermit, _msgSender(), takerSig);
+    }
+
+    /// @dev Settle an OtcOrder between maker and taker transfering funds directly between
+    /// the counterparties. Both Maker and Taker have signed the same order, and submission
+    /// is via a third party
+    /// @dev the taker's witness is not calculated nor verified here as calling function is trusted
+    function fillOtcOrderMetaTxn(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory makerPermit,
+        address maker,
+        bytes memory makerSig,
+        ISignatureTransfer.PermitTransferFrom memory takerPermit,
+        address taker,
+        bytes memory takerSig
+    ) internal {
+        (
+            ISignatureTransfer.SignatureTransferDetails memory makerTransferDetails,
+            address makerToken,
+            uint256 makerAmount
+        ) = _permitToTransferDetails(makerPermit, recipient);
+        (
+            ISignatureTransfer.SignatureTransferDetails memory takerTransferDetails,
+            address takerToken,
+            uint256 takerAmount
+        ) = _permitToTransferDetails(takerPermit, maker);
+
+        bytes32 witness = _hashConsideration(
+            Consideration({token: takerToken, amount: takerAmount, counterparty: taker, partialFillAllowed: false})
+        );
+        _transferFrom(takerPermit, takerTransferDetails, taker, takerSig);
+        _transferFrom(makerPermit, makerTransferDetails, maker, witness, CONSIDERATION_WITNESS, makerSig, false);
+
+        _logOtcOrder(
+            witness,
+            _hashConsideration(
+                Consideration({token: makerToken, amount: makerAmount, counterparty: maker, partialFillAllowed: false})
+            ),
+            uint128(makerAmount)
+        );
+    }
+
+    /// @dev Settle an OtcOrder between maker and Settler retaining funds in this contract.
+    /// @dev pre-condition: msgSender has been authenticated against the requestor
+    /// One Permit2 signature is consumed, with the maker Permit2 containing a witness of the OtcOrder.
+    // In this variant, Maker pays recipient and Settler pays Maker
+    function fillOtcOrderSelfFunded(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        address maker,
+        bytes memory makerSig,
+        IERC20 takerToken,
+        uint256 maxTakerAmount,
+        address msgSender
+    ) internal {
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails;
+        Consideration memory takerConsideration;
+        takerConsideration.partialFillAllowed = true;
+        uint256 buyAmount;
+        (transferDetails, takerConsideration.token, buyAmount) = _permitToTransferDetails(permit, recipient);
+        takerConsideration.amount = buyAmount;
+        takerConsideration.counterparty = maker;
+
+        Consideration memory makerConsideration = Consideration({
+            token: address(takerToken),
+            amount: maxTakerAmount,
+            counterparty: msgSender,
+            partialFillAllowed: true
+        });
+        bytes32 witness = _hashConsideration(makerConsideration);
+
+        uint256 takerAmount = takerToken.balanceOf(address(this));
+        if (takerAmount > maxTakerAmount) {
+            takerAmount = maxTakerAmount;
+        }
+        transferDetails.requestedAmount = transferDetails.requestedAmount.unsafeMulDiv(takerAmount, maxTakerAmount);
+
+        takerToken.safeTransfer(maker, takerAmount);
+        _transferFrom(permit, transferDetails, maker, witness, CONSIDERATION_WITNESS, makerSig, false);
+
+        _logOtcOrder(witness, _hashConsideration(takerConsideration), uint128(buyAmount));
+    }
+}
+
+
+// File: src/core/UniswapV3.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {IERC20} from "../IERC20.sol";
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+import {UnsafeMath} from "../utils/UnsafeMath.sol";
+import {Panic} from "../utils/Panic.sol";
+import {SafeTransferLib} from "../vendor/SafeTransferLib.sol";
+import {AddressDerivation} from "../utils/AddressDerivation.sol";
+import {SettlerAbstract} from "../SettlerAbstract.sol";
+
+import {TooMuchSlippage, ConfusedDeputy} from "./SettlerErrors.sol";
+
+interface IUniswapV3Pool {
+    /// @notice Swap token0 for token1, or token1 for token0
+    /// @dev The caller of this method receives a callback in the form of IUniswapV3SwapCallback#uniswapV3SwapCallback
+    /// @param recipient The address to receive the output of the swap
+    /// @param zeroForOne The direction of the swap, true for token0 to token1, false for token1 to token0
+    /// @param amountSpecified The amount of the swap, which implicitly configures the swap as exact input (positive),
+    /// or exact output (negative)
+    /// @param sqrtPriceLimitX96 The Q64.96 sqrt price limit. If zero for one, the price cannot be less than this
+    /// value after the swap. If one for zero, the price cannot be greater than this value after the swap
+    /// @param data Any data to be passed through to the callback
+    /// @return amount0 The delta of the balance of token0 of the pool, exact when negative, minimum when positive
+    /// @return amount1 The delta of the balance of token1 of the pool, exact when negative, minimum when positive
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+}
+
+abstract contract UniswapV3 is SettlerAbstract {
+    using UnsafeMath for uint256;
+    using SafeTransferLib for IERC20;
+
+    /// @dev UniswapV3 Factory contract address
+    address private immutable UNI_FACTORY_ADDRESS;
+    /// @dev UniswapV3 pool init code hash.
+    bytes32 private immutable UNI_POOL_INIT_CODE_HASH;
+    /// @dev Minimum size of an encoded swap path:
+    ///      sizeof(address(inputToken) | uint24(fee) | address(outputToken))
+    uint256 private constant SINGLE_HOP_PATH_SIZE = 0x2b;
+    /// @dev How many bytes to skip ahead in an encoded path to start at the next hop:
+    ///      sizeof(address(inputToken) | uint24(fee))
+    uint256 private constant PATH_SKIP_HOP_SIZE = 0x17;
+    /// @dev The size of the swap callback prefix data before the Permit2 data.
+    uint256 private constant SWAP_CALLBACK_PREFIX_DATA_SIZE = 0x3f;
+    /// @dev The offset from the pointer to the length of the swap callback prefix data to the start of the Permit2 data.
+    uint256 private constant SWAP_CALLBACK_PERMIT2DATA_OFFSET = 0x5f;
+    uint256 private constant PERMIT_DATA_SIZE = 0x80;
+    uint256 private constant ISFORWARDED_DATA_SIZE = 0x20;
+    /// @dev Minimum tick price sqrt ratio.
+    uint160 private constant MIN_PRICE_SQRT_RATIO = 4295128739;
+    /// @dev Minimum tick price sqrt ratio.
+    uint160 private constant MAX_PRICE_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+    /// @dev Mask of lower 20 bytes.
+    uint256 private constant ADDRESS_MASK = 0x00ffffffffffffffffffffffffffffffffffffffff;
+    /// @dev Mask of lower 3 bytes.
+    uint256 private constant UINT24_MASK = 0xffffff;
+
+    constructor(address uniFactory, bytes32 poolInitCodeHash) {
+        UNI_FACTORY_ADDRESS = uniFactory;
+        UNI_POOL_INIT_CODE_HASH = poolInitCodeHash;
+    }
+
+    /// @dev Sell a token for another token directly against uniswap v3.
+    /// @param encodedPath Uniswap-encoded path.
+    /// @param bips proportion of current balance of the first token in the path to sell.
+    /// @param minBuyAmount Minimum amount of the last token in the path to buy.
+    /// @param recipient The recipient of the bought tokens.
+    /// @return buyAmount Amount of the last token in the path bought.
+    function sellTokenForTokenToUniswapV3(
+        address recipient,
+        bytes memory encodedPath,
+        uint256 bips,
+        uint256 minBuyAmount
+    ) internal returns (uint256 buyAmount) {
+        buyAmount = _swap(
+            recipient,
+            encodedPath,
+            // We don't care about phantom overflow here because reserves are
+            // limited to 128 bits. Any token balance that would overflow here
+            // would also break UniV3.
+            (IERC20(address(bytes20(encodedPath))).balanceOf(address(this)) * bips).unsafeDiv(10_000),
+            minBuyAmount,
+            address(this), // payer
+            new bytes(SWAP_CALLBACK_PREFIX_DATA_SIZE)
+        );
+    }
+
+    /// @dev Sell a token for another token directly against uniswap v3. Payment is using a Permit2 signature.
+    /// @param encodedPath Uniswap-encoded path.
+    /// @param sellAmount amount of the first token in the path to sell.
+    /// @param minBuyAmount Minimum amount of the last token in the path to buy.
+    /// @param recipient The recipient of the bought tokens.
+    /// @param permit The PermitTransferFrom allowing this contract to spend the taker's tokens
+    /// @param sig The taker's signature for Permit2
+    /// @return buyAmount Amount of the last token in the path bought.
+    function sellTokenForTokenToUniswapV3VIP(
+        address recipient,
+        bytes memory encodedPath,
+        uint256 sellAmount,
+        uint256 minBuyAmount,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        bytes memory sig
+    ) internal returns (uint256 buyAmount) {
+        bytes memory swapCallbackData =
+            new bytes(SWAP_CALLBACK_PREFIX_DATA_SIZE + PERMIT_DATA_SIZE + ISFORWARDED_DATA_SIZE + sig.length);
+        _encodePermit2Data(swapCallbackData, permit, sig, _isForwarded());
+
+        buyAmount = _swap(recipient, encodedPath, sellAmount, minBuyAmount, _msgSender(), swapCallbackData);
+    }
+
+    /// @dev Sell a token for another token directly against uniswap v3. Payment is using a Permit2 signature.
+    /// @param encodedPath Uniswap-encoded path.
+    /// @param sellAmount amount of the first token in the path to sell.
+    /// @param minBuyAmount Minimum amount of the last token in the path to buy.
+    /// @param recipient The recipient of the bought tokens.
+    /// @param payer The taker of the transaction and the signer of the permit
+    /// @param permit The PermitTransferFrom allowing this contract to spend the taker's tokens
+    /// @param sig The taker's signature for Permit2
+    /// @return buyAmount Amount of the last token in the path bought.
+    function sellTokenForTokenToUniswapV3MetaTxn(
+        address recipient,
+        bytes memory encodedPath,
+        uint256 sellAmount,
+        uint256 minBuyAmount,
+        address payer,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        bytes memory sig
+    ) internal returns (uint256 buyAmount) {
+        bytes memory swapCallbackData =
+            new bytes(SWAP_CALLBACK_PREFIX_DATA_SIZE + PERMIT_DATA_SIZE + ISFORWARDED_DATA_SIZE + sig.length);
+        _encodePermit2Data(swapCallbackData, permit, sig, false);
+
+        buyAmount = _swap(recipient, encodedPath, sellAmount, minBuyAmount, payer, swapCallbackData);
+    }
+
+    // Executes successive swaps along an encoded uniswap path.
+    function _swap(
+        address recipient,
+        bytes memory encodedPath,
+        uint256 sellAmount,
+        uint256 minBuyAmount,
+        address payer,
+        bytes memory swapCallbackData
+    ) private returns (uint256 buyAmount) {
+        if (sellAmount > uint256(type(int256).max)) {
+            Panic.panic(Panic.ARITHMETIC_OVERFLOW);
+        }
+
+        IERC20 outputToken;
+        while (true) {
+            bool isPathMultiHop = _isPathMultiHop(encodedPath);
+            bool zeroForOne;
+            IUniswapV3Pool pool;
+            {
+                (IERC20 token0, uint24 fee, IERC20 token1) = _decodeFirstPoolInfoFromPath(encodedPath);
+                outputToken = token1;
+                if (!(zeroForOne = token0 < token1)) {
+                    (token0, token1) = (token1, token0);
+                }
+                pool = _toPool(token0, fee, token1);
+                _updateSwapCallbackData(swapCallbackData, token0, fee, token1, payer);
+            }
+
+            int256 amount0;
+            int256 amount1;
+            if (payer == address(this)) {
+                (amount0, amount1) = pool.swap(
+                    // Intermediate tokens go to this contract.
+                    isPathMultiHop ? address(this) : recipient,
+                    zeroForOne,
+                    int256(sellAmount),
+                    zeroForOne ? MIN_PRICE_SQRT_RATIO + 1 : MAX_PRICE_SQRT_RATIO - 1,
+                    swapCallbackData
+                );
+            } else {
+                (amount0, amount1) = abi.decode(
+                    _setOperatorAndCall(
+                        address(pool),
+                        abi.encodeCall(
+                            pool.swap,
+                            (
+                                // Intermediate tokens go to this contract.
+                                isPathMultiHop ? address(this) : recipient,
+                                zeroForOne,
+                                int256(sellAmount),
+                                zeroForOne ? MIN_PRICE_SQRT_RATIO + 1 : MAX_PRICE_SQRT_RATIO - 1,
+                                swapCallbackData
+                            )
+                        )
+                    ),
+                    (int256, int256)
+                );
+            }
+
+            {
+                int256 _buyAmount = -(zeroForOne ? amount1 : amount0);
+                if (_buyAmount < 0) {
+                    Panic.panic(Panic.ARITHMETIC_OVERFLOW);
+                }
+                buyAmount = uint256(_buyAmount);
+            }
+            if (!isPathMultiHop) {
+                // Done.
+                break;
+            }
+            // Continue with next hop.
+            payer = address(this); // Subsequent hops are paid for by us.
+            sellAmount = buyAmount;
+            // Skip to next hop along path.
+            encodedPath = _shiftHopFromPathInPlace(encodedPath);
+            assembly ("memory-safe") {
+                mstore(swapCallbackData, SWAP_CALLBACK_PREFIX_DATA_SIZE)
+            }
+        }
+        if (buyAmount < minBuyAmount) {
+            revert TooMuchSlippage(address(outputToken), minBuyAmount, buyAmount);
+        }
+    }
+
+    // Return whether or not an encoded uniswap path contains more than one hop.
+    function _isPathMultiHop(bytes memory encodedPath) private pure returns (bool) {
+        return encodedPath.length > SINGLE_HOP_PATH_SIZE;
+    }
+
+    function _decodeFirstPoolInfoFromPath(bytes memory encodedPath)
+        private
+        pure
+        returns (IERC20 inputToken, uint24 fee, IERC20 outputToken)
+    {
+        if (encodedPath.length < SINGLE_HOP_PATH_SIZE) {
+            Panic.panic(Panic.ARRAY_OUT_OF_BOUNDS);
+        }
+        assembly ("memory-safe") {
+            // Solidity cleans dirty bits automatically
+            inputToken := mload(add(encodedPath, 0x14))
+            fee := mload(add(encodedPath, 0x17))
+            outputToken := mload(add(encodedPath, SINGLE_HOP_PATH_SIZE))
+        }
+    }
+
+    // Skip past the first hop of an encoded uniswap path in-place.
+    function _shiftHopFromPathInPlace(bytes memory encodedPath) private pure returns (bytes memory) {
+        if (encodedPath.length < PATH_SKIP_HOP_SIZE) {
+            Panic.panic(Panic.ARRAY_OUT_OF_BOUNDS);
+        }
+        assembly ("memory-safe") {
+            let length := sub(mload(encodedPath), PATH_SKIP_HOP_SIZE)
+            encodedPath := add(encodedPath, PATH_SKIP_HOP_SIZE)
+            mstore(encodedPath, length)
+        }
+        return encodedPath;
+    }
+
+    function _encodePermit2Data(
+        bytes memory swapCallbackData,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        bytes memory sig,
+        bool isForwarded
+    ) private pure {
+        assembly ("memory-safe") {
+            {
+                let permitted := mload(permit)
+                mstore(add(swapCallbackData, SWAP_CALLBACK_PERMIT2DATA_OFFSET), mload(permitted))
+                mstore(add(swapCallbackData, add(SWAP_CALLBACK_PERMIT2DATA_OFFSET, 0x20)), mload(add(permitted, 0x20)))
+            }
+            mstore(add(swapCallbackData, add(SWAP_CALLBACK_PERMIT2DATA_OFFSET, 0x40)), mload(add(permit, 0x20)))
+            mstore(add(swapCallbackData, add(SWAP_CALLBACK_PERMIT2DATA_OFFSET, 0x60)), mload(add(permit, 0x40)))
+            mstore(add(swapCallbackData, add(SWAP_CALLBACK_PERMIT2DATA_OFFSET, PERMIT_DATA_SIZE)), and(isForwarded, 1))
+            mcopy(
+                add(
+                    swapCallbackData,
+                    add(add(SWAP_CALLBACK_PERMIT2DATA_OFFSET, PERMIT_DATA_SIZE), ISFORWARDED_DATA_SIZE)
+                ),
+                add(sig, 0x20),
+                mload(sig)
+            )
+        }
+    }
+
+    // Update `swapCallbackData` in place with new values.
+    function _updateSwapCallbackData(
+        bytes memory swapCallbackData,
+        IERC20 token0,
+        uint24 fee,
+        IERC20 token1,
+        address payer
+    ) private pure {
+        assembly ("memory-safe") {
+            let length := mload(swapCallbackData)
+            mstore(add(swapCallbackData, 0x3f), payer)
+            mstore(add(swapCallbackData, 0x2b), token1)
+            mstore(add(swapCallbackData, 0x17), fee)
+            mstore(add(swapCallbackData, 0x14), token0)
+            mstore(swapCallbackData, length)
+        }
+    }
+
+    // Compute the pool address given two tokens and a fee.
+    function _toPool(IERC20 inputToken, uint24 fee, IERC20 outputToken) private view returns (IUniswapV3Pool) {
+        // address(keccak256(abi.encodePacked(
+        //     hex"ff",
+        //     UNI_FACTORY_ADDRESS,
+        //     keccak256(abi.encode(inputToken, outputToken, fee)),
+        //     UNI_POOL_INIT_CODE_HASH
+        // )))
+        (IERC20 token0, IERC20 token1) =
+            inputToken < outputToken ? (inputToken, outputToken) : (outputToken, inputToken);
+        bytes32 salt;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(0x00, and(ADDRESS_MASK, token0))
+            mstore(0x20, and(ADDRESS_MASK, token1))
+            mstore(0x40, and(UINT24_MASK, fee))
+            salt := keccak256(0x00, 0x60)
+            mstore(0x40, ptr)
+        }
+        return IUniswapV3Pool(
+            AddressDerivation.deriveDeterministicContract(UNI_FACTORY_ADDRESS, salt, UNI_POOL_INIT_CODE_HASH)
+        );
+    }
+
+    error ZeroSwapAmount();
+
+    /// @dev The UniswapV3 pool swap callback which pays the funds requested
+    ///      by the caller/pool to the pool. Can only be called by a valid
+    ///      UniswapV3 pool.
+    /// @param amount0Delta Token0 amount owed.
+    /// @param amount1Delta Token1 amount owed.
+    /// @param data Arbitrary data forwarded from swap() caller. A packed encoding of: inputToken, outputToken, fee, payer, permit
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        // Decode the data.
+        IERC20 token0;
+        uint24 fee;
+        IERC20 token1;
+        address payer;
+        assembly ("memory-safe") {
+            {
+                let firstWord := calldataload(data.offset)
+                token0 := shr(0x60, firstWord)
+                fee := shr(0x48, firstWord)
+            }
+            token1 := calldataload(add(data.offset, 0xb))
+            payer := calldataload(add(data.offset, 0x1f))
+        }
+        if (msg.sender != address(_toPool(token0, fee, token1))) {
+            revert ConfusedDeputy();
+        }
+
+        bytes calldata permit2Data = data[SWAP_CALLBACK_PREFIX_DATA_SIZE:];
+        // Pay the amount owed to the pool.
+        if (amount0Delta > 0) {
+            _pay(token0, payer, uint256(amount0Delta), permit2Data);
+        } else if (amount1Delta > 0) {
+            _pay(token1, payer, uint256(amount1Delta), permit2Data);
+        } else {
+            revert ZeroSwapAmount();
+        }
+    }
+
+    function _pay(IERC20 token, address payer, uint256 amount, bytes calldata permit2Data) private {
+        if (payer == address(this)) {
+            token.safeTransfer(msg.sender, amount);
+        } else {
+            (ISignatureTransfer.PermitTransferFrom memory permit, bool isForwarded) =
+                abi.decode(permit2Data, (ISignatureTransfer.PermitTransferFrom, bool));
+            bytes calldata sig = permit2Data[PERMIT_DATA_SIZE + ISFORWARDED_DATA_SIZE:];
+            (ISignatureTransfer.SignatureTransferDetails memory transferDetails,,) =
+                _permitToTransferDetails(permit, msg.sender);
+            _transferFrom(permit, transferDetails, payer, sig, isForwarded);
+        }
+    }
+}
+
+
+// File: src/core/UniswapV2.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {IERC20} from "../IERC20.sol";
+import {UnsafeMath} from "../utils/UnsafeMath.sol";
+import {Panic} from "../utils/Panic.sol";
+import {TooMuchSlippage} from "./SettlerErrors.sol";
+
+interface IUniV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112, uint112, uint32);
+    function swap(uint256, uint256, address, bytes calldata) external;
+}
+
+abstract contract UniswapV2 {
+    using UnsafeMath for uint256;
+
+    // bytes4(keccak256("getReserves()"))
+    uint32 private constant UNI_PAIR_RESERVES_SELECTOR = 0x0902f1ac;
+    // bytes4(keccak256("swap(uint256,uint256,address,bytes)"))
+    uint32 private constant UNI_PAIR_SWAP_SELECTOR = 0x022c0d9f;
+    // bytes4(keccak256("transfer(address,uint256)"))
+    uint32 private constant ERC20_TRANSFER_SELECTOR = 0xa9059cbb;
+    // bytes4(keccak256("balanceOf(address)"))
+    uint32 private constant ERC20_BALANCEOF_SELECTOR = 0x70a08231;
+
+    /// @dev Sell a token for another token using UniswapV2.
+    function sellToUniswapV2(
+        address recipient,
+        address sellToken,
+        address pool,
+        uint8 swapInfo,
+        uint256 bips,
+        uint256 minBuyAmount
+    ) internal {
+        // Preventing calls to Permit2 or AH is not explicitly required as neither of these contracts implement the `swap` nor `transfer` selector
+
+        // |7|6|5|4|3|2|1|0| - bit positions in swapInfo (uint8)
+        // |0|0|0|0|0|0|F|Z| - Z: zeroForOne flag, F: sellTokenHasFee flag
+        bool zeroForOne = (swapInfo & 1) == 1; // Extract the least significant bit (bit 0)
+        bool sellTokenHasFee = (swapInfo & 2) >> 1 == 1; // Extract the second least significant bit (bit 1) and shift it right
+
+        uint256 sellAmount;
+        uint256 buyAmount;
+        // If bips is zero we assume there are no funds within this contract, skip the updating sellAmount.
+        // This case occurs if the pool is being chained, in which the funds have been sent directly to the pool
+        if (bips != 0) {
+            // We don't care about phantom overflow here because reserves are
+            // limited to 112 bits. Any token balance that would overflow here would
+            // also break UniV2.
+            // It is *possible* to set `bips` above the basis and therefore
+            // cause an overflow on this multiplication. However, `bips` is
+            // passed as authenticated calldata, so this is a GIGO error that we
+            // do not attempt to fix.
+            unchecked {
+                sellAmount = (IERC20(sellToken).balanceOf(address(this)) * bips).unsafeDiv(10_000);
+            }
+        }
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+
+            // transfer sellAmount (a non zero amount) of sellToken to the pool
+            if sellAmount {
+                mstore(ptr, ERC20_TRANSFER_SELECTOR)
+                mstore(add(ptr, 0x20), pool)
+                mstore(add(ptr, 0x40), sellAmount)
+                // ...||ERC20_TRANSFER_SELECTOR|pool|sellAmount|
+                if iszero(call(gas(), sellToken, 0, add(ptr, 0x1c), 0x44, 0x00, 0x20)) { bubbleRevert(ptr) }
+                if iszero(or(iszero(returndatasize()), and(iszero(lt(returndatasize(), 0x20)), eq(mload(0x00), 1)))) {
+                    revert(0, 0)
+                }
+            }
+
+            // get pool reserves
+            let sellReserve
+            let buyReserve
+            mstore(0x00, UNI_PAIR_RESERVES_SELECTOR)
+            // ||UNI_PAIR_RESERVES_SELECTOR|
+            if iszero(staticcall(gas(), pool, 0x1c, 0x04, 0x00, 0x40)) { bubbleRevert(ptr) }
+            if lt(returndatasize(), 0x40) { revert(0, 0) }
+            {
+                let r := shl(5, zeroForOne)
+                buyReserve := mload(r)
+                sellReserve := mload(xor(0x20, r))
+            }
+
+            // Update the sell amount in the following cases:
+            //   the funds are in the pool already (flagged by sellAmount being 0)
+            //   the sell token has a fee (flagged by sellTokenHasFee)
+            if or(iszero(sellAmount), sellTokenHasFee) {
+                // retrieve the sellToken balance of the pool
+                mstore(0x00, ERC20_BALANCEOF_SELECTOR)
+                mstore(0x20, and(0xffffffffffffffffffffffffffffffffffffffff, pool))
+                // ||ERC20_BALANCEOF_SELECTOR|pool|
+                if iszero(staticcall(gas(), sellToken, 0x1c, 0x24, 0x00, 0x20)) { bubbleRevert(ptr) }
+                if lt(returndatasize(), 0x20) { revert(0, 0) }
+                let bal := mload(0x00)
+
+                // determine real sellAmount by comparing pool's sellToken balance to reserve amount
+                if lt(bal, sellReserve) {
+                    mstore(0x00, 0x4e487b71) // selector for `Panic(uint256)`
+                    mstore(0x20, 0x11) // panic code for arithmetic underflow
+                    revert(0x1c, 0x24)
+                }
+                sellAmount := sub(bal, sellReserve)
+            }
+
+            // compute buyAmount based on sellAmount and reserves
+            let sellAmountWithFee := mul(sellAmount, 997)
+            buyAmount := div(mul(sellAmountWithFee, buyReserve), add(sellAmountWithFee, mul(sellReserve, 1000)))
+            let swapCalldata := add(ptr, 0x1c)
+            // set up swap call selector and empty callback data
+            mstore(ptr, UNI_PAIR_SWAP_SELECTOR)
+            mstore(add(ptr, 0x80), 0x80) // offset to length of data
+            mstore(add(ptr, 0xa0), 0) // length of data
+
+            // set amount0Out and amount1Out
+            {
+                // If `zeroForOne`, offset is 0x24, else 0x04
+                let offset := add(0x04, shl(5, zeroForOne))
+                mstore(add(swapCalldata, offset), buyAmount)
+                mstore(add(swapCalldata, xor(0x20, offset)), 0)
+            }
+
+            mstore(add(swapCalldata, 0x44), and(0xffffffffffffffffffffffffffffffffffffffff, recipient))
+            // ...||UNI_PAIR_SWAP_SELECTOR|amount0Out|amount1Out|recipient|data|
+
+            // perform swap at the pool sending bought tokens to the recipient
+            if iszero(call(gas(), pool, 0, swapCalldata, 0xa4, 0, 0)) { bubbleRevert(swapCalldata) }
+
+            // revert with the return data from the most recent call
+            function bubbleRevert(p) {
+                returndatacopy(p, 0, returndatasize())
+                revert(p, returndatasize())
+            }
+        }
+        if (buyAmount < minBuyAmount) {
+            revert TooMuchSlippage(
+                zeroForOne ? IUniV2Pair(pool).token1() : IUniV2Pair(pool).token0(), minBuyAmount, sellAmount
+            );
+        }
+    }
+}
+
+
+// File: src/core/MakerPSM.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {IERC20, IERC20Meta} from "../IERC20.sol";
+
+import {SafeTransferLib} from "../vendor/SafeTransferLib.sol";
+import {UnsafeMath} from "../utils/UnsafeMath.sol";
+
+interface IPSM {
+    /// @dev Get the fee for selling DAI to USDC in PSM
+    /// @return tout toll out [wad]
+    function tout() external view returns (uint256);
+
+    /// @dev Get the address of the underlying vault powering PSM
+    /// @return address of gemJoin contract
+    function gemJoin() external view returns (address);
+
+    /// @dev Sell USDC for DAI
+    /// @param usr The address of the account trading USDC for DAI.
+    /// @param gemAmt The amount of USDC to sell in USDC base units
+    function sellGem(address usr, uint256 gemAmt) external;
+
+    /// @dev Buy USDC for DAI
+    /// @param usr The address of the account trading DAI for USDC
+    /// @param gemAmt The amount of USDC to buy in USDC base units
+    function buyGem(address usr, uint256 gemAmt) external;
+}
+
+abstract contract MakerPSM {
+    using UnsafeMath for uint256;
+    using SafeTransferLib for IERC20;
+    using SafeTransferLib for IERC20Meta;
+
+    // Maker units https://github.com/makerdao/dss/blob/master/DEVELOPING.md
+    // wad: fixed point decimal with 18 decimals (for basic quantities, e.g. balances)
+    uint256 internal constant WAD = 10 ** 18;
+
+    IERC20 internal immutable DAI;
+
+    constructor(address dai) {
+        DAI = IERC20(dai);
+    }
+
+    function makerPsmSellGem(address recipient, uint256 bips, IPSM psm, IERC20Meta gemToken) internal {
+        // phantom overflow can't happen here because PSM prohibits gemToken with decimals > 18
+        uint256 sellAmount = (gemToken.balanceOf(address(this)) * bips).unsafeDiv(10_000);
+        gemToken.safeApproveIfBelow(psm.gemJoin(), sellAmount);
+        psm.sellGem(recipient, sellAmount);
+    }
+
+    function makerPsmBuyGem(address recipient, uint256 bips, IPSM psm, IERC20Meta gemToken) internal {
+        // phantom overflow can't happen here because DAI has decimals = 18
+        uint256 sellAmount = (DAI.balanceOf(address(this)) * bips).unsafeDiv(10_000);
+        unchecked {
+            uint256 feeDivisor = psm.tout() + WAD; // eg. 1.001 * 10 ** 18 with 0.1% fee [tout is in wad];
+            // overflow can't happen at all because DAI is reasonable and PSM prohibits gemToken with decimals > 18
+            uint256 buyAmount = (sellAmount * 10 ** uint256(gemToken.decimals())).unsafeDiv(feeDivisor);
+
+            DAI.safeApproveIfBelow(address(psm), sellAmount);
+            psm.buyGem(recipient, buyAmount);
+        }
+    }
+}
+
+
+// File: src/vendor/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.25;
+
+import {IERC20} from "../IERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    uint32 private constant _TRANSFER_FROM_FAILED_SELECTOR = 0x7939f424; // bytes4(keccak256("TransferFromFailed()"))
+    uint32 private constant _TRANSFER_FAILED_SELECTOR = 0x90b8ec18; // bytes4(keccak256("TransferFailed()"))
+    uint32 private constant _APPROVE_FAILED_SELECTOR = 0x3e3f8f73; // bytes4(keccak256("ApproveFailed()"))
+
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address payable to, uint256 amount) internal {
+        assembly ("memory-safe") {
+            // Transfer the ETH and store if it succeeded or not.
+            if iszero(call(gas(), to, amount, 0, 0, 0, 0)) {
+                let freeMemoryPointer := mload(0x40)
+                returndatacopy(freeMemoryPointer, 0, returndatasize())
+                revert(freeMemoryPointer, returndatasize())
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 amount) internal {
+        assembly ("memory-safe") {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "from" argument.
+            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+            // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+            if iszero(call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)) {
+                returndatacopy(freeMemoryPointer, 0, returndatasize())
+                revert(freeMemoryPointer, returndatasize())
+            }
+            // We check that the call either returned exactly 1 (can't just be non-zero data), or had no
+            // return data.
+            if iszero(or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize()))) {
+                mstore(0, _TRANSFER_FROM_FAILED_SELECTOR)
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    function safeTransfer(IERC20 token, address to, uint256 amount) internal {
+        assembly ("memory-safe") {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+            // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+            if iszero(call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)) {
+                returndatacopy(freeMemoryPointer, 0, returndatasize())
+                revert(freeMemoryPointer, returndatasize())
+            }
+            // We check that the call either returned exactly 1 (can't just be non-zero data), or had no
+            // return data.
+            if iszero(or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize()))) {
+                mstore(0, _TRANSFER_FAILED_SELECTOR)
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    function safeApprove(IERC20 token, address to, uint256 amount) internal {
+        assembly ("memory-safe") {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+            // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+            if iszero(call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)) {
+                returndatacopy(freeMemoryPointer, 0, returndatasize())
+                revert(freeMemoryPointer, returndatasize())
+            }
+            // We check that the call either returned exactly 1 (can't just be non-zero data), or had no
+            // return data.
+            if iszero(or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize()))) {
+                mstore(0, _APPROVE_FAILED_SELECTOR)
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    function safeApproveIfBelow(IERC20 token, address spender, uint256 amount) internal {
+        uint256 allowance = token.allowance(address(this), spender);
+        if (allowance < amount) {
+            if (allowance != 0) {
+                safeApprove(token, spender, 0);
+            }
+            safeApprove(token, spender, type(uint256).max);
+        }
+    }
+}
+
+
+// File: src/utils/UnsafeMath.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+library UnsafeMath {
+    function unsafeInc(uint256 x) internal pure returns (uint256) {
+        unchecked {
+            return x + 1;
+        }
+    }
+
+    function unsafeInc(int256 x) internal pure returns (int256) {
+        unchecked {
+            return x + 1;
+        }
+    }
+
+    function unsafeNeg(int256 x) internal pure returns (int256) {
+        unchecked {
+            return -x;
+        }
+    }
+
+    function unsafeDiv(uint256 numerator, uint256 denominator) internal pure returns (uint256 quotient) {
+        assembly ("memory-safe") {
+            quotient := div(numerator, denominator)
+        }
+    }
+
+    function unsafeDiv(int256 numerator, int256 denominator) internal pure returns (int256 quotient) {
+        assembly ("memory-safe") {
+            quotient := sdiv(numerator, denominator)
+        }
+    }
+
+    function unsafeMod(uint256 numerator, uint256 denominator) internal pure returns (uint256 remainder) {
+        assembly ("memory-safe") {
+            remainder := mod(numerator, denominator)
+        }
+    }
+
+    function unsafeMod(int256 numerator, int256 denominator) internal pure returns (int256 remainder) {
+        assembly ("memory-safe") {
+            remainder := smod(numerator, denominator)
+        }
+    }
+
+    function unsafeMulMod(uint256 a, uint256 b, uint256 m) internal pure returns (uint256 r) {
+        assembly ("memory-safe") {
+            r := mulmod(a, b, m)
+        }
+    }
+
+    function unsafeAddMod(uint256 a, uint256 b, uint256 m) internal pure returns (uint256 r) {
+        assembly ("memory-safe") {
+            r := addmod(a, b, m)
+        }
+    }
+}
+
+
+// File: src/vendor/FullMath.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {UnsafeMath} from "../utils/UnsafeMath.sol";
+import {Panic} from "../utils/Panic.sol";
+
+/// @title Contains 512-bit math functions
+/// @notice Facilitates multiplication and division that can have overflow of an intermediate value without any loss of precision
+/// @dev Handles "phantom overflow" i.e., allows multiplication and division where an intermediate value overflows 256 bits
+/// @dev Credit to Remco Bloemen under MIT license https://xn--2-umb.com/21/muldiv
+library FullMath {
+    using UnsafeMath for uint256;
+
+    /// @notice 512-bit multiply [prod1 prod0] = a * b
+    /// @param a The multiplicand
+    /// @param b The multiplier
+    /// @param denominator The divisor
+    /// @return prod0 Least significant 256 bits of the product
+    /// @return prod1 Most significant 256 bits of the product
+    /// @return remainder Remainder of full-precision division
+    function _mulDivSetup(uint256 a, uint256 b, uint256 denominator)
+        private
+        pure
+        returns (uint256 prod0, uint256 prod1, uint256 remainder)
+    {
+        // Compute the product mod 2**256 and mod 2**256 - 1 then use the Chinese
+        // Remainder Theorem to reconstruct the 512 bit result. The result is stored
+        // in two 256 variables such that product = prod1 * 2**256 + prod0
+        assembly ("memory-safe") {
+            // Full-precision multiplication
+            {
+                let mm := mulmod(a, b, 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+                prod0 := mul(a, b)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+            remainder := mulmod(a, b, denominator)
+        }
+    }
+
+    /// @notice 512-bit by 256-bit division.
+    /// @param prod0 Least significant 256 bits of the product
+    /// @param prod1 Most significant 256 bits of the product
+    /// @param denominator The divisor
+    /// @param remainder Remainder of full-precision division
+    /// @return The 256-bit result
+    /// @dev Overflow and division by zero aren't checked and are GIGO errors
+    function _mulDivInvert(uint256 prod0, uint256 prod1, uint256 denominator, uint256 remainder)
+        private
+        pure
+        returns (uint256)
+    {
+        uint256 inv;
+        assembly ("memory-safe") {
+            // Make division exact by rounding [prod1 prod0] down to a multiple of
+            // denominator
+            // Subtract 256 bit number from 512 bit number
+            prod1 := sub(prod1, gt(remainder, prod0))
+            prod0 := sub(prod0, remainder)
+
+            // Factor powers of two out of denominator
+            {
+                // Compute largest power of two divisor of denominator.
+                // Always >= 1.
+                let twos := and(sub(0, denominator), denominator)
+
+                // Divide denominator by power of two
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by the factors of two
+                prod0 := div(prod0, twos)
+                // Shift in bits from prod1 into prod0. For this we need to flip `twos`
+                // such that it is 2**256 / twos.
+                // If twos is zero, then it becomes one
+                twos := add(div(sub(0, twos), twos), 1)
+                prod0 := or(prod0, mul(prod1, twos))
+            }
+
+            // Invert denominator mod 2**256
+            // Now that denominator is an odd number, it has an inverse modulo 2**256
+            // such that denominator * inv = 1 mod 2**256.
+            // Compute the inverse by starting with a seed that is correct correct for
+            // four bits. That is, denominator * inv = 1 mod 2**4
+            inv := xor(mul(3, denominator), 2)
+
+            // Now use Newton-Raphson iteration to improve the precision.
+            // Thanks to Hensel's lifting lemma, this also works in modular
+            // arithmetic, doubling the correct bits in each step.
+            inv := mul(inv, sub(2, mul(denominator, inv))) // inverse mod 2**8
+            inv := mul(inv, sub(2, mul(denominator, inv))) // inverse mod 2**16
+            inv := mul(inv, sub(2, mul(denominator, inv))) // inverse mod 2**32
+            inv := mul(inv, sub(2, mul(denominator, inv))) // inverse mod 2**64
+            inv := mul(inv, sub(2, mul(denominator, inv))) // inverse mod 2**128
+            inv := mul(inv, sub(2, mul(denominator, inv))) // inverse mod 2**256
+        }
+
+        // Because the division is now exact we can divide by multiplying with the
+        // modular inverse of denominator. This will give us the correct result
+        // modulo 2**256. Since the precoditions guarantee that the outcome is less
+        // than 2**256, this is the final result.  We don't need to compute the high
+        // bits of the result and prod1 is no longer required.
+        unchecked {
+            return prod0 * inv;
+        }
+    }
+
+    /// @notice Calculates a×b÷denominator with full precision then rounds towards 0. Throws if result overflows a uint256 or denominator == 0
+    /// @param a The multiplicand
+    /// @param b The multiplier
+    /// @param denominator The divisor
+    /// @return The 256-bit result
+    function mulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256) {
+        (uint256 prod0, uint256 prod1, uint256 remainder) = _mulDivSetup(a, b, denominator);
+        // Make sure the result is less than 2**256.
+        // Also prevents denominator == 0
+        if (denominator <= prod1) {
+            Panic.panic(denominator == 0 ? Panic.DIVISION_BY_ZERO : Panic.ARITHMETIC_OVERFLOW);
+        }
+
+        // Handle non-overflow cases, 256 by 256 division
+        if (prod1 == 0) {
+            return prod0.unsafeDiv(denominator);
+        }
+        return _mulDivInvert(prod0, prod1, denominator, remainder);
+    }
+
+    /// @notice Calculates a×b÷denominator with full precision then rounds towards 0. Overflowing a uint256 or denominator == 0 are GIGO errors
+    /// @param a The multiplicand
+    /// @param b The multiplier
+    /// @param denominator The divisor
+    /// @return The 256-bit result
+    function unsafeMulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256) {
+        (uint256 prod0, uint256 prod1, uint256 remainder) = _mulDivSetup(a, b, denominator);
+        // Overflow and zero-division checks are skipped
+        // Handle non-overflow cases, 256 by 256 division
+        if (prod1 == 0) {
+            return prod0.unsafeDiv(denominator);
+        }
+        return _mulDivInvert(prod0, prod1, denominator, remainder);
+    }
+}
+
+
+// File: src/utils/FreeMemory.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+abstract contract FreeMemory {
+    modifier DANGEROUS_freeMemory() {
+        uint256 freeMemPtr;
+        assembly ("memory-safe") {
+            freeMemPtr := mload(0x40)
+        }
+        _;
+        assembly ("memory-safe") {
+            mstore(0x40, freeMemPtr)
+        }
+    }
+}
+
+
+// File: src/ISettlerActions.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+
+interface ISettlerActions {
+    /// @dev Transfer funds from msg.sender Permit2.
+    function PERMIT2_TRANSFER_FROM(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        bytes memory sig
+    ) external;
+
+    /// @dev Transfer funds from metatransaction requestor into the Settler contract using Permit2. Only for use in `Settler.executeMetaTxn` where the signature is provided as calldata
+    function METATXN_PERMIT2_TRANSFER_FROM(address recipient, ISignatureTransfer.PermitTransferFrom memory) external;
+
+    /// @dev Settle an OtcOrder between maker and taker transfering funds directly between the parties
+    // Post-req: Payout if recipient != taker
+    function SETTLER_OTC_PERMIT2(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory makerPermit,
+        address maker,
+        bytes memory makerSig,
+        ISignatureTransfer.PermitTransferFrom memory takerPermit,
+        bytes memory takerSig
+    ) external;
+
+    /// @dev Settle an OtcOrder between maker and taker transfering funds directly between the parties for the entire amount
+    function METATXN_SETTLER_OTC_PERMIT2(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory makerPermit,
+        address maker,
+        bytes memory makerSig,
+        ISignatureTransfer.PermitTransferFrom memory takerPermit
+    ) external;
+
+    /// @dev Settle an OtcOrder between Maker and Settler. Transfering funds from the Settler contract to maker.
+    /// Retaining funds in the settler contract.
+    // Pre-req: Funded
+    // Post-req: Payout
+    function SETTLER_OTC_SELF_FUNDED(
+        address recipient,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        address maker,
+        bytes memory makerSig,
+        address takerToken,
+        uint256 maxTakerAmount
+    ) external;
+
+    /// @dev Trades against UniswapV3 using the contracts balance for funding
+    // Pre-req: Funded
+    // Post-req: Payout
+    function UNISWAPV3_SWAP_EXACT_IN(address recipient, uint256 bips, uint256 amountOutMin, bytes memory path)
+        external;
+
+    /// @dev Trades against UniswapV3 using user funds via Permit2 for funding
+    function UNISWAPV3_PERMIT2_SWAP_EXACT_IN(
+        address recipient,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bytes memory path,
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        bytes memory sig
+    ) external;
+
+    function MAKER_PSM_SELL_GEM(address recipient, uint256 bips, address psm, address gemToken) external;
+    function MAKER_PSM_BUY_GEM(address recipient, uint256 bips, address psm, address gemToken) external;
+
+    /// @dev Trades against UniswapV3 using user funds via Permit2 for funding. Metatransaction variant. Signature is over all actions.
+    function METATXN_UNISWAPV3_PERMIT2_SWAP_EXACT_IN(
+        address recipient,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bytes memory path,
+        ISignatureTransfer.PermitTransferFrom memory permit
+    ) external;
+
+    /// @dev Trades against UniswapV2 using the contracts balance for funding
+    function UNISWAPV2_SWAP(
+        address recipient,
+        address sellToken,
+        address pool,
+        uint8 swapInfo,
+        uint256 bips,
+        uint256 amountOutMin
+    ) external;
+
+    function POSITIVE_SLIPPAGE(address recipient, address token, uint256 expectedAmount) external;
+
+    /// @dev Trades against a basic AMM which follows the approval, transferFrom(msg.sender) interaction
+    // Pre-req: Funded
+    // Post-req: Payout
+    function BASIC_SELL(address pool, address sellToken, uint256 bips, uint256 offset, bytes calldata data) external;
+}
+
+
+// File: src/core/SettlerErrors.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/// @notice Thrown when an offset is not the expected value
+error InvalidOffset();
+
+/// @notice Thrown when a validating a target contract to avoid certain types of targets
+error ConfusedDeputy();
+
+/// @notice Thrown when a target contract is invalid given the context
+error InvalidTarget();
+
+/// @notice Thrown when validating the caller against the expected caller
+error InvalidSender();
+
+/// @notice Thrown in cases when using a Trusted Forwarder / AllowanceHolder is not allowed
+error ForwarderNotAllowed();
+
+/// @notice Thrown when a signature length is not the expected length
+error InvalidSignatureLen();
+
+/// @notice Thrown when a slippage limit is exceeded
+error TooMuchSlippage(address token, uint256 expected, uint256 actual);
+
+
+// File: lib/permit2/src/interfaces/IEIP712.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IEIP712 {
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: src/allowanceholder/AllowanceHolderContext.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {Context} from "../Context.sol";
+import {IAllowanceHolder} from "./IAllowanceHolder.sol";
+
+abstract contract AllowanceHolderContext is Context {
+    IAllowanceHolder internal constant _ALLOWANCE_HOLDER = IAllowanceHolder(0x0000000000001fF3684f28c67538d4D072C22734);
+
+    function _isForwarded() internal view virtual override returns (bool) {
+        return super._isForwarded() || super._msgSender() == address(_ALLOWANCE_HOLDER);
+    }
+
+    function _msgSender() internal view virtual override returns (address sender) {
+        sender = super._msgSender();
+        if (sender == address(_ALLOWANCE_HOLDER)) {
+            // ERC-2771 like usage where the _trusted_ `AllowanceHolder` has appended the appropriate
+            // msg.sender to the msg data
+            assembly ("memory-safe") {
+                sender := shr(0x60, calldataload(sub(calldatasize(), 0x14)))
+            }
+        }
+    }
+
+    // this is here to avoid foot-guns and make it very explicit that we intend
+    // to pass the confused deputy check in AllowanceHolder
+    function balanceOf(address) external pure {
+        assembly ("memory-safe") {
+            mstore8(0x00, 0x00)
+            revert(0x00, 0x01)
+        }
+    }
+}
+
+
+// File: src/SettlerAbstract.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {Permit2PaymentAbstract} from "./core/Permit2PaymentAbstract.sol";
+
+abstract contract SettlerAbstract is Permit2PaymentAbstract {
+    // Permit2 Witness for meta transactions
+    string internal constant ACTIONS_AND_SLIPPAGE_TYPE =
+        "ActionsAndSlippage(address buyToken,address recipient,uint256 minAmountOut,bytes[] actions)";
+    bytes32 internal constant ACTIONS_AND_SLIPPAGE_TYPEHASH =
+        0x7d6b6ac05bf0d3f905c044bcb7baf6b20670f84c2275870747ac3b8fa8c43e12;
+
+    constructor() {
+        assert(ACTIONS_AND_SLIPPAGE_TYPEHASH == keccak256(bytes(ACTIONS_AND_SLIPPAGE_TYPE)));
+    }
+}
+
+
+// File: src/utils/Revert.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+library Revert {
+    function _revert(bytes memory reason) internal pure {
+        assembly ("memory-safe") {
+            revert(add(reason, 0x20), mload(reason))
+        }
+    }
+
+    function maybeRevert(bool success, bytes memory reason) internal pure {
+        if (!success) {
+            _revert(reason);
+        }
+    }
+}
+
+
+// File: src/utils/Panic.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+library Panic {
+    function panic(uint256 code) internal pure {
+        assembly ("memory-safe") {
+            mstore(0x00, 0x4e487b71) // selector for `Panic(uint256)`
+            mstore(0x20, code)
+            revert(0x1c, 0x24)
+        }
+    }
+
+    // https://docs.soliditylang.org/en/latest/control-structures.html#panic-via-assert-and-error-via-require
+    uint8 internal constant GENERIC = 0x00;
+    uint8 internal constant ASSERT_FAIL = 0x01;
+    uint8 internal constant ARITHMETIC_OVERFLOW = 0x11;
+    uint8 internal constant DIVISION_BY_ZERO = 0x12;
+    uint8 internal constant ENUM_CAST = 0x21;
+    uint8 internal constant CORRUPT_STORAGE_ARRAY = 0x22;
+    uint8 internal constant POP_EMPTY_ARRAY = 0x31;
+    uint8 internal constant ARRAY_OUT_OF_BOUNDS = 0x32;
+    uint8 internal constant OUT_OF_MEMORY = 0x41;
+    uint8 internal constant ZERO_FUNCTION_POINTER = 0x51;
+}
+
+
+// File: src/utils/AddressDerivation.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {Panic} from "./Panic.sol";
+import {UnsafeMath} from "./UnsafeMath.sol";
+
+library AddressDerivation {
+    using UnsafeMath for uint256;
+
+    uint256 internal constant _SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
+    uint256 internal constant _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    uint256 internal constant SECP256K1_GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798;
+    uint256 internal constant SECP256K1_GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8;
+
+    error InvalidCurve(uint256 x, uint256 y);
+
+    // keccak256(abi.encodePacked(ECMUL([x, y], k)))[12:]
+    function deriveEOA(uint256 x, uint256 y, uint256 k) internal pure returns (address) {
+        if (k == 0) {
+            Panic.panic(Panic.DIVISION_BY_ZERO);
+        }
+        if (k >= _SECP256K1_N || x >= _SECP256K1_P || y >= _SECP256K1_P) {
+            Panic.panic(Panic.ARITHMETIC_OVERFLOW);
+        }
+
+        // +/-7 are neither square nor cube mod p, so we only have to check one
+        // coordinate against 0. if it is 0, then the other is too (the point at
+        // infinity) or the point is invalid
+        if (
+            x == 0
+                || y.unsafeMulMod(y, _SECP256K1_P)
+                    != x.unsafeMulMod(x, _SECP256K1_P).unsafeMulMod(x, _SECP256K1_P).unsafeAddMod(7, _SECP256K1_P)
+        ) {
+            revert InvalidCurve(x, y);
+        }
+
+        unchecked {
+            // https://ethresear.ch/t/you-can-kinda-abuse-ecrecover-to-do-ecmul-in-secp256k1-today/2384
+            return ecrecover(
+                bytes32(0), uint8(27 + (y & 1)), bytes32(x), bytes32(UnsafeMath.unsafeMulMod(x, k, _SECP256K1_N))
+            );
+        }
+    }
+
+    // keccak256(RLP([deployer, nonce]))[12:]
+    function deriveContract(address deployer, uint64 nonce) internal pure returns (address result) {
+        if (nonce == 0) {
+            assembly ("memory-safe") {
+                mstore(
+                    0x00,
+                    or(
+                        0xd694000000000000000000000000000000000000000080,
+                        shl(8, and(0xffffffffffffffffffffffffffffffffffffffff, deployer))
+                    )
+                )
+                result := keccak256(0x09, 0x17)
+            }
+        } else if (nonce < 0x80) {
+            assembly ("memory-safe") {
+                // we don't care about dirty bits in `deployer`; they'll be overwritten later
+                mstore(0x14, deployer)
+                mstore(0x00, 0xd694)
+                mstore8(0x34, nonce)
+                result := keccak256(0x1e, 0x17)
+            }
+        } else {
+            // compute ceil(log_256(nonce)) + 1
+            uint256 nonceLength = 8;
+            unchecked {
+                if ((uint256(nonce) >> 32) != 0) {
+                    nonceLength += 32;
+                    if (nonce == type(uint64).max) {
+                        Panic.panic(Panic.ARITHMETIC_OVERFLOW);
+                    }
+                }
+                if ((uint256(nonce) >> 8) >= (1 << nonceLength)) {
+                    nonceLength += 16;
+                }
+                if (uint256(nonce) >= (1 << nonceLength)) {
+                    nonceLength += 8;
+                }
+                // ceil
+                if ((uint256(nonce) << 8) >= (1 << nonceLength)) {
+                    nonceLength += 8;
+                }
+                // bytes, not bits
+                nonceLength >>= 3;
+            }
+            assembly ("memory-safe") {
+                // we don't care about dirty bits in `deployer` or `nonce`. they'll be overwritten later
+                mstore(nonceLength, nonce)
+                mstore8(0x20, add(0x7f, nonceLength))
+                mstore(0x00, deployer)
+                mstore8(0x0a, add(0xd5, nonceLength))
+                mstore8(0x0b, 0x94)
+                result := keccak256(0x0a, add(0x16, nonceLength))
+            }
+        }
+    }
+
+    // keccak256(abi.encodePacked(bytes1(0xff), deployer, salt, initHash))[12:]
+    function deriveDeterministicContract(address deployer, bytes32 salt, bytes32 initHash)
+        internal
+        pure
+        returns (address result)
+    {
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            // we don't care about dirty bits in `deployer`; they'll be overwritten later
+            mstore(ptr, deployer)
+            mstore8(add(ptr, 0x0b), 0xff)
+            mstore(add(ptr, 0x20), salt)
+            mstore(add(ptr, 0x40), initHash)
+            result := keccak256(add(ptr, 0x0b), 0x55)
+        }
+    }
+}
+
+
+// File: src/Context.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+abstract contract AbstractContext {
+    function _msgSender() internal view virtual returns (address);
+
+    function _msgData() internal view virtual returns (bytes calldata);
+
+    function _isForwarded() internal view virtual returns (bool);
+}
+
+abstract contract Context is AbstractContext {
+    function _msgSender() internal view virtual override returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual override returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _isForwarded() internal view virtual override returns (bool) {
+        return false;
+    }
+}
+
+
+// File: src/allowanceholder/IAllowanceHolder.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+interface IAllowanceHolder {
+    /// @notice Executes against `target` with the `data` payload. Prior to execution, token permits
+    ///         are temporarily stored for the duration of the transaction. These permits can be
+    ///         consumed by the `operator` during the execution
+    /// @notice `operator` consumes the funds during its operations by calling back into
+    ///         `AllowanceHolder` with `transferFrom`, consuming a token permit.
+    /// @dev Neither `exec` nor `transferFrom` check that `token` contains code.
+    /// @dev msg.sender is forwarded to target appended to the msg data (similar to ERC-2771)
+    /// @param operator An address which is allowed to consume the token permits
+    /// @param token The ERC20 token the caller has authorised to be consumed
+    /// @param amount The quantity of `token` the caller has authorised to be consumed
+    /// @param target A contract to execute operations with `data`
+    /// @param data The data to forward to `target`
+    /// @return result The returndata from calling `target` with `data`
+    /// @notice If calling `target` with `data` reverts, the revert is propagated
+    function exec(address operator, address token, uint256 amount, address payable target, bytes calldata data)
+        external
+        payable
+        returns (bytes memory result);
+
+    /// @notice The counterpart to `exec` which allows for the consumption of token permits later
+    ///         during execution
+    /// @dev *DOES NOT* check that `token` contains code. This function vacuously succeeds if
+    ///      `token` is empty.
+    /// @dev can only be called by the `operator` previously registered in `exec`
+    /// @param token The ERC20 token to transfer
+    /// @param owner The owner of tokens to transfer
+    /// @param recipient The destination/beneficiary of the ERC20 `transferFrom`
+    /// @param amount The quantity of `token` to transfer`
+    /// @return true
+    function transferFrom(address token, address owner, address recipient, uint256 amount) external returns (bool);
+}
+
+
+// File: src/core/Permit2PaymentAbstract.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {AbstractContext} from "../Context.sol";
+
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+
+abstract contract Permit2PaymentAbstract is AbstractContext {
+    string internal constant TOKEN_PERMISSIONS_TYPE = "TokenPermissions(address token,uint256 amount)";
+
+    function isRestrictedTarget(address) internal view virtual returns (bool);
+
+    function _permitToTransferDetails(ISignatureTransfer.PermitTransferFrom memory permit, address recipient)
+        internal
+        pure
+        virtual
+        returns (ISignatureTransfer.SignatureTransferDetails memory transferDetails, address token, uint256 amount);
+
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes32 witness,
+        string memory witnessTypeString,
+        bytes memory sig,
+        bool isForwarded
+    ) internal virtual;
+
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes32 witness,
+        string memory witnessTypeString,
+        bytes memory sig
+    ) internal virtual;
+
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes memory sig,
+        bool isForwarded
+    ) internal virtual;
+
+    function _transferFrom(
+        ISignatureTransfer.PermitTransferFrom memory permit,
+        ISignatureTransfer.SignatureTransferDetails memory transferDetails,
+        address from,
+        bytes memory sig
+    ) internal virtual;
+
+    function _setOperatorAndCall(address payable target, uint256 value, bytes memory data)
+        internal
+        virtual
+        returns (bytes memory);
+
+    function _setOperatorAndCall(address target, bytes memory data) internal virtual returns (bytes memory);
+
+    modifier metaTx(address msgSender, bytes32 witness) virtual;
+}
+

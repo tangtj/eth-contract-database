@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+contract TokenToBlackholeRecorder {
+    address public constant BLACKHOLE_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+    IERC20 public token;
+    uint256 public totalSent;
+
+    event TokenSentToBlackhole(address indexed sender, uint256 indexed amount, string solanaAddress);
+
+    constructor(address _tokenAddress) {
+        token = IERC20(_tokenAddress);
+    }
+
+    function sendToBlackhole(uint256 amount, string calldata solanaAddress) external {
+        require(token.transferFrom(msg.sender, BLACKHOLE_ADDRESS, amount), "Transfer failed");
+        totalSent += amount;
+        emit TokenSentToBlackhole(msg.sender, amount, solanaAddress);
+    }
+}
