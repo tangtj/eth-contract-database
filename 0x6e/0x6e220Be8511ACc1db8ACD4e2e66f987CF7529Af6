@@ -1,0 +1,1166 @@
+
+// File: src/VeBeacon.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.4;
+
+import "solmate/utils/SafeTransferLib.sol";
+
+import "universal-bridge-lib/UniversalBridgeLib.sol";
+
+import "./VeRecipient.sol";
+import "./base/Structs.sol";
+import "./interfaces/IVotingEscrow.sol";
+
+/// @title VeBeacon
+/// @author zefram.eth
+/// @notice Broadcasts veToken balances to other chains
+contract VeBeacon {
+    /// -----------------------------------------------------------------------
+    /// Errors
+    /// -----------------------------------------------------------------------
+
+    error VeBeacon__UserNotInitialized();
+
+    /// -----------------------------------------------------------------------
+    /// Events
+    /// -----------------------------------------------------------------------
+
+    event BroadcastVeBalance(address indexed user, uint256 indexed chainId);
+
+    /// -----------------------------------------------------------------------
+    /// Constants
+    /// -----------------------------------------------------------------------
+
+    uint256 internal constant SLOPE_CHANGES_LENGTH = 8;
+    uint256 internal constant DATA_LENGTH = 4 + 8 * 32 + 32 + SLOPE_CHANGES_LENGTH * 64; // 4b selector + 8 * 32b args + 32b array length + SLOPE_CHANGES_LENGTH * 64b array content
+
+    /// -----------------------------------------------------------------------
+    /// Immutable params
+    /// -----------------------------------------------------------------------
+
+    IVotingEscrow public immutable votingEscrow;
+    address public immutable recipientAddress;
+
+    /// -----------------------------------------------------------------------
+    /// Constructor
+    /// -----------------------------------------------------------------------
+
+    constructor(IVotingEscrow votingEscrow_, address recipientAddress_) {
+        votingEscrow = votingEscrow_;
+        recipientAddress = recipientAddress_;
+    }
+
+    /// -----------------------------------------------------------------------
+    /// External functions
+    /// -----------------------------------------------------------------------
+
+    /// @notice Broadcasts a user's vetoken balance to another chain. Should use getRequiredMessageValue()
+    /// to compute the msg.value required when calling this function.
+    /// @param user the user address
+    /// @param chainId the target chain's ID
+    /// @param gasLimit the gas limit of the call to the recipient
+    /// @param maxFeePerGas the max gas price used, only relevant for some chains (e.g. Arbitrum)
+    function broadcastVeBalance(address user, uint256 chainId, uint256 gasLimit, uint256 maxFeePerGas)
+        external
+        payable
+    {
+        _broadcastVeBalance(user, chainId, gasLimit, maxFeePerGas);
+        _refundEthBalanceIfWorthIt();
+    }
+
+    /// @notice Broadcasts a user's vetoken balance to a list of other chains. Should use getRequiredMessageValue()
+    /// to compute the msg.value required when calling this function (currently only applicable to Arbitrum).
+    /// @param user the user address
+    /// @param chainIdList the chain ID of the target chains
+    /// @param gasLimit the gas limit of each call to the recipient
+    /// @param maxFeePerGas the max gas price used, only relevant for some chains (e.g. Arbitrum)
+    function broadcastVeBalanceMultiple(
+        address user,
+        uint256[] calldata chainIdList,
+        uint256 gasLimit,
+        uint256 maxFeePerGas
+    ) external payable {
+        uint256 chainIdListLength = chainIdList.length;
+        for (uint256 i; i < chainIdListLength;) {
+            _broadcastVeBalance(user, chainIdList[i], gasLimit, maxFeePerGas);
+
+            unchecked {
+                ++i;
+            }
+        }
+        _refundEthBalanceIfWorthIt();
+    }
+
+    /// @notice Broadcasts multiple users' vetoken balances to a list of other chains. Should use getRequiredMessageValue()
+    /// to compute the msg.value required when calling this function (currently only applicable to Arbitrum).
+    /// @param userList the user addresses
+    /// @param chainIdList the chain ID of the target chains
+    /// @param gasLimit the gas limit of each call to the recipient
+    /// @param maxFeePerGas the max gas price used, only relevant for some chains (e.g. Arbitrum)
+    function broadcastVeBalanceMultiple(
+        address[] calldata userList,
+        uint256[] calldata chainIdList,
+        uint256 gasLimit,
+        uint256 maxFeePerGas
+    ) external payable {
+        uint256 userListLength = userList.length;
+        uint256 chainIdListLength = chainIdList.length;
+        for (uint256 i; i < userListLength;) {
+            for (uint256 j; j < chainIdListLength;) {
+                _broadcastVeBalance(userList[i], chainIdList[j], gasLimit, maxFeePerGas);
+
+                unchecked {
+                    ++j;
+                }
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+        _refundEthBalanceIfWorthIt();
+    }
+
+    /// @notice Computes the msg.value needed when calling broadcastVeBalance(). Only relevant for Arbitrum.
+    /// @param chainId the target chain's ID
+    /// @param gasLimit the gas limit of the call to the recipient
+    /// @param maxFeePerGas the max gas price used, only relevant for some chains (e.g. Arbitrum)
+    /// @return the msg.value required
+    function getRequiredMessageValue(uint256 chainId, uint256 gasLimit, uint256 maxFeePerGas)
+        external
+        view
+        returns (uint256)
+    {
+        return UniversalBridgeLib.getRequiredMessageValue(chainId, DATA_LENGTH, gasLimit, maxFeePerGas);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Internal functions
+    /// -----------------------------------------------------------------------
+
+    function _broadcastVeBalance(address user, uint256 chainId, uint256 gasLimit, uint256 maxFeePerGas)
+        internal
+        virtual
+    {
+        bytes memory data;
+        {
+            // get user voting escrow data
+            uint256 epoch = votingEscrow.user_point_epoch(user);
+            if (epoch == 0) revert VeBeacon__UserNotInitialized();
+            (int128 userBias, int128 userSlope, uint256 userTs,) = votingEscrow.user_point_history(user, epoch);
+
+            // get global data
+            epoch = votingEscrow.epoch();
+            (int128 globalBias, int128 globalSlope, uint256 globalTs,) = votingEscrow.point_history(epoch);
+
+            // fetch slope changes in the range [currentEpochStartTimestamp + 1 weeks, currentEpochStartTimestamp + (SLOPE_CHANGES_LENGTH + 1) * 1 weeks]
+            uint256 currentEpochStartTimestamp = (block.timestamp / (1 weeks)) * (1 weeks);
+            SlopeChange[] memory slopeChanges = new SlopeChange[](SLOPE_CHANGES_LENGTH);
+            for (uint256 i; i < SLOPE_CHANGES_LENGTH;) {
+                currentEpochStartTimestamp += 1 weeks;
+                slopeChanges[i] = SlopeChange({
+                    ts: currentEpochStartTimestamp,
+                    change: votingEscrow.slope_changes(currentEpochStartTimestamp)
+                });
+                unchecked {
+                    ++i;
+                }
+            }
+
+            data = abi.encodeWithSelector(
+                VeRecipient.updateVeBalance.selector,
+                user,
+                userBias,
+                userSlope,
+                userTs,
+                globalBias,
+                globalSlope,
+                globalTs,
+                slopeChanges
+            );
+        }
+
+        // send data to recipient on target chain using UniversalBridgeLib
+        uint256 requiredValue = UniversalBridgeLib.getRequiredMessageValue(chainId, DATA_LENGTH, gasLimit, maxFeePerGas);
+        UniversalBridgeLib.sendMessage(chainId, recipientAddress, data, gasLimit, requiredValue, maxFeePerGas);
+
+        emit BroadcastVeBalance(user, chainId);
+    }
+
+    function _refundEthBalanceIfWorthIt() internal {
+        if (address(this).balance == 0) return; // early return if beacon has no balance
+        if (address(this).balance < block.basefee * 21000) return; // early return if refunding ETH costs more than the refunded amount
+        SafeTransferLib.safeTransferETH(msg.sender, address(this).balance);
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), from) // Append the "from" argument.
+            mstore(add(freeMemoryPointer, 36), to) // Append the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), to) // Append the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), to) // Append the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: lib/universal-bridge-lib/src/UniversalBridgeLib.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.4;
+
+import "./bridges/ArbitrumBridge.sol";
+import "./bridges/OptimismBridge.sol";
+import "./bridges/PolygonBridge.sol";
+import "./bridges/ArbitraryMessageBridge.sol";
+
+/// @title Unified library for sending messages from Ethereum to other chains and rollups
+/// @author zefram.eth
+/// @notice Enables sending messages from Ethereum to other chains via a single interface.
+library UniversalBridgeLib {
+    /// -----------------------------------------------------------------------
+    /// Constants
+    /// -----------------------------------------------------------------------
+
+    uint256 internal constant DEFAULT_MAX_FEE_PER_GAS = 0.1 gwei;
+
+    uint256 internal constant CHAINID_ARBITRUM = 42161;
+    ArbitrumBridge internal constant BRIDGE_ARBITRUM = ArbitrumBridge(0x4Dbd4fc535Ac27206064B68FfCf827b0A60BAB3f);
+
+    uint256 internal constant CHAINID_OPTIMISM = 10;
+    OptimismBridge internal constant BRIDGE_OPTIMISM = OptimismBridge(0x25ace71c97B33Cc4729CF772ae268934F7ab5fA1);
+
+    uint256 internal constant CHAINID_POLYGON = 137;
+    PolygonBridge internal constant BRIDGE_POLYGON = PolygonBridge(0xfe5e5D361b2ad62c541bAb87C45a0B9B018389a2);
+
+    uint256 internal constant CHAINID_BSC = 56;
+    ArbitraryMessageBridge internal constant BRIDGE_BSC =
+        ArbitraryMessageBridge(0x07955be2967B655Cf52751fCE7ccC8c61EA594e2);
+
+    uint256 internal constant CHAINID_GNOSIS = 100;
+    ArbitraryMessageBridge internal constant BRIDGE_GNOSIS =
+        ArbitraryMessageBridge(0x4C36d2919e407f0Cc2Ee3c993ccF8ac26d9CE64e);
+
+    /// -----------------------------------------------------------------------
+    /// Errors
+    /// -----------------------------------------------------------------------
+
+    error UniversalBridgeLib__GasLimitTooLarge();
+    error UniversalBridgeLib__ChainIdNotSupported();
+    error UniversalBridgeLib__MsgValueNotSupported();
+
+    /// -----------------------------------------------------------------------
+    /// Main functions
+    /// -----------------------------------------------------------------------
+
+    /// @notice Sends message to recipient on target chain with the given calldata.
+    /// @dev For calls to Arbitrum, any extra msg.value above what getRequiredMessageValue() returns will
+    /// be used as the msg.value of the L2 call to the recipient.
+    /// @param chainId the target chain's ID
+    /// @param recipient the message recipient on the target chain
+    /// @param data the calldata the recipient will be called with
+    /// @param gasLimit the gas limit of the call to the recipient
+    /// @param value the amount of ETH to send along with the message (only supported by Arbitrum)
+    function sendMessage(uint256 chainId, address recipient, bytes memory data, uint256 gasLimit, uint256 value)
+        internal
+    {
+        sendMessage(chainId, recipient, data, gasLimit, value, DEFAULT_MAX_FEE_PER_GAS);
+    }
+
+    /// @notice Sends message to recipient on target chain with the given calldata.
+    /// @dev For calls to Arbitrum, any extra msg.value above what getRequiredMessageValue() returns will
+    /// be used as the msg.value of the L2 call to the recipient.
+    /// @param chainId the target chain's ID
+    /// @param recipient the message recipient on the target chain
+    /// @param data the calldata the recipient will be called with
+    /// @param gasLimit the gas limit of the call to the recipient
+    /// @param value the amount of ETH to send along with the message (only supported by Arbitrum)
+    /// @param maxFeePerGas the max gas price used, only relevant for some chains (e.g. Arbitrum)
+    function sendMessage(
+        uint256 chainId,
+        address recipient,
+        bytes memory data,
+        uint256 gasLimit,
+        uint256 value,
+        uint256 maxFeePerGas
+    ) internal {
+        if (chainId == CHAINID_ARBITRUM) _sendMessageArbitrum(recipient, data, gasLimit, value, maxFeePerGas);
+        else if (chainId == CHAINID_OPTIMISM) _sendMessageOptimism(recipient, data, gasLimit, value);
+        else if (chainId == CHAINID_POLYGON) _sendMessagePolygon(recipient, data, value);
+        else if (chainId == CHAINID_BSC) _sendMessageAMB(BRIDGE_BSC, recipient, data, gasLimit, value);
+        else if (chainId == CHAINID_GNOSIS) _sendMessageAMB(BRIDGE_GNOSIS, recipient, data, gasLimit, value);
+        else revert UniversalBridgeLib__ChainIdNotSupported();
+    }
+
+    /// @notice Computes the minimum msg.value needed when calling sendMessage()
+    /// @param chainId the target chain's ID
+    /// @param dataLength the length of the calldata the recipient will be called with, in bytes
+    /// @param gasLimit the gas limit of the call to the recipient
+    /// @return the minimum msg.value required
+    function getRequiredMessageValue(uint256 chainId, uint256 dataLength, uint256 gasLimit)
+        internal
+        view
+        returns (uint256)
+    {
+        return getRequiredMessageValue(chainId, dataLength, gasLimit, DEFAULT_MAX_FEE_PER_GAS);
+    }
+
+    /// @notice Computes the minimum msg.value needed when calling sendMessage()
+    /// @param chainId the target chain's ID
+    /// @param dataLength the length of the calldata the recipient will be called with, in bytes
+    /// @param gasLimit the gas limit of the call to the recipient
+    /// @param maxFeePerGas the max gas price used, only relevant for some chains (e.g. Arbitrum)
+    /// @return the minimum msg.value required
+    function getRequiredMessageValue(uint256 chainId, uint256 dataLength, uint256 gasLimit, uint256 maxFeePerGas)
+        internal
+        view
+        returns (uint256)
+    {
+        if (chainId != CHAINID_ARBITRUM) {
+            return 0;
+        } else {
+            uint256 submissionCost = BRIDGE_ARBITRUM.calculateRetryableSubmissionFee(dataLength, block.basefee);
+            return gasLimit * maxFeePerGas + submissionCost;
+        }
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Internal helpers for sending message to different chains
+    /// -----------------------------------------------------------------------
+
+    function _sendMessageArbitrum(
+        address recipient,
+        bytes memory data,
+        uint256 gasLimit,
+        uint256 value,
+        uint256 maxFeePerGas
+    ) internal {
+        uint256 submissionCost = BRIDGE_ARBITRUM.calculateRetryableSubmissionFee(data.length, block.basefee);
+        uint256 l2CallValue = value - submissionCost - gasLimit * maxFeePerGas;
+        BRIDGE_ARBITRUM.createRetryableTicket{value: value}(
+            recipient, l2CallValue, submissionCost, msg.sender, msg.sender, gasLimit, maxFeePerGas, data
+        );
+    }
+
+    function _sendMessageOptimism(address recipient, bytes memory data, uint256 gasLimit, uint256 value) internal {
+        if (value != 0) revert UniversalBridgeLib__MsgValueNotSupported();
+        if (gasLimit > type(uint32).max) revert UniversalBridgeLib__GasLimitTooLarge();
+        BRIDGE_OPTIMISM.sendMessage(recipient, data, uint32(gasLimit));
+    }
+
+    function _sendMessagePolygon(address recipient, bytes memory data, uint256 value) internal {
+        if (value != 0) revert UniversalBridgeLib__MsgValueNotSupported();
+        BRIDGE_POLYGON.sendMessageToChild(recipient, data);
+    }
+
+    function _sendMessageAMB(
+        ArbitraryMessageBridge bridge,
+        address recipient,
+        bytes memory data,
+        uint256 gasLimit,
+        uint256 value
+    ) internal {
+        if (value != 0) revert UniversalBridgeLib__MsgValueNotSupported();
+        if (gasLimit > bridge.maxGasPerTx()) revert UniversalBridgeLib__GasLimitTooLarge();
+        bridge.requireToPassMessage(recipient, data, gasLimit);
+    }
+}
+
+
+// File: src/VeRecipient.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.4;
+
+import {CrossChainEnabled} from "openzeppelin-contracts/contracts/crosschain/CrossChainEnabled.sol";
+
+import "./base/Structs.sol";
+import {BoringOwnable} from "./base/BoringOwnable.sol";
+
+/// @title VeRecipient
+/// @author zefram.eth
+/// @notice Recipient on non-Ethereum networks that receives data from the Ethereum beacon
+/// and makes vetoken balances available on this network.
+abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
+    /// -----------------------------------------------------------------------
+    /// Errors
+    /// -----------------------------------------------------------------------
+
+    error VeRecipient__InvalidInput();
+
+    /// -----------------------------------------------------------------------
+    /// Events
+    /// -----------------------------------------------------------------------
+
+    event UpdateVeBalance(address indexed user);
+    event SetBeacon(address indexed newBeacon);
+
+    /// -----------------------------------------------------------------------
+    /// Constants
+    /// -----------------------------------------------------------------------
+
+    uint256 internal constant MAX_ITERATIONS = 255;
+
+    /// -----------------------------------------------------------------------
+    /// Storage variables
+    /// -----------------------------------------------------------------------
+
+    address public beacon;
+    mapping(address => Point) public userData;
+    Point public globalData;
+    mapping(uint256 => int128) public slopeChanges;
+
+    /// -----------------------------------------------------------------------
+    /// Constructor
+    /// -----------------------------------------------------------------------
+
+    constructor(address beacon_, address owner_) BoringOwnable(owner_) {
+        beacon = beacon_;
+        emit SetBeacon(beacon_);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Crosschain functions
+    /// -----------------------------------------------------------------------
+
+    /// @notice Called by VeBeacon from Ethereum via bridge to update vetoken balance & supply info.
+    function updateVeBalance(
+        address user,
+        int128 userBias,
+        int128 userSlope,
+        uint256 userTs,
+        int128 globalBias,
+        int128 globalSlope,
+        uint256 globalTs,
+        SlopeChange[] calldata slopeChanges_
+    ) external onlyCrossChainSender(beacon) {
+        userData[user] = Point({bias: userBias, slope: userSlope, ts: userTs});
+        globalData = Point({bias: globalBias, slope: globalSlope, ts: globalTs});
+
+        uint256 slopeChangesLength = slopeChanges_.length;
+        for (uint256 i; i < slopeChangesLength;) {
+            slopeChanges[slopeChanges_[i].ts] = slopeChanges_[i].change;
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        emit UpdateVeBalance(user);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Owner functions
+    /// -----------------------------------------------------------------------
+
+    /// @notice Called by owner to update the beacon address.
+    /// @dev The beacon address needs to be updateable because VeBeacon needs to be redeployed
+    /// when support for a new network is added.
+    /// @param newBeacon The new address
+    function setBeacon(address newBeacon) external onlyOwner {
+        if (newBeacon == address(0)) revert VeRecipient__InvalidInput();
+        beacon = newBeacon;
+        emit SetBeacon(newBeacon);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// View functions
+    /// -----------------------------------------------------------------------
+
+    /// @notice Computes the vetoken balance of a user. Returns 0 if the user's data hasn't
+    /// been broadcasted from VeBeacon. Exhibits the same time-decay behavior as regular
+    /// VotingEscrow contracts.
+    /// @param user The user address to query
+    /// @return The user's vetoken balance.
+    function balanceOf(address user) external view returns (uint256) {
+        // storage loads
+        Point memory u = userData[user];
+
+        // compute vetoken balance
+        int256 veBalance = u.bias - u.slope * int128(int256(block.timestamp - u.ts));
+        if (veBalance < 0) veBalance = 0;
+        return uint256(veBalance);
+    }
+
+    /// @notice Computes the total supply of the vetoken. Returns 0 if data hasn't
+    /// been broadcasted from VeBeacon. Exhibits the same time-decay behavior as regular
+    /// VotingEscrow contracts.
+    /// @dev The value may diverge from the correct value if `updateVeBalance()` hasn't been
+    /// called for 8 consecutive epochs (~2 months). This is because we limit the size of each
+    /// slopeChanges update to limit gas costs.
+    /// @return The vetoken's total supply
+    function totalSupply() external view returns (uint256) {
+        Point memory g = globalData;
+        uint256 ti = (g.ts / (1 weeks)) * (1 weeks);
+        for (uint256 i; i < MAX_ITERATIONS;) {
+            ti += 1 weeks;
+            int128 slopeChange;
+            if (ti > block.timestamp) {
+                ti = block.timestamp;
+            } else {
+                slopeChange = slopeChanges[ti];
+            }
+            g.bias -= g.slope * int128(int256(ti - g.ts));
+            if (ti == block.timestamp) break;
+            g.slope += slopeChange;
+            g.ts = ti;
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        if (g.bias < 0) g.bias = 0;
+        return uint256(uint128(g.bias));
+    }
+
+    /// @notice Returns the timestamp a user's vetoken position was last updated. Returns 0 if the user's data
+    /// has never been broadcasted.
+    /// @dev Added for compatibility with kick() in gauge contracts.
+    /// @param user The user's address
+    /// @return The last update timestamp
+    function user_point_history__ts(address user, uint256 /*epoch*/ ) external view returns (uint256) {
+        return userData[user].ts;
+    }
+
+    /// @notice Just returns 0.
+    /// @dev Added for compatibility with kick() in gauge contracts.
+    function user_point_epoch(address /*user*/ ) external pure returns (uint256) {
+        return 0;
+    }
+}
+
+
+// File: src/base/Structs.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.4;
+
+struct SlopeChange {
+    uint256 ts;
+    int128 change;
+}
+
+struct Point {
+    int128 bias;
+    int128 slope;
+    uint256 ts;
+}
+
+
+// File: src/interfaces/IVotingEscrow.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.6.11;
+pragma abicoder v2;
+
+interface IVotingEscrow {
+    struct LockedBalance {
+        int128 amount;
+        uint256 end;
+    }
+
+    function change_pending_admin(address addr) external;
+
+    function claim_admin() external;
+
+    function commit_smart_wallet_checker(address addr) external;
+
+    function apply_smart_wallet_checker() external;
+
+    function get_last_user_slope(address addr) external view returns (int128);
+
+    function user_point_history__ts(address _addr, uint256 _idx) external view returns (uint256);
+
+    function locked__end(address _addr) external view returns (uint256);
+
+    function checkpoint() external;
+
+    function deposit_for(address _addr, uint256 _value) external;
+
+    function create_lock(uint256 _value, uint256 _unlock_time) external;
+
+    function increase_amount(uint256 _value) external;
+
+    function increase_unlock_time(uint256 _unlock_time) external;
+
+    function withdraw() external;
+
+    function balanceOf(address addr) external view returns (uint256);
+
+    function balanceOf(address addr, uint256 _t) external view returns (uint256);
+
+    function balanceOfAt(address addr, uint256 _block) external view returns (uint256);
+
+    function totalSupply() external view returns (uint256);
+
+    function totalSupply(uint256 t) external view returns (uint256);
+
+    function totalSupplyAt(uint256 _block) external view returns (uint256);
+
+    function changeController(address _newController) external;
+
+    function token() external view returns (address);
+
+    function supply() external view returns (uint256);
+
+    function locked(address addr) external view returns (LockedBalance memory);
+
+    function epoch() external view returns (uint256);
+
+    function point_history(uint256 arg0) external view returns (int128 bias, int128 slope, uint256 ts, uint256 blk);
+
+    function user_point_history(address arg0, uint256 arg1)
+        external
+        view
+        returns (int128 bias, int128 slope, uint256 ts, uint256 blk);
+
+    function user_point_epoch(address arg0) external view returns (uint256);
+
+    function slope_changes(uint256 arg0) external view returns (int128);
+
+    function name() external view returns (string memory);
+
+    function symbol() external view returns (string memory);
+
+    function version() external view returns (string memory);
+
+    function decimals() external view returns (uint256);
+
+    function future_smart_wallet_checker() external view returns (address);
+
+    function smart_wallet_checker() external view returns (address);
+
+    function admin() external view returns (address);
+
+    function pending_admin() external view returns (address);
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/universal-bridge-lib/src/bridges/ArbitrumBridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.9 <0.9.0;
+
+interface ArbitrumBridge {
+    /**
+     * @notice Put a message in the L2 inbox that can be reexecuted for some fixed amount of time if it reverts
+     * @dev all msg.value will deposited to callValueRefundAddress on L2
+     * @dev Gas limit and maxFeePerGas should not be set to 1 as that is used to trigger the RetryableData error
+     * @param to destination L2 contract address
+     * @param l2CallValue call value for retryable L2 message
+     * @param maxSubmissionCost Max gas deducted from user's L2 balance to cover base submission fee
+     * @param excessFeeRefundAddress gasLimit x maxFeePerGas - execution cost gets credited here on L2 balance
+     * @param callValueRefundAddress l2Callvalue gets credited here on L2 if retryable txn times out or gets cancelled
+     * @param gasLimit Max gas deducted from user's L2 balance to cover L2 execution. Should not be set to 1 (magic value used to trigger the RetryableData error)
+     * @param maxFeePerGas price bid for L2 execution. Should not be set to 1 (magic value used to trigger the RetryableData error)
+     * @param data ABI encoded data of L2 message
+     * @return unique message number of the retryable transaction
+     */
+    function createRetryableTicket(
+        address to,
+        uint256 l2CallValue,
+        uint256 maxSubmissionCost,
+        address excessFeeRefundAddress,
+        address callValueRefundAddress,
+        uint256 gasLimit,
+        uint256 maxFeePerGas,
+        bytes calldata data
+    ) external payable returns (uint256);
+
+    /**
+     * @notice Get the L1 fee for submitting a retryable
+     * @dev This fee can be paid by funds already in the L2 aliased address or by the current message value
+     * @dev This formula may change in the future, to future proof your code query this method instead of inlining!!
+     * @param dataLength The length of the retryable's calldata, in bytes
+     * @param baseFee The block basefee when the retryable is included in the chain, if 0 current block.basefee will be used
+     */
+    function calculateRetryableSubmissionFee(uint256 dataLength, uint256 baseFee) external view returns (uint256);
+}
+
+
+// File: lib/universal-bridge-lib/src/bridges/OptimismBridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.9 <0.9.0;
+
+interface OptimismBridge {
+    function sendMessage(address target, bytes calldata message, uint32 gasLimit) external;
+}
+
+
+// File: lib/universal-bridge-lib/src/bridges/PolygonBridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.9 <0.9.0;
+
+interface PolygonBridge {
+    function sendMessageToChild(address receiver, bytes calldata data) external;
+}
+
+
+// File: lib/universal-bridge-lib/src/bridges/ArbitraryMessageBridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.9 <0.9.0;
+
+interface ArbitraryMessageBridge {
+    function maxGasPerTx() external view returns (uint256);
+    function requireToPassMessage(address target, bytes calldata data, uint256 gas) external returns (bytes32);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/crosschain/CrossChainEnabled.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (crosschain/CrossChainEnabled.sol)
+
+pragma solidity ^0.8.4;
+
+import "./errors.sol";
+
+/**
+ * @dev Provides information for building cross-chain aware contracts. This
+ * abstract contract provides accessors and modifiers to control the execution
+ * flow when receiving cross-chain messages.
+ *
+ * Actual implementations of cross-chain aware contracts, which are based on
+ * this abstraction, will  have to inherit from a bridge-specific
+ * specialization. Such specializations are provided under
+ * `crosschain/<chain>/CrossChainEnabled<chain>.sol`.
+ *
+ * _Available since v4.6._
+ */
+abstract contract CrossChainEnabled {
+    /**
+     * @dev Throws if the current function call is not the result of a
+     * cross-chain execution.
+     */
+    modifier onlyCrossChain() {
+        if (!_isCrossChain()) revert NotCrossChainCall();
+        _;
+    }
+
+    /**
+     * @dev Throws if the current function call is not the result of a
+     * cross-chain execution initiated by `account`.
+     */
+    modifier onlyCrossChainSender(address expected) {
+        address actual = _crossChainSender();
+        if (expected != actual) revert InvalidCrossChainSender(actual, expected);
+        _;
+    }
+
+    /**
+     * @dev Returns whether the current function call is the result of a
+     * cross-chain message.
+     */
+    function _isCrossChain() internal view virtual returns (bool);
+
+    /**
+     * @dev Returns the address of the sender of the cross-chain message that
+     * triggered the current function call.
+     *
+     * IMPORTANT: Should revert with `NotCrossChainCall` if the current function
+     * call is not the result of a cross-chain message.
+     */
+    function _crossChainSender() internal view virtual returns (address);
+}
+
+
+// File: src/base/BoringOwnable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// Source: https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/access/Ownable.sol + Claimable.sol
+// Simplified by BoringCrypto
+
+contract BoringOwnableData {
+    address public owner;
+    address public pendingOwner;
+}
+
+contract BoringOwnable is BoringOwnableData {
+    error BoringOwnable__ZeroAddress();
+    error BoringOwnable__NotPendingOwner();
+    error BoringOwnable__NotOwner();
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(address owner_) {
+        owner = owner_;
+        emit OwnershipTransferred(address(0), owner_);
+    }
+
+    /// @notice Transfers ownership to `newOwner`. Either directly or claimable by the new pending owner.
+    /// Can only be invoked by the current `owner`.
+    /// @param newOwner Address of the new owner.
+    /// @param direct True if `newOwner` should be set immediately. False if `newOwner` needs to use `claimOwnership`.
+    /// @param renounce Allows the `newOwner` to be `address(0)` if `direct` and `renounce` is True. Has no effect otherwise.
+    function transferOwnership(address newOwner, bool direct, bool renounce) public onlyOwner {
+        if (direct) {
+            // Checks
+            if (newOwner == address(0) && !renounce) revert BoringOwnable__ZeroAddress();
+
+            // Effects
+            emit OwnershipTransferred(owner, newOwner);
+            owner = newOwner;
+            pendingOwner = address(0);
+        } else {
+            // Effects
+            pendingOwner = newOwner;
+        }
+    }
+
+    /// @notice Needs to be called by `pendingOwner` to claim ownership.
+    function claimOwnership() public {
+        address _pendingOwner = pendingOwner;
+
+        // Checks
+        if (msg.sender != _pendingOwner) revert BoringOwnable__NotPendingOwner();
+
+        // Effects
+        emit OwnershipTransferred(owner, _pendingOwner);
+        owner = _pendingOwner;
+        pendingOwner = address(0);
+    }
+
+    /// @notice Only allows the `owner` to execute the function.
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert BoringOwnable__NotOwner();
+        _;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/crosschain/errors.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (crosschain/errors.sol)
+
+pragma solidity ^0.8.4;
+
+error NotCrossChainCall();
+error InvalidCrossChainSender(address actual, address expected);
+

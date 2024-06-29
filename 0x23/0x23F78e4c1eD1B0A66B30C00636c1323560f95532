@@ -1,0 +1,1348 @@
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+// File: @openzeppelin/contracts/utils/Context.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+// File: @openzeppelin/contracts/access/Ownable.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// File: @openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+// File: @openzeppelin/contracts/utils/Address.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error AddressInsufficientBalance(address account);
+
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedInnerCall();
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert AddressInsufficientBalance(address(this));
+        }
+
+        (bool success, ) = recipient.call{value: amount}("");
+        if (!success) {
+            revert FailedInnerCall();
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {FailedInnerCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert AddressInsufficientBalance(address(this));
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {FailedInnerCall}) in case of an
+     * unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {FailedInnerCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {FailedInnerCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert FailedInnerCall();
+        }
+    }
+}
+
+// File: @openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.20;
+
+
+
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev An operation with an ERC20 token failed.
+     */
+    error SafeERC20FailedOperation(address token);
+
+    /**
+     * @dev Indicates a failed `decreaseAllowance` request.
+     */
+    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        forceApprove(token, spender, oldAllowance + value);
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no
+     * value, non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {
+        unchecked {
+            uint256 currentAllowance = token.allowance(address(this), spender);
+            if (currentAllowance < requestedDecrease) {
+                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);
+            }
+            forceApprove(token, spender, currentAllowance - requestedDecrease);
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data);
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20FailedOperation(address(token));
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return success && (returndata.length == 0 || abi.decode(returndata, (bool))) && address(token).code.length > 0;
+    }
+}
+
+// File: @uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol
+
+pragma solidity >=0.6.2;
+
+interface IUniswapV2Router01 {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB, uint liquidity);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB);
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountToken, uint amountETH);
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountA, uint amountB);
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountToken, uint amountETH);
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapTokensForExactTokens(
+        uint amountOut,
+        uint amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+    function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+
+    function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB);
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut);
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external pure returns (uint amountIn);
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+    function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+// File: @uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol
+
+pragma solidity >=0.6.2;
+
+
+interface IUniswapV2Router02 is IUniswapV2Router01 {
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountETH);
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountETH);
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable;
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+}
+
+// File: IPresale.sol
+
+// Website: https://genesisdao.io/
+// X: https://x.com/0xGenesisDAO
+// Discord: https://discord.gg/genesisdao
+
+
+//                                         &                                       
+//                           (&&&&&&&&&&&&&&&&&&&&&&&&&&&*                         
+//                      &&&&&&&&&&&&&&&&&&&&&@,,@@@@&&&&&&&&&&&                    
+//                  &&&&&&&&&&&&&&&&&&&&&,,,,,,,,,*@@@&&&&&&&&&&&&&                
+//               &&&&&&&&&&&&&&&&&&&&,,,,,,,,,,,@@@@@@@&&&&&&&&&&&&&&&             
+//            &&&&&&&&&&&&&&&&&@,,,,,,,,,,,@@@@@@@@@@&&&&&&&&&&&&&&&&&&&&          
+//          &&&&&&&&&&&&&&@,,,,,,,,,,,*@@@@@@@@@@&&&&&&&&&@,,,,,#@@@@&&&&&&        
+//        &&&&&&&&&&&&#,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&&*,,,,,,,,,,,,@@@@&&&&&&      
+//       &&&&&&&&&@..,,.,,,,,@@@@@@@@@@&&&&&&&&&&@,,,,,,,,,,,,,,,,,@@@@&&&&&&&     
+//     #&&&&&&&&&&@..,,,,,%@@@@@@@@&&&&&&&&&@,,,,,,,,,,,,@@,,,,,,,,@@@@&&&&&&&&    
+//    &&&&&&&&&&&&@..,,,,,&@@@@&&&&&&&&&..,,,,,,,,,,@@@@@@@@,,,,,,,@@@@&&&&&&&&&&  
+//   &&&&&&&&&&&&&@..,,,,,&@@@@&&&&&&&&@..,,,,,@@@@@@@@@@@@@,,,,,,,@@@@&&&&&&&&&&* 
+//   &&&&&&&&&&&&&@..,,,,,&@@@@&&&&&&&&@@@@@@@@@@@@@@&&&&&&@,,,,,,,@@@@&&&&&&&&&&& 
+//  &&&&&&&&&&&&&&@..,,,,@@@@@@&&&&&&&&&&&&@@@@@@&&&&&&&&&&@@,,,,,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@@@@@@@@//*,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,@@@@@@@@@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&&@@@/**,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,*@@@@@@@@@&&&&&&&&&&&&&
+// &&&&&&&&&&&&&&&@.....,.,,@@@@@@@@@@@@@@@@@@@@@@@@@@&&%@@@@@@/*,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@....,,,,@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@/**,,,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@....,,,,@@@@&&&&&&&&&&&&&&&&&&&&&&&&&&&&@,,,,,,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@....,,,,@@@@&&&&&&&&&@,,,,,@@@@&&&&&&&&&@,,,,,,,@@@@&&&&&&&&&&&&
+//   &&&&&&&&&&&&&@....,,,,@@@@&&&&&,,,,,,,,,,,,@@@@&&&&&&&@,,,,,,,@@@@&&&&&&&&&&& 
+//   &&&&&&&&&&&&&@....,,,,@@@@,,,,,,,,,,,,,,@@@@@@@&&&&&&&@,,,,,,,@@@@&&&&&&&&&&* 
+//    &&&&&&&&&&&&@....,,,,,,,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&,,,,,,,,@@@@&&&&&&&&&&  
+//     /&&&&&&&&&&@....,,,,,,,,,,,@@@@@@@@@@@@&&&&&&&&@,,,,,,,,,,,,@@@@&&&&&&&&    
+//       &&&&&&&&&@@....,,,,,@@@@@@@@@@@@&&&&&&&&&,,,,,,,,,,,,,@@@@@@@@&&&&&&&     
+//        &&&&&&&&&@@@@@@@@@@@@@@@@&&&&&&&&&&@,,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&      
+//          &&&&&&&&&&@@@@@@@@&&&&&&&&&&@,,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&&&&        
+//            &&&&&&&&&&&&&&&&&&&&&&..,,,,,,,,,,(@@@@@@@@@@&&&&&&&&&&&&&&          
+//               &&&&&&&&&&&&&&&&&@...,,,,,,@@@@@@@@@@&&&&&&&&&&&&&&&&             
+//                  &&&&&&&&&&&&&&@@@@@@@@@@@@@@@@&&&&&&&&&&&&&&&&&                
+//                      &&&&&&&&&&&&@@@@@@@@@&&&&&&&&&&&&&&&&&&                    
+//                           *&&&&&&&&&&&&&&&&&&&&&&&&&&& 
+
+
+interface IPresale {
+    
+    /**
+     * @dev Emitted when an unauthorized address attempts an action requiring specific permissions.
+     */
+    error Unauthorized();
+
+    /**
+     * @dev Emitted when an action is performed in an invalid state.
+     * @param currentState The current state of the contract.
+     */
+    error InvalidState(uint8 currentState);
+
+    /**
+     * @dev Emitted when attempting to finalize a presale that has not reached its soft cap.
+     */
+    error SoftCapNotReached();
+
+    /**
+     * @dev Emitted when a purchase attempt exceeds the presale's hard cap.
+     */
+    error HardCapExceed();
+
+    /**
+     * @dev Emitted when user with no contribution attempts to claim tokens.
+     */
+    error NotClaimable();
+
+    /**
+     * @dev Emitted when a purchase or refund attempt is made outside the presale period.
+     */
+    error NotInPurchasePeriod();
+
+    /**
+     * @dev Emitted when a purchase amount is below the minimum allowed.
+     */
+    error PurchaseBelowMinimum();
+
+    /**
+     * @dev Emitted when a participant's purchase would exceed the maximum allowed contribution.
+     */
+    error PurchaseLimitExceed();
+
+    /**
+     * @dev Emitted when a refund is requested under conditions that do not permit refunds.
+     */
+    error NotRefundable();
+
+    /**
+     * @dev Emitted when the process of adding liquidity to a liquidity pool fails.
+     */
+    error LiquificationFailed();
+
+    /**
+     * @dev Emitted when the initialization parameters provided to the contract are invalid.
+     */
+    error InvalidInitializationParameters();
+
+    /**
+     * @dev Emitted when the pool validation parameters provided to the contract are invalid.
+     */
+    error InvalidCapValue();
+
+    /**
+     * @dev Emitted when the pool validation parameters provided to the contract are invalid.
+     */
+    error InvalidLimitValue();
+
+    /**
+     * @dev Emitted when the pool validation parameters provided to the contract are invalid.
+     */
+    error InvalidLiquidityValue();
+
+
+    /**
+     * @dev Emitted when the pool validation parameters provided to the contract are invalid.
+     */
+    error InvalidTimestampValue();
+
+    /**
+     * @dev Emitted when the presale contract owner deposits tokens for sale.
+     * This is usually done before the presale starts to ensure tokens are available for purchase.
+     * @param creator Address of the contract owner who performs the deposit.
+     * @param amount Amount of tokens deposited.
+     * @param timestamp Block timestamp when the deposit occurred.
+     */
+    event Deposit(address indexed creator, uint256 amount, uint256 timestamp);
+
+    /**
+     * @dev Emitted for each purchase made during the presale. Tracks the buyer, the amount of ETH contributed,
+     * and the amount of tokens purchased.
+     * @param beneficiary Address of the participant who made the purchase.
+     * @param contribution Amount of ETH contributed by the participant.
+     */
+    event Purchase(address indexed beneficiary, uint256 contribution);
+
+    /**
+     * @dev Emitted when the presale is successfully finalized. Finalization may involve distributing tokens,
+     * transferring raised funds to a designated wallet, and/or enabling token claim functionality.
+     * @param creator Address of the contract owner who finalized the presale.
+     * @param amount Total amount of ETH raised in the presale.
+     * @param timestamp Block timestamp when the finalization occurred.
+     */
+    event Finalized(address indexed creator, uint256 amount, uint256 timestamp);
+
+    /**
+     * @dev Emitted when a participant successfully claims a refund. This is typically allowed when the presale
+     * is cancelled or does not meet its funding goals.
+     * @param beneficiary Address of the participant receiving the refund.
+     * @param amount Amount of wei refunded.
+     * @param timestamp Block timestamp when the refund occurred.
+     */
+    event Refund(address indexed beneficiary, uint256 amount, uint256 timestamp);
+
+    /**
+     * @dev Emitted when participants claim their purchased tokens after the presale is finalized. 
+     * @param beneficiary Address of the participant claiming tokens.
+     * @param amount Amount of tokens claimed.
+     * @param timestamp Block timestamp when the claim occurred.
+     */
+    event TokenClaim(address indexed beneficiary, uint256 amount, uint256 timestamp);
+
+    /**
+     * @dev Emitted when the presale is cancelled by the contract owner. A cancellation may allow participants
+     * to claim refunds for their contributions.
+     * @param creator Address of the contract owner who cancelled the presale.
+     * @param timestamp Block timestamp when the cancellation occurred.
+     */
+    event Cancel(address indexed creator, uint256 timestamp);
+
+    /**
+     * @dev Allows for the deposit of presale tokens by the owner.
+     * This function is intended to be called by the presale contract owner to
+     * deposit the tokens that are to be sold during the presale.
+     * 
+     * @return The amount of tokens deposited for the presale.
+     */
+    function deposit() external returns (uint256);
+
+    /**
+     * @dev Finalizes the presale, allowing for the distribution of tokens to
+     * participants and the withdrawal of funds raised to the beneficiary. This
+     * function is typically called after the presale ends, assuming it meets
+     * any predefined criteria such as minimum funding goals.
+     * 
+     * @return A boolean value indicating whether the presale was successfully
+     * finalized.
+     */
+    function finalize() external returns (bool);
+
+    /**
+     * @dev Cancels the presale and enables the refund process for participants.
+     * This function can be used in scenarios where the presale does not meet
+     * its goals or if the organizer decides to cancel the event for any reason.
+     * 
+     * @return A boolean value indicating whether the presale was successfully
+     * cancelled.
+     */
+    function cancel() external returns (bool);
+
+    /**
+     * @dev Allows participants to claim their purchased tokens after the presale
+     * is finalized. Participants call this function to receive the tokens they
+     * are entitled to.
+     * 
+     * @return The amount of tokens claimed by the caller.
+     */
+    function claim() external returns (uint256);
+
+    /**
+    * @dev Allows contributors to get a refund when the presale fails or is canceled.
+    */
+    function unlockClaim() external;
+
+    /**
+     * @dev Enables participants to request a refund of their contribution if the
+     * presale is cancelled or if they are otherwise eligible for a refund
+     * according to the presale's terms.
+     * 
+     * @return The amount of funds refunded to the caller.
+     */
+    function refund() external returns (uint256);
+}
+// File: Presale.sol
+
+// Website: https://genesisdao.io/
+// X: https://x.com/0xGenesisDAO
+// Discord: https://discord.gg/genesisdao
+
+pragma solidity ^0.8.24;
+
+
+//                                         &                                       
+//                           (&&&&&&&&&&&&&&&&&&&&&&&&&&&*                         
+//                      &&&&&&&&&&&&&&&&&&&&&@,,@@@@&&&&&&&&&&&                    
+//                  &&&&&&&&&&&&&&&&&&&&&,,,,,,,,,*@@@&&&&&&&&&&&&&                
+//               &&&&&&&&&&&&&&&&&&&&,,,,,,,,,,,@@@@@@@&&&&&&&&&&&&&&&             
+//            &&&&&&&&&&&&&&&&&@,,,,,,,,,,,@@@@@@@@@@&&&&&&&&&&&&&&&&&&&&          
+//          &&&&&&&&&&&&&&@,,,,,,,,,,,*@@@@@@@@@@&&&&&&&&&@,,,,,#@@@@&&&&&&        
+//        &&&&&&&&&&&&#,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&&*,,,,,,,,,,,,@@@@&&&&&&      
+//       &&&&&&&&&@..,,.,,,,,@@@@@@@@@@&&&&&&&&&&@,,,,,,,,,,,,,,,,,@@@@&&&&&&&     
+//     #&&&&&&&&&&@..,,,,,%@@@@@@@@&&&&&&&&&@,,,,,,,,,,,,@@,,,,,,,,@@@@&&&&&&&&    
+//    &&&&&&&&&&&&@..,,,,,&@@@@&&&&&&&&&..,,,,,,,,,,@@@@@@@@,,,,,,,@@@@&&&&&&&&&&  
+//   &&&&&&&&&&&&&@..,,,,,&@@@@&&&&&&&&@..,,,,,@@@@@@@@@@@@@,,,,,,,@@@@&&&&&&&&&&* 
+//   &&&&&&&&&&&&&@..,,,,,&@@@@&&&&&&&&@@@@@@@@@@@@@@&&&&&&@,,,,,,,@@@@&&&&&&&&&&& 
+//  &&&&&&&&&&&&&&@..,,,,@@@@@@&&&&&&&&&&&&@@@@@@&&&&&&&&&&@@,,,,,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@@@@@@@@//*,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,@@@@@@@@@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&&@@@/**,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,*@@@@@@@@@&&&&&&&&&&&&&
+// &&&&&&&&&&&&&&&@.....,.,,@@@@@@@@@@@@@@@@@@@@@@@@@@&&%@@@@@@/*,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@....,,,,@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@/**,,,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@....,,,,@@@@&&&&&&&&&&&&&&&&&&&&&&&&&&&&@,,,,,,,@@@@&&&&&&&&&&&&
+//  &&&&&&&&&&&&&&@....,,,,@@@@&&&&&&&&&@,,,,,@@@@&&&&&&&&&@,,,,,,,@@@@&&&&&&&&&&&&
+//   &&&&&&&&&&&&&@....,,,,@@@@&&&&&,,,,,,,,,,,,@@@@&&&&&&&@,,,,,,,@@@@&&&&&&&&&&& 
+//   &&&&&&&&&&&&&@....,,,,@@@@,,,,,,,,,,,,,,@@@@@@@&&&&&&&@,,,,,,,@@@@&&&&&&&&&&* 
+//    &&&&&&&&&&&&@....,,,,,,,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&,,,,,,,,@@@@&&&&&&&&&&  
+//     /&&&&&&&&&&@....,,,,,,,,,,,@@@@@@@@@@@@&&&&&&&&@,,,,,,,,,,,,@@@@&&&&&&&&    
+//       &&&&&&&&&@@....,,,,,@@@@@@@@@@@@&&&&&&&&&,,,,,,,,,,,,,@@@@@@@@&&&&&&&     
+//        &&&&&&&&&@@@@@@@@@@@@@@@@&&&&&&&&&&@,,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&      
+//          &&&&&&&&&&@@@@@@@@&&&&&&&&&&@,,,,,,,,,,,,@@@@@@@@@@@&&&&&&&&&&&        
+//            &&&&&&&&&&&&&&&&&&&&&&..,,,,,,,,,,(@@@@@@@@@@&&&&&&&&&&&&&&          
+//               &&&&&&&&&&&&&&&&&@...,,,,,,@@@@@@@@@@&&&&&&&&&&&&&&&&             
+//                  &&&&&&&&&&&&&&@@@@@@@@@@@@@@@@&&&&&&&&&&&&&&&&&                
+//                      &&&&&&&&&&&&@@@@@@@@@&&&&&&&&&&&&&&&&&&                    
+//                           *&&&&&&&&&&&&&&&&&&&&&&&&&&& 
+
+
+
+
+
+
+
+/**
+ * @title Presale contract
+ * @notice Create and manage a presales of an ERC20 token
+ */
+contract Presale is IPresale, Ownable {
+    using SafeERC20 for IERC20;
+    using Address for address payable;
+
+    /// Scaling factor to maintain precision.
+    uint256 constant SCALE = 10**18;
+
+    /** 
+     * @notice Presale options
+     * @param tokenDeposit Total tokens deposited for sale and liquidity.
+     * @param softCap Minimum Wei to be raised to consider the presale successful.
+     * @param max Maximum Wei contribution per address.
+     * @param min Minimum Wei contribution per address.
+     * @param start Start timestamp of the presale.
+     * @param end End timestamp of the presale.
+     * @param liquidityBps Basis points of funds raised to be allocated to liquidity.
+     * @param launchIncreaseBps The price increase from presale to launch.
+     * @param seederNum The amount of seeders.
+     * @param seederPremiumBps The premium seeders will get.
+    */ 
+    struct PresaleOptions{
+        uint256 tokenDeposit;
+        uint256 softCap;
+        uint256 hardCap;
+        uint256 max;
+        uint256 min;
+        uint112 start;
+        uint112 end;
+        uint32 liquidityBps;
+        uint32 launchIncreaseBps;
+        uint256 seederRaisedWei;
+        uint32 seederPremiumBps;
+    }
+
+    /** 
+     * @notice Presale pool
+     * @param token Address of the token.
+     * @param uniswapV2Router02
+     * @param tokenBalance Token balance in this contract
+     * @param tokensClaimable
+     * @param tokensLiquidity
+     * @param weiRaised
+     * @param weth
+     * @param state Current state of the presale {1: Initialized, 2: Active, 3: Canceled, 4: Finalized, 5: Claimable}.
+     * @param options PresaleOptions struct containing configuration for the presale.
+    */
+    struct Pool {
+        IERC20 token;
+        IUniswapV2Router02 uniswapV2Router02;
+	    address routerAddress;
+        uint256 tokenBalance;
+        uint256 tokensClaimable;
+        uint256 tokensLiquidity;
+        uint256 weiRaised;
+        address weth;
+        uint8 state;
+        PresaleOptions options;
+    }
+
+    mapping(address => uint256) public contributions;
+
+    Pool public pool;
+
+    /// @notice Canceled or NOT softcapped and expired
+    modifier onlyRefundable() {
+        require(pool.state == 3 || (block.timestamp > pool.options.end && pool.weiRaised < pool.options.softCap), 
+        "Presale has to be cancelled, or softcap not met during active period.");
+        _;
+    }
+    
+    /** 
+     * @param _weth Address of WETH.
+     * @param _token Address of the presale token.
+     * @param _uniswapV2Router02 Address of the Uniswap V2 router.
+     * @param _options Configuration options for the presale.
+    */
+    constructor (address _weth, address _token, address _uniswapV2Router02, PresaleOptions memory _options) Ownable(msg.sender) {
+        _prevalidatePool(_options);
+        pool.uniswapV2Router02 = IUniswapV2Router02(_uniswapV2Router02);
+	    pool.routerAddress = _uniswapV2Router02;
+        pool.token = IERC20(_token);
+        pool.state = 1;
+        pool.weth = _weth;
+        pool.options = _options;
+    }
+
+    receive() external payable {
+        _purchase(msg.sender, msg.value);
+    }
+
+    /** 
+     * @notice Calling this function deposits tokens into the contract. Contributions are unavailable until this 
+     * function is called by the owner of the presale.
+     * NOTE This function uses { transferFrom } method from { IERC20 } to handle token deposits into the contract, make sure to approve this contract to spend the required tokens for deposit.
+     * @return The amount of tokens deposited.
+    */
+    function deposit() external onlyOwner returns (uint256) {
+        if(pool.state != 1) revert InvalidState(pool.state);
+        pool.state = 2;
+        
+        pool.tokenBalance += pool.options.tokenDeposit;
+        pool.tokensLiquidity = _tokensForLiquidity();
+        pool.tokensClaimable = _tokensForPresale();
+
+        IERC20(pool.token).safeTransferFrom(msg.sender, address(this), pool.options.tokenDeposit);
+
+        emit Deposit(msg.sender, pool.options.tokenDeposit, block.timestamp);
+        return pool.options.tokenDeposit;
+    }
+
+
+    /** 
+     * @notice Call this function to finalize a succesful presale. 
+     * This will allocate the share of seeder tokens for redist, and calculate the amount of ETH needed for LP. 
+     * The remaining ETH is transfered to the sender. 
+     * @return True if the finalization was successful.
+    */
+    function finalize() external onlyOwner returns(bool) {
+        if(pool.state != 2) revert InvalidState(pool.state);
+        if(pool.weiRaised < pool.options.softCap) revert SoftCapNotReached();
+        require(block.timestamp > pool.options.end, "Presale still in active period");
+ 
+        pool.state = 4;
+
+        // Calculate the tokens owed to the seed investors
+        uint256 seederTokens = _seederTokens();
+
+        // Send seed investor tokens to owner, for further redistribution
+        IERC20(pool.token).safeTransfer(msg.sender, seederTokens);
+        pool.tokenBalance -= seederTokens;
+
+        // Subtract the seed investor tokens from the amount allocated to the LP        
+        pool.tokensLiquidity -= seederTokens;
+        
+        uint256 liquidityWei = _liquidityWei();
+
+        if(pool.weiRaised < liquidityWei) revert InvalidLiquidityValue();
+
+        uint256 withdrawable = pool.weiRaised - liquidityWei;
+        if (withdrawable > 0) payable(msg.sender).sendValue(withdrawable);
+
+        // Add LP
+        _liquify(liquidityWei, pool.tokensLiquidity);
+        pool.tokenBalance -= pool.tokensLiquidity;
+
+        emit Finalized(msg.sender, pool.weiRaised, block.timestamp);
+        
+        return true;
+    }
+
+    /** 
+     * @notice Call this function to cancel a presale. Calling this function withdraws deposited tokens and allows contributors 
+     * to refund their contributions. Can only cancel NOT finalized presale. 
+     * @return True if the cancellation was successful.
+    */
+    function cancel() external onlyOwner returns(bool){
+        if(pool.state > 2) revert InvalidState(pool.state);
+
+        pool.state = 3;
+
+        if (pool.tokenBalance > 0) {
+            uint256 amount = pool.tokenBalance;
+            pool.tokenBalance = 0;
+            IERC20(pool.token).safeTransfer(msg.sender, amount);
+        }
+
+        emit Cancel(msg.sender, block.timestamp);
+
+        return true;
+    }
+
+    /**
+     * @notice Allows the owner to extend the active period of the presale, but only while the presale is ongoing.
+    */
+    function extendEndTime(uint112 end) external onlyOwner {
+        if(block.timestamp < pool.options.start || block.timestamp > pool.options.end) revert NotInPurchasePeriod(); // Presale can only be extended during active period
+        if(pool.state != 2) revert InvalidState(pool.state);
+        pool.options.end = end;
+    }
+
+    /** 
+     * @notice Allows contributors to claim their tokens after the presale is finalized.
+     * @return The amount of tokens claimed.
+    */
+    function claim() external returns (uint256) {
+        if(pool.state != 5) revert InvalidState(pool.state);
+        if (contributions[msg.sender] == 0) revert NotClaimable();
+
+        uint256 amount = userTokens(msg.sender);
+        pool.tokenBalance -= amount;
+        contributions[msg.sender] = 0;
+        
+        IERC20(pool.token).safeTransfer(msg.sender, amount);
+        emit TokenClaim(msg.sender, amount, block.timestamp);
+        return amount;
+    }
+
+    /*
+    * @notice must be called manually by owner post finalize. Will allow investors to claim their tokens from the presale.
+    */
+    function unlockClaim() external onlyOwner {
+        if(pool.state != 4) revert InvalidState(pool.state);
+        pool.state = 5;
+    }
+
+    /** 
+     * @notice Allows contributors to get a refund when the presale fails or is canceled.
+     * @return The amount of Wei refunded.
+    */
+    function refund() external onlyRefundable returns (uint256) {
+        if(contributions[msg.sender] == 0) revert NotRefundable();
+
+        uint256 amount = contributions[msg.sender];
+
+        if(address(this).balance >= amount) {   
+            contributions[msg.sender] = 0;
+            payable(msg.sender).sendValue(amount);
+            emit Refund(msg.sender, amount, block.timestamp);
+        }
+
+        return amount;
+    }
+
+    /** 
+     * @notice Handles token purchase.
+     * @param beneficiary The address making the purchase.
+     * @param amount The amount of Wei contributed.
+    */
+    function _purchase(address beneficiary, uint256 amount) private {
+        _prevalidatePurchase(beneficiary, amount);
+
+        pool.weiRaised += amount;
+        contributions[beneficiary] += amount;
+        
+        emit Purchase(beneficiary, amount);
+    }
+
+    /**
+     * @notice Handles liquidity provisioning.
+     * @param _weiAmount The amount of Wei to be added to liquidity.
+     * @param _tokenAmount The amount of tokens to be added to liquidity.
+    */
+    function _liquify(uint256 _weiAmount, uint256 _tokenAmount) private {
+        IERC20(pool.token).approve(pool.routerAddress, _tokenAmount);
+        IERC20(pool.weth).approve(pool.routerAddress, _weiAmount);	
+        (uint amountToken, uint amountETH,) = pool.uniswapV2Router02.addLiquidityETH{value : _weiAmount}(
+            address(pool.token),
+            _tokenAmount,
+            _tokenAmount,
+            _weiAmount,
+            owner(),
+            block.timestamp + 600
+        );
+        
+        if(amountToken != _tokenAmount && amountETH != _weiAmount) revert LiquificationFailed();
+    }
+
+    /**
+     * @notice Validates the purchase conditions before accepting funds.
+     * @param _beneficiary The address attempting to make a purchase.
+     * @param _amount The amount of Wei being contributed.
+     * @return True if the purchase is valid.
+    */
+    function _prevalidatePurchase(address _beneficiary, uint256 _amount) internal view returns(bool) {
+        if(pool.state != 2) revert InvalidState(pool.state);
+        if(block.timestamp < pool.options.start || block.timestamp > pool.options.end) revert NotInPurchasePeriod();
+        if(pool.options.hardCap > 0 && pool.weiRaised + _amount > pool.options.hardCap) revert HardCapExceed();
+        if(_amount < pool.options.min) revert PurchaseBelowMinimum();
+        if(_amount + contributions[_beneficiary] > pool.options.max) revert PurchaseLimitExceed();
+        return true;
+    }
+
+    /**
+     * @param _options The presale options.
+     * @return True if the pool configuration is valid.
+    */
+    function _prevalidatePool(PresaleOptions memory _options) internal pure returns(bool) {
+        if (_options.softCap == 0) revert InvalidCapValue();
+        if (_options.min == 0 || _options.min > _options.max) revert InvalidLimitValue();
+        if (_options.liquidityBps < 0 || _options.liquidityBps > 10000) revert InvalidLiquidityValue();
+        if (_options.end < _options.start) revert InvalidTimestampValue();
+        return true;
+    }
+
+    /**
+     * @notice Tokens per user rate is dynamically calculated using the proportional allocation of current raise amount in Wei.
+     * @param contributor The address of the contributor.
+     * @return The amount of tokens claimable by the contributor.
+    */
+    function userTokens(address contributor) public view returns(uint256){
+        return ((contributions[contributor] * SCALE) / pool.weiRaised * pool.tokensClaimable) / SCALE;
+    }
+
+    /**
+     * @notice Tokens per seed investor rate is dynamically calculated using the proportional allocation of current raise amount in Wei.
+     * @return The total amount of tokens allocated to the seed investors
+    */
+    function _seederTokens() internal view returns(uint256) {
+        return ((_seederTotalValue() * SCALE) / pool.weiRaised * pool.tokensClaimable) / SCALE;
+    }
+
+    /**
+     * @notice Calculates the amount of effective wei the seeders have raised.
+     * For example, at a 30% premium (seederPremiumBps = 3000), and 10 ETH seed funds raised, the total value will be 13 ETH.
+     * @return The amount of token value in wei the seeders have raised.
+    */
+    function _seederTotalValue() internal view returns (uint256) {
+        return pool.options.seederRaisedWei + (pool.options.seederRaisedWei * pool.options.seederPremiumBps / 10_000);
+    }
+
+    /**
+    * @notice Calculates the amount of ETH going to LP based on the number of tokens, and liquidity raised. 
+    * Launch value of the token should be at launchIncreaseBps% below presale price (1000 = 10%).
+    * @return the number of ETH in wei to be added to the LP.
+    */ 
+    function _liquidityWei() internal view returns (uint256) {
+        uint256 tokensPerWei = ((pool.tokensClaimable * SCALE) / pool.weiRaised) / SCALE;
+        uint256 tokensPerWeiLaunch = tokensPerWei - (tokensPerWei * pool.options.launchIncreaseBps / 10_000);
+        uint256 liquidityWei = ((pool.tokensLiquidity * SCALE) / tokensPerWeiLaunch) / SCALE;
+        return liquidityWei;
+    }
+
+    /**
+     * @notice Calculates the amount of tokens allocated for liquidity.
+     * @return The amount of tokens for liquidity.
+    */
+    function _tokensForLiquidity() internal view returns (uint256){
+        return pool.options.tokenDeposit * pool.options.liquidityBps / 10_000;
+    }
+
+    /**
+     * @notice Calculates the amount of tokens allocated for the presale.
+     * @return The amount of tokens available for the presale.
+    */
+    function _tokensForPresale() internal view returns (uint256){
+        return pool.options.tokenDeposit - (pool.options.tokenDeposit * pool.options.liquidityBps / 10_000);
+    }
+}

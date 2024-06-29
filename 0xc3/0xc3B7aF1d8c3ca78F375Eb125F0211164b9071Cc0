@@ -1,0 +1,1888 @@
+
+// File: @maverick/contracts/contracts/interfaces/IFactory.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import "../interfaces/IPool.sol";
+import "../interfaces/IPosition.sol";
+
+interface IFactory {
+    event PoolCreated(
+        address poolAddress,
+        uint256 fee,
+        uint256 tickSpacing,
+        int32 activeTick,
+        int256 lookback,
+        uint64 protocolFeeRatio,
+        IERC20 tokenA,
+        IERC20 tokenB
+    );
+    event SetFactoryProtocolFeeRatio(uint64 protocolFeeRatio);
+    event SetFactoryOwner(address owner);
+
+    /// @notice creates new pool
+    /// @param _fee is a rate in prbmath 60x18 decimal format
+    /// @param _tickSpacing  1.0001^tickSpacing is the bin width
+    /// @param _activeTick initial activeTick of the pool
+    /// @param _lookback TWAP lookback in whole seconds
+    /// @param _tokenA ERC20 token
+    /// @param _tokenB ERC20 token
+    function create(
+        uint256 _fee,
+        uint256 _tickSpacing,
+        int256 _lookback,
+        int32 _activeTick,
+        IERC20 _tokenA,
+        IERC20 _tokenB
+    ) external returns (IPool);
+
+    function lookup(
+        uint256 fee,
+        uint256 tickSpacing,
+        int256 lookback,
+        IERC20 tokenA,
+        IERC20 tokenB
+    ) external view returns (IPool);
+
+    function owner() external view returns (address);
+
+    function position() external view returns (IPosition);
+
+    /// @notice protocolFeeRatio ratio of the swap fee that is kept for the
+    //protocol
+    function protocolFeeRatio() external view returns (uint64);
+
+    /// @notice lookup table for whether a pool is owned by the factory
+    function isFactoryPool(IPool pool) external view returns (bool);
+}
+
+
+// File: @maverick/contracts/contracts/interfaces/IPool.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./IFactory.sol";
+
+interface IPool {
+    event Swap(
+        address sender,
+        address recipient,
+        bool tokenAIn,
+        bool exactOutput,
+        uint256 amountIn,
+        uint256 amountOut,
+        int32 activeTick
+    );
+
+    event AddLiquidity(address indexed sender, uint256 indexed tokenId, BinDelta[] binDeltas);
+
+    event MigrateBinsUpStack(address indexed sender, uint128 binId, uint32 maxRecursion);
+
+    event TransferLiquidity(uint256 fromTokenId, uint256 toTokenId, RemoveLiquidityParams[] params);
+
+    event RemoveLiquidity(
+        address indexed sender,
+        address indexed recipient,
+        uint256 indexed tokenId,
+        BinDelta[] binDeltas
+    );
+
+    event BinMerged(uint128 indexed binId, uint128 reserveA, uint128 reserveB, uint128 mergeId);
+
+    event BinMoved(uint128 indexed binId, int128 previousTick, int128 newTick);
+
+    event ProtocolFeeCollected(uint256 protocolFee, bool isTokenA);
+
+    event SetProtocolFeeRatio(uint256 protocolFee);
+
+    /// @notice return parameters for Add/Remove liquidity
+    /// @param binId of the bin that changed
+    /// @param kind one of the 4 Kinds (0=static, 1=right, 2=left, 3=both)
+    /// @param isActive bool to indicate whether the bin is still active
+    /// @param lowerTick is the lower price tick of the bin in its current state
+    /// @param deltaA amount of A token that has been added or removed
+    /// @param deltaB amount of B token that has been added or removed
+    /// @param deltaLpToken amount of LP balance that has increase (add) or decreased (remove)
+    struct BinDelta {
+        uint128 deltaA;
+        uint128 deltaB;
+        uint256 deltaLpBalance;
+        uint128 binId;
+        uint8 kind;
+        int32 lowerTick;
+        bool isActive;
+    }
+
+    /// @notice time weighted average state
+    /// @param twa the twa at the last update instant
+    /// @param value the new value that was passed in at the last update
+    /// @param lastTimestamp timestamp of the last update in seconds
+    /// @param lookback time in seconds
+    struct TwaState {
+        int96 twa;
+        int96 value;
+        uint64 lastTimestamp;
+    }
+
+    /// @notice bin state parameters
+    /// @param kind one of the 4 Kinds (0=static, 1=right, 2=left, 3=both)
+    /// @param lowerTick is the lower price tick of the bin in its current state
+    /// @param mergeId binId of the bin that this bin has merged in to
+    /// @param reserveA amount of A token in bin
+    /// @param reserveB amount of B token in bin
+    /// @param totalSupply total amount of LP tokens in this bin
+    /// @param mergeBinBalance LP token balance that this bin posseses of the merge bin
+    struct BinState {
+        uint128 reserveA;
+        uint128 reserveB;
+        uint128 mergeBinBalance;
+        uint128 mergeId;
+        uint128 totalSupply;
+        uint8 kind;
+        int32 lowerTick;
+    }
+
+    /// @notice Parameters for each bin that will get new liquidity
+    /// @param kind one of the 4 Kinds (0=static, 1=right, 2=left, 3=both)
+    /// @param pos bin position
+    /// @param isDelta bool that indicates whether the bin position is relative
+    //to the current bin or an absolute position
+    /// @param deltaA amount of A token to add
+    /// @param deltaB amount of B token to add
+    struct AddLiquidityParams {
+        uint8 kind;
+        int32 pos;
+        bool isDelta;
+        uint128 deltaA;
+        uint128 deltaB;
+    }
+
+    /// @notice Parameters for each bin that will have liquidity removed
+    /// @param binId index of the bin losing liquidity
+    /// @param amount LP balance amount to remove
+    struct RemoveLiquidityParams {
+        uint128 binId;
+        uint128 amount;
+    }
+
+    /// @notice State of the pool
+    /// @param activeTick  current bin position that contains the active bins
+    /// @param status pool status.  e.g. locked or unlocked; status values
+    //defined in Pool.sol
+    /// @param binCounter index of the last bin created
+    /// @param protocolFeeRatio ratio of the swap fee that is kept for the
+    //protocol
+    struct State {
+        int32 activeTick;
+        uint8 status;
+        uint128 binCounter;
+        uint64 protocolFeeRatio;
+    }
+
+    /// @notice fee for pool in 18 decimal format
+    function fee() external view returns (uint256);
+
+    /// @notice tickSpacing of pool where 1.0001^tickSpacing is the bin width
+    function tickSpacing() external view returns (uint256);
+
+    /// @notice address of token A
+    function tokenA() external view returns (IERC20);
+
+    /// @notice address of token B
+    function tokenB() external view returns (IERC20);
+
+    /// @notice address of Factory
+    function factory() external view returns (IFactory);
+
+    /// @notice bitmap of active bins
+    function binMap(int32 tick) external view returns (uint256);
+
+    /// @notice mapping of tick/kind to binId
+    function binPositions(int32 tick, uint256 kind) external view returns (uint128);
+
+    /// @notice internal accounting of the sum tokenA balance across bins
+    function binBalanceA() external view returns (uint128);
+
+    /// @notice internal accounting of the sum tokenB balance across bins
+    function binBalanceB() external view returns (uint128);
+
+    /// @notice log_binWidth of the time weighted average price
+    function getTwa() external view returns (TwaState memory);
+
+    /// @notice pool state
+    function getState() external view returns (State memory);
+
+    /// @notice Add liquidity to a pool.
+    /// @param tokenId NFT token ID that will hold the position
+    /// @param params array of AddLiquidityParams that specify the mode and
+    //position of the liquidity
+    /// @param data callback function that addLiquidity will call so that the
+    //caller can transfer tokens
+    function addLiquidity(
+        uint256 tokenId,
+        AddLiquidityParams[] calldata params,
+        bytes calldata data
+    )
+        external
+        returns (
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            BinDelta[] memory binDeltas
+        );
+
+    /// @notice Transfer liquidity in an array of bins from one nft tokenId
+    //to another
+    /// @param fromTokenId NFT token ID that holds the position being transferred
+    /// @param toTokenId NFT token ID that is receiving liquidity
+    /// @param params array of binIds and amounts to transfer
+    function transferLiquidity(
+        uint256 fromTokenId,
+        uint256 toTokenId,
+        RemoveLiquidityParams[] calldata params
+    ) external;
+
+    /// @notice Remove liquidity from a pool.
+    /// @param recipient address that will receive the removed tokens
+    /// @param tokenId NFT token ID that holds the position being removed
+    /// @param params array of RemoveLiquidityParams that specify the bins,
+    //and amounts
+    function removeLiquidity(
+        address recipient,
+        uint256 tokenId,
+        RemoveLiquidityParams[] calldata params
+    )
+        external
+        returns (
+            uint256 tokenAOut,
+            uint256 tokenBOut,
+            BinDelta[] memory binDeltas
+        );
+
+    /// @notice Migrate bins up the linked list of merged bins so that its
+    //mergeId is the currrent active bin.
+    /// @param binId is an array of the binIds to be migrated
+    /// @param maxRecursion is the maximum recursion depth of the migration. set to
+    //zero to recurse until the active bin is found.
+    function migrateBinUpStack(uint128 binId, uint32 maxRecursion) external;
+
+    /// @notice swap tokens
+    /// @param recipient address that will receive the output tokens
+    /// @param amount amount of token that is either the input if exactOutput
+    //is false or the output if exactOutput is true
+    /// @param tokenAIn bool indicating whether tokenA is the input
+    /// @param exactOutput bool indicating whether the amount specified is the
+    //exact output amount (true)
+    /// @param sqrtPriceLimit limiting sqrt price of the swap.  A value of 0
+    //indicates no limit.  Limit is only engaged for exactOutput=false.  If the
+    //limit is reached only part of the input amount will be swapped and the
+    //callback will only require that amount of the swap to be paid.
+    /// @param data callback function that swap will call so that the
+    //caller can transfer tokens
+    function swap(
+        address recipient,
+        uint256 amount,
+        bool tokenAIn,
+        bool exactOutput,
+        uint256 sqrtPriceLimit,
+        bytes calldata data
+    ) external returns (uint256 amountIn, uint256 amountOut);
+
+    /// @notice bin information for a given binId
+    function getBin(uint128 binId) external view returns (BinState memory bin);
+
+    /// @notice LP token balance for a given tokenId at a given binId
+    function balanceOf(uint256 tokenId, uint128 binId) external view returns (uint256 lpToken);
+
+    /// @notice tokenA scale value
+    /// @dev msb is a flag to indicate whether tokenA has more or less than 18
+    //decimals.  Scale is used in conjuction with Math.toScale/Math.fromScale
+    //functions to convert from token amounts to D18 scale internal pool
+    //accounting.
+    function tokenAScale() external view returns (uint256);
+
+    /// @notice tokenB scale value
+    /// @dev msb is a flag to indicate whether tokenA has more or less than 18
+    //decimals.  Scale is used in conjuction with Math.toScale/Math.fromScale
+    //functions to convert from token amounts to D18 scale internal pool
+    //accounting.
+    function tokenBScale() external view returns (uint256);
+}
+
+
+// File: @maverick/contracts/contracts/interfaces/IPosition.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC721/extensions/IERC721Enumerable.sol";
+import "../interfaces/IPositionMetadata.sol";
+
+interface IPosition is IERC721Enumerable {
+    event SetMetadata(IPositionMetadata metadata);
+
+    /// @notice mint new position NFT
+    function mint(address to) external returns (uint256 tokenId);
+
+    /// @notice mint new position NFT
+    function tokenOfOwnerByIndexExists(address owner, uint256 index) external view returns (bool);
+}
+
+
+// File: @maverick/contracts/contracts/interfaces/IPositionMetadata.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IPositionMetadata {
+    function tokenURI(uint256 tokenId) external view returns (string memory);
+}
+
+
+// File: @maverick/contracts/contracts/interfaces/ISwapCallback.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface ISwapCallback {
+    function swapCallback(
+        uint256 amountIn,
+        uint256 amountOut,
+        bytes calldata data
+    ) external;
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: @openzeppelin/contracts/token/ERC721/IERC721.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC721/IERC721.sol)
+
+pragma solidity ^0.8.0;
+
+import "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC721 compliant contract.
+ */
+interface IERC721 is IERC165 {
+    /**
+     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.
+     */
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.
+     */
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /**
+     * @dev Returns the number of tokens in ``owner``'s account.
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata data
+    ) external;
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC721 protocol to prevent tokens from being forever locked.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external;
+
+    /**
+     * @dev Transfers `tokenId` token from `from` to `to`.
+     *
+     * WARNING: Usage of this method is discouraged, use {safeTransferFrom} whenever possible.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external;
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) external;
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the caller.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool _approved) external;
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) external view returns (address operator);
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}
+     */
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/token/ERC721/extensions/IERC721Enumerable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC721/extensions/IERC721Enumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC721.sol";
+
+/**
+ * @title ERC-721 Non-Fungible Token Standard, optional enumeration extension
+ * @dev See https://eips.ethereum.org/EIPS/eip-721
+ */
+interface IERC721Enumerable is IERC721 {
+    /**
+     * @dev Returns the total amount of tokens stored by the contract.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns a token ID owned by `owner` at a given `index` of its token list.
+     * Use along with {balanceOf} to enumerate all of ``owner``'s tokens.
+     */
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+
+    /**
+     * @dev Returns a token ID at a given `index` of all the tokens stored by the contract.
+     * Use along with {totalSupply} to enumerate all tokens.
+     */
+    function tokenByIndex(uint256 index) external view returns (uint256);
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: contracts/Router.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import "@maverick/contracts/contracts/interfaces/IPool.sol";
+import "@maverick/contracts/contracts/interfaces/IFactory.sol";
+import "@maverick/contracts/contracts/interfaces/IPosition.sol";
+
+import "./interfaces/IRouter.sol";
+import "./interfaces/external/IWETH9.sol";
+import "./libraries/TransferHelper.sol";
+import "./libraries/Path.sol";
+import "./libraries/Deadline.sol";
+import "./libraries/Multicall.sol";
+import "./libraries/SelfPermit.sol";
+
+contract Router is IRouter, Multicall, SelfPermit, Deadline {
+    using Path for bytes;
+    /// @dev Used as the placeholder value for amountInCached, because the
+    //computed amount in for an exact output swap / can never actually be this
+    //value
+    uint256 private constant DEFAULT_AMOUNT_IN_CACHED = type(uint256).max;
+
+    /// @dev Transient storage variable used for returning the computed amount in for an exact output swap.
+    uint256 private amountInCached = DEFAULT_AMOUNT_IN_CACHED;
+
+    struct AddLiquidityCallbackData {
+        IERC20 tokenA;
+        IERC20 tokenB;
+        IPool pool;
+        address payer;
+    }
+
+    struct SwapCallbackData {
+        bytes path;
+        address payer;
+        bool exactOutput;
+    }
+
+    /// @inheritdoc IRouter
+    IFactory public immutable factory;
+    /// @inheritdoc IRouter
+    IPosition public immutable position;
+    /// @inheritdoc ISlimRouter
+    IWETH9 public immutable WETH9;
+
+    constructor(IFactory _factory, IWETH9 _WETH9) {
+        factory = _factory;
+        position = _factory.position();
+        WETH9 = _WETH9;
+    }
+
+    receive() external payable {
+        require(IWETH9(msg.sender) == WETH9, "Not WETH9");
+    }
+
+    /// @inheritdoc ISlimRouter
+    function unwrapWETH9(uint256 amountMinimum, address recipient) public payable override {
+        uint256 balanceWETH9 = WETH9.balanceOf(address(this));
+        require(balanceWETH9 >= amountMinimum, "Insufficient WETH9");
+
+        if (balanceWETH9 > 0) {
+            WETH9.withdraw(balanceWETH9);
+            TransferHelper.safeTransferETH(recipient, balanceWETH9);
+        }
+    }
+
+    /// @inheritdoc ISlimRouter
+    function sweepToken(IERC20 token, uint256 amountMinimum, address recipient) public payable {
+        uint256 balanceToken = token.balanceOf(address(this));
+        require(balanceToken >= amountMinimum, "Insufficient token");
+
+        if (balanceToken > 0) {
+            TransferHelper.safeTransfer(address(token), recipient, balanceToken);
+        }
+    }
+
+    /// @inheritdoc ISlimRouter
+    function refundETH() external payable override {
+        if (address(this).balance > 0)
+            TransferHelper.safeTransferETH(msg.sender, address(this).balance);
+    }
+
+    /// @param token The token to pay
+    /// @param payer The entity that must pay
+    /// @param recipient The entity that will receive payment
+    /// @param value The amount to pay
+    function pay(IERC20 token, address payer, address recipient, uint256 value) internal {
+        if (IWETH9(address(token)) == WETH9 && address(this).balance >= value) {
+            WETH9.deposit{value: value}();
+            WETH9.transfer(recipient, value);
+        } else if (payer == address(this)) {
+            TransferHelper.safeTransfer(address(token), recipient, value);
+        } else {
+            TransferHelper.safeTransferFrom(address(token), payer, recipient, value);
+        }
+    }
+
+    function swapCallback(uint256 amountToPay, uint256 amountOut, bytes calldata _data) external {
+        require(amountToPay > 0 && amountOut > 0, "In or Out Amount is Zero");
+        require(factory.isFactoryPool(IPool(msg.sender)), "Must call from a Factory Pool");
+
+        SwapCallbackData memory data = abi.decode(_data, (SwapCallbackData));
+        (IERC20 tokenIn, IERC20 tokenOut, IPool pool) = data.path.decodeFirstPool();
+
+        require(msg.sender == address(pool));
+
+        if (data.exactOutput) {
+            if (data.path.hasMultiplePools()) {
+                data.path = data.path.skipToken();
+                exactOutputInternal(amountToPay, msg.sender, data);
+            } else {
+                amountInCached = amountToPay;
+                pay(tokenOut, data.payer, msg.sender, amountToPay);
+            }
+        } else {
+            pay(tokenIn, data.payer, msg.sender, amountToPay);
+        }
+    }
+
+    function exactInputInternal(
+        uint256 amountIn,
+        address recipient,
+        uint256 sqrtPriceLimitD18,
+        SwapCallbackData memory data
+    ) private returns (uint256 amountOut) {
+        if (recipient == address(0)) recipient = address(this);
+
+        (IERC20 tokenIn, IERC20 tokenOut, IPool pool) = data.path.decodeFirstPool();
+
+        bool tokenAIn = tokenIn < tokenOut;
+
+        (, amountOut) = pool.swap(
+            recipient,
+            amountIn,
+            tokenAIn,
+            false,
+            sqrtPriceLimitD18,
+            abi.encode(data)
+        );
+    }
+
+    /// @inheritdoc ISlimRouter
+    function exactInputSingle(
+        ExactInputSingleParams calldata params
+    ) external payable override checkDeadline(params.deadline) returns (uint256 amountOut) {
+        bool tokenAIn = params.tokenIn < params.tokenOut;
+
+        (, amountOut) = params.pool.swap(
+            (params.recipient == address(0)) ? address(this) : params.recipient,
+            params.amountIn,
+            tokenAIn,
+            false,
+            params.sqrtPriceLimitD18,
+            abi.encode(
+                SwapCallbackData({
+                    path: abi.encodePacked(params.tokenIn, params.pool, params.tokenOut),
+                    payer: msg.sender,
+                    exactOutput: false
+                })
+            )
+        );
+        require(amountOut >= params.amountOutMinimum, "Too little received");
+    }
+
+    /// @inheritdoc IRouter
+    function exactInput(
+        ExactInputParams memory params
+    ) external payable override checkDeadline(params.deadline) returns (uint256 amountOut) {
+        address payer = msg.sender;
+
+        while (true) {
+            bool stillMultiPoolSwap = params.path.hasMultiplePools();
+
+            params.amountIn = exactInputInternal(
+                params.amountIn,
+                stillMultiPoolSwap ? address(this) : params.recipient,
+                0,
+                SwapCallbackData({
+                    path: params.path.getFirstPool(),
+                    payer: payer,
+                    exactOutput: false
+                })
+            );
+
+            if (stillMultiPoolSwap) {
+                payer = address(this);
+                params.path = params.path.skipToken();
+            } else {
+                amountOut = params.amountIn;
+                break;
+            }
+        }
+
+        require(amountOut >= params.amountOutMinimum, "Too little received");
+    }
+
+    /// @dev Performs a single exact output swap
+    function exactOutputInternal(
+        uint256 amountOut,
+        address recipient,
+        SwapCallbackData memory data
+    ) private returns (uint256 amountIn) {
+        if (recipient == address(0)) recipient = address(this);
+
+        (IERC20 tokenOut, IERC20 tokenIn, IPool pool) = data.path.decodeFirstPool();
+
+        bool tokenAIn = tokenIn < tokenOut;
+        uint256 amountOutReceived;
+        (amountIn, amountOutReceived) = pool.swap(
+            recipient,
+            amountOut,
+            tokenAIn,
+            true,
+            0,
+            abi.encode(data)
+        );
+        require(amountOutReceived == amountOut, "Requested amount not available");
+    }
+
+    /// @inheritdoc ISlimRouter
+    function exactOutputSingle(
+        ExactOutputSingleParams calldata params
+    ) external payable override checkDeadline(params.deadline) returns (uint256 amountIn) {
+        bool tokenAIn = params.tokenIn < params.tokenOut;
+        uint256 amountOutReceived;
+        (amountIn, amountOutReceived) = params.pool.swap(
+            (params.recipient == address(0)) ? address(this) : params.recipient,
+            params.amountOut,
+            tokenAIn,
+            true,
+            0,
+            abi.encode(
+                SwapCallbackData({
+                    path: abi.encodePacked(params.tokenOut, params.pool, params.tokenIn),
+                    payer: msg.sender,
+                    exactOutput: true
+                })
+            )
+        );
+        require(amountOutReceived == params.amountOut, "Requested amount not available");
+        require(amountIn <= params.amountInMaximum, "Too much requested");
+        amountInCached = DEFAULT_AMOUNT_IN_CACHED;
+    }
+
+    /// @inheritdoc IRouter
+    function exactOutput(
+        ExactOutputParams calldata params
+    ) external payable override checkDeadline(params.deadline) returns (uint256 amountIn) {
+        exactOutputInternal(
+            params.amountOut,
+            params.recipient,
+            SwapCallbackData({path: params.path, payer: msg.sender, exactOutput: true})
+        );
+
+        amountIn = amountInCached;
+        require(amountIn <= params.amountInMaximum, "Too much requested");
+        amountInCached = DEFAULT_AMOUNT_IN_CACHED;
+    }
+
+    // Liqudity
+
+    function addLiquidityCallback(uint256 amountA, uint256 amountB, bytes calldata _data) external {
+        AddLiquidityCallbackData memory data = abi.decode(_data, (AddLiquidityCallbackData));
+        require(factory.isFactoryPool(IPool(msg.sender)));
+        require(msg.sender == address(data.pool));
+        if (amountA != 0) {
+            pay(data.tokenA, data.payer, msg.sender, amountA);
+        }
+        if (amountB != 0) {
+            pay(data.tokenB, data.payer, msg.sender, amountB);
+        }
+    }
+
+    function addLiquidity(
+        IPool pool,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount
+    )
+        private
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        )
+    {
+        if (tokenId == 0) {
+            if (IPosition(position).tokenOfOwnerByIndexExists(msg.sender, 0)) {
+                tokenId = IPosition(position).tokenOfOwnerByIndex(msg.sender, 0);
+            } else {
+                tokenId = IPosition(position).mint(msg.sender);
+            }
+        }
+        receivingTokenId = tokenId;
+
+        AddLiquidityCallbackData memory data = AddLiquidityCallbackData({
+            tokenA: pool.tokenA(),
+            tokenB: pool.tokenB(),
+            pool: pool,
+            payer: msg.sender
+        });
+        (tokenAAmount, tokenBAmount, binDeltas) = pool.addLiquidity(
+            tokenId,
+            params,
+            abi.encode(data)
+        );
+
+        require(
+            tokenAAmount >= minTokenAAmount && tokenBAmount >= minTokenBAmount,
+            "Too little added"
+        );
+    }
+
+    /// @inheritdoc IRouter
+    function addLiquidityToPool(
+        IPool pool,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        uint256 deadline
+    )
+        external
+        payable
+        checkDeadline(deadline)
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        )
+    {
+        return addLiquidity(pool, tokenId, params, minTokenAAmount, minTokenBAmount);
+    }
+
+    /// @inheritdoc IRouter
+    function addLiquidityWTickLimits(
+        IPool pool,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        int32 minActiveTick,
+        int32 maxActiveTick,
+        uint256 deadline
+    )
+        external
+        payable
+        checkDeadline(deadline)
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        )
+    {
+        int32 activeTick = pool.getState().activeTick;
+
+        require(
+            activeTick >= minActiveTick && activeTick <= maxActiveTick,
+            "activeTick not in range"
+        );
+
+        return addLiquidity(pool, tokenId, params, minTokenAAmount, minTokenBAmount);
+    }
+
+    function getOrCreatePool(PoolParams calldata poolParams) private returns (IPool pool) {
+        {
+            pool = IFactory(factory).lookup(
+                poolParams.fee,
+                poolParams.tickSpacing,
+                poolParams.lookback,
+                poolParams.tokenA,
+                poolParams.tokenB
+            );
+        }
+        if (address(pool) == address(0)) {
+            pool = IFactory(factory).create(
+                poolParams.fee,
+                poolParams.tickSpacing,
+                poolParams.lookback,
+                poolParams.activeTick,
+                poolParams.tokenA,
+                poolParams.tokenB
+            );
+        }
+    }
+
+    /// @inheritdoc IRouter
+    function getOrCreatePoolAndAddLiquidity(
+        PoolParams calldata poolParams,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata addParams,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        uint256 deadline
+    )
+        external
+        payable
+        checkDeadline(deadline)
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        )
+    {
+        IPool pool = getOrCreatePool(poolParams);
+        return addLiquidity(pool, tokenId, addParams, minTokenAAmount, minTokenBAmount);
+    }
+
+    /// @inheritdoc IRouter
+    function migrateBinsUpStack(
+        IPool pool,
+        uint128[] calldata binIds,
+        uint32 maxRecursion,
+        uint256 deadline
+    ) external checkDeadline(deadline) {
+        for (uint256 i = 0; i < binIds.length; i++) {
+            pool.migrateBinUpStack(binIds[i], maxRecursion);
+        }
+    }
+
+    /// @inheritdoc IRouter
+    function removeLiquidity(
+        IPool pool,
+        address recipient,
+        uint256 tokenId,
+        IPool.RemoveLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        uint256 deadline
+    )
+        external
+        checkDeadline(deadline)
+        returns (uint256 tokenAAmount, uint256 tokenBAmount, IPool.BinDelta[] memory binDeltas)
+    {
+        require(msg.sender == position.ownerOf(tokenId), "P");
+
+        if (recipient == address(0)) recipient = address(this);
+        (tokenAAmount, tokenBAmount, binDeltas) = pool.removeLiquidity(recipient, tokenId, params);
+
+        require(
+            tokenAAmount >= minTokenAAmount && tokenBAmount >= minTokenBAmount,
+            "Too little removed"
+        );
+    }
+}
+
+
+// File: contracts/interfaces/IMulticall.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.7.5;
+pragma abicoder v2;
+
+/// @title Multicall interface
+/// @notice Enables calling multiple methods in a single call to the contract
+interface IMulticall {
+    /// @notice Call multiple functions in the current contract and return the data from all of them if they all succeed
+    /// @dev The `msg.value` should not be trusted for any method callable from multicall.
+    /// @param data The encoded function data for each of the calls to make to this contract
+    /// @return results The results from each of the calls passed in via data
+    function multicall(bytes[] calldata data) external payable returns (bytes[] memory results);
+}
+
+
+// File: contracts/interfaces/IRouter.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import "@maverick/contracts/contracts/interfaces/IFactory.sol";
+import "@maverick/contracts/contracts/interfaces/IPool.sol";
+import "@maverick/contracts/contracts/interfaces/IPosition.sol";
+import "@maverick/contracts/contracts/interfaces/ISwapCallback.sol";
+import "./external/IWETH9.sol";
+import "./ISlimRouter.sol";
+
+interface IRouter is ISlimRouter {
+    /// @return Returns the address of the factory
+    function factory() external view returns (IFactory);
+
+    /// @return Returns the address of the Position NFT
+    function position() external view returns (IPosition);
+
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of
+    //another along the specified path
+    /// @param params The parameters necessary for the multi-hop swap, encoded
+    //as `ExactInputParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInput(
+        ExactInputParams calldata params
+    ) external payable returns (uint256 amountOut);
+
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of
+    //another along the specified path (reversed)
+    /// @param params The parameters necessary for the multi-hop swap, encoded
+    //as `ExactOutputParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutput(
+        ExactOutputParams calldata params
+    ) external payable returns (uint256 amountIn);
+
+    struct PoolParams {
+        uint256 fee;
+        uint256 tickSpacing;
+        int256 lookback;
+        int32 activeTick;
+        IERC20 tokenA;
+        IERC20 tokenB;
+    }
+
+    /// @notice create a pool and add liquidity to it
+    /// @param poolParams paramters of a pool
+    /// @param tokenId nft id of token that will hold lp balance, use 0 to mint a new token
+    /// @param addParams paramters of liquidity addition
+    /// @param minTokenAAmount minimum amount of token A to add, revert if not met
+    /// @param minTokenBAmount minimum amount of token B to add, revert if not met
+    /// @param deadline epoch timestamp in seconds
+    function getOrCreatePoolAndAddLiquidity(
+        PoolParams calldata poolParams,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata addParams,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        );
+
+    /// @notice add liquidity to a pool
+    /// @param pool pool to add liquidity to
+    /// @param tokenId nft id of token that will hold lp balance, use 0 to mint a new token
+    /// @param params paramters of liquidity addition
+    /// @param minTokenAAmount minimum amount of token A to add, revert if not met
+    /// @param minTokenBAmount minimum amount of token B to add, revert if not met
+    /// @param deadline epoch timestamp in seconds
+    function addLiquidityToPool(
+        IPool pool,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        );
+
+    /// @notice add liquidity to a pool with active tick limits
+    /// @param pool pool to add liquidity to
+    /// @param tokenId nft id of token that will hold lp balance, use 0 to mint a new token
+    /// @param params paramters of liquidity addition
+    /// @param minTokenAAmount minimum amount of token A to add, revert if not met
+    /// @param minTokenBAmount minimum amount of token B to add, revert if not met
+    /// @param minActiveTick lowest activeTick (inclusive) of pool that will permit transaction to pass
+    /// @param maxActiveTick highest activeTick (inclusive) of pool that will permit transaction to pass
+    /// @param deadline epoch timestamp in seconds
+    function addLiquidityWTickLimits(
+        IPool pool,
+        uint256 tokenId,
+        IPool.AddLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        int32 minActiveTick,
+        int32 maxActiveTick,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 receivingTokenId,
+            uint256 tokenAAmount,
+            uint256 tokenBAmount,
+            IPool.BinDelta[] memory binDeltas
+        );
+
+    /// @notice moves the head of input merged bins to the active bin
+    /// @param pool to remove from
+    /// @param binIds array of bin Ids to migrate
+    /// @param maxRecursion maximum recursion depth before returning; 0=no max
+    /// @param deadline epoch timestamp in seconds
+    function migrateBinsUpStack(
+        IPool pool,
+        uint128[] calldata binIds,
+        uint32 maxRecursion,
+        uint256 deadline
+    ) external;
+
+    /// @notice remove liquidity from pool and receive WETH if one of the tokens is WETH
+    /// @dev router must be approved for the withdrawing tokenId: Position.approve(router, tokenId)
+    /// @param pool pool to remove from
+    /// @param recipient address where proceeds are sent; use zero or router address to leave tokens in router
+    /// @param tokenId ID of position NFT that holds liquidity
+    /// @param params paramters of liquidity removal
+    /// @param minTokenAAmount minimum amount of token A to receive, revert if not met
+    /// @param minTokenBAmount minimum amount of token B to receive, revert if not met
+    /// @param deadline epoch timestamp in seconds
+    function removeLiquidity(
+        IPool pool,
+        address recipient,
+        uint256 tokenId,
+        IPool.RemoveLiquidityParams[] calldata params,
+        uint256 minTokenAAmount,
+        uint256 minTokenBAmount,
+        uint256 deadline
+    )
+        external
+        returns (uint256 tokenAAmount, uint256 tokenBAmount, IPool.BinDelta[] memory binDeltas);
+}
+
+
+// File: contracts/interfaces/ISelfPermit.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.7.5;
+
+/// @title Self Permit
+/// @notice Functionality to call permit on any EIP-2612-compliant token for use in the route
+interface ISelfPermit {
+    /// @notice Permits this contract to spend a given token from `msg.sender`
+    /// @dev The `owner` is always msg.sender and the `spender` is always address(this).
+    /// @param token The address of the token spent
+    /// @param value The amount that can be spent of token
+    /// @param deadline A timestamp, the current blocktime must be less than or equal to this timestamp
+    /// @param v Must produce valid secp256k1 signature from the holder along with `r` and `s`
+    /// @param r Must produce valid secp256k1 signature from the holder along with `v` and `s`
+    /// @param s Must produce valid secp256k1 signature from the holder along with `r` and `v`
+    function selfPermit(
+        address token,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external payable;
+
+    /// @notice Permits this contract to spend a given token from `msg.sender`
+    /// @dev The `owner` is always msg.sender and the `spender` is always address(this).
+    /// Can be used instead of #selfPermit to prevent calls from failing due to a frontrun of a call to #selfPermit
+    /// @param token The address of the token spent
+    /// @param value The amount that can be spent of token
+    /// @param deadline A timestamp, the current blocktime must be less than or equal to this timestamp
+    /// @param v Must produce valid secp256k1 signature from the holder along with `r` and `s`
+    /// @param r Must produce valid secp256k1 signature from the holder along with `v` and `s`
+    /// @param s Must produce valid secp256k1 signature from the holder along with `r` and `v`
+    function selfPermitIfNecessary(
+        address token,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external payable;
+
+    /// @notice Permits this contract to spend the sender's tokens for permit signatures that have the `allowed` parameter
+    /// @dev The `owner` is always msg.sender and the `spender` is always address(this)
+    /// @param token The address of the token spent
+    /// @param nonce The current nonce of the owner
+    /// @param expiry The timestamp at which the permit is no longer valid
+    /// @param v Must produce valid secp256k1 signature from the holder along with `r` and `s`
+    /// @param r Must produce valid secp256k1 signature from the holder along with `v` and `s`
+    /// @param s Must produce valid secp256k1 signature from the holder along with `r` and `v`
+    function selfPermitAllowed(
+        address token,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external payable;
+
+    /// @notice Permits this contract to spend the sender's tokens for permit signatures that have the `allowed` parameter
+    /// @dev The `owner` is always msg.sender and the `spender` is always address(this)
+    /// Can be used instead of #selfPermitAllowed to prevent calls from failing due to a frontrun of a call to #selfPermitAllowed.
+    /// @param token The address of the token spent
+    /// @param nonce The current nonce of the owner
+    /// @param expiry The timestamp at which the permit is no longer valid
+    /// @param v Must produce valid secp256k1 signature from the holder along with `r` and `s`
+    /// @param r Must produce valid secp256k1 signature from the holder along with `v` and `s`
+    /// @param s Must produce valid secp256k1 signature from the holder along with `r` and `v`
+    function selfPermitAllowedIfNecessary(
+        address token,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external payable;
+}
+
+
+// File: contracts/interfaces/ISlimRouter.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import "@maverick/contracts/contracts/interfaces/IFactory.sol";
+import "@maverick/contracts/contracts/interfaces/IPool.sol";
+import "@maverick/contracts/contracts/interfaces/IPosition.sol";
+import "@maverick/contracts/contracts/interfaces/ISwapCallback.sol";
+import "./external/IWETH9.sol";
+
+interface ISlimRouter is ISwapCallback {
+    /// @return Returns the address of WETH9
+    function WETH9() external view returns (IWETH9);
+
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        IPool pool;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint256 sqrtPriceLimitD18;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of
+    //another token
+    /// @param params The parameters necessary for the swap, encoded as
+    //`ExactInputSingleParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInputSingle(
+        ExactInputSingleParams calldata params
+    ) external payable returns (uint256 amountOut);
+
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        IPool pool;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of
+    //another token
+    /// @param params The parameters necessary for the swap, encoded as
+    //`ExactOutputSingleParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutputSingle(
+        ExactOutputSingleParams calldata params
+    ) external payable returns (uint256 amountIn);
+
+    /// @notice Unwraps the contract's WETH9 balance and sends it to recipient as ETH.
+    /// @dev The amountMinimum parameter prevents malicious contracts from stealing WETH9 from users.
+    /// @param amountMinimum The minimum amount of WETH9 to unwrap
+    /// @param recipient The address receiving ETH
+    function unwrapWETH9(uint256 amountMinimum, address recipient) external payable;
+
+    /// @notice Refunds any ETH balance held by this contract to the `msg.sender`
+    /// @dev Useful for bundling with mint or increase liquidity that uses ether, or exact output swaps
+    /// that use ether for the input amount
+    function refundETH() external payable;
+
+    /// @notice Transfers the full amount of a token held by this contract to recipient
+    /// @dev The amountMinimum parameter prevents malicious contracts from stealing the token from users
+    /// @param token The contract address of the token which will be transferred to `recipient`
+    /// @param amountMinimum The minimum amount of token required for a transfer
+    /// @param recipient The destination address of the token
+    function sweepToken(IERC20 token, uint256 amountMinimum, address recipient) external payable;
+}
+
+
+// File: contracts/interfaces/external/IERC20PermitAllowed.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.5.0;
+
+/// @title Interface for permit
+/// @notice Interface used by DAI/CHAI for permit
+interface IERC20PermitAllowed {
+    /// @notice Approve the spender to spend some tokens via the holder signature
+    /// @dev This is the permit interface used by DAI and CHAI
+    /// @param holder The address of the token holder, the token owner
+    /// @param spender The address of the token spender
+    /// @param nonce The holder's nonce, increases at each call to permit
+    /// @param expiry The timestamp at which the permit is no longer valid
+    /// @param allowed Boolean that sets approval amount, true for type(uint256).max and false for 0
+    /// @param v Must produce valid secp256k1 signature from the holder along with `r` and `s`
+    /// @param r Must produce valid secp256k1 signature from the holder along with `v` and `s`
+    /// @param s Must produce valid secp256k1 signature from the holder along with `r` and `v`
+    function permit(
+        address holder,
+        address spender,
+        uint256 nonce,
+        uint256 expiry,
+        bool allowed,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
+
+// File: contracts/interfaces/external/IWETH9.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @title Interface for WETH9
+interface IWETH9 is IERC20 {
+    /// @notice Deposit ether to get wrapped ether
+    function deposit() external payable;
+
+    /// @notice Withdraw wrapped ether to get ether
+    function withdraw(uint256) external;
+}
+
+
+// File: contracts/libraries/BytesLib.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * @title Solidity Bytes Arrays Utils
+ * @author Gonçalo Sá <goncalo.sa@consensys.net>
+ *
+ * @dev Bytes tightly packed arrays utility library for ethereum contracts written in Solidity.
+ *      The library lets you concatenate, slice and type cast bytes arrays both in memory and storage.
+ */
+pragma solidity ^0.8.0;
+
+library BytesLib {
+    function slice(
+        bytes memory _bytes,
+        uint256 _start,
+        uint256 _length
+    ) internal pure returns (bytes memory) {
+        require(_length + 31 >= _length, "slice_overflow");
+        require(_start + _length >= _start, "slice_overflow");
+        require(_bytes.length >= _start + _length, "slice_outOfBounds");
+
+        bytes memory tempBytes;
+
+        assembly {
+            switch iszero(_length)
+            case 0 {
+                // Get a location of some free memory and store it in tempBytes as
+                // Solidity does for memory variables.
+                tempBytes := mload(0x40)
+
+                // The first word of the slice result is potentially a partial
+                // word read from the original array. To read it, we calculate
+                // the length of that partial word and start copying that many
+                // bytes into the array. The first word we copy will start with
+                // data we don't care about, but the last `lengthmod` bytes will
+                // land at the beginning of the contents of the new array. When
+                // we're done copying, we overwrite the full first word with
+                // the actual length of the slice.
+                let lengthmod := and(_length, 31)
+
+                // The multiplication in the next line is necessary
+                // because when slicing multiples of 32 bytes (lengthmod == 0)
+                // the following copy loop was copying the origin's length
+                // and then ending prematurely not copying everything it should.
+                let mc := add(add(tempBytes, lengthmod), mul(0x20, iszero(lengthmod)))
+                let end := add(mc, _length)
+
+                for {
+                    // The multiplication in the next line has the same exact purpose
+                    // as the one above.
+                    let cc := add(add(add(_bytes, lengthmod), mul(0x20, iszero(lengthmod))), _start)
+                } lt(mc, end) {
+                    mc := add(mc, 0x20)
+                    cc := add(cc, 0x20)
+                } {
+                    mstore(mc, mload(cc))
+                }
+
+                mstore(tempBytes, _length)
+
+                //update free-memory pointer
+                //allocating the array padded to 32 bytes like the compiler does now
+                mstore(0x40, and(add(mc, 31), not(31)))
+            }
+            //if we want a zero-length slice let's just return a zero-length array
+            default {
+                tempBytes := mload(0x40)
+                //zero out the 32 bytes slice we are about to return
+                //we need to do it because Solidity does not garbage collect
+                mstore(tempBytes, 0)
+
+                mstore(0x40, add(tempBytes, 0x20))
+            }
+        }
+
+        return tempBytes;
+    }
+
+    function toAddress(bytes memory _bytes, uint256 _start) internal pure returns (address) {
+        require(_start + 20 >= _start, "toAddress_overflow");
+        require(_bytes.length >= _start + 20, "toAddress_outOfBounds");
+        address tempAddress;
+
+        assembly {
+            tempAddress := div(mload(add(add(_bytes, 0x20), _start)), 0x1000000000000000000000000)
+        }
+
+        return tempAddress;
+    }
+
+    function toUint24(bytes memory _bytes, uint256 _start) internal pure returns (uint24) {
+        require(_start + 3 >= _start, "toUint24_overflow");
+        require(_bytes.length >= _start + 3, "toUint24_outOfBounds");
+        uint24 tempUint;
+
+        assembly {
+            tempUint := mload(add(add(_bytes, 0x3), _start))
+        }
+
+        return tempUint;
+    }
+}
+
+
+// File: contracts/libraries/Deadline.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+
+abstract contract Deadline {
+    modifier checkDeadline(uint256 deadline) {
+        require(block.timestamp <= deadline, "Transaction too old");
+        _;
+    }
+}
+
+
+// File: contracts/libraries/Multicall.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+pragma abicoder v2;
+
+import "../interfaces/IMulticall.sol";
+
+/// @title Multicall
+/// @notice Enables calling multiple methods in a single call to the contract
+abstract contract Multicall is IMulticall {
+    /// @inheritdoc IMulticall
+    function multicall(
+        bytes[] calldata data
+    ) public payable override returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            (bool success, bytes memory result) = address(this).delegatecall(data[i]);
+
+            if (!success) {
+                // Next 5 lines from https://ethereum.stackexchange.com/a/83577
+                if (result.length < 68) revert();
+                assembly {
+                    result := add(result, 0x04)
+                }
+                revert(abi.decode(result, (string)));
+            }
+
+            results[i] = result;
+        }
+    }
+}
+
+
+// File: contracts/libraries/Path.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import "@maverick/contracts/contracts/interfaces/IPool.sol";
+
+import "./BytesLib.sol";
+
+/// @title Functions for manipulating path data for multihop swaps
+library Path {
+    using BytesLib for bytes;
+
+    /// @dev The length of the bytes encoded address
+    uint256 private constant ADDR_SIZE = 20;
+
+    /// @dev The offset of a single token address and pool address
+    uint256 private constant NEXT_OFFSET = ADDR_SIZE + ADDR_SIZE;
+    /// @dev The offset of an encoded pool key
+    uint256 private constant POP_OFFSET = NEXT_OFFSET + ADDR_SIZE;
+    /// @dev The minimum length of an encoding that contains 2 or more pools
+    uint256 private constant MULTIPLE_POOLS_MIN_LENGTH = POP_OFFSET + NEXT_OFFSET;
+
+    /// @notice Returns true iff the path contains two or more pools
+    /// @param path The encoded swap path
+    /// @return True if path contains two or more pools, otherwise false
+    function hasMultiplePools(bytes memory path) internal pure returns (bool) {
+        return path.length >= MULTIPLE_POOLS_MIN_LENGTH;
+    }
+
+    /// @notice Returns the number of pools in the path
+    /// @param path The encoded swap path
+    /// @return The number of pools in the path
+    function numPools(bytes memory path) internal pure returns (uint256) {
+        // Ignore the first token address. From then on every fee and token offset indicates a pool.
+        return ((path.length - ADDR_SIZE) / NEXT_OFFSET);
+    }
+
+    /// @notice Decodes the first pool in path
+    /// @param path The bytes encoded swap path
+    /// @return tokenIn The input in a path
+    /// @return tokenOut The output in a path
+    /// @return pool The pool
+    function decodeFirstPool(
+        bytes memory path
+    ) internal pure returns (IERC20 tokenIn, IERC20 tokenOut, IPool pool) {
+        tokenIn = IERC20(path.toAddress(0));
+        pool = IPool(path.toAddress(ADDR_SIZE));
+        tokenOut = IERC20(path.toAddress(NEXT_OFFSET));
+    }
+
+    /// @notice Gets the segment corresponding to the first pool in the path
+    /// @param path The bytes encoded swap path
+    /// @return The segment containing all data necessary to target the first pool in the path
+    function getFirstPool(bytes memory path) internal pure returns (bytes memory) {
+        return path.slice(0, POP_OFFSET);
+    }
+
+    /// @notice Skips a token + pool element from the buffer and returns the remainder
+    /// @param path The swap path
+    /// @return The remaining token + pool elements in the path
+    function skipToken(bytes memory path) internal pure returns (bytes memory) {
+        return path.slice(NEXT_OFFSET, path.length - NEXT_OFFSET);
+    }
+}
+
+
+// File: contracts/libraries/SelfPermit.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.5.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol";
+
+import "../interfaces/ISelfPermit.sol";
+import "../interfaces/external/IERC20PermitAllowed.sol";
+
+/// @title Self Permit
+/// @notice Functionality to call permit on any EIP-2612-compliant token for use in the route
+/// @dev These functions are expected to be embedded in multicalls to allow EOAs to approve a contract and call a function
+/// that requires an approval in a single transaction.
+abstract contract SelfPermit is ISelfPermit {
+    /// @inheritdoc ISelfPermit
+    function selfPermit(
+        address token,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public payable override {
+        IERC20Permit(token).permit(msg.sender, address(this), value, deadline, v, r, s);
+    }
+
+    /// @inheritdoc ISelfPermit
+    function selfPermitIfNecessary(
+        address token,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external payable override {
+        if (IERC20(token).allowance(msg.sender, address(this)) < value)
+            selfPermit(token, value, deadline, v, r, s);
+    }
+
+    /// @inheritdoc ISelfPermit
+    function selfPermitAllowed(
+        address token,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public payable override {
+        IERC20PermitAllowed(token).permit(msg.sender, address(this), nonce, expiry, true, v, r, s);
+    }
+
+    /// @inheritdoc ISelfPermit
+    function selfPermitAllowedIfNecessary(
+        address token,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external payable override {
+        if (IERC20(token).allowance(msg.sender, address(this)) < type(uint256).max)
+            selfPermitAllowed(token, nonce, expiry, v, r, s);
+    }
+}
+
+
+// File: contracts/libraries/TransferHelper.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.6.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+library TransferHelper {
+    /// @notice Transfers tokens from the targeted address to the given destination
+    /// @notice Errors with 'STF' if transfer fails
+    /// @param token The contract address of the token to be transferred
+    /// @param from The originating address from which the tokens will be transferred
+    /// @param to The destination address of the transfer
+    /// @param value The amount to be transferred
+    function safeTransferFrom(address token, address from, address to, uint256 value) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, value)
+        );
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "STF");
+    }
+
+    /// @notice Transfers tokens from msg.sender to a recipient
+    /// @dev Errors with ST if transfer fails
+    /// @param token The contract address of the token which will be transferred
+    /// @param to The recipient of the transfer
+    /// @param value The value of the transfer
+    function safeTransfer(address token, address to, uint256 value) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.transfer.selector, to, value)
+        );
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "ST");
+    }
+
+    /// @notice Approves the stipulated contract to spend the given allowance in the given token
+    /// @dev Errors with 'SA' if transfer fails
+    /// @param token The contract address of the token to be approved
+    /// @param to The target of the approval
+    /// @param value The amount of the given token the target will be allowed to spend
+    function safeApprove(address token, address to, uint256 value) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.approve.selector, to, value)
+        );
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "SA");
+    }
+
+    /// @notice Transfers ETH to the recipient address
+    /// @dev Fails with `STE`
+    /// @param to The destination of the transfer
+    /// @param value The value to be transferred
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success, ) = to.call{value: value}(new bytes(0));
+        require(success, "STE");
+    }
+}
+

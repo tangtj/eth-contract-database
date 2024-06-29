@@ -1,0 +1,890 @@
+
+// File: contracts/Arcas/CCIPBridge/Bridge.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import {IRouterClient} from "@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol";
+import "https://github.com/Vectorized/solady/blob/main/src/auth/Ownable.sol";
+import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
+import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+    function transfer(address to, uint256 value) external returns (bool);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+    function approve(address spender, uint256 value) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+}
+
+contract CCIPBridgeConfiguration is Ownable {
+    address router;
+    address weth;
+    uint64 destinationChainSelector;
+    address bridgeToken;
+
+    /// @param _owner The owner of the configuration contract, will be passed to the Bridge contract.
+    constructor(address _owner) Ownable() {
+        _initializeOwner(_owner);
+    }
+
+    /// @param _router The address of the router contract.
+    /// @param _weth The address of the weth contract.
+    /// @param _destinationChainSelector The address of the destination chain selector, this is immutable.
+    /// @param _bridgeToken The address of the bridge token, this is immutable.
+    function setConfiguration(
+        address _router, 
+        address _weth, 
+        uint64 _destinationChainSelector,
+        address _bridgeToken
+    ) external onlyOwner {
+        router = _router;
+        weth = _weth;
+        destinationChainSelector = _destinationChainSelector;
+        bridgeToken = _bridgeToken;
+    }
+
+    function getRouter() external view returns(address _router) {
+        _router = router;
+    }
+
+    function getConfiguration() external view returns(
+        address _router, 
+        address _weth, 
+        uint64 _destinationChainSelector,
+        address _bridgeToken
+    ) {
+        _router = router;
+        _weth = weth;
+        _destinationChainSelector = destinationChainSelector;
+        _bridgeToken = bridgeToken;
+    }
+}
+
+/// @title - A Chainlink CCIP bridge for Arcas between ETH and BNB chain.
+/// The idea is same single deployment on both chains, allowing you to then set an immutable mirror for the bridge
+contract Bridge is Ownable, CCIPReceiver, ReentrancyGuard {
+
+    /////////////////////////////////////////////////////////
+    //                                                     //
+    //                      ERRORS                         //
+    //                                                     //
+    /////////////////////////////////////////////////////////
+
+    error InsufficientWETH();
+    error InvalidChainSelector();
+    error InvalidSender();
+    error BridgeLocked();
+    error CannotSendToBurnAddress();
+    error InvalidAmount();
+    error InsufficientTokenBalance();
+    error InsufficientFeePayment();
+
+    /////////////////////////////////////////////////////////
+    //                                                     //
+    //                      PARAMETERS                     //
+    //                                                     //            
+    /////////////////////////////////////////////////////////
+
+    // Bridge only for a single chain
+    uint64 private immutable allowedChainSelector;
+    // Arcas token to be bridged
+    IERC20 public immutable arcas;
+    // Chainlink CCIP Router 
+    IRouterClient private immutable s_router;
+    // Native wrapped token
+    IWETH public immutable weth;
+    // Lock the bridge
+    bool public lock;
+
+    /////////////////////////////////////////////////////////
+    //                                                     //
+    //                      CONSTRUCTOR                    //
+    //                                                     //            
+    ///////////////////////////////////////////////////////// 
+
+    /// @notice Constructor initializes the contract with the router address.
+    constructor(
+        address _configuration
+        )
+    Ownable()
+    CCIPReceiver(CCIPBridgeConfiguration(_configuration).getRouter())
+     {
+        (
+            address _router, 
+            address _weth, 
+            uint64 _destinationChainSelector, 
+            address _bridgeToken
+        ) = CCIPBridgeConfiguration(_configuration).getConfiguration();
+
+        s_router = IRouterClient(_router);
+        weth = IWETH(_weth);
+        allowedChainSelector = _destinationChainSelector;
+        arcas = IERC20(_bridgeToken);
+        lock = true;
+        _initializeOwner(CCIPBridgeConfiguration(_configuration).owner());
+
+        weth.approve(_router, type(uint256).max);
+    }
+
+    /////////////////////////////////////////////////////////
+    //                                                     //
+    //                 ADMIN CONTROLS                      //
+    //                                                     //        
+    /////////////////////////////////////////////////////////
+
+    /// @notice Toggle lock for users using the bridge function
+    function toggleLock() external onlyOwner {
+        lock = !lock;   
+    }
+
+    /// @notice Allows the owner to extract additional WETH in contract as fees.
+    function withdrawWeth(
+        uint256 _amount,
+        address _recipient
+    ) external onlyOwner {
+        if(weth.balanceOf(address(this)) < _amount) revert InsufficientWETH();
+
+        weth.transfer(_recipient, _amount);
+    }
+    
+
+    /// @notice Sends data to receiver on the destination chain.
+    /// @dev Pays the gas fee with msg.value and wraps it to WETH
+    /// @param _amount The uint amount to be sent.
+    /// @param _tokenRecipient The address to send token to.
+    /// @return messageId The ID of the message that was sent.
+    function bridge(
+        uint256 _amount,
+        address _tokenRecipient
+    ) external payable nonReentrant returns (bytes32 messageId) {
+
+        //Ensure bridge is open for use
+        if (lock) revert BridgeLocked();
+        //Ensure recipient isn't burn
+        if (_tokenRecipient == address(0)) revert CannotSendToBurnAddress();
+        //Ensure amount is greater than 0
+        if (_amount == 0) revert InvalidAmount();
+
+        // Create an EVM2AnyMessage struct in memory with necessary information for sending a cross-chain message
+        Client.EVM2AnyMessage memory evm2AnyMessage = Client.EVM2AnyMessage({
+            receiver: abi.encode(address(this)), // ABI-encoded receiver address
+            data: abi.encode(_amount, _tokenRecipient), // ABI-encoded number and recipient for transfer
+            tokenAmounts: new Client.EVMTokenAmount[](0), // Empty array indicating no tokens are being sent
+            extraArgs: Client._argsToBytes(
+                // Additional arguments, setting gas limit
+                Client.EVMExtraArgsV1({gasLimit: 100_000})
+            ),
+            // Set the feeToken  address, indicating native wrapped WETH will be used for fees
+            feeToken: address(weth)
+        });
+
+        // Transfers the tokens into the bridge
+        arcas.transferFrom(msg.sender, address(this), _amount);
+
+        // Cache balance of wrapped native before message send
+        uint256 wrappedNativeBalanceBefore = weth.balanceOf(address(this));
+
+        // Do wrap of msg.value to wrapped native
+        weth.deposit{value: msg.value}();
+
+        // Send the message through the router and store the returned message ID
+        messageId = s_router.ccipSend(allowedChainSelector, evm2AnyMessage);
+
+        // Revert if message send consumed more wrapped native than was supplied
+        if (wrappedNativeBalanceBefore > weth.balanceOf(address(this))) {
+            revert InsufficientFeePayment();
+        }
+
+        // Return the message ID
+        return messageId;
+    }
+
+
+    // Function for frontend to estimate fee required for bridge in native tokens.
+    function getFee(
+        uint256 _amount,
+        address _tokenRecipient
+    ) external view returns (uint256 fee) {
+        // Create an EVM2AnyMessage struct in memory with necessary information for sending a cross-chain message
+        Client.EVM2AnyMessage memory evm2AnyMessage = Client.EVM2AnyMessage({
+            receiver: abi.encode(address(this)), // ABI-encoded receiver address
+            data: abi.encode(_amount, _tokenRecipient), // ABI-encoded number
+            tokenAmounts: new Client.EVMTokenAmount[](0), // Empty array indicating no tokens are being sent
+            extraArgs: Client._argsToBytes(
+                // Additional arguments, setting gas limit
+                Client.EVMExtraArgsV1({gasLimit: 100_000})
+            ),
+            // Set the feeToken  address, indicating native wrapped WETH will be used for fees
+            feeToken: address(weth)
+        });
+
+        // Get the fee required to send the message
+        fee = s_router.getFee(
+            allowedChainSelector,
+            evm2AnyMessage
+        );
+    }
+
+    /// Handles a CCIP received message and bridges the tokens
+    function _ccipReceive(
+        Client.Any2EVMMessage memory any2EvmMessage
+    ) internal nonReentrant override {
+        
+        //Ensure the chain is correct
+        if (any2EvmMessage.sourceChainSelector != allowedChainSelector) revert InvalidChainSelector();
+        //Ensure the sender is the mirror
+        if (abi.decode(any2EvmMessage.sender, (address)) != address(this)) revert InvalidSender();
+        //Ensure the bridge is not locked
+        if (lock) revert BridgeLocked();
+
+        // abi-decoding of the sent token amount for bridging
+        (uint256 amount, address tokenRecipient) = abi.decode(any2EvmMessage.data, (uint256, address)); 
+
+        if (arcas.balanceOf(address(this)) < amount) revert InsufficientTokenBalance();
+
+        // Arcas token transfer
+        arcas.transfer(tokenRecipient, amount);
+    }
+}
+
+// File: @openzeppelin/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: @chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IAny2EVMMessageReceiver} from "../interfaces/IAny2EVMMessageReceiver.sol";
+
+import {Client} from "../libraries/Client.sol";
+
+import {IERC165} from "../../vendor/openzeppelin-solidity/v4.8.0/contracts/utils/introspection/IERC165.sol";
+
+/// @title CCIPReceiver - Base contract for CCIP applications that can receive messages.
+abstract contract CCIPReceiver is IAny2EVMMessageReceiver, IERC165 {
+  address internal immutable i_router;
+
+  constructor(address router) {
+    if (router == address(0)) revert InvalidRouter(address(0));
+    i_router = router;
+  }
+
+  /// @notice IERC165 supports an interfaceId
+  /// @param interfaceId The interfaceId to check
+  /// @return true if the interfaceId is supported
+  /// @dev Should indicate whether the contract implements IAny2EVMMessageReceiver
+  /// e.g. return interfaceId == type(IAny2EVMMessageReceiver).interfaceId || interfaceId == type(IERC165).interfaceId
+  /// This allows CCIP to check if ccipReceive is available before calling it.
+  /// If this returns false or reverts, only tokens are transferred to the receiver.
+  /// If this returns true, tokens are transferred and ccipReceive is called atomically.
+  /// Additionally, if the receiver address does not have code associated with
+  /// it at the time of execution (EXTCODESIZE returns 0), only tokens will be transferred.
+  function supportsInterface(bytes4 interfaceId) public pure virtual override returns (bool) {
+    return interfaceId == type(IAny2EVMMessageReceiver).interfaceId || interfaceId == type(IERC165).interfaceId;
+  }
+
+  /// @inheritdoc IAny2EVMMessageReceiver
+  function ccipReceive(Client.Any2EVMMessage calldata message) external virtual override onlyRouter {
+    _ccipReceive(message);
+  }
+
+  /// @notice Override this function in your implementation.
+  /// @param message Any2EVMMessage
+  function _ccipReceive(Client.Any2EVMMessage memory message) internal virtual;
+
+  /////////////////////////////////////////////////////////////////////
+  // Plumbing
+  /////////////////////////////////////////////////////////////////////
+
+  /// @notice Return the current router
+  /// @return i_router address
+  function getRouter() public view returns (address) {
+    return address(i_router);
+  }
+
+  error InvalidRouter(address router);
+
+  /// @dev only calls from the set router are accepted.
+  modifier onlyRouter() {
+    if (msg.sender != address(i_router)) revert InvalidRouter(msg.sender);
+    _;
+  }
+}
+
+
+// File: @chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// End consumer library.
+library Client {
+  /// @dev RMN depends on this struct, if changing, please notify the RMN maintainers.
+  struct EVMTokenAmount {
+    address token; // token address on the local chain.
+    uint256 amount; // Amount of tokens.
+  }
+
+  struct Any2EVMMessage {
+    bytes32 messageId; // MessageId corresponding to ccipSend on source.
+    uint64 sourceChainSelector; // Source chain selector.
+    bytes sender; // abi.decode(sender) if coming from an EVM chain.
+    bytes data; // payload sent in original message.
+    EVMTokenAmount[] destTokenAmounts; // Tokens and their amounts in their destination chain representation.
+  }
+
+  // If extraArgs is empty bytes, the default is 200k gas limit.
+  struct EVM2AnyMessage {
+    bytes receiver; // abi.encode(receiver address) for dest EVM chains
+    bytes data; // Data payload
+    EVMTokenAmount[] tokenAmounts; // Token transfers
+    address feeToken; // Address of feeToken. address(0) means you will send msg.value.
+    bytes extraArgs; // Populate this with _argsToBytes(EVMExtraArgsV1)
+  }
+
+  // bytes4(keccak256("CCIP EVMExtraArgsV1"));
+  bytes4 public constant EVM_EXTRA_ARGS_V1_TAG = 0x97a657c9;
+  struct EVMExtraArgsV1 {
+    uint256 gasLimit;
+  }
+
+  function _argsToBytes(EVMExtraArgsV1 memory extraArgs) internal pure returns (bytes memory bts) {
+    return abi.encodeWithSelector(EVM_EXTRA_ARGS_V1_TAG, extraArgs);
+  }
+}
+
+
+// File: https://github.com/Vectorized/solady/blob/main/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+///
+/// @dev Note:
+/// This implementation does NOT auto-initialize the owner to `msg.sender`.
+/// You MUST call the `_initializeOwner` in the constructor / initializer.
+///
+/// While the ownable portion follows
+/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,
+/// the nomenclature for the 2-step ownership handover may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /// @dev Cannot double-initialize.
+    error AlreadyInitialized();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by:
+    /// `bytes32(~uint256(uint32(bytes4(keccak256("_OWNER_SLOT_NOT")))))`.
+    /// It is intentionally chosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    bytes32 internal constant _OWNER_SLOT =
+        0xffffffffffffffffffffffffffffffffffffffffffffffffffffffff74873927;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Override to return true to make `_initializeOwner` prevent double-initialization.
+    function _guardInitializeOwner() internal pure virtual returns (bool guard) {}
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        if (_guardInitializeOwner()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                if sload(ownerSlot) {
+                    mstore(0x00, 0x0dc149f0) // `AlreadyInitialized()`.
+                    revert(0x1c, 0x04)
+                }
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Store the new value.
+                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+            }
+        } else {
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Store the new value.
+                sstore(_OWNER_SLOT, newOwner)
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+            }
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        if (_guardInitializeOwner()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+                // Store the new value.
+                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))
+            }
+        } else {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let ownerSlot := _OWNER_SLOT
+                // Clean the upper 96 bits.
+                newOwner := shr(96, shl(96, newOwner))
+                // Emit the {OwnershipTransferred} event.
+                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+                // Store the new value.
+                sstore(ownerSlot, newOwner)
+            }
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(_OWNER_SLOT))) {
+                mstore(0x00, 0x82b42900) // `Unauthorized()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    /// Override to return a different value if needed.
+    /// Made internal to conserve bytecode. Wrap it in a public function if needed.
+    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + _ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(_OWNER_SLOT)
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+
+
+// File: @chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Client} from "../libraries/Client.sol";
+
+interface IRouterClient {
+  error UnsupportedDestinationChain(uint64 destChainSelector);
+  error InsufficientFeeTokenAmount();
+  error InvalidMsgValue();
+
+  /// @notice Checks if the given chain ID is supported for sending/receiving.
+  /// @param chainSelector The chain to check.
+  /// @return supported is true if it is supported, false if not.
+  function isChainSupported(uint64 chainSelector) external view returns (bool supported);
+
+  /// @notice Gets a list of all supported tokens which can be sent or received
+  /// to/from a given chain id.
+  /// @param chainSelector The chainSelector.
+  /// @return tokens The addresses of all tokens that are supported.
+  function getSupportedTokens(uint64 chainSelector) external view returns (address[] memory tokens);
+
+  /// @param destinationChainSelector The destination chainSelector
+  /// @param message The cross-chain CCIP message including data and/or tokens
+  /// @return fee returns execution fee for the message
+  /// delivery to destination chain, denominated in the feeToken specified in the message.
+  /// @dev Reverts with appropriate reason upon invalid message.
+  function getFee(
+    uint64 destinationChainSelector,
+    Client.EVM2AnyMessage memory message
+  ) external view returns (uint256 fee);
+
+  /// @notice Request a message to be sent to the destination chain
+  /// @param destinationChainSelector The destination chain ID
+  /// @param message The cross-chain CCIP message including data and/or tokens
+  /// @return messageId The message ID
+  /// @dev Note if msg.value is larger than the required fee (from getFee) we accept
+  /// the overpayment with no refund.
+  /// @dev Reverts with appropriate reason upon invalid message.
+  function ccipSend(
+    uint64 destinationChainSelector,
+    Client.EVM2AnyMessage calldata message
+  ) external payable returns (bytes32);
+}
+
+
+// File: @chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.0/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+// File: @chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IAny2EVMMessageReceiver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Client} from "../libraries/Client.sol";
+
+/// @notice Application contracts that intend to receive messages from
+/// the router should implement this interface.
+interface IAny2EVMMessageReceiver {
+  /// @notice Called by the Router to deliver a message.
+  /// If this reverts, any token transfers also revert. The message
+  /// will move to a FAILED state and become available for manual execution.
+  /// @param message CCIP Message
+  /// @dev Note ensure you check the msg.sender is the OffRampRouter
+  function ccipReceive(Client.Any2EVMMessage calldata message) external;
+}
+

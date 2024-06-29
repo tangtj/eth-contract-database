@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.7;
+
+contract HowOfenYouDoSport {
+        
+    event HowOfenYouDoSPORT(uint8 writeAnumFrom0to255);
+
+    function howOfenYouDoSPORT(uint8 _writeAnumFrom0to255) public {
+        emit HowOfenYouDoSPORT(_writeAnumFrom0to255);
+    }
+
+
+}

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.2;
+
+contract HowOfenYouUseWeb3App {
+        
+    event HowOfenYouUseWEB3App(uint8 AnumBetween0AND255);
+
+    function howOfenYouUseWEB3App(uint8 _AnumBetween0And255) public {
+        emit HowOfenYouUseWEB3App(_AnumBetween0And255);
+    }
+
+
+}
