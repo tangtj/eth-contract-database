@@ -1,0 +1,3202 @@
+
+// File: src/LINE.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+/// @title LINE by Figure31
+/// @notice LINE is a photographic series of 250 tokens placed within a synthetic landscape. 
+/// Using photographic and post-production techniques similar to Figure31's SALT, the images in 
+/// LINE are captured using a digital camera combined with ultra-telephoto lenses. All photographs 
+/// are taken in remote empty landscapes at sundown or night. There is no artificial light, only 
+/// indirect natural light hitting the camera sensor. Photographs are arranged as panoramas 
+/// to recreate a unified landscape.
+///
+/// @author wilt.eth
+import {Constants} from "./Constants.sol";
+import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import {Descriptor} from "./Descriptor.sol";
+import {ITokenDescriptor} from "./ITokenDescriptor.sol";
+import {ERC721} from "solmate/tokens/ERC721.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
+
+/// @dev Thrown when attempting to change a token to a star, which is already a star.
+error AlreadyStarToken();
+
+/// @dev Thrown when too many tokens are attempted to be minted within a single transaction.
+error ExceedsMaxMintPerTransaction();
+
+/// @dev Thrown when a token has not yet reached the end of the grid.
+error HasNotReachedEnd();
+
+/// @dev Thrown when the eth passed to purchase a token is incorrect.
+error IncorrectPrice();
+
+/// @dev Thrown when attempting to move in a direction opposite of the token's designated direction.
+error InvalidDirection();
+
+/// @dev Thrown when the max number of star tokens has already occurred.
+error MaxStarTokensReached();
+
+/// @dev Thrown when attempting to mint a token after minting has closed.
+error MintingClosed();
+
+/// @dev Thrown when attempting to move a token, and the ability to move tokens has not started yet or is a star token.
+error MovementLocked();
+
+/// @dev Thrown when checking the owner or approved address for a non-existent NFT.
+error NotMinted();
+
+/// @dev Thrown when checking that the caller is not the owner of the NFT.
+error NotTokenOwner();
+
+/// @dev Thrown when attempting to move a token to a place on the grid that is already taken.
+error PositionCurrentlyTaken(uint256 x, uint256 y);
+
+/// @dev Thrown when attempting to mint a token to a place on the grid that was not marked to be minted from.
+error PositionNotMintable(uint256 x, uint256 y);
+
+/// @dev Thrown when attempting to move a token to a place that is outside the bounds of the grid.
+error PositionOutOfBounds(uint256 x, uint256 y);
+
+contract LINE is ERC721, Ownable2Step, ReentrancyGuard, Constants {
+
+    using SafeTransferLib for address payable;
+
+    /// @dev Struct containing the details of the Dutch auction
+    struct SalesConfig {
+        // start time of the auction
+        uint64 startTime;
+
+        // end time of the auction
+        uint64 endTime;
+        
+        // initial price of the Dutch auction
+        uint256 startPriceInWei;
+
+        // resting price of the Dutch auction
+        uint256 endPriceInWei;
+
+        // recepient of the funds from the Dutch auction
+        address payable fundsRecipient;
+    }
+
+    /// @dev The maximum allowed number of star tokens.
+    uint256 public constant MAX_STAR_TOKENS = 25;
+
+    /// @dev The maximum allowed number of tokens to be minted within a single transaction.
+    uint256 public constant MAX_MINT_PER_TX = 5;
+    
+    /// @dev The maximum number of tokens to be minted.
+    uint256 public constant MAX_SUPPLY = 250;
+    uint256 internal immutable FUNDS_SEND_GAS_LIMIT = 210_000;
+
+    /// @dev The merkle root for collectors/holders.
+    bytes32 public holdersMerkleRoot;
+
+    /// @dev The merkle root for members of FingerprintsDAO.
+    bytes32 public fpMembersMerkleRoot;
+
+    /// @dev Keeps track of the current token id.
+    uint256 public currentTokenId = 1;
+    
+    /// @dev Keeps track of the number of tokens that have become star tokens.
+    uint256 public numStarTokens;
+    
+    /// @dev The flag to determine if tokens have the ability to move.
+    bool public canMove;
+    bool private _isMintingClosed;
+    uint256 private  _totalSupply;
+
+    ITokenDescriptor public descriptor;
+    SalesConfig public config;
+
+    uint256[NUM_COLUMNS][NUM_ROWS] internal _grid;
+    ITokenDescriptor.Coordinate[] internal _availableCoordinates;
+    mapping(bytes32 => uint256) internal _coordinateHashToIndex;
+    mapping(bytes32 => bool) internal _mintableCoordinates;
+    mapping(uint256 => ITokenDescriptor.Token) public tokenIdToTokenInfo;
+
+    constructor(address _descriptor) ERC721("LINE", "LINE") Ownable(msg.sender) {
+        descriptor = ITokenDescriptor(_descriptor);
+        config.startTime = uint64(1708538400);
+        config.endTime = uint64(1708538400 + 3600);
+        config.startPriceInWei = 1000000000000000000; // 1 eth
+        config.endPriceInWei = 150000000000000000; // .15 eth
+        config.fundsRecipient = payable(0x943ccdd95803e35369Ccf42e9618f992fD2Fea2E);
+    }
+    
+    /// @dev Mints a token at a random position on the grid.
+    function mintRandom(uint256 quantity, bytes32[] calldata merkleProof) external payable nonReentrant {
+        if (block.timestamp < config.startTime || _isMintingClosed) {
+            revert MintingClosed();
+        }
+
+        if (quantity > MAX_MINT_PER_TX) {
+            revert ExceedsMaxMintPerTransaction();
+        }
+        
+        uint256 currentPrice = getCurrentPrice();
+        if (merkleProof.length > 0) {
+            currentPrice = _getDiscountedCurrentPrice(merkleProof, msg.sender, currentPrice);
+        }
+
+        uint256 totalPrice = currentPrice * quantity;
+        if (msg.value < totalPrice) {
+            revert IncorrectPrice();
+        }
+
+        uint256 ethToReturn;
+        for (uint256 i=0; i < quantity;) {
+            bool success;
+            if (_availableCoordinates.length == 0) {
+                success = false;
+            } else {
+                ITokenDescriptor.Coordinate memory coordinateToMint = _availableCoordinates[0];
+                success = _mintWithChecks(coordinateToMint, msg.sender);
+            }
+
+            if (!success) {
+                ethToReturn += currentPrice;
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        // return eth for any pieces that failed to mint because a point on the board was already taken when the mint occurred
+        if (ethToReturn > 0) {
+            payable(msg.sender).safeTransferETH(ethToReturn);
+        }
+    }
+
+    /// @dev Mints a token at the specified on the grid.
+    function mintAtPosition(ITokenDescriptor.Coordinate[] memory coordinates, bytes32[] calldata merkleProof) external payable nonReentrant {
+        if (block.timestamp < config.startTime || _isMintingClosed) {
+            revert MintingClosed();
+        }
+
+        uint256 numCoordinates = coordinates.length;
+        if (numCoordinates > MAX_MINT_PER_TX) {
+            revert ExceedsMaxMintPerTransaction();
+        }
+        
+        uint256 currentPrice = getCurrentPrice();
+        if (merkleProof.length > 0) {
+            currentPrice = _getDiscountedCurrentPrice(merkleProof, msg.sender, currentPrice);
+        }
+
+        if (msg.value < (currentPrice * numCoordinates)) {
+            revert IncorrectPrice();
+        }
+
+        uint256 ethToReturn;
+        for (uint256 i=0; i < numCoordinates;) {
+            bool success = _mintWithChecks(coordinates[i], msg.sender);
+            if (!success) {
+                ethToReturn += currentPrice;
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        // return eth for any pieces that failed to mint because a point on the board was already taken when the mint occurred
+        if (ethToReturn > 0) {
+            payable(msg.sender).safeTransferETH(ethToReturn);
+        }
+    }
+
+    function artistMint(address receiver, ITokenDescriptor.Coordinate[] memory coordinates) external onlyOwner {
+        if (_isMintingClosed) {
+            revert MintingClosed();
+        }
+
+        uint256 numCoordinates = coordinates.length;
+        for (uint256 i=0; i < numCoordinates;) {
+            _mintWithChecks(coordinates[i], receiver);
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Ends the ability to mint.
+    function closeMint() external onlyOwner {
+        _closeMint();
+    }
+
+    /// @dev Moves a token one spot to the north on the cartesian grid.
+    function moveNorth(uint256 tokenId) external {
+        if (tokenIdToTokenInfo[tokenId].direction != ITokenDescriptor.Direction.UP) {
+            revert InvalidDirection();
+        }
+
+        _move(tokenId, 0, -1);
+    }
+
+    /// @dev Moves a token one spot to the northwest on the cartesian grid.
+    function moveNorthwest(uint256 tokenId) external {
+        if (tokenIdToTokenInfo[tokenId].direction != ITokenDescriptor.Direction.UP) {
+            revert InvalidDirection();
+        }
+
+        _move(tokenId, -1, -1);
+    }
+
+    /// @dev Moves a token one spot to the northeast on the cartesian grid.
+    function moveNortheast(uint256 tokenId) external {
+        if (tokenIdToTokenInfo[tokenId].direction != ITokenDescriptor.Direction.UP) {
+            revert InvalidDirection();
+        }
+
+        _move(tokenId, 1, -1);
+    }
+
+    /// @dev Moves a token one spot to the south on the cartesian grid.
+    function moveSouth(uint256 tokenId) external {
+        if (tokenIdToTokenInfo[tokenId].direction != ITokenDescriptor.Direction.DOWN) {
+            revert InvalidDirection();
+        }
+
+        _move(tokenId, 0, 1);
+    }
+
+    /// @dev Moves a token one spot to the southwest on the cartesian grid.
+    function moveSouthwest(uint256 tokenId) external {
+        if (tokenIdToTokenInfo[tokenId].direction != ITokenDescriptor.Direction.DOWN) {
+            revert InvalidDirection();
+        }
+
+        _move(tokenId, -1, 1);
+    }
+
+    /// @dev Moves a token one spot to the southeast on the cartesian grid.
+    function moveSoutheast(uint256 tokenId) external {
+        if (tokenIdToTokenInfo[tokenId].direction != ITokenDescriptor.Direction.DOWN) {
+            revert InvalidDirection();
+        }
+
+        _move(tokenId, 1, 1);
+    }
+
+    /// @dev Moves a token one spot to the west on the cartesian grid.
+    function moveWest(uint256 tokenId) external {
+        _move(tokenId, -1, 0);
+    }
+
+    /// @dev Moves a token one spot to the east on the cartesian grid.
+    function moveEast(uint256 tokenId) external {
+        _move(tokenId, 1, 0);
+    }
+
+    /// @dev Converts a token to be a star token and locks their token at the given position.
+    function lockAsStar(uint256 tokenId, uint256 x, uint256 y) external {
+        if (msg.sender != ownerOf(tokenId)) {
+            revert NotTokenOwner();
+        }
+
+        ITokenDescriptor.Token memory token = tokenIdToTokenInfo[tokenId];
+        if (!_isPositionWithinBounds(x, y, token.direction)) {
+            revert PositionOutOfBounds(x,y);
+        }
+
+        uint256 yGridIndex = _calculateYGridIndex(y);
+        if (_grid[yGridIndex][x] > 0) {
+            revert PositionCurrentlyTaken(x,y);
+        }
+
+        if (numStarTokens == MAX_STAR_TOKENS) {
+            revert MaxStarTokensReached();
+        }
+
+        if (!token.hasReachedEnd) {
+            revert HasNotReachedEnd();
+        }
+        
+        if (token.isStar) {
+            revert AlreadyStarToken();
+        }
+
+        _grid[_calculateYGridIndex(token.current.y)][token.current.x] = 0;
+        _grid[yGridIndex][x] = tokenId;
+
+        tokenIdToTokenInfo[tokenId].current = ITokenDescriptor.Coordinate({x: x, y: y});
+        tokenIdToTokenInfo[tokenId].timestamp = block.timestamp;
+        tokenIdToTokenInfo[tokenId].isStar = true;
+        numStarTokens++;
+    }
+
+    /// @dev Sets the coordinates that are available to minted.
+    function setInitialAvailableCoordinates(ITokenDescriptor.Coordinate[] calldata coordinates) external onlyOwner {
+        uint256 currentNumTokens = _availableCoordinates.length;
+        for (uint256 i = 0; i < coordinates.length;) {
+            bytes32 hash = _getCoordinateHash(coordinates[i]);
+            _mintableCoordinates[hash] = true;
+            _coordinateHashToIndex[hash] = currentNumTokens + i;
+            _availableCoordinates.push(coordinates[i]);
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Updates the details of the Dutch auction.
+    function updateConfig(
+        uint64 startTime,
+        uint64 endTime,
+        uint256 startPriceInWei,
+        uint256 endPriceInWei,
+        address payable fundsRecipient
+    ) external onlyOwner {
+        config.startTime = startTime;
+        config.endTime = endTime;
+        config.startPriceInWei = startPriceInWei;
+        config.endPriceInWei = endPriceInWei;
+        config.fundsRecipient = fundsRecipient;
+    }
+
+    /// @dev Sets the address of the descriptor.
+    function setDescriptor(address _descriptor) external onlyOwner {
+        descriptor = ITokenDescriptor(_descriptor);
+    }
+
+    /// @dev Updates the merkle roots
+    function updateMerkleRoots(bytes32 _holdersRoot, bytes32 _fpMembersRoot) external onlyOwner {
+        holdersMerkleRoot = _holdersRoot;
+        fpMembersMerkleRoot = _fpMembersRoot;
+    }
+
+    /// @dev Withdraws the eth from the contract to the set funds receipient.
+    function withdraw() external onlyOwner {
+        uint256 balance = address(this).balance;
+        (bool success, ) = config.fundsRecipient.call{
+            value: balance,
+            gas: FUNDS_SEND_GAS_LIMIT
+        }("");
+        require(success, "Transfer failed.");
+    }
+
+    /// @dev Returns the available coordinates that are still available for mint.
+    function getAvailableCoordinates() external view returns (ITokenDescriptor.Coordinate[] memory) {
+        return _availableCoordinates;
+    }
+
+    /// @dev Returns the cartesian grid of where tokens are placed at within the grid.
+    function getGrid() external view returns (uint256[NUM_COLUMNS][NUM_ROWS] memory) {
+        return _grid;
+    }
+
+    /// @dev Returns the details of a token.
+    function getToken(uint256 tokenId) external view returns (ITokenDescriptor.Token memory) {
+        return tokenIdToTokenInfo[tokenId];
+    }
+
+    /// @dev Returns the details of all tokens.
+    function getTokens() external view returns (ITokenDescriptor.Token[] memory) {
+        ITokenDescriptor.Token[] memory tokens = new ITokenDescriptor.Token[](_totalSupply);
+
+        for(uint256 i=0;i < _totalSupply;) {
+            tokens[i] = tokenIdToTokenInfo[i+1];
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        return tokens;
+    }
+    
+    /// @dev Returns if a wallet address/proof is part of the given merkle root.
+    function checkMerkleProof(
+        bytes32[] calldata merkleProof,
+        address _address,
+        bytes32 _root
+    ) public pure returns (bool) {
+        bytes32 leaf = keccak256(abi.encodePacked(_address));
+        return MerkleProof.verify(merkleProof, _root, leaf);
+    }
+
+    /// @dev Returns the current price of the Dutch auction.
+    function getCurrentPrice() public view returns (uint256) {      
+        uint256 duration = config.endTime - config.startTime;
+        uint256 halflife = 950; // adjust this to adjust speed of decay
+
+        if (block.timestamp < config.startTime) {
+            return config.startPriceInWei;
+        }
+
+        uint256 elapsedTime = ((block.timestamp - config.startTime) / 10 ) * 10;  
+        if (elapsedTime >= duration) {
+            return config.endPriceInWei;
+        }
+
+        // h/t artblocks for exponential decaying price math
+        uint256 decayedPrice = config.startPriceInWei;
+        // Divide by two (via bit-shifting) for the number of entirely completed
+        // half-lives that have elapsed since auction start time.
+        decayedPrice >>= elapsedTime / halflife;
+        // Perform a linear interpolation between partial half-life points, to
+        // approximate the current place on a perfect exponential decay curve.
+        decayedPrice -= (decayedPrice * (elapsedTime % halflife)) / halflife / 2;
+        if (decayedPrice < config.endPriceInWei) {
+            // Price may not decay below stay `basePrice`.
+            return config.endPriceInWei;
+        }
+        
+        return (decayedPrice / 1000000000000000) * 1000000000000000;
+    }
+
+    /// @dev Returns the token ids that a wallet has ownership of.
+    function tokensOfOwner(address _owner) public view returns (uint256[] memory) {
+        uint256 balance = balanceOf(_owner);
+        uint256[] memory tokens = new uint256[](balance);
+        uint256 index;
+        unchecked {
+            for (uint256 i=1; i <= _totalSupply; i++) {
+                if (ownerOf(i) == _owner) {
+                    tokens[index] = i;
+                    index++;
+                }
+            }
+        }
+        
+        return tokens;
+    }
+
+    /// @dev Returns the tokenURI of the given token id.
+    function tokenURI(uint256 id) public view virtual override returns (string memory) {
+        if (ownerOf(id) == address(0)) {
+            revert NotMinted();
+        }
+
+        ITokenDescriptor.Token memory token = tokenIdToTokenInfo[id];
+        return descriptor.generateMetadata(id, token);
+    }
+
+    /// @dev Returns the total supply.
+    function totalSupply() public view returns (uint256) {
+        return _totalSupply;
+    }
+
+    function _mintWithChecks(ITokenDescriptor.Coordinate memory coordinate, address receiver) internal returns (bool) {        
+        uint256 tokenId = currentTokenId;
+        uint256 x = coordinate.x;
+        uint256 y = coordinate.y;
+        uint256 yIndex = _calculateYGridIndex(y); 
+
+        if (_grid[yIndex][x] > 0) {
+            return false;
+        }
+
+        bytes32 hash = _getCoordinateHash(ITokenDescriptor.Coordinate({x: x, y: y}));
+        if (!_mintableCoordinates[hash]) {
+            revert PositionNotMintable(x, y);
+        }
+
+        _grid[yIndex][x] = tokenId;
+        tokenIdToTokenInfo[tokenId] = ITokenDescriptor.Token({
+            initial: ITokenDescriptor.Coordinate({x: x, y: y}),
+            current: ITokenDescriptor.Coordinate({x: x, y: y}),
+            timestamp: block.timestamp,
+            hasReachedEnd: false,
+            isStar: false,
+            direction: y >= 12 ? ITokenDescriptor.Direction.DOWN : ITokenDescriptor.Direction.UP,
+            numMovements: 0
+        });
+
+        if (tokenId != MAX_SUPPLY) {
+            currentTokenId++;
+        } else {
+            _closeMint();
+        }
+        
+        _totalSupply++;
+        _removeFromAvailability(_coordinateHashToIndex[hash]);
+        _mint(receiver, tokenId);
+
+        return true;
+    }
+
+    function _move(uint256 tokenId, int256 xDelta, int256 yDelta) private {
+        if (msg.sender != ownerOf(tokenId)) {
+            revert NotTokenOwner();
+        }
+
+        if (!canMove) {
+            revert MovementLocked();
+        }
+
+        ITokenDescriptor.Token memory token = tokenIdToTokenInfo[tokenId];
+        if (token.isStar) {
+            revert MovementLocked();
+        }
+
+        uint256 x = token.current.x;
+        if (xDelta == -1) {
+            x--;
+        } else if (xDelta == 1) {
+            x++;
+        }
+
+        uint256 y = token.current.y;
+        if (yDelta == -1) {
+            y++;
+        } else if (yDelta == 1) {
+            y--;
+        }
+
+        if (!_isPositionWithinBounds(x, y, token.direction)) {
+            revert PositionOutOfBounds(x,y);
+        }
+
+        uint256 yGridIndex = _calculateYGridIndex(y);
+        if (_grid[yGridIndex][x] > 0) {
+            revert PositionCurrentlyTaken(x,y);
+        }
+
+        _grid[_calculateYGridIndex(token.current.y)][token.current.x] = 0;
+        _grid[yGridIndex][x] = tokenId;
+
+        tokenIdToTokenInfo[tokenId].current = ITokenDescriptor.Coordinate({x: x, y: y});
+        tokenIdToTokenInfo[tokenId].hasReachedEnd = ((token.direction == ITokenDescriptor.Direction.UP && y == (NUM_ROWS - 2)) || (token.direction == ITokenDescriptor.Direction.DOWN && y == 1));
+        tokenIdToTokenInfo[tokenId].numMovements = ++token.numMovements;
+        tokenIdToTokenInfo[tokenId].timestamp = block.timestamp;
+    }
+
+    function _closeMint() private {
+        _isMintingClosed = true;
+        canMove = true;
+    }
+
+    function _calculateYGridIndex(uint256 y) private pure returns (uint256) {
+        return (NUM_ROWS - 1) - y;
+    }
+
+    function _getCoordinateHash(ITokenDescriptor.Coordinate memory coordinate) private pure returns (bytes32) {
+        return keccak256(abi.encode(coordinate));
+    }
+
+    function _getDiscountedCurrentPrice(bytes32[] calldata merkleProof, address addressToCheck, uint256 currentPrice) private view returns (uint256) {
+        bool isFp = checkMerkleProof(merkleProof, addressToCheck, fpMembersMerkleRoot);
+        bool isPartner = checkMerkleProof(merkleProof, addressToCheck, holdersMerkleRoot);
+        
+        if (isFp) {
+            currentPrice = (currentPrice * 75) / 100; // 25% off
+        } else if (isPartner) {
+            currentPrice = (currentPrice * 85) / 100; // 15% off
+        }
+
+        return currentPrice;
+    }
+
+    function _isPositionWithinBounds(uint256 x, uint256 y, ITokenDescriptor.Direction tokenDirection) private pure returns (bool) {
+        if (x < 1 || x >= NUM_COLUMNS - 1) {
+            return false;
+        }
+
+        if (tokenDirection == ITokenDescriptor.Direction.DOWN) {
+            return y > 0;
+        } else {
+            return y < NUM_ROWS - 1;
+        }
+    }
+
+    function _removeFromAvailability(uint256 index) private {
+        uint256 lastCoordinateIndex = _availableCoordinates.length - 1;
+        ITokenDescriptor.Coordinate memory lastCoordinate = _availableCoordinates[lastCoordinateIndex];
+        ITokenDescriptor.Coordinate memory coordinateToBeRemoved = _availableCoordinates[index];
+
+        _availableCoordinates[index] = lastCoordinate;
+        _coordinateHashToIndex[_getCoordinateHash(lastCoordinate)] = index;
+        delete _coordinateHashToIndex[_getCoordinateHash(coordinateToBeRemoved)];
+        _availableCoordinates.pop();
+    }
+}
+
+
+// File: src/Constants.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+contract Constants {
+    uint256 public constant NUM_ROWS = 25;
+    uint256 public constant NUM_COLUMNS = 25;
+}
+
+// File: lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/MerkleProof.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev These functions deal with verification of Merkle Tree proofs.
+ *
+ * The tree and the proofs can be generated using our
+ * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].
+ * You will find a quickstart guide in the readme.
+ *
+ * WARNING: You should avoid using leaf values that are 64 bytes long prior to
+ * hashing, or use a hash function other than keccak256 for hashing leaves.
+ * This is because the concatenation of a sorted pair of internal nodes in
+ * the Merkle tree could be reinterpreted as a leaf value.
+ * OpenZeppelin's JavaScript library generates Merkle trees that are safe
+ * against this attack out of the box.
+ */
+library MerkleProof {
+    /**
+     *@dev The multiproof provided is not valid.
+     */
+    error MerkleProofInvalidMultiproof();
+
+    /**
+     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree
+     * defined by `root`. For this, a `proof` must be provided, containing
+     * sibling hashes on the branch from the leaf to the root of the tree. Each
+     * pair of leaves and each pair of pre-images are assumed to be sorted.
+     */
+    function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+        return processProof(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Calldata version of {verify}
+     */
+    function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+        return processProofCalldata(proof, leaf) == root;
+    }
+
+    /**
+     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up
+     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt
+     * hash matches the root of the tree. When processing the proof, the pairs
+     * of leafs & pre-images are assumed to be sorted.
+     */
+    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            computedHash = _hashPair(computedHash, proof[i]);
+        }
+        return computedHash;
+    }
+
+    /**
+     * @dev Calldata version of {processProof}
+     */
+    function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            computedHash = _hashPair(computedHash, proof[i]);
+        }
+        return computedHash;
+    }
+
+    /**
+     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by
+     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+    function multiProofVerify(
+        bytes32[] memory proof,
+        bool[] memory proofFlags,
+        bytes32 root,
+        bytes32[] memory leaves
+    ) internal pure returns (bool) {
+        return processMultiProof(proof, proofFlags, leaves) == root;
+    }
+
+    /**
+     * @dev Calldata version of {multiProofVerify}
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+    function multiProofVerifyCalldata(
+        bytes32[] calldata proof,
+        bool[] calldata proofFlags,
+        bytes32 root,
+        bytes32[] memory leaves
+    ) internal pure returns (bool) {
+        return processMultiProofCalldata(proof, proofFlags, leaves) == root;
+    }
+
+    /**
+     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction
+     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another
+     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false
+     * respectively.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree
+     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the
+     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).
+     */
+    function processMultiProof(
+        bytes32[] memory proof,
+        bool[] memory proofFlags,
+        bytes32[] memory leaves
+    ) internal pure returns (bytes32 merkleRoot) {
+        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by
+        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+        // the Merkle tree.
+        uint256 leavesLen = leaves.length;
+        uint256 proofLen = proof.length;
+        uint256 totalHashes = proofFlags.length;
+
+        // Check proof validity.
+        if (leavesLen + proofLen != totalHashes + 1) {
+            revert MerkleProofInvalidMultiproof();
+        }
+
+        // The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+        bytes32[] memory hashes = new bytes32[](totalHashes);
+        uint256 leafPos = 0;
+        uint256 hashPos = 0;
+        uint256 proofPos = 0;
+        // At each step, we compute the next hash using two values:
+        // - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+        //   get the next hash.
+        // - depending on the flag, either another value from the "main queue" (merging branches) or an element from the
+        //   `proof` array.
+        for (uint256 i = 0; i < totalHashes; i++) {
+            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+            bytes32 b = proofFlags[i]
+                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])
+                : proof[proofPos++];
+            hashes[i] = _hashPair(a, b);
+        }
+
+        if (totalHashes > 0) {
+            if (proofPos != proofLen) {
+                revert MerkleProofInvalidMultiproof();
+            }
+            unchecked {
+                return hashes[totalHashes - 1];
+            }
+        } else if (leavesLen > 0) {
+            return leaves[0];
+        } else {
+            return proof[0];
+        }
+    }
+
+    /**
+     * @dev Calldata version of {processMultiProof}.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+    function processMultiProofCalldata(
+        bytes32[] calldata proof,
+        bool[] calldata proofFlags,
+        bytes32[] memory leaves
+    ) internal pure returns (bytes32 merkleRoot) {
+        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by
+        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+        // the Merkle tree.
+        uint256 leavesLen = leaves.length;
+        uint256 proofLen = proof.length;
+        uint256 totalHashes = proofFlags.length;
+
+        // Check proof validity.
+        if (leavesLen + proofLen != totalHashes + 1) {
+            revert MerkleProofInvalidMultiproof();
+        }
+
+        // The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+        bytes32[] memory hashes = new bytes32[](totalHashes);
+        uint256 leafPos = 0;
+        uint256 hashPos = 0;
+        uint256 proofPos = 0;
+        // At each step, we compute the next hash using two values:
+        // - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+        //   get the next hash.
+        // - depending on the flag, either another value from the "main queue" (merging branches) or an element from the
+        //   `proof` array.
+        for (uint256 i = 0; i < totalHashes; i++) {
+            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+            bytes32 b = proofFlags[i]
+                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])
+                : proof[proofPos++];
+            hashes[i] = _hashPair(a, b);
+        }
+
+        if (totalHashes > 0) {
+            if (proofPos != proofLen) {
+                revert MerkleProofInvalidMultiproof();
+            }
+            unchecked {
+                return hashes[totalHashes - 1];
+            }
+        } else if (leavesLen > 0) {
+            return leaves[0];
+        } else {
+            return proof[0];
+        }
+    }
+
+    /**
+     * @dev Sorts the pair (a, b) and hashes the result.
+     */
+    function _hashPair(bytes32 a, bytes32 b) private pure returns (bytes32) {
+        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);
+    }
+
+    /**
+     * @dev Implementation of keccak256(abi.encode(a, b)) that doesn't allocate or expand memory.
+     */
+    function _efficientHash(bytes32 a, bytes32 b) private pure returns (bytes32 value) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            value := keccak256(0x00, 0x40)
+        }
+    }
+}
+
+
+// File: src/Descriptor.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+import {Constants} from "./Constants.sol";
+import {ITokenDescriptor} from "./ITokenDescriptor.sol";
+import {JsonWriter} from "solidity-json-writer/JsonWriter.sol";
+import {Base64} from '@openzeppelin/contracts/utils/Base64.sol';
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+
+contract Descriptor is ITokenDescriptor, Constants {
+    using JsonWriter for JsonWriter.Json;
+
+    function generateMetadata(uint256 tokenId, Token calldata token) 
+        external 
+        view 
+        returns (string memory) 
+    {
+        JsonWriter.Json memory writer;
+        writer = writer.writeStartObject();
+
+        writer = writer.writeStringProperty(
+            'name',
+            string.concat('LINE ', Strings.toString(tokenId))
+        );
+
+        writer = writer.writeStringProperty(
+            'description',
+            'LINE is a dynamic photographic series of 250 tokens, each positioned within a meticulously crafted landscape of 625 coordinates. Tokens act like lenses, where location influences perception. They may cross this terrain while their paths intersect in time and space. By Figure31'
+        );
+
+        writer = writer.writeStringProperty(
+            'external_url',
+            'https://line.fingerprintsdao.xyz'
+        );
+
+        uint256 currentImageIndex = _getCurrentPanoramicImageIndex(token);
+        writer = writer.writeStringProperty(
+            'image',
+            string.concat('ar://Y-05cY1jiKkVn9aCL3Di3sOWfCUZRPLaoASs0LYJOsU/', Strings.toString(currentImageIndex), '.jpg')
+        );
+
+        writer = _generateAttributes(writer, token);
+
+        writer = writer.writeEndObject();
+
+        return string(
+            abi.encodePacked(
+                'data:application/json;base64,',
+                Base64.encode(abi.encodePacked(writer.value))
+            )
+        );
+    }
+
+    function _determineCurrentImagePoint(Token calldata token)
+        private
+        view
+        returns (uint256, uint256)
+    {
+        uint256 numDaysPassed = (block.timestamp - token.timestamp) / 1 days;
+        uint256 numPanoramicPoints;
+
+        if (!token.isStar) {
+            numPanoramicPoints = 10; // 180° panoramic view
+        } else {
+            numPanoramicPoints = 16; // 360° panoramic view
+        }
+
+        uint256 panoramicPoint = numDaysPassed % numPanoramicPoints;
+
+        // is at the origin point for the day
+        if (panoramicPoint % 2 == 0) {
+            return (token.current.x, token.current.y);            
+        }
+
+        uint256 x;
+        uint256 y;
+
+        // full panoramic view
+        // 1 = west
+        // 3 = northwest
+        // 5 = north
+        // 7 = northeast
+        // 9 = east
+        // 11 = southeast
+        // 13 = south
+        // 15 = southwest
+        if (token.isStar) {
+            if (panoramicPoint == 1) {
+                x = token.current.x - 1;
+                y = token.current.y;
+            } else if (panoramicPoint == 3) {
+                x = token.current.x - 1;
+                y = token.current.y + 1;
+            } else if (panoramicPoint == 5) {
+                x = token.current.x;
+                y = token.current.y + 1;
+            } else if (panoramicPoint == 7) {
+                x = token.current.x + 1;
+                y = token.current.y + 1;
+            } else if (panoramicPoint == 9) {
+                x = token.current.x + 1;
+                y = token.current.y;
+            } else if (panoramicPoint == 11) {
+                x = token.current.x + 1;
+                y = token.current.y - 1;
+            } else if (panoramicPoint == 13) {
+                x = token.current.x;
+                y = token.current.y - 1;
+            } else if (panoramicPoint == 15) {
+                x = token.current.x - 1;
+                y = token.current.y - 1;
+            }
+
+            return (x,y);
+        }
+
+        // 1 = look west
+        // 3 = look southwest
+        // 5 = look south
+        // 7 = look southeast
+        // 9 = look east
+        if (token.direction == Direction.DOWN) {
+            if (panoramicPoint == 1) {
+                x = token.current.x - 1;
+                y = token.current.y;
+            } else if (panoramicPoint == 3) {
+                x = token.current.x - 1;
+                y = token.current.y - 1;
+            } else if (panoramicPoint == 5) {
+                x = token.current.x;
+                y = token.current.y - 1;
+            } else if (panoramicPoint == 7) {
+                x = token.current.x + 1;
+                y = token.current.y - 1;
+            } else if (panoramicPoint == 9) {
+                x = token.current.x + 1;
+                y = token.current.y;
+            }
+        }
+        
+        // 1 = look west
+        // 3 = look northwest
+        // 5 = look north
+        // 7 = look northeast
+        // 9 = look east
+        if (token.direction == Direction.UP) {
+            if (panoramicPoint == 1) {
+                x = token.current.x - 1;
+                y = token.current.y;
+            } else if (panoramicPoint == 3) {
+                x = token.current.x - 1;
+                y = token.current.y + 1;
+            } else if (panoramicPoint == 5) {
+                x = token.current.x;
+                y = token.current.y + 1;
+            } else if (panoramicPoint == 7) {
+                x = token.current.x + 1;
+                y = token.current.y + 1;
+            } else if (panoramicPoint == 9) {
+                x = token.current.x + 1;
+                y = token.current.y;
+            }
+        }
+
+        return (x,y);
+    }
+
+    function _getCurrentPanoramicImageIndex(Token calldata token) 
+        private
+        view
+        returns (uint256) 
+    {
+        (uint256 x, uint256 y) = _determineCurrentImagePoint(token);
+        return _calculateImageIndex(x, y);
+    }
+    
+    function _calculateImageIndex(uint256 x, uint256 y)
+        private
+        pure
+        returns (uint256) 
+    {
+        uint256 yIndex = (NUM_ROWS - 1) - y;
+        return ((NUM_ROWS - yIndex - 1) * NUM_COLUMNS) + x;
+    }
+
+    function _generateAttributes(JsonWriter.Json memory _writer, Token calldata token) 
+        private 
+        view 
+        returns (JsonWriter.Json memory writer)
+    {
+        writer = _writer.writeStartArray('attributes');
+
+        (uint256 imagePointX, uint256 imagePointY) = _determineCurrentImagePoint(token);
+        writer = _addStringAttribute(writer, 'Origin Point', string.concat(Strings.toString(token.current.x), ',', Strings.toString(token.current.y)));
+        writer = _addStringAttribute(writer, 'Image Point', string.concat(Strings.toString(imagePointX), ',', Strings.toString(imagePointY)));
+        writer = _addStringAttribute(writer, 'Type', token.direction == Direction.UP ? 'Up' : 'Down');
+        writer = _addStringAttribute(writer, 'Starting Point', string.concat(Strings.toString(token.initial.x), ',', Strings.toString(token.initial.y)));
+        writer = _addStringAttribute(writer, 'Has Reached End', token.hasReachedEnd == true ? 'Yes' : 'No');
+        writer = _addStringAttribute(writer, 'Is Star', token.isStar == true ? 'Yes' : 'No');
+        writer = _addStringAttribute(writer, 'Movements', Strings.toString(token.numMovements));
+
+        writer = writer.writeEndArray();
+    }
+
+    function _addStringAttribute(
+        JsonWriter.Json memory _writer,
+        string memory key,
+        string memory value
+    ) private pure returns (JsonWriter.Json memory writer) {
+        writer = _writer.writeStartObject();
+        writer = writer.writeStringProperty('trait_type', key);
+        writer = writer.writeStringProperty('value', value);
+        writer = writer.writeEndObject();
+    }
+}
+
+// File: src/ITokenDescriptor.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+interface ITokenDescriptor {
+    enum Direction {
+        UP,
+        DOWN
+    }
+
+    struct Coordinate {
+        uint256 x;
+        uint256 y;
+    }
+
+    struct Token {
+        Coordinate initial;
+        Coordinate current;
+        uint256 timestamp;
+        bool hasReachedEnd;
+        bool isStar;
+        Direction direction;
+        uint256 numMovements;
+    }
+
+    function generateMetadata(uint256 tokenId, ITokenDescriptor.Token calldata token)
+        external
+        view
+        returns (string memory);
+}
+
+// File: lib/solmate/src/tokens/ERC721.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern, minimalist, and gas efficient ERC-721 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol)
+abstract contract ERC721 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 indexed id);
+
+    event Approval(address indexed owner, address indexed spender, uint256 indexed id);
+
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /*//////////////////////////////////////////////////////////////
+                         METADATA STORAGE/LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    function tokenURI(uint256 id) public view virtual returns (string memory);
+
+    /*//////////////////////////////////////////////////////////////
+                      ERC721 BALANCE/OWNER STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(uint256 => address) internal _ownerOf;
+
+    mapping(address => uint256) internal _balanceOf;
+
+    function ownerOf(uint256 id) public view virtual returns (address owner) {
+        require((owner = _ownerOf[id]) != address(0), "NOT_MINTED");
+    }
+
+    function balanceOf(address owner) public view virtual returns (uint256) {
+        require(owner != address(0), "ZERO_ADDRESS");
+
+        return _balanceOf[owner];
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         ERC721 APPROVAL STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(uint256 => address) public getApproved;
+
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(string memory _name, string memory _symbol) {
+        name = _name;
+        symbol = _symbol;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC721 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 id) public virtual {
+        address owner = _ownerOf[id];
+
+        require(msg.sender == owner || isApprovedForAll[owner][msg.sender], "NOT_AUTHORIZED");
+
+        getApproved[id] = spender;
+
+        emit Approval(owner, spender, id);
+    }
+
+    function setApprovalForAll(address operator, bool approved) public virtual {
+        isApprovedForAll[msg.sender][operator] = approved;
+
+        emit ApprovalForAll(msg.sender, operator, approved);
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 id
+    ) public virtual {
+        require(from == _ownerOf[id], "WRONG_FROM");
+
+        require(to != address(0), "INVALID_RECIPIENT");
+
+        require(
+            msg.sender == from || isApprovedForAll[from][msg.sender] || msg.sender == getApproved[id],
+            "NOT_AUTHORIZED"
+        );
+
+        // Underflow of the sender's balance is impossible because we check for
+        // ownership above and the recipient's balance can't realistically overflow.
+        unchecked {
+            _balanceOf[from]--;
+
+            _balanceOf[to]++;
+        }
+
+        _ownerOf[id] = to;
+
+        delete getApproved[id];
+
+        emit Transfer(from, to, id);
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id
+    ) public virtual {
+        transferFrom(from, to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, from, id, "") ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        bytes calldata data
+    ) public virtual {
+        transferFrom(from, to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, from, id, data) ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC165 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return
+            interfaceId == 0x01ffc9a7 || // ERC165 Interface ID for ERC165
+            interfaceId == 0x80ac58cd || // ERC165 Interface ID for ERC721
+            interfaceId == 0x5b5e139f; // ERC165 Interface ID for ERC721Metadata
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 id) internal virtual {
+        require(to != address(0), "INVALID_RECIPIENT");
+
+        require(_ownerOf[id] == address(0), "ALREADY_MINTED");
+
+        // Counter overflow is incredibly unrealistic.
+        unchecked {
+            _balanceOf[to]++;
+        }
+
+        _ownerOf[id] = to;
+
+        emit Transfer(address(0), to, id);
+    }
+
+    function _burn(uint256 id) internal virtual {
+        address owner = _ownerOf[id];
+
+        require(owner != address(0), "NOT_MINTED");
+
+        // Ownership check above ensures no underflow.
+        unchecked {
+            _balanceOf[owner]--;
+        }
+
+        delete _ownerOf[id];
+
+        delete getApproved[id];
+
+        emit Transfer(owner, address(0), id);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL SAFE MINT LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _safeMint(address to, uint256 id) internal virtual {
+        _mint(to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, address(0), id, "") ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function _safeMint(
+        address to,
+        uint256 id,
+        bytes memory data
+    ) internal virtual {
+        _mint(to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, address(0), id, data) ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+}
+
+/// @notice A generic interface for a contract which properly accepts ERC721 tokens.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol)
+abstract contract ERC721TokenReceiver {
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external virtual returns (bytes4) {
+        return ERC721TokenReceiver.onERC721Received.selector;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable2Step.sol)
+
+pragma solidity ^0.8.20;
+
+import {Ownable} from "./Ownable.sol";
+
+/**
+ * @dev Contract module which provides access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is specified at deployment time in the constructor for `Ownable`. This
+ * can later be changed with {transferOwnership} and {acceptOwnership}.
+ *
+ * This module is used through inheritance. It will make available all functions
+ * from parent (Ownable).
+ */
+abstract contract Ownable2Step is Ownable {
+    address private _pendingOwner;
+
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Returns the address of the pending owner.
+     */
+    function pendingOwner() public view virtual returns (address) {
+        return _pendingOwner;
+    }
+
+    /**
+     * @dev Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one.
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        _pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner(), newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual override {
+        delete _pendingOwner;
+        super._transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev The new owner accepts the ownership transfer.
+     */
+    function acceptOwnership() public virtual {
+        address sender = _msgSender();
+        if (pendingOwner() != sender) {
+            revert OwnableUnauthorizedAccount(sender);
+        }
+        _transferOwnership(sender);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private _status;
+
+    /**
+     * @dev Unauthorized reentrant call.
+     */
+    error ReentrancyGuardReentrantCall();
+
+    constructor() {
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be NOT_ENTERED
+        if (_status == ENTERED) {
+            revert ReentrancyGuardReentrantCall();
+        }
+
+        // Any calls to nonReentrant after this point will fail
+        _status = ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == ENTERED;
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "from" argument.
+            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: lib/solidity-json-writer/contracts/JsonWriter.sol
+//SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+library JsonWriter {
+
+    using JsonWriter for string;
+
+    struct Json {
+        int256 depthBitTracker;
+        string value;
+    }
+
+    bytes1 constant BACKSLASH = bytes1(uint8(92));
+    bytes1 constant BACKSPACE = bytes1(uint8(8));
+    bytes1 constant CARRIAGE_RETURN = bytes1(uint8(13));
+    bytes1 constant DOUBLE_QUOTE = bytes1(uint8(34));
+    bytes1 constant FORM_FEED = bytes1(uint8(12));
+    bytes1 constant FRONTSLASH = bytes1(uint8(47));
+    bytes1 constant HORIZONTAL_TAB = bytes1(uint8(9));
+    bytes1 constant NEWLINE = bytes1(uint8(10));
+
+    string constant TRUE = "true";
+    string constant FALSE = "false";
+    bytes1 constant OPEN_BRACE = "{";
+    bytes1 constant CLOSED_BRACE = "}";
+    bytes1 constant OPEN_BRACKET = "[";
+    bytes1 constant CLOSED_BRACKET = "]";
+    bytes1 constant LIST_SEPARATOR = ",";
+
+    int256 constant MAX_INT256 = type(int256).max;
+
+    /**
+     * @dev Writes the beginning of a JSON array.
+     */
+    function writeStartArray(Json memory json) 
+        internal
+        pure
+        returns (Json memory)
+    {
+        return writeStart(json, OPEN_BRACKET);
+    }
+
+    /**
+     * @dev Writes the beginning of a JSON array with a property name as the key.
+     */
+    function writeStartArray(Json memory json, string memory propertyName)
+        internal
+        pure
+        returns (Json memory)
+    {
+        return writeStart(json, propertyName, OPEN_BRACKET);
+    }
+
+    /**
+     * @dev Writes the beginning of a JSON object.
+     */
+    function writeStartObject(Json memory json)
+        internal
+        pure
+        returns (Json memory)
+    {
+        return writeStart(json, OPEN_BRACE);
+    }
+
+    /**
+     * @dev Writes the beginning of a JSON object with a property name as the key.
+     */
+    function writeStartObject(Json memory json, string memory propertyName)
+        internal
+        pure
+        returns (Json memory)
+    {
+        return writeStart(json, propertyName, OPEN_BRACE);
+    }
+
+    /**
+     * @dev Writes the end of a JSON array.
+     */
+    function writeEndArray(Json memory json)
+        internal
+        pure
+        returns (Json memory)
+    {
+        return writeEnd(json, CLOSED_BRACKET);
+    }
+
+    /**
+     * @dev Writes the end of a JSON object.
+     */
+    function writeEndObject(Json memory json)
+        internal
+        pure
+        returns (Json memory)
+    {
+        return writeEnd(json, CLOSED_BRACE);
+    }
+
+    /**
+     * @dev Writes the property name and address value (as a JSON string) as part of a name/value pair of a JSON object.
+     */
+    function writeAddressProperty(
+        Json memory json,
+        string memory propertyName,
+        address value
+    ) internal pure returns (Json memory) {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": "', addressToString(value), '"'));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": "', addressToString(value), '"'));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the address value (as a JSON string) as an element of a JSON array.
+     */
+    function writeAddressValue(Json memory json, address value)
+        internal
+        pure
+        returns (Json memory)
+    {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', addressToString(value), '"'));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', addressToString(value), '"'));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the property name and boolean value (as a JSON literal "true" or "false") as part of a name/value pair of a JSON object.
+     */
+    function writeBooleanProperty(
+        Json memory json,
+        string memory propertyName,
+        bool value
+    ) internal pure returns (Json memory) {
+        string memory strValue;
+        if (value) {
+            strValue = TRUE;
+        } else {
+            strValue = FALSE;
+        }
+
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": ', strValue));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": ', strValue));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the boolean value (as a JSON literal "true" or "false") as an element of a JSON array.
+     */
+    function writeBooleanValue(Json memory json, bool value)
+        internal
+        pure
+        returns (Json memory)
+    {
+        string memory strValue;
+        if (value) {
+            strValue = TRUE;
+        } else {
+            strValue = FALSE;
+        }
+
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, strValue));
+        } else {
+            json.value = string(abi.encodePacked(json.value, strValue));
+        }
+        
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the property name and int value (as a JSON number) as part of a name/value pair of a JSON object.
+     */
+    function writeIntProperty(
+        Json memory json,
+        string memory propertyName,
+        int256 value
+    ) internal pure returns (Json memory) {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": ', intToString(value)));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": ', intToString(value)));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the int value (as a JSON number) as an element of a JSON array.
+     */
+    function writeIntValue(Json memory json, int256 value)
+        internal
+        pure
+        returns (Json memory)
+    {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, intToString(value)));
+        } else {
+            json.value = string(abi.encodePacked(json.value, intToString(value)));
+        }
+        
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the property name and value of null as part of a name/value pair of a JSON object.
+     */
+    function writeNullProperty(Json memory json, string memory propertyName)
+        internal
+        pure
+        returns (Json memory)
+    {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": null'));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": null'));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the value of null as an element of a JSON array.
+     */
+    function writeNullValue(Json memory json)
+        internal
+        pure
+        returns (Json memory)
+    {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, "null"));
+        } else {
+            json.value = string(abi.encodePacked(json.value, "null"));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the string text value (as a JSON string) as an element of a JSON array.
+     */
+    function writeStringProperty(
+        Json memory json,
+        string memory propertyName,
+        string memory value
+    ) internal pure returns (Json memory) {
+        string memory jsonEscapedString = escapeJsonString(value);
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": "', jsonEscapedString, '"'));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": "', jsonEscapedString, '"'));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the property name and string text value (as a JSON string) as part of a name/value pair of a JSON object.
+     */
+    function writeStringValue(Json memory json, string memory value)
+        internal
+        pure
+        returns (Json memory)
+    {
+        string memory jsonEscapedString = escapeJsonString(value);
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', jsonEscapedString, '"'));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', jsonEscapedString, '"'));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the property name and uint value (as a JSON number) as part of a name/value pair of a JSON object.
+     */
+    function writeUintProperty(
+        Json memory json,
+        string memory propertyName,
+        uint256 value
+    ) internal pure returns (Json memory) {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": ', uintToString(value)));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": ', uintToString(value)));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the uint value (as a JSON number) as an element of a JSON array.
+     */
+    function writeUintValue(Json memory json, uint256 value)
+        internal
+        pure
+        returns (Json memory)
+    {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, uintToString(value)));
+        } else {
+            json.value = string(abi.encodePacked(json.value, uintToString(value)));
+        }
+
+        json.depthBitTracker = setListSeparatorFlag(json);
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the beginning of a JSON array or object based on the token parameter.
+     */
+    function writeStart(Json memory json, bytes1 token)
+        private
+        pure
+        returns (Json memory)
+    {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, token));
+        } else {
+            json.value = string(abi.encodePacked(json.value, token));
+        }
+
+        json.depthBitTracker &= MAX_INT256;
+        json.depthBitTracker++;
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the beginning of a JSON array or object based on the token parameter with a property name as the key.
+     */
+    function writeStart(
+        Json memory json,
+        string memory propertyName,
+        bytes1 token
+    ) private pure returns (Json memory) {
+        if (json.depthBitTracker < 0) {
+            json.value = string(abi.encodePacked(json.value, LIST_SEPARATOR, '"', propertyName, '": ', token));
+        } else {
+            json.value = string(abi.encodePacked(json.value, '"', propertyName, '": ', token));
+        }
+
+        json.depthBitTracker &= MAX_INT256;
+        json.depthBitTracker++;
+
+        return json;
+    }
+
+    /**
+     * @dev Writes the end of a JSON array or object based on the token parameter.
+     */
+    function writeEnd(Json memory json, bytes1 token)
+        private
+        pure
+        returns (Json memory)
+    {
+        json.value = string(abi.encodePacked(json.value, token));
+        json.depthBitTracker = setListSeparatorFlag(json);
+        
+        if (getCurrentDepth(json) != 0) {
+            json.depthBitTracker--;
+        }
+
+        return json;
+    }
+
+    /**
+     * @dev Escapes any characters that required by JSON to be escaped.
+     */
+    function escapeJsonString(string memory value)
+        private
+        pure
+        returns (string memory str)
+    {
+        bytes memory b = bytes(value);
+        bool foundEscapeChars;
+
+        for (uint256 i; i < b.length; i++) {
+            if (b[i] == BACKSLASH) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == DOUBLE_QUOTE) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == FRONTSLASH) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == HORIZONTAL_TAB) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == FORM_FEED) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == NEWLINE) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == CARRIAGE_RETURN) {
+                foundEscapeChars = true;
+                break;
+            } else if (b[i] == BACKSPACE) {
+                foundEscapeChars = true;
+                break;
+            }
+        }
+
+        if (!foundEscapeChars) {
+            return value;
+        }
+
+        for (uint256 i; i < b.length; i++) {
+            if (b[i] == BACKSLASH) {
+                str = string(abi.encodePacked(str, "\\\\"));
+            } else if (b[i] == DOUBLE_QUOTE) {
+                str = string(abi.encodePacked(str, '\\"'));
+            } else if (b[i] == FRONTSLASH) {
+                str = string(abi.encodePacked(str, "\\/"));
+            } else if (b[i] == HORIZONTAL_TAB) {
+                str = string(abi.encodePacked(str, "\\t"));
+            } else if (b[i] == FORM_FEED) {
+                str = string(abi.encodePacked(str, "\\f"));
+            } else if (b[i] == NEWLINE) {
+                str = string(abi.encodePacked(str, "\\n"));
+            } else if (b[i] == CARRIAGE_RETURN) {
+                str = string(abi.encodePacked(str, "\\r"));
+            } else if (b[i] == BACKSPACE) {
+                str = string(abi.encodePacked(str, "\\b"));
+            } else {
+                str = string(abi.encodePacked(str, b[i]));
+            }
+        }
+
+        return str;
+    }
+
+    /**
+     * @dev Tracks the recursive depth of the nested objects / arrays within the JSON text
+     * written so far. This provides the depth of the current token.
+     */
+    function getCurrentDepth(Json memory json) private pure returns (int256) {
+        return json.depthBitTracker & MAX_INT256;
+    }
+
+    /**
+     * @dev The highest order bit of json.depthBitTracker is used to discern whether we are writing the first item in a list or not.
+     * if (json.depthBitTracker >> 255) == 1, add a list separator before writing the item
+     * else, no list separator is needed since we are writing the first item.
+     */
+    function setListSeparatorFlag(Json memory json)
+        private
+        pure
+        returns (int256)
+    {
+        return json.depthBitTracker | (int256(1) << 255);
+    }
+
+        /**
+     * @dev Converts an address to a string.
+     */
+    function addressToString(address _address)
+        internal
+        pure
+        returns (string memory)
+    {
+        bytes32 value = bytes32(uint256(uint160(_address)));
+        bytes16 alphabet = "0123456789abcdef";
+
+        bytes memory str = new bytes(42);
+        str[0] = "0";
+        str[1] = "x";
+        for (uint256 i; i < 20; i++) {
+            str[2 + i * 2] = alphabet[uint8(value[i + 12] >> 4)];
+            str[3 + i * 2] = alphabet[uint8(value[i + 12] & 0x0f)];
+        }
+
+        return string(str);
+    }
+
+    /**
+     * @dev Converts an int to a string.
+     */
+    function intToString(int256 i) internal pure returns (string memory) {
+        if (i == 0) {
+            return "0";
+        }
+
+        if (i == type(int256).min) {
+            // hard-coded since int256 min value can't be converted to unsigned
+            return "-57896044618658097711785492504343953926634992332820282019728792003956564819968"; 
+        }
+
+        bool negative = i < 0;
+        uint256 len;
+        uint256 j;
+        if(!negative) {
+            j = uint256(i);
+        } else {
+            j = uint256(-i);
+            ++len; // make room for '-' sign
+        }
+        
+        uint256 l = j;
+        while (j != 0) {
+            len++;
+            j /= 10;
+        }
+
+        bytes memory bstr = new bytes(len);
+        uint256 k = len;
+        while (l != 0) {
+            bstr[--k] = bytes1((48 + uint8(l - (l / 10) * 10)));
+            l /= 10;
+        }
+
+        if (negative) {
+            bstr[0] = "-"; // prepend '-'
+        }
+
+        return string(bstr);
+    }
+
+    /**
+     * @dev Converts a uint to a string.
+     */
+    function uintToString(uint256 _i) internal pure returns (string memory) {
+        if (_i == 0) {
+            return "0";
+        }
+
+        uint256 j = _i;
+        uint256 len;
+        while (j != 0) {
+            len++;
+            j /= 10;
+        }
+
+        bytes memory bstr = new bytes(len);
+        uint256 k = len;
+        while (_i != 0) {
+            bstr[--k] = bytes1((48 + uint8(_i - (_i / 10) * 10)));
+            _i /= 10;
+        }
+
+        return string(bstr);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Base64.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Base64.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides a set of functions to operate with Base64 strings.
+ */
+library Base64 {
+    /**
+     * @dev Base64 Encoding/Decoding Table
+     */
+    string internal constant _TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /**
+     * @dev Converts a `bytes` to its Bytes64 `string` representation.
+     */
+    function encode(bytes memory data) internal pure returns (string memory) {
+        /**
+         * Inspired by Brecht Devos (Brechtpd) implementation - MIT licence
+         * https://github.com/Brechtpd/base64/blob/e78d9fd951e7b0977ddca77d92dc85183770daf4/base64.sol
+         */
+        if (data.length == 0) return "";
+
+        // Loads the table into memory
+        string memory table = _TABLE;
+
+        // Encoding takes 3 bytes chunks of binary data from `bytes` data parameter
+        // and split into 4 numbers of 6 bits.
+        // The final Base64 length should be `bytes` data length multiplied by 4/3 rounded up
+        // - `data.length + 2`  -> Round up
+        // - `/ 3`              -> Number of 3-bytes chunks
+        // - `4 *`              -> 4 characters for each chunk
+        string memory result = new string(4 * ((data.length + 2) / 3));
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Prepare the lookup table (skip the first "length" byte)
+            let tablePtr := add(table, 1)
+
+            // Prepare result pointer, jump over length
+            let resultPtr := add(result, 32)
+
+            // Run over the input, 3 bytes at a time
+            for {
+                let dataPtr := data
+                let endPtr := add(data, mload(data))
+            } lt(dataPtr, endPtr) {
+
+            } {
+                // Advance 3 bytes
+                dataPtr := add(dataPtr, 3)
+                let input := mload(dataPtr)
+
+                // To write each character, shift the 3 bytes (18 bits) chunk
+                // 4 times in blocks of 6 bits for each character (18, 12, 6, 0)
+                // and apply logical AND with 0x3F which is the number of
+                // the previous character in the ASCII table prior to the Base64 Table
+                // The result is then added to the table to get the character to write,
+                // and finally write it in the result pointer but with a left shift
+                // of 256 (1 byte) - 8 (1 ASCII char) = 248 bits
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(18, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(12, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(6, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(input, 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+            }
+
+            // When data `bytes` is not exactly 3 bytes long
+            // it is padded with `=` characters at the end
+            switch mod(mload(data), 3)
+            case 1 {
+                mstore8(sub(resultPtr, 1), 0x3d)
+                mstore8(sub(resultPtr, 2), 0x3d)
+            }
+            case 2 {
+                mstore8(sub(resultPtr, 1), 0x3d)
+            }
+        }
+
+        return result;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Strings.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Strings.sol)
+
+pragma solidity ^0.8.20;
+
+import {Math} from "./math/Math.sol";
+import {SignedMath} from "./math/SignedMath.sol";
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+    bytes16 private constant HEX_DIGITS = "0123456789abcdef";
+    uint8 private constant ADDRESS_LENGTH = 20;
+
+    /**
+     * @dev The `value` string doesn't fit in the specified `length`.
+     */
+    error StringsInsufficientHexLength(uint256 value, uint256 length);
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            uint256 length = Math.log10(value) + 1;
+            string memory buffer = new string(length);
+            uint256 ptr;
+            /// @solidity memory-safe-assembly
+            assembly {
+                ptr := add(buffer, add(32, length))
+            }
+            while (true) {
+                ptr--;
+                /// @solidity memory-safe-assembly
+                assembly {
+                    mstore8(ptr, byte(mod(value, 10), HEX_DIGITS))
+                }
+                value /= 10;
+                if (value == 0) break;
+            }
+            return buffer;
+        }
+    }
+
+    /**
+     * @dev Converts a `int256` to its ASCII `string` decimal representation.
+     */
+    function toStringSigned(int256 value) internal pure returns (string memory) {
+        return string.concat(value < 0 ? "-" : "", toString(SignedMath.abs(value)));
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            return toHexString(value, Math.log256(value) + 1);
+        }
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+        uint256 localValue = value;
+        bytes memory buffer = new bytes(2 * length + 2);
+        buffer[0] = "0";
+        buffer[1] = "x";
+        for (uint256 i = 2 * length + 1; i > 1; --i) {
+            buffer[i] = HEX_DIGITS[localValue & 0xf];
+            localValue >>= 4;
+        }
+        if (localValue != 0) {
+            revert StringsInsufficientHexLength(value, length);
+        }
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal
+     * representation.
+     */
+    function toHexString(address addr) internal pure returns (string memory) {
+        return toHexString(uint256(uint160(addr)), ADDRESS_LENGTH);
+    }
+
+    /**
+     * @dev Returns true if the two strings are equal.
+     */
+    function equal(string memory a, string memory b) internal pure returns (bool) {
+        return bytes(a).length == bytes(b).length && keccak256(bytes(a)) == keccak256(bytes(b));
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    /**
+     * @dev Muldiv operation overflow.
+     */
+    error MathOverflowedMulDiv();
+
+    enum Rounding {
+        Floor, // Toward negative infinity
+        Ceil, // Toward positive infinity
+        Trunc, // Toward zero
+        Expand // Away from zero
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds towards infinity instead
+     * of rounding towards zero.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (b == 0) {
+            // Guarantee the same behavior as in a regular Solidity division.
+            return a / b;
+        }
+
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or
+     * denominator == 0.
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv) with further edits by
+     * Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0 = x * y; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            if (denominator <= prod1) {
+                revert MathOverflowedMulDiv();
+            }
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator.
+            // Always >= 1. See https://cs.stackexchange.com/q/138556/92363.
+
+            uint256 twos = denominator & (0 - denominator);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also
+            // works in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (unsignedRoundsUp(rounding) && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded
+     * towards zero.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (unsignedRoundsUp(rounding) && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (unsignedRoundsUp(rounding) && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (unsignedRoundsUp(rounding) && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (unsignedRoundsUp(rounding) && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Returns whether a provided rounding mode is considered rounding up for unsigned integers.
+     */
+    function unsignedRoundsUp(Rounding rounding) internal pure returns (bool) {
+        return uint8(rounding) % 2 == 1;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/SignedMath.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Standard signed math utilities missing in the Solidity language.
+ */
+library SignedMath {
+    /**
+     * @dev Returns the largest of two signed numbers.
+     */
+    function max(int256 a, int256 b) internal pure returns (int256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two signed numbers.
+     */
+    function min(int256 a, int256 b) internal pure returns (int256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two signed numbers without overflow.
+     * The result is rounded towards zero.
+     */
+    function average(int256 a, int256 b) internal pure returns (int256) {
+        // Formula from the book "Hacker's Delight"
+        int256 x = (a & b) + ((a ^ b) >> 1);
+        return x + (int256(uint256(x) >> 255) & (a ^ b));
+    }
+
+    /**
+     * @dev Returns the absolute unsigned value of a signed value.
+     */
+    function abs(int256 n) internal pure returns (uint256) {
+        unchecked {
+            // must be unchecked in order to support `n = type(int256).min`
+            return uint256(n >= 0 ? n : -n);
+        }
+    }
+}
+

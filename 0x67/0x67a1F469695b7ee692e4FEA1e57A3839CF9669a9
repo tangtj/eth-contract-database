@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: UNLICENSED 
+//CopyRight Metallis Crypta.io, ALL RIGHTS RESERVED 2021-2024
+//Version 2.0 2-23-24
+pragma solidity 0.8.20;
+
+    //**************************************   Interfaces  *****************************************//
+
+
+interface ERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address tokenOwner) external view returns (uint256 balance);    
+    function transfer(address recipient, uint256 amount) external returns (bool success); 
+    function approve(address spender, uint256 tokens) external returns (bool success);
+    function transferFrom(address from, address to, uint256 tokens) external returns (bool success);
+    function allowance(address sender, address spender) external view returns (uint256 remaining);
+}
+
+interface Imultisig {
+    function pause() external returns (bool);
+    function unPause() external returns (bool);
+    function authorizeContract(address _contract) external;
+    function revokeContract(address _contract) external;
+    function addMultisigWallet(address _wallet) external;
+    function removeMultisigWallet(address _wallet) external;
+    function initiateProposal(
+        string memory _proposalName, 
+        bytes memory _proposalFunction, 
+        address _proposalContract,
+        uint _requiredVotes, 
+        uint _duration
+        ) external returns (uint proposalId);
+    function voteOnProposal(uint _proposalId, bool _vote) external;
+  
+}
+
+interface ImetallisMain {
+    function purchasewMetallis(address _buyer, string memory _tokenName, uint256 _tokenAmount) external returns (bool);
+    function setMultisigContract(address _multisigContract) external returns (address);
+    function addToWhitelist(address _address) external;
+    function updatePurchaseTokens(string memory _tokenName, ERC20 _tokenAddress, uint _decimals, uint _weiDiff, bool _active) external;
+    function updatewMetallisPrice(string memory _tokenName, ERC20 _tokenAddress, uint256 _wMetallisPrice) external;
+    function pauseContract(bool _status) external returns (bool);
+    function getMultisigContract() external view returns (Imultisig, address);
+    function getwMetallisContract() external view returns(IwMetallis, address);
+    function getwMetallisPrice(string memory _tokenName) external view returns (uint256);
+    function isWhitelisted() external view returns (bool);
+    function isAddressWhitelisted(address _whitelistAddress) external  view returns (bool);
+    function isPurchaseTokenActive(string memory tokenName) external view returns (bool);
+    function contractTokenBalances(string memory _tokenName) external view returns (uint256, uint256);
+    function wMetallisMintedBalance() external view returns(uint256);
+    function withdrawFunds(address tokenAddress, uint256 amount) external payable returns (bool success);
+    function transferOwnership(address newOwner) external returns (address);
+    function setTreasuries(string memory _treasuryName, address _treasuryAddress, uint _rate) external;
+
+}
+
+interface IwMetallis {
+    // Custom functions specific to the wMetallis contract
+    function distributeTokens(address buyer, uint256 wMetallisAmount) external returns (bool);
+    function pause() external;
+    function unPause() external;
+    function pauseStatus() external view returns (bool);
+    function setMultisigContract(address _multisigContract) external returns(address multisig);
+    function contractBalances(string memory _tokenName) external view returns (uint256); 
+    function addTokens(string memory _tokenName, ERC20 _tokenAddress, uint _decimals, bool _active) external;
+    function removeTokens(string memory _tokenName) external;
+    function isTokenActive(string memory tokenName) external view returns (bool);
+    function mintwMetallis(uint256 _mintAmount) external returns (string memory, uint256);
+    function burnwMetallis(uint256 _burnAmount) external returns (string memory, uint256);
+    function withdrawFunds(address tokenAddress, uint256 amount) external payable;
+    function manualTokenTransfer(address tokenAddress, address to, uint256 amount) external returns(bool);
+    function authorizeContract(address _contract) external returns (address);
+    function revokeContractAuthorization(address _contract) external returns (address);
+    function transferOwnership(address newOwner) external;
+    function wMetallisBalance() external view returns (uint);
+    function setMetallisMainContract(address _metallisMainAddress) external  returns (address);
+    function getMultisigAddress() external view returns (Imultisig _multisigContract, address _multisig);
+}
+
+
+
+contract wMetallis is ERC20, IwMetallis {
+
+    //************************************** State Variables *****************************************//
+
+
+    address internal multisigAddress;
+    address internal adminAddress;
+    address internal metallisMainAddress;
+    address public owner;
+    bool internal functionLocked;
+    bool public paused;
+    Imultisig internal multisigContract;
+    ImetallisMain internal metallisMainContract;
+    string public name = 'wMetallis';
+    string public symbol = 'wMTLIS';
+    string public logoUrl = "https://metalliscrypta.io/symbollogo.png";
+    string public _websiteUrl = "https://metalliscrypta.io";
+    uint public decimals = 18;
+    uint256 public totalSupply; 
+    uint256 public maxTotalSupply;
+
+  
+    //**************************************    Mappings    *****************************************//
+
+
+    // Mappings for balances and allowances
+    mapping(address => uint256) private _balances; // Map user balances
+    mapping(address => mapping(address => uint256)) private _allowances;  // Map user allowances
+    mapping(address => bool) internal authorizedContracts; // Mapping of authorized contract addresses
+    mapping(address => uint256) internal deposits; // Mapping to keep track of all Ether deposits
+    mapping(string => TokenInfo) internal erc20Tokens;  // Sets ERC20 Token id of Proposal Struct and maps to proposals array
+    mapping(address => mapping (address => uint)) public distributedTokens; // Mapping of calling contract, buyer address, and amount distributed
+    mapping(address => uint) internal mints; // Log and map all token mints
+    mapping(address => uint) internal burns; // Log all token burns
+
+    //**************************************       Structs      *****************************************//
+   
+    struct TokenInfo {
+        ERC20 tokenAddress;
+        uint decimals;
+        bool active;
+    }
+
+    //**************************************       Events      *****************************************//
+
+
+    event InternalTransfer(address indexed from, address indexed to, uint256 value); //Emit on successful transfer
+    event Approval(address indexed owner, address indexed spender, uint256 value); //Emit on successful approval
+    event AuthorizationChanged(address indexed contractAddress, bool isAuthorized); //Emit on any change
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner); //Emit on any change to ownership
+    event EtherReceived(address sender, uint256 amount); //Emit when Ether is received and by which address
+    event MintSuccess(uint256 mintAmount, uint256 newSupply); //Emit when new mint is made
+    event BurnSuccess(address sender, address zeroAddress, uint256 burnAmount); //Emit when tokens are burned
+    event MultisigChanged(address indexed _multisigContract); //Emit if multisig contract is changed
+    event TokenInfoUpdated(string tokenName, address tokenAddress, bool active); // Emit when updating token info
+    event TokenRemoved(string tokenName, ERC20 tokenAddress); // Emit if token is removed from the contract
+    
+    //**************************************      Modifiers      *****************************************//
+
+
+    // Modifier restricting function access to the owner of the contract only
+    modifier onlyOwner () {
+        require(msg.sender == owner, "You are not the owner");
+        _;
+    }
+
+    // Modifier restricting access to the multisig wallet address only
+    modifier onlyMultisig() {
+        require(msg.sender == multisigAddress, "Caller is not the multisig contract");
+        _;
+    }
+
+    // Modifier restricting access to the multisig wallet address only
+    modifier onlyAdmin() {
+        require(msg.sender == adminAddress, "Caller is not the multisig contract");
+        _;
+    }
+
+    // Modifier to restrict function calls to authorized contracts
+    modifier onlyAuthorizedContracts() {
+        require(authorizedContracts[msg.sender], "Caller is not authorized");
+        _;
+    }
+
+    // Modifier to lock a function while it is being exectued until it has finished 
+    modifier functionLock() {
+        require(!functionLocked, "Reentrant call detected");
+        functionLocked = true;
+        _;
+        functionLocked = false;
+    }
+
+
+
+    //**************************************    Constructor     *****************************************//
+
+
+    constructor(
+        address _multisigAddress,
+        address _metallisMainAddress,
+        address _adminAddress
+    ) {
+        multisigContract = Imultisig(_multisigAddress); // Initialize instances of the contract interfaces
+        metallisMainContract = ImetallisMain(_metallisMainAddress); // Initialize instances of the contract interfaces
+        adminAddress = _adminAddress; // Define Admin Address upon deployment
+        paused = false; // Set initial emergency paused state to false
+        functionLocked = false; // Set initial function lock state to false
+        maxTotalSupply = 5000000 * (10 ** 18); //5M coins in wei
+        owner = msg.sender; // Set the owner of the contract to the deployer address
+        uint256 firstMintAmount = 483000 * (10 ** 18); // first mint amount
+        _balances[address(this)] = firstMintAmount; // Assigning first minted tokens to the contract itself
+        totalSupply = firstMintAmount; // Update the total supply
+
+    }
+
+    //************************************** Core ERC20 Functions *****************************************//
+
+
+    // Returns the account balance of another account with address `tokenOwner`.
+    function balanceOf(address tokenOwner) external view returns (uint256 balance) {
+        return _balances[tokenOwner];
+    }
+
+    function transfer(address recipient, uint256 amount) external returns (bool) {
+        require (!paused, "Contract is currently paused");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+        require(_balances[msg.sender] >= amount, "ERC20: transfer amount exceeds balance");
+        _balances[msg.sender] = _balances[msg.sender] - amount;
+        _balances[recipient] = _balances[recipient] + amount;
+        return true;
+    }
+
+    // Approves the `spender` to withdraw from user account multiple times, up to the `tokens` amount.
+    function approve(address spender, uint256 tokens) external returns (bool success) {
+        require (!paused, "Contract is currently paused");
+        require(spender != address(0), "Approve to the zero address");
+        _allowances[msg.sender][spender] = tokens;
+        emit Approval(msg.sender, spender, tokens);
+        return true;
+    }
+
+    // Transfers `tokens` amount of tokens from address `from` to address `to`.
+    function transferFrom(address from, address to, uint256 tokens) external returns (bool success) {
+        require (!paused, "Contract is currently paused");
+        require(tokens <= _balances[from], "Insufficient balance");
+        require(tokens <= _allowances[from][msg.sender], "Insufficient allowance");
+        require(to != address(0), "Transfer to the zero address");
+        _balances[from] -= tokens;
+        _balances[to] += tokens;
+        _allowances[from][msg.sender] -= tokens;
+        return true;
+    }
+
+    // Returns the amount of tokens approved by the owner that can be transferred to the spender's account.
+    function allowance(address sender, address spender) external view returns (uint256 remaining) {
+        return _allowances[sender][spender];
+    }
+
+    //************************************** Getter Functions *****************************************//
+
+    //Function to allow checks of authorized contracts
+    function isContractAuthorized(address _contract) external view returns (string memory) {
+        if (authorizedContracts[_contract]) {
+            return "Contract is authorized";
+        } else {
+            return "Contract is not authorized";
+        }
+    }
+
+    // Function to check the contract's balance of erc20 Tokens
+    function contractBalances(string memory _tokenName) external view onlyOwner returns (uint256) {
+        bool _token = erc20Tokens [_tokenName].active;
+        require(_token == true, "No active token by that name");
+        uint256 balance = erc20Tokens [_tokenName].tokenAddress.balanceOf(address(this));
+        return balance / (10**erc20Tokens[_tokenName].decimals); // Fetch the balance and truncate decimals
+    }
+
+    // Get wMetallis balance of contract
+    function wMetallisBalance() external view onlyAuthorizedContracts returns (uint){
+        return totalSupply;
+    }
+
+    function isTokenActive(string memory tokenName) external view returns (bool) {
+        return erc20Tokens[tokenName].active;
+    }
+
+    function getMultisigAddress() external view onlyAuthorizedContracts returns (Imultisig, address) {
+        return (multisigContract, multisigAddress);
+    }
+
+
+    //************************************** Setter Functions *****************************************//
+
+    // Function to pause the contract
+    function pause() external onlyOwner {
+        paused = true;
+    }
+
+    // Function to unpause the contract
+    function unPause() external onlyOwner {
+        paused = false;
+    }
+
+    // Function to check the contract's paused status
+    function pauseStatus() public view returns (bool) {
+        return paused;
+    }
+
+    // Set the multisig contract address
+    function setMultisigContract(address _multisigAddress) external onlyOwner returns(address){
+        multisigContract = Imultisig(_multisigAddress); // Update Multisig Address
+        multisigAddress = _multisigAddress; // Set the multisigAddress variable 
+        emit MultisigChanged(multisigAddress); // Emit the updated address
+        return multisigAddress; //return the updated multisig address
+    }
+    
+    // Set metallisMain Contract address
+    function setMetallisMainContract(address _metallisMainAddress) external onlyOwner returns (address){
+        metallisMainContract = ImetallisMain(_metallisMainAddress);
+        metallisMainAddress = _metallisMainAddress;
+        return metallisMainAddress;
+    }
+
+    // Set admin address
+    function setAdminAddress(address _newAdminAddress) external onlyAdmin returns (address){
+        adminAddress = _newAdminAddress;
+        return adminAddress;
+    }
+
+    // Set token addresses that the contract will accept
+    function addTokens(
+        string memory _tokenName, 
+        ERC20 _tokenAddress, 
+        uint _decimals, 
+        bool _active) external onlyOwner {
+            erc20Tokens[_tokenName] = TokenInfo(_tokenAddress, _decimals, _active);
+            emit TokenInfoUpdated(_tokenName, address(_tokenAddress), _active);
+    }
+
+    // Remove tokens from the approved tokens array
+    function removeTokens(string memory _tokenName) external onlyOwner {
+        emit TokenRemoved(_tokenName, erc20Tokens[_tokenName].tokenAddress);
+        delete erc20Tokens[_tokenName];
+    }
+
+    // Function to authorize a contract address
+    function authorizeContract(address _contract) external onlyOwner returns (address) {
+        authorizedContracts[_contract] = true;
+        emit AuthorizationChanged(_contract, true);
+        return _contract;
+    }
+
+    // Function to revoke authorization of a contract address
+    function revokeContractAuthorization(address _contract) external onlyOwner returns (address) {
+        authorizedContracts[_contract] = false;
+        emit AuthorizationChanged(_contract, false);
+        return _contract;
+    }
+
+
+    //************************************** Internal Functions *****************************************//
+
+    // Custom ERC20 internal transfer function
+    function _transfer(address sender, address recipient, uint256 amount) private returns (bool){
+        require (!paused, "Contract is currently paused");
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+        require(_balances[sender] >= amount, "ERC20: transfer amount exceeds balance");
+        _balances[sender] = _balances[sender] - amount;
+        _balances[recipient] = _balances[recipient] + amount;
+        emit InternalTransfer(sender, recipient, amount);
+        return true;
+    }
+
+    // Function to receive Ether. msg.value is the amount of Ether sent mapped to address making deposit
+    receive() external payable {
+        deposits[msg.sender] += msg.value;
+        emit EtherReceived(msg.sender, msg.value);
+    }
+
+    // Fallback function to accept ETH sent to the contract and map deposit to sender address
+    fallback() external payable {
+        deposits[msg.sender] += msg.value;
+        emit EtherReceived(msg.sender, msg.value);
+    }
+
+    // Function to allow the owner to mint more wMetallis tokens
+    // pass "abi.encodeWithSignature("mintwMetallis(uint256)", mintAmount);" to proposal for vote
+    function mintwMetallis(uint256 _mintAmount) external onlyMultisig returns (string memory, uint256) {
+        require(!paused, "Contract is paused");
+        // Make sure that the mint cannot exceed the total supply
+        require(totalSupply + _mintAmount <= maxTotalSupply, "Mint exceeds max supply");
+        // Add the newly minted tokens tot he total supply
+        totalSupply += _mintAmount;
+        mints [address(this)] += _mintAmount;
+        emit MintSuccess(_mintAmount, totalSupply);
+        return ("Mint Successful. Tokens Minted: ",_mintAmount);
+    }
+
+    // Function to allow the owner to burn wMetallis tokens
+    function burnwMetallis(uint256 _burnAmount) external onlyMultisig returns (string memory, uint256) {
+        require(!paused, "Contract is paused");
+        // Make sure that the burn amount cannot exceed the total supply
+        require(totalSupply - _burnAmount >= 0, "Burn exceeds total supply");
+        // Subtract the burned tokens from the total supply
+        totalSupply -= _burnAmount;
+        burns [address(this)] += _burnAmount;
+        emit BurnSuccess(msg.sender, address(0), _burnAmount);
+        return ("Burn Successful. Tokens Burned: ", _burnAmount);
+    }
+
+    // Function to allow owner to withraw funds from the contract
+    function withdrawFunds(address tokenAddress, uint256 amount) external onlyAdmin functionLock payable {
+        require (!paused, "Contract is currently paused");
+        // Handling Ether withdrawal
+        if (tokenAddress == address(0)) {
+            require(address(this).balance >= amount, "Insufficient ETH balance");
+            (bool success, ) = msg.sender.call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            // Handling ERC20 token withdrawal
+            require(tokenAddress != address(0), "Invalid token address");
+            uint256 balance = ERC20(tokenAddress).balanceOf(address(this));
+            require(balance >= amount, "Insufficient token balance");
+            require(ERC20(tokenAddress).transfer(msg.sender, amount), "Token transfer failed");
+        }
+    }
+
+    // Function to manually transfer ERC20 tokens from contract
+        function manualTokenTransfer(address tokenAddress, address to, uint256 amount) external onlyAdmin functionLock returns(bool){
+        require (!paused, "Contract is currently paused");
+        ERC20 tokenContract = ERC20(tokenAddress);
+        bool success = tokenContract.transfer(to, amount);
+        require(success, "Token transfer failed");
+        return success;
+    }
+
+    // Distribute purchased wMetallis Tokens when purchased and called by the Main Contract
+    function distributeTokens(address _buyer, uint256 wMetallisAmount) external onlyAuthorizedContracts functionLock returns (bool) {
+        require (!paused, "Contract is currently paused");
+        require(_balances[address(this)] >= wMetallisAmount, "Insufficient wMetallis balance in contract"); // Make sure the contract has enough minted tokens to complete the transaction
+        bool success =_transfer(address(this), _buyer, wMetallisAmount); // Call the internal _transfer function to send wMetalllis to buyer
+        require(success, "Distribute tokens failed"); // if transfer fails, revert and throw error
+        distributedTokens[msg.sender][_buyer] += wMetallisAmount; // Map the caller,buyer, and wMetallis amount transfered
+        return true; // Tell the main contract that the distribution was completed ok
+    }
+
+    function transferOwnership(address newOwner) external onlyAdmin {
+        require(newOwner != address(0), "New owner is the zero address");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+}

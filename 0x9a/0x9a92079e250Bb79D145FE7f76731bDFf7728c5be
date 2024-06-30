@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+/*
+ * @title Access Control Contract
+ * @dev Handles CEO address authorization for contracts that inherit from it
+ */
+contract AccessControl {
+    address payable public ceoAddress;
+
+    constructor() {
+        ceoAddress = payable(msg.sender);
+    }
+
+    modifier onlyCEO() {
+        require(msg.sender == ceoAddress, "Caller is not the CEO");
+        _;
+    }
+
+    function setCEO(address payable _newCEO) public onlyCEO {
+        require(_newCEO != address(0), "CEO address cannot be zero");
+        ceoAddress = _newCEO;
+    }
+}
+
+/*
+ * @title BlingETH Contract
+ * @dev Manages ETH to Bling token sales
+ * @version 1.1
+ */
+contract BlingETH is AccessControl {
+    string public constant version = "1.1";
+    mapping(uint256 => uint256) public packages; // package Id to ETH amount
+    uint256[] private packageIds;
+
+    event Purchase(
+        address indexed buyer,
+        uint256 ethSent,
+        uint256 indexed packageId
+    );
+    event Withdrawal(address indexed to, uint256 amount);
+    event PackageUpdate(
+        uint256 indexed packageId,
+        uint256 ethAmount,
+        address indexed updatedBy
+    );
+
+    constructor() {
+        // initialize bling packages and package Ids
+        packages[250] = 0.005 ether;
+        packages[500] = 0.01 ether;
+        packages[1000] = 0.02 ether;
+        packages[2000] = 0.04 ether;
+        packageIds = [250, 500, 1000, 2000];
+    }
+
+    // purchase bling token package
+    function buyBling(uint256 packageId) public payable {
+        uint256 packagePrice = packages[packageId];
+        require(packagePrice > 0, "Package does not exist");
+        require(msg.value == packagePrice, "Incorrect ETH amount");
+
+        emit Purchase(msg.sender, msg.value, packageId);
+    }
+
+    // withdraw accumulated funds
+    function withdrawFunds() public onlyCEO {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No funds available");
+        ceoAddress.transfer(balance);
+
+        emit Withdrawal(ceoAddress, balance);
+    }
+
+    // insert new packageId into packageIds array in sorted order
+    function addPackage(uint256 newPackageId) internal {
+        uint256 length = packageIds.length;
+        uint256[] memory newPackageIds = new uint256[](length + 1);
+        bool inserted = false;
+
+        for (uint256 i = 0; i < length; i++) {
+            if (newPackageId < packageIds[i] && !inserted) {
+                newPackageIds[i] = newPackageId;
+                inserted = true;
+            }
+            newPackageIds[i + (inserted ? 1 : 0)] = packageIds[i];
+        }
+
+        if (!inserted) {
+            newPackageIds[length] = newPackageId;
+        }
+        packageIds = newPackageIds;
+    }
+
+    // remove packageId from packageIds array
+    function removePackage(uint256 packageId) internal {
+        uint256 length = packageIds.length;
+        uint256[] memory newPackageIds = new uint256[](length - 1);
+        uint256 j = 0;
+
+        for (uint256 i = 0; i < length; i++) {
+            if (packageIds[i] != packageId) {
+                newPackageIds[j] = packageIds[i];
+                j++;
+            }
+        }
+        packageIds = newPackageIds;
+    }
+
+    // add or update packages
+    function setPackage(uint256 packageId, uint256 ethAmount) public onlyCEO {
+        bool exists = packages[packageId] > 0;
+
+        if (!exists && ethAmount > 0) {
+            addPackage(packageId);
+        } else if (exists && ethAmount == 0) {
+            removePackage(packageId);
+        }
+        packages[packageId] = ethAmount;
+
+        emit PackageUpdate(packageId, ethAmount, msg.sender);
+    }
+
+    // return all packages except those with value of zero
+    function getAllPackages()
+        public
+        view
+        returns (uint256[] memory, uint256[] memory)
+    {
+        uint256 count = 0;
+        for (uint256 i = 0; i < packageIds.length; i++) {
+            if (packages[packageIds[i]] > 0) {
+                count++;
+            }
+        }
+
+        uint256[] memory ids = new uint256[](count);
+        uint256[] memory values = new uint256[](count);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < packageIds.length; i++) {
+            if (packages[packageIds[i]] > 0) {
+                ids[index] = packageIds[i];
+                values[index] = packages[packageIds[i]];
+                index++;
+            }
+        }
+
+        return (ids, values);
+    }
+
+    // return balance of contract
+    function getContractBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+}

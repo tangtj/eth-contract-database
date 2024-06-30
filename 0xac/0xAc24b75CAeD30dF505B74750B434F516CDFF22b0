@@ -1,0 +1,1815 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+
+interface IERC165 {
+	/// @notice Query if a contract implements an interface
+	/// @param interfaceID The interface identifier, as specified in ERC-165
+	/// @dev Interface identification is specified in ERC-165. This function
+	/// uses less than 30,000 gas.
+	/// @return `true` if the contract implements `interfaceID` and
+	/// `interfaceID` is not 0xffffffff, `false` otherwise
+	function supportsInterface(bytes4 interfaceID) external view returns (bool);
+}
+
+
+/// @title ERC-721 Non-Fungible Token Standard
+/// @dev See https://eips.ethereum.org/EIPS/eip-721
+/// Note: the ERC-165 identifier for this interface is 0x80ac58cd.
+interface IERC721 is IERC165 {
+	/// @dev This emits when ownership of any NFT changes by any mechanism.
+	/// This event emits when NFTs are created (`from` == 0) and destroyed
+	/// (`to` == 0). Exception: during contract creation, any number of NFTs
+	/// may be created and assigned without emitting Transfer. At the time of
+	/// any transfer, the approved address for that NFT (if any) is reset to none.
+	event Transfer(address indexed _from, address indexed _to, uint256 indexed _tokenId);
+
+	/// @dev This emits when the approved address for an NFT is changed or
+	/// reaffirmed. The zero address indicates there is no approved address.
+	/// When a Transfer event emits, this also indicates that the approved
+	/// address for that NFT (if any) is reset to none.
+	event Approval(address indexed _owner, address indexed _approved, uint256 indexed _tokenId);
+
+	/// @dev This emits when an operator is enabled or disabled for an owner.
+	/// The operator can manage all NFTs of the owner.
+	event ApprovalForAll(address indexed _owner, address indexed _operator, bool _approved);
+
+	/// @notice Count all NFTs assigned to an owner
+	/// @dev NFTs assigned to the zero address are considered invalid, and this
+	/// function throws for queries about the zero address.
+	/// @param _owner An address for whom to query the balance
+	/// @return The number of NFTs owned by `_owner`, possibly zero
+	function balanceOf(address _owner) external view returns (uint256);
+
+	/// @notice Find the owner of an NFT
+	/// @dev NFTs assigned to zero address are considered invalid, and queries
+	/// about them do throw.
+	/// @param _tokenId The identifier for an NFT
+	/// @return The address of the owner of the NFT
+	function ownerOf(uint256 _tokenId) external view returns (address);
+
+	/// @notice Transfers the ownership of an NFT from one address to another address
+	/// @dev Throws unless `msg.sender` is the current owner, an authorized
+	/// operator, or the approved address for this NFT. Throws if `_from` is
+	/// not the current owner. Throws if `_to` is the zero address. Throws if
+	/// `_tokenId` is not a valid NFT. When transfer is complete, this function
+	/// checks if `_to` is a smart contract (code size > 0). If so, it calls
+	/// `onERC721Received` on `_to` and throws if the return value is not
+	/// `bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`.
+	/// @param _from The current owner of the NFT
+	/// @param _to The new owner
+	/// @param _tokenId The NFT to transfer
+	/// @param data Additional data with no specified format, sent in call to `_to`
+	function safeTransferFrom(address _from, address _to, uint256 _tokenId, bytes calldata data) external payable;
+
+	/// @notice Transfers the ownership of an NFT from one address to another address
+	/// @dev This works identically to the other function with an extra data parameter,
+	/// except this function just sets data to "".
+	/// @param _from The current owner of the NFT
+	/// @param _to The new owner
+	/// @param _tokenId The NFT to transfer
+	function safeTransferFrom(address _from, address _to, uint256 _tokenId) external payable;
+
+	/// @notice Transfer ownership of an NFT -- THE CALLER IS RESPONSIBLE
+	/// TO CONFIRM THAT `_to` IS CAPABLE OF RECEIVING NFTS OR ELSE
+	/// THEY MAY BE PERMANENTLY LOST
+	/// @dev Throws unless `msg.sender` is the current owner, an authorized
+	/// operator, or the approved address for this NFT. Throws if `_from` is
+	/// not the current owner. Throws if `_to` is the zero address. Throws if
+	/// `_tokenId` is not a valid NFT.
+	/// @param _from The current owner of the NFT
+	/// @param _to The new owner
+	/// @param _tokenId The NFT to transfer
+	function transferFrom(address _from, address _to, uint256 _tokenId) external payable;
+
+	/// @notice Change or reaffirm the approved address for an NFT
+	/// @dev The zero address indicates there is no approved address.
+	/// Throws unless `msg.sender` is the current NFT owner, or an authorized
+	/// operator of the current owner.
+	/// @param _approved The new approved NFT controller
+	/// @param _tokenId The NFT to approve
+	function approve(address _approved, uint256 _tokenId) external payable;
+
+	/// @notice Enable or disable approval for a third party ("operator") to manage
+	/// all of `msg.sender`'s assets
+	/// @dev Emits the ApprovalForAll event. The contract MUST allow
+	/// multiple operators per owner.
+	/// @param _operator Address to add to the set of authorized operators
+	/// @param _approved True if the operator is approved, false to revoke approval
+	function setApprovalForAll(address _operator, bool _approved) external;
+
+	/// @notice Get the approved address for a single NFT
+	/// @dev Throws if `_tokenId` is not a valid NFT.
+	/// @param _tokenId The NFT to find the approved address for
+	/// @return The approved address for this NFT, or the zero address if there is none
+	function getApproved(uint256 _tokenId) external view returns (address);
+
+	/// @notice Query if an address is an authorized operator for another address
+	/// @param _owner The address that owns the NFTs
+	/// @param _operator The address that acts on behalf of the owner
+	/// @return True if `_operator` is an approved operator for `_owner`, false otherwise
+	function isApprovedForAll(address _owner, address _operator) external view returns (bool);
+}
+
+/// @dev Note: the ERC-165 identifier for this interface is 0x150b7a02.
+interface IERC721TokenReceiver {
+	/// @notice Handle the receipt of an NFT
+	/// @dev The ERC721 smart contract calls this function on the recipient
+	/// after a `transfer`. This function MAY throw to revert and reject the
+	/// transfer. Return of other than the magic value MUST result in the
+	/// transaction being reverted.
+	/// Note: the contract address is always the message sender.
+	/// @param _operator The address which called `safeTransferFrom` function
+	/// @param _from The address which previously owned the token
+	/// @param _tokenId The NFT identifier which is being transferred
+	/// @param _data Additional data with no specified format
+	/// @return `bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`
+	///  unless throwing
+	function onERC721Received(address _operator, address _from, uint256 _tokenId, bytes calldata _data)
+	external
+	returns (bytes4);
+}
+
+
+/**
+ * @dev These functions deal with verification of Merkle Tree proofs.
+ *
+ * The tree and the proofs can be generated using our
+ * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].
+ * You will find a quickstart guide in the readme.
+ *
+ * WARNING: You should avoid using leaf values that are 64 bytes long prior to
+ * hashing, or use a hash function other than keccak256 for hashing leaves.
+ * This is because the concatenation of a sorted pair of internal nodes in
+ * the Merkle tree could be reinterpreted as a leaf value.
+ * OpenZeppelin's JavaScript library generates Merkle trees that are safe
+ * against this attack out of the box.
+ */
+library MerkleProof {
+	/**
+	 *@dev The multiproof provided is not valid.
+     */
+	error MerkleProofInvalidMultiproof();
+
+	/**
+	 * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree
+     * defined by `root`. For this, a `proof` must be provided, containing
+     * sibling hashes on the branch from the leaf to the root of the tree. Each
+     * pair of leaves and each pair of pre-images are assumed to be sorted.
+     */
+	function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+		return processProof(proof, leaf) == root;
+	}
+
+	/**
+	 * @dev Calldata version of {verify}
+     */
+	function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+		return processProofCalldata(proof, leaf) == root;
+	}
+
+	/**
+	 * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up
+     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt
+     * hash matches the root of the tree. When processing the proof, the pairs
+     * of leafs & pre-images are assumed to be sorted.
+     */
+	function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {
+		bytes32 computedHash = leaf;
+		for (uint256 i = 0; i < proof.length; i++) {
+			computedHash = _hashPair(computedHash, proof[i]);
+		}
+		return computedHash;
+	}
+
+	/**
+	 * @dev Calldata version of {processProof}
+     */
+	function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {
+		bytes32 computedHash = leaf;
+		for (uint256 i = 0; i < proof.length; i++) {
+			computedHash = _hashPair(computedHash, proof[i]);
+		}
+		return computedHash;
+	}
+
+	/**
+	 * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by
+     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+	function multiProofVerify(
+		bytes32[] memory proof,
+		bool[] memory proofFlags,
+		bytes32 root,
+		bytes32[] memory leaves
+	) internal pure returns (bool) {
+		return processMultiProof(proof, proofFlags, leaves) == root;
+	}
+
+	/**
+	 * @dev Calldata version of {multiProofVerify}
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+	function multiProofVerifyCalldata(
+		bytes32[] calldata proof,
+		bool[] calldata proofFlags,
+		bytes32 root,
+		bytes32[] memory leaves
+	) internal pure returns (bool) {
+		return processMultiProofCalldata(proof, proofFlags, leaves) == root;
+	}
+
+	/**
+	 * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction
+     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another
+     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false
+     * respectively.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree
+     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the
+     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).
+     */
+	function processMultiProof(
+		bytes32[] memory proof,
+		bool[] memory proofFlags,
+		bytes32[] memory leaves
+	) internal pure returns (bytes32 merkleRoot) {
+		// This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by
+		// consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+		// `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+		// the Merkle tree.
+		uint256 leavesLen = leaves.length;
+		uint256 proofLen = proof.length;
+		uint256 totalHashes = proofFlags.length;
+
+		// Check proof validity.
+		if (leavesLen + proofLen != totalHashes + 1) {
+			revert MerkleProofInvalidMultiproof();
+		}
+
+		// The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+		// `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+		bytes32[] memory hashes = new bytes32[](totalHashes);
+		uint256 leafPos = 0;
+		uint256 hashPos = 0;
+		uint256 proofPos = 0;
+		// At each step, we compute the next hash using two values:
+		// - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+		//   get the next hash.
+		// - depending on the flag, either another value from the "main queue" (merging branches) or an element from the
+		//   `proof` array.
+		for (uint256 i = 0; i < totalHashes; i++) {
+			bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+			bytes32 b = proofFlags[i]
+				? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])
+				: proof[proofPos++];
+			hashes[i] = _hashPair(a, b);
+		}
+
+		if (totalHashes > 0) {
+			if (proofPos != proofLen) {
+				revert MerkleProofInvalidMultiproof();
+			}
+			unchecked {
+				return hashes[totalHashes - 1];
+			}
+		} else if (leavesLen > 0) {
+			return leaves[0];
+		} else {
+			return proof[0];
+		}
+	}
+
+	/**
+	 * @dev Calldata version of {processMultiProof}.
+     *
+     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.
+     */
+	function processMultiProofCalldata(
+		bytes32[] calldata proof,
+		bool[] calldata proofFlags,
+		bytes32[] memory leaves
+	) internal pure returns (bytes32 merkleRoot) {
+		// This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by
+		// consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the
+		// `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of
+		// the Merkle tree.
+		uint256 leavesLen = leaves.length;
+		uint256 proofLen = proof.length;
+		uint256 totalHashes = proofFlags.length;
+
+		// Check proof validity.
+		if (leavesLen + proofLen != totalHashes + 1) {
+			revert MerkleProofInvalidMultiproof();
+		}
+
+		// The xxxPos values are "pointers" to the next value to consume in each array. All accesses are done using
+		// `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's "pop".
+		bytes32[] memory hashes = new bytes32[](totalHashes);
+		uint256 leafPos = 0;
+		uint256 hashPos = 0;
+		uint256 proofPos = 0;
+		// At each step, we compute the next hash using two values:
+		// - a value from the "main queue". If not all leaves have been consumed, we get the next leaf, otherwise we
+		//   get the next hash.
+		// - depending on the flag, either another value from the "main queue" (merging branches) or an element from the
+		//   `proof` array.
+		for (uint256 i = 0; i < totalHashes; i++) {
+			bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];
+			bytes32 b = proofFlags[i]
+				? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])
+				: proof[proofPos++];
+			hashes[i] = _hashPair(a, b);
+		}
+
+		if (totalHashes > 0) {
+			if (proofPos != proofLen) {
+				revert MerkleProofInvalidMultiproof();
+			}
+			unchecked {
+				return hashes[totalHashes - 1];
+			}
+		} else if (leavesLen > 0) {
+			return leaves[0];
+		} else {
+			return proof[0];
+		}
+	}
+
+	/**
+	 * @dev Sorts the pair (a, b) and hashes the result.
+     */
+	function _hashPair(bytes32 a, bytes32 b) private pure returns (bytes32) {
+		return a < b ? _efficientHash(a, b) : _efficientHash(b, a);
+	}
+
+	/**
+	 * @dev Implementation of keccak256(abi.encode(a, b)) that doesn't allocate or expand memory.
+     */
+	function _efficientHash(bytes32 a, bytes32 b) private pure returns (bytes32 value) {
+		/// @solidity memory-safe-assembly
+		assembly {
+			mstore(0x00, a)
+			mstore(0x20, b)
+			value := keccak256(0x00, 0x40)
+		}
+	}
+}
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+	/**
+	 * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+	event Transfer(address indexed from, address indexed to, uint256 value);
+
+	/**
+	 * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+	event Approval(address indexed owner, address indexed spender, uint256 value);
+
+	/**
+	 * @dev Returns the value of tokens in existence.
+     */
+	function totalSupply() external view returns (uint256);
+
+	/**
+	 * @dev Returns the value of tokens owned by `account`.
+     */
+	function balanceOf(address account) external view returns (uint256);
+
+	/**
+	 * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+	function transfer(address to, uint256 value) external returns (bool);
+
+	/**
+	 * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+	function allowance(address owner, address spender) external view returns (uint256);
+
+	/**
+	 * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+	function approve(address spender, uint256 value) external returns (bool);
+
+	/**
+	 * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+	function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+	function _msgSender() internal view virtual returns (address) {
+		return msg.sender;
+	}
+
+	function _msgData() internal view virtual returns (bytes calldata) {
+		return msg.data;
+	}
+
+	function _contextSuffixLength() internal view virtual returns (uint256) {
+		return 0;
+	}
+}
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+	address private _owner;
+
+	/**
+	 * @dev The caller account is not authorized to perform an operation.
+     */
+	error OwnableUnauthorizedAccount(address account);
+
+	/**
+	 * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+	error OwnableInvalidOwner(address owner);
+
+	event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+	/**
+	 * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+	constructor(address initialOwner) {
+		if (initialOwner == address(0)) {
+			revert OwnableInvalidOwner(address(0));
+		}
+		_transferOwnership(initialOwner);
+	}
+
+	/**
+	 * @dev Throws if called by any account other than the owner.
+     */
+	modifier onlyOwner() {
+		_checkOwner();
+		_;
+	}
+
+	/**
+	 * @dev Returns the address of the current owner.
+     */
+	function owner() public view virtual returns (address) {
+		return _owner;
+	}
+
+	/**
+	 * @dev Throws if the sender is not the owner.
+     */
+	function _checkOwner() internal view virtual {
+		if (owner() != _msgSender()) {
+			revert OwnableUnauthorizedAccount(_msgSender());
+		}
+	}
+
+	/**
+	 * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+	function renounceOwnership() public virtual onlyOwner {
+		_transferOwnership(address(0));
+	}
+
+	/**
+	 * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+	function transferOwnership(address newOwner) public virtual onlyOwner {
+		if (newOwner == address(0)) {
+			revert OwnableInvalidOwner(address(0));
+		}
+		_transferOwnership(newOwner);
+	}
+
+	/**
+	 * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+	function _transferOwnership(address newOwner) internal virtual {
+		address oldOwner = _owner;
+		_owner = newOwner;
+		emit OwnershipTransferred(oldOwner, newOwner);
+	}
+}
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+	/**
+	 * @dev Muldiv operation overflow.
+     */
+	error MathOverflowedMulDiv();
+
+	enum Rounding {
+		Floor, // Toward negative infinity
+		Ceil, // Toward positive infinity
+		Trunc, // Toward zero
+		Expand // Away from zero
+	}
+
+	/**
+	 * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     */
+	function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+		unchecked {
+			uint256 c = a + b;
+			if (c < a) return (false, 0);
+			return (true, c);
+		}
+	}
+
+	/**
+	 * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     */
+	function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+		unchecked {
+			if (b > a) return (false, 0);
+			return (true, a - b);
+		}
+	}
+
+	/**
+	 * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     */
+	function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+		unchecked {
+		// Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+		// benefit is lost if 'b' is also tested.
+		// See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+			if (a == 0) return (true, 0);
+			uint256 c = a * b;
+			if (c / a != b) return (false, 0);
+			return (true, c);
+		}
+	}
+
+	/**
+	 * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     */
+	function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+		unchecked {
+			if (b == 0) return (false, 0);
+			return (true, a / b);
+		}
+	}
+
+	/**
+	 * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     */
+	function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+		unchecked {
+			if (b == 0) return (false, 0);
+			return (true, a % b);
+		}
+	}
+
+	/**
+	 * @dev Returns the largest of two numbers.
+     */
+	function max(uint256 a, uint256 b) internal pure returns (uint256) {
+		return a > b ? a : b;
+	}
+
+	/**
+	 * @dev Returns the smallest of two numbers.
+     */
+	function min(uint256 a, uint256 b) internal pure returns (uint256) {
+		return a < b ? a : b;
+	}
+
+	/**
+	 * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+	function average(uint256 a, uint256 b) internal pure returns (uint256) {
+		// (a + b) / 2 can overflow.
+		return (a & b) + (a ^ b) / 2;
+	}
+
+	/**
+	 * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds towards infinity instead
+     * of rounding towards zero.
+     */
+	function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+		if (b == 0) {
+			// Guarantee the same behavior as in a regular Solidity division.
+			return a / b;
+		}
+
+		// (a + b - 1) / b can overflow on addition, so we distribute.
+		return a == 0 ? 0 : (a - 1) / b + 1;
+	}
+
+	/**
+	 * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or
+     * denominator == 0.
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv) with further edits by
+     * Uniswap Labs also under MIT license.
+     */
+	function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+		unchecked {
+		// 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+		// use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+		// variables such that product = prod1 * 2^256 + prod0.
+			uint256 prod0 = x * y; // Least significant 256 bits of the product
+			uint256 prod1; // Most significant 256 bits of the product
+			assembly {
+				let mm := mulmod(x, y, not(0))
+				prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+			}
+
+		// Handle non-overflow cases, 256 by 256 division.
+			if (prod1 == 0) {
+				// Solidity will revert if denominator == 0, unlike the div opcode on its own.
+				// The surrounding unchecked block does not change this fact.
+				// See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+				return prod0 / denominator;
+			}
+
+		// Make sure the result is less than 2^256. Also prevents denominator == 0.
+			if (denominator <= prod1) {
+				revert MathOverflowedMulDiv();
+			}
+
+		///////////////////////////////////////////////
+		// 512 by 256 division.
+		///////////////////////////////////////////////
+
+		// Make division exact by subtracting the remainder from [prod1 prod0].
+			uint256 remainder;
+			assembly {
+			// Compute remainder using mulmod.
+				remainder := mulmod(x, y, denominator)
+
+			// Subtract 256 bit number from 512 bit number.
+				prod1 := sub(prod1, gt(remainder, prod0))
+				prod0 := sub(prod0, remainder)
+			}
+
+		// Factor powers of two out of denominator and compute largest power of two divisor of denominator.
+		// Always >= 1. See https://cs.stackexchange.com/q/138556/92363.
+
+			uint256 twos = denominator & (0 - denominator);
+			assembly {
+			// Divide denominator by twos.
+				denominator := div(denominator, twos)
+
+			// Divide [prod1 prod0] by twos.
+				prod0 := div(prod0, twos)
+
+			// Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+				twos := add(div(sub(0, twos), twos), 1)
+			}
+
+		// Shift in bits from prod1 into prod0.
+			prod0 |= prod1 * twos;
+
+		// Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+		// that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+		// four bits. That is, denominator * inv = 1 mod 2^4.
+			uint256 inverse = (3 * denominator) ^ 2;
+
+		// Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also
+		// works in modular arithmetic, doubling the correct bits in each step.
+			inverse *= 2 - denominator * inverse; // inverse mod 2^8
+			inverse *= 2 - denominator * inverse; // inverse mod 2^16
+			inverse *= 2 - denominator * inverse; // inverse mod 2^32
+			inverse *= 2 - denominator * inverse; // inverse mod 2^64
+			inverse *= 2 - denominator * inverse; // inverse mod 2^128
+			inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+		// Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+		// This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+		// less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+		// is no longer required.
+			result = prod0 * inverse;
+			return result;
+		}
+	}
+
+	/**
+	 * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+	function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+		uint256 result = mulDiv(x, y, denominator);
+		if (unsignedRoundsUp(rounding) && mulmod(x, y, denominator) > 0) {
+			result += 1;
+		}
+		return result;
+	}
+
+	/**
+	 * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded
+     * towards zero.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+	function sqrt(uint256 a) internal pure returns (uint256) {
+		if (a == 0) {
+			return 0;
+		}
+
+		// For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+		//
+		// We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+		// `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+		//
+		// This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+		// → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+		// → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+		//
+		// Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+		uint256 result = 1 << (log2(a) >> 1);
+
+		// At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+		// since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+		// every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+		// into the expected uint128 result.
+		unchecked {
+			result = (result + a / result) >> 1;
+			result = (result + a / result) >> 1;
+			result = (result + a / result) >> 1;
+			result = (result + a / result) >> 1;
+			result = (result + a / result) >> 1;
+			result = (result + a / result) >> 1;
+			result = (result + a / result) >> 1;
+			return min(result, a / result);
+		}
+	}
+
+	/**
+	 * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+	function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+		unchecked {
+			uint256 result = sqrt(a);
+			return result + (unsignedRoundsUp(rounding) && result * result < a ? 1 : 0);
+		}
+	}
+
+	/**
+	 * @dev Return the log in base 2 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+	function log2(uint256 value) internal pure returns (uint256) {
+		uint256 result = 0;
+		unchecked {
+			if (value >> 128 > 0) {
+				value >>= 128;
+				result += 128;
+			}
+			if (value >> 64 > 0) {
+				value >>= 64;
+				result += 64;
+			}
+			if (value >> 32 > 0) {
+				value >>= 32;
+				result += 32;
+			}
+			if (value >> 16 > 0) {
+				value >>= 16;
+				result += 16;
+			}
+			if (value >> 8 > 0) {
+				value >>= 8;
+				result += 8;
+			}
+			if (value >> 4 > 0) {
+				value >>= 4;
+				result += 4;
+			}
+			if (value >> 2 > 0) {
+				value >>= 2;
+				result += 2;
+			}
+			if (value >> 1 > 0) {
+				result += 1;
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+	function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+		unchecked {
+			uint256 result = log2(value);
+			return result + (unsignedRoundsUp(rounding) && 1 << result < value ? 1 : 0);
+		}
+	}
+
+	/**
+	 * @dev Return the log in base 10 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     */
+	function log10(uint256 value) internal pure returns (uint256) {
+		uint256 result = 0;
+		unchecked {
+			if (value >= 10 ** 64) {
+				value /= 10 ** 64;
+				result += 64;
+			}
+			if (value >= 10 ** 32) {
+				value /= 10 ** 32;
+				result += 32;
+			}
+			if (value >= 10 ** 16) {
+				value /= 10 ** 16;
+				result += 16;
+			}
+			if (value >= 10 ** 8) {
+				value /= 10 ** 8;
+				result += 8;
+			}
+			if (value >= 10 ** 4) {
+				value /= 10 ** 4;
+				result += 4;
+			}
+			if (value >= 10 ** 2) {
+				value /= 10 ** 2;
+				result += 2;
+			}
+			if (value >= 10 ** 1) {
+				result += 1;
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+	function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+		unchecked {
+			uint256 result = log10(value);
+			return result + (unsignedRoundsUp(rounding) && 10 ** result < value ? 1 : 0);
+		}
+	}
+
+	/**
+	 * @dev Return the log in base 256 of a positive value rounded towards zero.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+	function log256(uint256 value) internal pure returns (uint256) {
+		uint256 result = 0;
+		unchecked {
+			if (value >> 128 > 0) {
+				value >>= 128;
+				result += 16;
+			}
+			if (value >> 64 > 0) {
+				value >>= 64;
+				result += 8;
+			}
+			if (value >> 32 > 0) {
+				value >>= 32;
+				result += 4;
+			}
+			if (value >> 16 > 0) {
+				value >>= 16;
+				result += 2;
+			}
+			if (value >> 8 > 0) {
+				result += 1;
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+	function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+		unchecked {
+			uint256 result = log256(value);
+			return result + (unsignedRoundsUp(rounding) && 1 << (result << 3) < value ? 1 : 0);
+		}
+	}
+
+	/**
+	 * @dev Returns whether a provided rounding mode is considered rounding up for unsigned integers.
+     */
+	function unsignedRoundsUp(Rounding rounding) internal pure returns (bool) {
+		return uint8(rounding) % 2 == 1;
+	}
+}
+
+/**
+ * @dev Standard signed math utilities missing in the Solidity language.
+ */
+library SignedMath {
+	/**
+	 * @dev Returns the largest of two signed numbers.
+     */
+	function max(int256 a, int256 b) internal pure returns (int256) {
+		return a > b ? a : b;
+	}
+
+	/**
+	 * @dev Returns the smallest of two signed numbers.
+     */
+	function min(int256 a, int256 b) internal pure returns (int256) {
+		return a < b ? a : b;
+	}
+
+	/**
+	 * @dev Returns the average of two signed numbers without overflow.
+     * The result is rounded towards zero.
+     */
+	function average(int256 a, int256 b) internal pure returns (int256) {
+		// Formula from the book "Hacker's Delight"
+		int256 x = (a & b) + ((a ^ b) >> 1);
+		return x + (int256(uint256(x) >> 255) & (a ^ b));
+	}
+
+	/**
+	 * @dev Returns the absolute unsigned value of a signed value.
+     */
+	function abs(int256 n) internal pure returns (uint256) {
+		unchecked {
+		// must be unchecked in order to support `n = type(int256).min`
+			return uint256(n >= 0 ? n : -n);
+		}
+	}
+}
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+	bytes16 private constant HEX_DIGITS = "0123456789abcdef";
+	uint8 private constant ADDRESS_LENGTH = 20;
+
+	/**
+	 * @dev The `value` string doesn't fit in the specified `length`.
+     */
+	error StringsInsufficientHexLength(uint256 value, uint256 length);
+
+	/**
+	 * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+	function toString(uint256 value) internal pure returns (string memory) {
+		unchecked {
+			uint256 length = Math.log10(value) + 1;
+			string memory buffer = new string(length);
+			uint256 ptr;
+		/// @solidity memory-safe-assembly
+			assembly {
+				ptr := add(buffer, add(32, length))
+			}
+			while (true) {
+				ptr--;
+				/// @solidity memory-safe-assembly
+				assembly {
+					mstore8(ptr, byte(mod(value, 10), HEX_DIGITS))
+				}
+				value /= 10;
+				if (value == 0) break;
+			}
+			return buffer;
+		}
+	}
+
+	/**
+	 * @dev Converts a `int256` to its ASCII `string` decimal representation.
+     */
+	function toStringSigned(int256 value) internal pure returns (string memory) {
+		return string.concat(value < 0 ? "-" : "", toString(SignedMath.abs(value)));
+	}
+
+	/**
+	 * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+	function toHexString(uint256 value) internal pure returns (string memory) {
+		unchecked {
+			return toHexString(value, Math.log256(value) + 1);
+		}
+	}
+
+	/**
+	 * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+	function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+		uint256 localValue = value;
+		bytes memory buffer = new bytes(2 * length + 2);
+		buffer[0] = "0";
+		buffer[1] = "x";
+		for (uint256 i = 2 * length + 1; i > 1; --i) {
+			buffer[i] = HEX_DIGITS[localValue & 0xf];
+			localValue >>= 4;
+		}
+		if (localValue != 0) {
+			revert StringsInsufficientHexLength(value, length);
+		}
+		return string(buffer);
+	}
+
+	/**
+	 * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal
+     * representation.
+     */
+	function toHexString(address addr) internal pure returns (string memory) {
+		return toHexString(uint256(uint160(addr)), ADDRESS_LENGTH);
+	}
+
+	/**
+	 * @dev Returns true if the two strings are equal.
+     */
+	function equal(string memory a, string memory b) internal pure returns (bool) {
+		return bytes(a).length == bytes(b).length && keccak256(bytes(a)) == keccak256(bytes(b));
+	}
+}
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+	// Booleans are more expensive than uint256 or any type that takes up a full
+	// word because each write operation emits an extra SLOAD to first read the
+	// slot's contents, replace the bits taken up by the boolean, and then write
+	// back. This is the compiler's defense against contract upgrades and
+	// pointer aliasing, and it cannot be disabled.
+
+	// The values being non-zero value makes deployment a bit more expensive,
+	// but in exchange the refund on every call to nonReentrant will be lower in
+	// amount. Since refunds are capped to a percentage of the total
+	// transaction's gas, it is best to keep them low in cases like this one, to
+	// increase the likelihood of the full refund coming into effect.
+	uint256 private constant NOT_ENTERED = 1;
+	uint256 private constant ENTERED = 2;
+
+	uint256 private _status;
+
+	/**
+	 * @dev Unauthorized reentrant call.
+     */
+	error ReentrancyGuardReentrantCall();
+
+	constructor() {
+		_status = NOT_ENTERED;
+	}
+
+	/**
+	 * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+	modifier nonReentrant() {
+		_nonReentrantBefore();
+		_;
+		_nonReentrantAfter();
+	}
+
+	function _nonReentrantBefore() private {
+		// On the first call to nonReentrant, _status will be NOT_ENTERED
+		if (_status == ENTERED) {
+			revert ReentrancyGuardReentrantCall();
+		}
+
+		// Any calls to nonReentrant after this point will fail
+		_status = ENTERED;
+	}
+
+	function _nonReentrantAfter() private {
+		// By storing the original value once again, a refund is triggered (see
+		// https://eips.ethereum.org/EIPS/eip-2200)
+		_status = NOT_ENTERED;
+	}
+
+	/**
+	 * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+	function _reentrancyGuardEntered() internal view returns (bool) {
+		return _status == ENTERED;
+	}
+}
+
+/**
+ * @title IDelegateRegistry
+ * @custom:version 2.0
+ * @custom:author foobar (0xfoobar)
+ * @notice A standalone immutable registry storing delegated permissions from one address to another
+ */
+interface IDelegateRegistry {
+	/// @notice Delegation type, NONE is used when a delegation does not exist or is revoked
+	enum DelegationType {
+		NONE,
+		ALL,
+		CONTRACT,
+		ERC721,
+		ERC20,
+		ERC1155
+	}
+
+	/// @notice Struct for returning delegations
+	struct Delegation {
+		DelegationType type_;
+		address to;
+		address from;
+		bytes32 rights;
+		address contract_;
+		uint256 tokenId;
+		uint256 amount;
+	}
+
+	/// @notice Emitted when an address delegates or revokes rights for their entire wallet
+	event DelegateAll(address indexed from, address indexed to, bytes32 rights, bool enable);
+
+	/// @notice Emitted when an address delegates or revokes rights for a contract address
+	event DelegateContract(address indexed from, address indexed to, address indexed contract_, bytes32 rights, bool enable);
+
+	/// @notice Emitted when an address delegates or revokes rights for an ERC721 tokenId
+	event DelegateERC721(address indexed from, address indexed to, address indexed contract_, uint256 tokenId, bytes32 rights, bool enable);
+
+	/// @notice Emitted when an address delegates or revokes rights for an amount of ERC20 tokens
+	event DelegateERC20(address indexed from, address indexed to, address indexed contract_, bytes32 rights, uint256 amount);
+
+	/// @notice Emitted when an address delegates or revokes rights for an amount of an ERC1155 tokenId
+	event DelegateERC1155(address indexed from, address indexed to, address indexed contract_, uint256 tokenId, bytes32 rights, uint256 amount);
+
+	/// @notice Thrown if multicall calldata is malformed
+	error MulticallFailed();
+
+	/**
+	 * -----------  WRITE -----------
+	 */
+
+	/**
+	 * @notice Call multiple functions in the current contract and return the data from all of them if they all succeed
+     * @param data The encoded function data for each of the calls to make to this contract
+     * @return results The results from each of the calls passed in via data
+     */
+	function multicall(bytes[] calldata data) external payable returns (bytes[] memory results);
+
+	/**
+	 * @notice Allow the delegate to act on behalf of `msg.sender` for all contracts
+     * @param to The address to act as delegate
+     * @param rights Specific subdelegation rights granted to the delegate, pass an empty bytestring to encompass all rights
+     * @param enable Whether to enable or disable this delegation, true delegates and false revokes
+     * @return delegationHash The unique identifier of the delegation
+     */
+	function delegateAll(address to, bytes32 rights, bool enable) external payable returns (bytes32 delegationHash);
+
+	/**
+	 * @notice Allow the delegate to act on behalf of `msg.sender` for a specific contract
+     * @param to The address to act as delegate
+     * @param contract_ The contract whose rights are being delegated
+     * @param rights Specific subdelegation rights granted to the delegate, pass an empty bytestring to encompass all rights
+     * @param enable Whether to enable or disable this delegation, true delegates and false revokes
+     * @return delegationHash The unique identifier of the delegation
+     */
+	function delegateContract(address to, address contract_, bytes32 rights, bool enable) external payable returns (bytes32 delegationHash);
+
+	/**
+	 * @notice Allow the delegate to act on behalf of `msg.sender` for a specific ERC721 token
+     * @param to The address to act as delegate
+     * @param contract_ The contract whose rights are being delegated
+     * @param tokenId The token id to delegate
+     * @param rights Specific subdelegation rights granted to the delegate, pass an empty bytestring to encompass all rights
+     * @param enable Whether to enable or disable this delegation, true delegates and false revokes
+     * @return delegationHash The unique identifier of the delegation
+     */
+	function delegateERC721(address to, address contract_, uint256 tokenId, bytes32 rights, bool enable) external payable returns (bytes32 delegationHash);
+
+	/**
+	 * @notice Allow the delegate to act on behalf of `msg.sender` for a specific amount of ERC20 tokens
+     * @dev The actual amount is not encoded in the hash, just the existence of a amount (since it is an upper bound)
+     * @param to The address to act as delegate
+     * @param contract_ The address for the fungible token contract
+     * @param rights Specific subdelegation rights granted to the delegate, pass an empty bytestring to encompass all rights
+     * @param amount The amount to delegate, > 0 delegates and 0 revokes
+     * @return delegationHash The unique identifier of the delegation
+     */
+	function delegateERC20(address to, address contract_, bytes32 rights, uint256 amount) external payable returns (bytes32 delegationHash);
+
+	/**
+	 * @notice Allow the delegate to act on behalf of `msg.sender` for a specific amount of ERC1155 tokens
+     * @dev The actual amount is not encoded in the hash, just the existence of a amount (since it is an upper bound)
+     * @param to The address to act as delegate
+     * @param contract_ The address of the contract that holds the token
+     * @param tokenId The token id to delegate
+     * @param rights Specific subdelegation rights granted to the delegate, pass an empty bytestring to encompass all rights
+     * @param amount The amount of that token id to delegate, > 0 delegates and 0 revokes
+     * @return delegationHash The unique identifier of the delegation
+     */
+	function delegateERC1155(address to, address contract_, uint256 tokenId, bytes32 rights, uint256 amount) external payable returns (bytes32 delegationHash);
+
+	/**
+	 * ----------- CHECKS -----------
+	 */
+
+	/**
+	 * @notice Check if `to` is a delegate of `from` for the entire wallet
+     * @param to The potential delegate address
+     * @param from The potential address who delegated rights
+     * @param rights Specific rights to check for, pass the zero value to ignore subdelegations and check full delegations only
+     * @return valid Whether delegate is granted to act on the from's behalf
+     */
+	function checkDelegateForAll(address to, address from, bytes32 rights) external view returns (bool);
+
+	/**
+	 * @notice Check if `to` is a delegate of `from` for the specified `contract_` or the entire wallet
+     * @param to The delegated address to check
+     * @param contract_ The specific contract address being checked
+     * @param from The cold wallet who issued the delegation
+     * @param rights Specific rights to check for, pass the zero value to ignore subdelegations and check full delegations only
+     * @return valid Whether delegate is granted to act on from's behalf for entire wallet or that specific contract
+     */
+	function checkDelegateForContract(address to, address from, address contract_, bytes32 rights) external view returns (bool);
+
+	/**
+	 * @notice Check if `to` is a delegate of `from` for the specific `contract` and `tokenId`, the entire `contract_`, or the entire wallet
+     * @param to The delegated address to check
+     * @param contract_ The specific contract address being checked
+     * @param tokenId The token id for the token to delegating
+     * @param from The wallet that issued the delegation
+     * @param rights Specific rights to check for, pass the zero value to ignore subdelegations and check full delegations only
+     * @return valid Whether delegate is granted to act on from's behalf for entire wallet, that contract, or that specific tokenId
+     */
+	function checkDelegateForERC721(address to, address from, address contract_, uint256 tokenId, bytes32 rights) external view returns (bool);
+
+	/**
+	 * @notice Returns the amount of ERC20 tokens the delegate is granted rights to act on the behalf of
+     * @param to The delegated address to check
+     * @param contract_ The address of the token contract
+     * @param from The cold wallet who issued the delegation
+     * @param rights Specific rights to check for, pass the zero value to ignore subdelegations and check full delegations only
+     * @return balance The delegated balance, which will be 0 if the delegation does not exist
+     */
+	function checkDelegateForERC20(address to, address from, address contract_, bytes32 rights) external view returns (uint256);
+
+	/**
+	 * @notice Returns the amount of a ERC1155 tokens the delegate is granted rights to act on the behalf of
+     * @param to The delegated address to check
+     * @param contract_ The address of the token contract
+     * @param tokenId The token id to check the delegated amount of
+     * @param from The cold wallet who issued the delegation
+     * @param rights Specific rights to check for, pass the zero value to ignore subdelegations and check full delegations only
+     * @return balance The delegated balance, which will be 0 if the delegation does not exist
+     */
+	function checkDelegateForERC1155(address to, address from, address contract_, uint256 tokenId, bytes32 rights) external view returns (uint256);
+
+	/**
+	 * ----------- ENUMERATIONS -----------
+	 */
+
+	/**
+	 * @notice Returns all enabled delegations a given delegate has received
+     * @param to The address to retrieve delegations for
+     * @return delegations Array of Delegation structs
+     */
+	function getIncomingDelegations(address to) external view returns (Delegation[] memory delegations);
+
+	/**
+	 * @notice Returns all enabled delegations an address has given out
+     * @param from The address to retrieve delegations for
+     * @return delegations Array of Delegation structs
+     */
+	function getOutgoingDelegations(address from) external view returns (Delegation[] memory delegations);
+
+	/**
+	 * @notice Returns all hashes associated with enabled delegations an address has received
+     * @param to The address to retrieve incoming delegation hashes for
+     * @return delegationHashes Array of delegation hashes
+     */
+	function getIncomingDelegationHashes(address to) external view returns (bytes32[] memory delegationHashes);
+
+	/**
+	 * @notice Returns all hashes associated with enabled delegations an address has given out
+     * @param from The address to retrieve outgoing delegation hashes for
+     * @return delegationHashes Array of delegation hashes
+     */
+	function getOutgoingDelegationHashes(address from) external view returns (bytes32[] memory delegationHashes);
+
+	/**
+	 * @notice Returns the delegations for a given array of delegation hashes
+     * @param delegationHashes is an array of hashes that correspond to delegations
+     * @return delegations Array of Delegation structs, return empty structs for nonexistent or revoked delegations
+     */
+	function getDelegationsFromHashes(bytes32[] calldata delegationHashes) external view returns (Delegation[] memory delegations);
+
+	/**
+	 * ----------- STORAGE ACCESS -----------
+	 */
+
+	/**
+	 * @notice Allows external contracts to read arbitrary storage slots
+     */
+	function readSlot(bytes32 location) external view returns (bytes32);
+
+	/**
+	 * @notice Allows external contracts to read an arbitrary array of storage slots
+     */
+	function readSlots(bytes32[] calldata locations) external view returns (bytes32[] memory);
+}
+
+/*
+
+           MMMMMMMM
+        MMMZZZZZZZZMMM
+       MZZZZZZZZZZZZZZM
+       MZZZZZMMMMMMMMMM
+     MMZZZZMM++++MMMMMMMMMMM
+     MMZZZZMM+MMMMM===M===MM
+     MMZZZM++++++MM===M,,=MM
+     MMZZZM++I+++MMMMMM,,,=====
+     MMZZZM++III+++++++,,,======
+     MMZZZM++IIIIIIIIII,,=========
+       MZZM+++         II?=====NNNN
+       MZZM+++++M       II??===NNNN
+       MZZM+++++MI        II?NNNNNN
+       MZZM+++++MI           MMNNNN
+       MZZM+++++MI            IMNNN
+       MZZM+++++MI              MMN
+       MZZM++++++MM               M
+       MMMZMM++++MMM
+     MMMZZZMMM++MMMZMM
+    MZZZZZZMMZMMZMMZZZM  @author png
+    MZZZZZZMMZZZZ$$ZZZM  https://nakamingos.io
+    MZZZMMZ$$ZZZZZZMZZM
+    MZZZMMZZZZZZZZZMZZM
+
+o    o      .oo  o   o      .oo o     o o o    o .oPYo. .oPYo. .oPYo.
+8b   8     .P 8  8  .P     .P 8 8b   d8 8 8b   8 8    8 8    8 8
+8`b  8    .P  8 o8ob'     .P  8 8`b d'8 8 8`b  8 8      8    8 `Yooo.
+8 `b 8   oPooo8  8  `b   oPooo8 8 `o' 8 8 8 `b 8 8   oo 8    8     `8
+8  `b8  .P    8  8   8  .P    8 8     8 8 8  `b8 8    8 8    8      8
+8   `8 .P     8  8   8 .P     8 8     8 8 8   `8 `YooP8 `YooP' `YooP'
+..:::....:::::..:..::....:::::....::::......:::..:....8 :.....::.....:
+::::::::::::::::::::::::::::::::::::::::::::::::::::::8 ::::::::::::::
+ */
+contract Nakamingos is ReentrancyGuard, Ownable {
+	using Strings for uint256;
+
+	// Token name
+	string private _name = "Nakamingo Market";
+
+	// Token symbol
+	string private _symbol = "MINGO";
+
+	// State Values
+	bool paused = true;
+	bool clonesActive = false;
+	bool preSaleActive = false;
+	bool pinkSaleActive = false;
+	uint private nextTokenId = 1;
+
+	// Address constants
+	address public NAKAMIGO = 0xd774557b647330C91Bf44cfEAB205095f7E6c367;
+	address public DELEGATE_REGISTRY = 0x00000000000000447e69651d841bD8D104Bed493;
+	address payable private locker;
+	address[] private teamAddressList;
+
+	// Price constants
+	uint constant public PINK_PRICE = 3690000000000000;
+	uint constant public MINT_PRICE = 4200000000000000;
+
+	// Purchase and minting limits
+	uint8 constant public PURCHASE_LIMIT = 42;
+	uint8 constant public DEV_TERM = 40;
+	uint16 public MINGO_LIMIT = 19580;
+
+	// 52 one per week +
+	uint16 public PROMO_BUDGET = 187;
+	uint16 public LAST_TEAM_MINT = 0;
+
+	// Cloned mingo tracker
+	mapping(uint => bool) public cloneMap;
+	mapping(address => bool) public freeMap;
+
+	mapping(uint256 => bytes32) private merkleRoot;
+	mapping(uint256 => string) private merkleRootUri;
+	mapping(address => uint8) public allowListClaimedAmount;
+
+	uint8 public allowlistMaxClaimAmount = 42;
+	uint256 private rootIndex = 0;
+
+	event EthscribeClone(address minter, address indexed mintTo, uint indexed tokenId, uint indexed migoId);
+	event EthscribeMingo(address minter, address indexed mintTo, uint indexed firstTokenId, uint indexed amount);
+	event PreSaleEvent(address indexed setter, string indexed preSaleState, bool indexed status);
+	event TeamAddressesSet(address indexed setter, uint listSize);
+	event LockerSet(address indexed setter, address indexed locker);
+	event MerkleRoot(uint256 id, string uri);
+
+	event AllowlistClaimed(address user, uint amount);
+
+	constructor(
+		address _locker,
+		address[] memory _teamAddressList,
+		address initialOwner)
+	Ownable(initialOwner)
+	{
+		locker = payable(_locker);
+		setTeamAddresses(_teamAddressList);
+	}
+
+	/**
+	 * @dev Ethscribe Nakamingo NFTs by paying the specified mint amount.
+     * @param mintAmount The number of tokens to Ethscribe.
+     * @param mintTo The address to send Ethscriptions too.
+     */
+	function _ethscribe(uint8 mintAmount, address mintTo) private {
+		require(nextTokenId + mintAmount <= MINGO_LIMIT, "Where are the mingos?!");
+		require(mintAmount <= PURCHASE_LIMIT, "Too many mingos!");
+		require(mintTo != address(0), "Fire Bad!");
+
+		// emit purchase event
+		emit EthscribeMingo(msg.sender, mintTo, nextTokenId, mintAmount);
+
+		// increment tokenIds
+		nextTokenId = nextTokenId + mintAmount;
+
+		// check if team earned a token
+		if(LAST_TEAM_MINT + DEV_TERM <= nextTokenId) {
+			_teamShare();
+		}
+	}
+
+	/**
+	 * @dev Ethscribe Nakamingo NFTs by paying the specified mint amount.
+     * @param migoId The token ID of MIGO NFT to clone to Nakamingos.
+     */
+	function _ethscribeClone(uint migoId) private {
+		require(cloneMap[migoId] != true, "Cloned Already!");
+		require(IERC721(NAKAMIGO).ownerOf(migoId) != address(0), "No, Burned Clones!");
+
+		// set the mapping value to prevent double clone
+		cloneMap[migoId] = true;
+
+		// emit the event to api service to ethscribe the token
+		emit EthscribeClone(msg.sender, IERC721(NAKAMIGO).ownerOf(migoId), nextTokenId, migoId);
+
+		// increment tokenIds
+		nextTokenId++;
+
+		if(LAST_TEAM_MINT + DEV_TERM <= nextTokenId) {
+			_teamShare();
+		}
+	}
+
+	/**
+	 * @dev Ethscribe Nakamingo NFTs by paying the specified mint amount.
+     * @param mintAmount The number of MINGO NFTs to Ethscribe.
+     * @param mintTo The address to send the tokens to.
+     */
+	function mintMingo(uint8 mintAmount, address mintTo) public payable nonReentrant {
+		require(paused == false, "Hold up a mingo!");
+		require(nextTokenId + mintAmount <= MINGO_LIMIT, "Where are the mingos?!");
+		require(msg.value >= MINT_PRICE * mintAmount, "Insufficient Ether");
+
+		// Transfer Ether to the locker address
+		_sendEth(locker, msg.value);
+
+		// send to ethscribe the token
+		_ethscribe(mintAmount, mintTo);
+	}
+
+	/**
+	 * @dev Ethscribe a cloned Nakamingo to the owner of the original Nakamigo.
+     * @param migoId The ID of the Nakamigo to clone.
+     */
+	function mintClone(uint migoId) public payable nonReentrant {
+		require(clonesActive == false, "Hold up a mingo!");
+		require(nextTokenId <= MINGO_LIMIT, "All have been hatched!");
+		require(msg.value >= MINT_PRICE, "Insufficient Price for Clone!");
+
+		// Transfer Ether to the locker address
+		_sendEth(locker, msg.value);
+
+		// ethscribe the clone
+		_ethscribeClone(migoId);
+	}
+
+
+	function allowlistMint(
+		uint8 mintAmount,
+		bytes32[] calldata _merkleProof,
+		uint256 rootId
+	) external payable nonReentrant {
+		uint8 budget = allowListClaimedAmount[msg.sender] + mintAmount;
+		bytes32 leaf = keccak256(abi.encodePacked(msg.sender));
+		uint256 cost = PINK_PRICE * mintAmount;
+
+		require(pinkSaleActive == true, "Pink list is not active!");
+		require(MerkleProof.verify(_merkleProof, merkleRoot[rootId], leaf),
+			"Invalid Pink Proof.");
+		require(budget <= allowlistMaxClaimAmount, "Can't pink any more");
+		require(nextTokenId + mintAmount <= MINGO_LIMIT, "Where are the mingos?!");
+		require(msg.value >= cost, "Wrong amount of ETH sent");
+
+		allowListClaimedAmount[msg.sender] = budget;
+		_sendEth(locker, msg.value);
+
+		_ethscribe(mintAmount, msg.sender);
+
+		emit AllowlistClaimed(msg.sender, mintAmount);
+	}
+
+	/**
+	 * @dev Ethscribe a Nakamigo NFT during the presale if you have a Nakamigo and End of Sartoshi.
+     * @param migoId The ID of the NakaMIGO NFT to clone for free during presale.
+     */
+	function preSaleClone(uint migoId) public nonReentrant {
+		require(_PreSaleEligible(msg.sender), "Need a Migo to clone!");
+		require(freeMap[IERC721(NAKAMIGO).ownerOf(migoId)] != true, "You have been here before!");
+
+		// mark free mint in mapping
+		freeMap[IERC721(NAKAMIGO).ownerOf(migoId)] = true;
+		freeMap[msg.sender] = true;
+
+		// mint a clone of a nakamigo to the owner of it for free
+		_ethscribeClone(migoId);
+	}
+
+	/**
+	 * @dev Ethscribe a Nakamigo NFT during the presale if you have a Nakamigo.
+     * @param migoId The ID of the NakaMIGO NFT to clone for free during presale.
+     */
+	function delegatePreSaleClone(uint migoId, address delegate) public nonReentrant {
+		require(_PreSaleEligible(delegate), "Delegate needs a Nakamigo!");
+		require(freeMap[delegate] != true, "Delegate has been here before!");
+		require(IDelegateRegistry(DELEGATE_REGISTRY).checkDelegateForAll(
+			msg.sender,
+			delegate,
+			0) != true, "Delegate Not Set!");
+
+		freeMap[msg.sender] = true;
+		freeMap[delegate] = true;
+
+		// mint a clone of a nakamigo to the owner of it for free
+		_ethscribeClone(migoId);
+	}
+
+	/**
+	 * @dev Ethscribe Nakamingo NFTs by paying the specified mint amount.
+     * @param mintAmount The number of MINGO NFTs to Ethscribe.
+     */
+	function promoMint(uint8 mintAmount, address mintTo) public onlyOwner {
+		// Update the promo budget
+		PROMO_BUDGET = PROMO_BUDGET - mintAmount;
+		require(PROMO_BUDGET >= 0, "Promo budget exhausted.");
+
+		_ethscribe(mintAmount, mintTo);
+	}
+
+	function setMerkleRoot(
+		uint _newIndex,
+		bytes32 _newRoot,
+		string memory _merkleRootUri
+	) external onlyOwner {
+		require(_newIndex == rootIndex + 1, "Cannot rewrite an older root!");
+		rootIndex = _newIndex;
+		merkleRoot[rootIndex] = _newRoot;
+		merkleRootUri[rootIndex] = _merkleRootUri;
+		emit MerkleRoot(_newIndex, _merkleRootUri);
+	}
+
+	function setLocker(address newLocker) public onlyOwner {
+		locker = payable(newLocker);
+		emit LockerSet(msg.sender, locker);
+	}
+
+	function setTeamAddresses(address[] memory newAddressList) public onlyOwner {
+		require(newAddressList.length > 0, "Team addresses must not be empty!");
+
+		// Clear the old team array
+		delete teamAddressList;
+
+		// Update the TeamAddresses array
+		for (uint i = 0; i < newAddressList.length; i++) {
+			teamAddressList.push(newAddressList[i]);
+		}
+
+		// Emit an event to log the change
+		emit TeamAddressesSet(msg.sender, newAddressList.length);
+	}
+
+	function setAllowlistMaxClaimAmount(
+		uint8 _allowlistMaxClaimAmount
+	) external onlyOwner {
+		allowlistMaxClaimAmount = _allowlistMaxClaimAmount;
+	}
+	/*
+	 *    Helper Functions
+	/*
+	/**
+	 * @dev Private helper function returning eligibility for presale
+     * @param _to address to check balanceOf() ERC721
+     */
+	function _PreSaleEligible(address _user)
+	private
+	view
+	returns (bool)
+	{
+		require(preSaleActive == true, "Still too early!");
+		require((IERC721(NAKAMIGO).balanceOf(_user) > 0), "Need a Nakamigo");
+		require(freeMap[_user] != true, "Presale Limit Reached");
+		return true;
+	}
+
+	function pause() public onlyOwner {
+		paused = true;
+		emit PreSaleEvent(msg.sender, "paused", paused);
+	}
+
+	function unpause() public onlyOwner {
+		paused = false;
+		emit PreSaleEvent(msg.sender, "paused", paused);
+
+	}
+
+	function openClones() public onlyOwner {
+		clonesActive = true;
+		emit PreSaleEvent(msg.sender, "clonesActive", clonesActive);
+	}
+
+	function closeClones() public onlyOwner {
+		clonesActive = false;
+		emit PreSaleEvent(msg.sender, "clonesActive", clonesActive);
+
+	}
+
+	function openPinkList() public onlyOwner {
+		pinkSaleActive = true;
+		emit PreSaleEvent(msg.sender, "pinkList", pinkSaleActive);
+	}
+
+	function closePinkList() public onlyOwner {
+		pinkSaleActive = false;
+		emit PreSaleEvent(msg.sender, "pinkList", pinkSaleActive);
+
+	}
+
+	function openPresale() public onlyOwner {
+		preSaleActive = true;
+		emit PreSaleEvent(msg.sender, "preSaleActive", preSaleActive);
+
+	}
+
+	function closePresale() public onlyOwner {
+		preSaleActive = false;
+		emit PreSaleEvent(msg.sender, "preSaleActive", preSaleActive);
+	}
+
+	function name() public view virtual returns (string memory) {
+		return _name;
+	}
+
+	function symbol() public view virtual returns (string memory) {
+		return _symbol;
+	}
+
+	function getPauseStatus() public view virtual returns (bool) {
+		return paused;
+	}
+
+	function getPreSaleStatus() public view virtual returns (bool) {
+		return preSaleActive;
+	}
+
+	function getNextTokenId() public view virtual returns (uint) {
+		return nextTokenId;
+	}
+
+	function getMingosRemaining() public view virtual returns (uint) {
+		return MINGO_LIMIT - (nextTokenId - 1);
+	}
+
+	function getAllowListClaimed(address user) public view virtual returns (uint) {
+		return allowListClaimedAmount[user];
+	}
+
+	function TeamAddressList() public view virtual returns (address[] memory){
+		return teamAddressList;
+	}
+
+	/**
+	 * @dev team share allocated as mint occurs.
+     */
+	function _teamShare() private {
+		LAST_TEAM_MINT += DEV_TERM;
+
+		require(LAST_TEAM_MINT <= nextTokenId, "Not team share time!");
+		require(nextTokenId <= MINGO_LIMIT, "All have been hatched!");
+		require(teamAddressList.length > 0 , "Where is that team?");
+
+		// emit the event to api service to ethscribe the token
+		_ethscribe(1, teamAddressList[(LAST_TEAM_MINT/DEV_TERM) % teamAddressList.length]);
+
+		// check if there are any dev tokens
+		if(LAST_TEAM_MINT + DEV_TERM <= nextTokenId) {
+			_teamShare();
+		}
+	}
+
+	function _sendEth(address _destination, uint256 _amount) internal {
+		(bool sent, ) = _destination.call{value: _amount}("");
+		require(sent, "Failed to send Ether");
+	}
+
+	/**
+	 * @dev transfer tokens mistakenly sent to this contract
+     */
+	function withdrawToken(address _tokenContract, uint256 _amount) external onlyOwner {
+		IERC20 tokenContract = IERC20(_tokenContract);
+
+		// needs to execute `approve()` on the token contract to allow itself the transfer
+		tokenContract.approve(address(this), _amount);
+
+		tokenContract.transferFrom(address(this), locker, _amount);
+	}
+
+	/**
+	* @dev transfer ETH mistakenly sent to this contract
+     */
+	function withdrawETH(uint256 _amount) external onlyOwner {
+		_sendEth(locker, _amount);
+	}
+
+}
