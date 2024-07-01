@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract HowMuchYouLoveTheBitCoin {
+        
+    event HowMuchYouLoveTheBITCOIN(uint8 LevelFrom0To255);
+
+    function howMuchYouLoveTheBITCOIN(uint8 LevelFrom0To255) public {
+        emit HowMuchYouLoveTheBITCOIN(LevelFrom0To255);
+    }
+
+
+}

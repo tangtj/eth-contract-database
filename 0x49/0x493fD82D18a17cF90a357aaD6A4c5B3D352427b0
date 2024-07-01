@@ -1,0 +1,55 @@
+//SPDX-License-Identifier:UNLICENSE
+pragma solidity ^0.8.19;
+
+contract VLNDAirdrop{
+    address payable public Owner = payable(msg.sender);
+    address public DestinationMinter = 0xd195Ad2e69D59154550441C5DA30329512F1E796;
+    Hyperlane Mailbox = Hyperlane(0x35231d4c2D8B8ADcB5617A638A0c4548684c7C70);
+    Hyperlane GasProcessorContract = Hyperlane(0x56f52c0A1ddcD557285f7CBc782D3d83096CE1Cc);
+    
+    struct TX{
+        address Sender;
+        uint256 Payout;
+    }
+
+    function Deposit() public payable returns(bool HyperLaneSendSuccess){
+        uint256 GasQuote = GasProcessorContract.quoteGasPayment(137, 100000);
+        uint256 payout = ((msg.value - GasQuote) * 100);
+
+        TX memory MintInfo = TX(msg.sender, payout);
+        bool SendToPolygonStatus = SendToGnosis(MintInfo, GasQuote);
+
+        return(SendToPolygonStatus);
+    }
+
+    function OwnerWithdraw(address payable Destination) public {
+        require(msg.sender == Owner);
+
+        Destination.transfer(address(this).balance);
+    }
+
+    //Hyperlane functions
+
+    function SendToGnosis(TX memory MintInfo, uint256 GasQuote) internal returns(bool success){
+         bytes32 messageId = Mailbox.dispatch(137, addressToBytes32(DestinationMinter), abi.encode(MintInfo));
+         GasProcessorContract.payForGas{ value: GasQuote }(messageId, 137, 100000, msg.sender);
+
+         return(success);
+    }
+
+
+    function addressToBytes32(address _addr) public pure returns (bytes32) {
+        return bytes32(uint256(uint160(_addr)));
+    }   
+    function bytes32ToAddress(bytes32 _buf) public pure returns (address) {
+        return address(uint160(uint256(_buf)));
+    }
+
+}
+
+interface Hyperlane {
+    function dispatch(uint32 _destinationDomain, bytes32 _recipientAddress, bytes calldata _messageBody ) external returns (bytes32);
+    function process(bytes calldata _metadata, bytes calldata _message) external;
+    function payForGas(bytes32 _messageId, uint32 _destinationDomain, uint256 _gasAmount, address _refundAddress) external payable;
+    function quoteGasPayment(uint32 _destinationDomain, uint256 _gasAmount) external view returns (uint256);
+}

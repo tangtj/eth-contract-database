@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: UNLICENSE
+
+/*
+    Unrekt enables the trading of locked liquidity, allowing you to secure profits from failed projects LPs. But how Unrekt makes this possible? Well our dApp allows devs to sell their locked LPs, turning them into a very profitable and secure investment option for those buyers willing to wait for the unlock time.
+    Telegram: https://t.me/+nlVhTh6intE1ZWMx
+    Twitter: https://twitter.com/unrektprotocol
+    Website: https://unrektprotocol.com/
+    DAPP: https://dapp.unrektprotocol.com/
+    Docs: https://docs.unrektprotocol.com/
+    Mini App: https://t.me/unrektprotocolminiapp_bot
+*/
+
+pragma solidity 0.8.26;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        return c;
+    }
+
+}
+
+contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor () {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+contract UnrektProtocol is Context, IERC20, Ownable {
+    using SafeMath for uint256;
+    string private constant _name = unicode"Unrekt Protocol";
+    string private constant _symbol = unicode"UNREKT";
+    mapping (address => uint256) private _balances;
+    mapping (address => mapping (address => uint256)) private _allowances;
+    mapping (address => bool) private _isExcludedFromFee;
+
+    address public developmentWallet = 0x6015900ee8Da7008a236b46f9528136114ec7049;
+    address public marketingWallet = 0x51E11cA32f87f67016E76E62DB92E93bCE94b832;
+    address public revShareWallet = 0x013e9B0db1e24C57C09925E952Eae6453CcdaC81;
+    address public teamWallet = 0x639fAB1e71f06C63Af84a370A0d562c0C6cA4920;
+    address public buybackWallet = 0xcd3ffec64d00303aAf40B0Cf77E69c7EFf7F4BD0;
+    address public treasury = 0x047e30AD4e95d18f408CeC2B04ecA5917150F277;
+
+    address public stakingAddress;
+
+    uint public highTaxPeriod = 10 minutes;
+
+    address public _taxWallet;
+    uint256 public burnPercent = 2;
+    uint256 private _initialBuyTax=25;
+    uint256 private _initialSellTax=25;
+    uint256 private _finalBuyTax=5;
+    uint256 private _finalSellTax=5;
+    uint256 private _reduceBuyTaxAt=50;
+    uint256 private _reduceSellTaxAt=50;
+    uint256 private _preventSwapBefore=5;
+    uint256 private _buyCount=0;
+
+    uint8 private constant _decimals = 18;
+    uint256 private constant _tTotal = 100_000_000 * 10**_decimals;
+    uint256 public _maxWallet = _tTotal / 200;
+    uint256 public _taxSwapThreshold= _tTotal / 1000;
+    uint256 public _maxTaxSwap= _tTotal / 200;
+    
+    IUniswapV2Router02 private uniswapV2Router;
+    address private uniswapV2Pair;
+    bool private tradingEnabled;
+    bool private inSwap = false;
+    bool private swapEnabled = false;
+
+    struct Fees {
+        uint256 development;
+        uint256 marketing;
+        uint256 revShare;
+        uint256 team;
+        uint256 buyback;
+    }
+
+    Fees public fees = Fees({
+        development: 100,
+        marketing: 250,
+        revShare: 70,
+        team: 50,
+        buyback: 30
+    });
+
+    modifier lockTheSwap {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor () {
+        _taxWallet = (_msgSender());
+        _balances[_msgSender()] = _tTotal;
+        _isExcludedFromFee[msg.sender] = true;
+        _isExcludedFromFee[address(this)] = true;
+        _isExcludedFromFee[0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D] = true;
+        uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        uniswapV2Pair = IUniswapV2Factory(uniswapV2Router.factory()).createPair(address(this), uniswapV2Router.WETH());
+        emit Transfer(address(0), _msgSender(), _tTotal);
+    }
+
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public pure override returns (uint256) {
+        return _tTotal;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(sender, _msgSender(), _allowances[sender][_msgSender()].sub(amount, "ERC20: transfer amount exceeds allowance"));
+        return true;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _transfer(address from, address to, uint256 amount) private {
+        uint256 taxAmount=0;
+        if (!_isExcludedFromFee[from] && _isExcludedFromFee[to] == false && from != owner()) {
+            taxAmount = amount.mul((_buyCount>_reduceBuyTaxAt)?_finalBuyTax:_initialBuyTax).div(100);
+            require(tradingEnabled, "Trading is not open!");
+            if (from == uniswapV2Pair) {
+                require(balanceOf(to) + amount <= _maxWallet, "Exceeds the maxWallet.");
+                _buyCount++;
+            }
+
+            if(to == uniswapV2Pair){
+                taxAmount = amount.mul((_buyCount>_reduceSellTaxAt)?_finalSellTax:_initialSellTax).div(100);
+                require(_maxWallet < _tTotal, "Exceeds the maxWallet.");
+            }
+
+            uint256 contractTokenBalance = balanceOf(address(this));
+            if (!inSwap && to == uniswapV2Pair && swapEnabled && contractTokenBalance > _taxSwapThreshold && _buyCount > _preventSwapBefore) {
+                swapTokensForEth(min(amount, min(contractTokenBalance, _maxTaxSwap)));
+            }
+        }
+
+        if(taxAmount>0){
+          _balances[address(this)]=_balances[address(this)].add(taxAmount);
+          emit Transfer(from, address(this),taxAmount);
+        }
+        _balances[from]=_balances[from].sub(amount);
+        _balances[to]=_balances[to].add(amount.sub(taxAmount));
+        emit Transfer(from, to, amount.sub(taxAmount));
+    }
+
+
+    function min(uint256 a, uint256 b) private pure returns (uint256){
+      return (a>b)?b:a;
+    }
+
+    function swapTokensForEth(uint256 tokenAmount) private lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            _taxWallet,
+            block.timestamp
+        );
+    }
+
+    function start() external onlyOwner() {
+        swapEnabled = true;
+        tradingEnabled = true;
+    }
+
+    function setMaxWalletsize(uint amount) external onlyOwner {
+        _maxWallet = amount;
+    }
+
+    function removeLimits() external onlyOwner {
+        _finalBuyTax = 5;
+        _finalSellTax = 5;
+    }
+    
+    function manualSwap() external onlyOwner {
+        uint amount = min(balanceOf(address(this)), _maxTaxSwap);
+        swapTokensForEth(amount);
+    }
+
+    function setFee(uint256 _newFees) external onlyOwner{
+      require(_newFees<=30, "Max 30% fees allowed!");
+      _finalBuyTax=_newFees;
+      _finalSellTax=_newFees;
+      _initialBuyTax = _newFees;
+      _initialSellTax = _newFees;
+    }
+    
+    function excludeFromFees(address account, bool status) external onlyOwner {
+        _isExcludedFromFee[account] = status;
+    }
+
+    function updateTaxWallet(address newTaxWallet) external onlyOwner {
+        _taxWallet = newTaxWallet;
+    }
+
+    function updateStakingAddress(address newWallet) external onlyOwner {
+        stakingAddress = newWallet;
+    }
+
+    function setHighTaxPeriod(uint _newPeriod) external onlyOwner {
+        highTaxPeriod = _newPeriod;
+    }
+
+    receive() external payable {}
+}

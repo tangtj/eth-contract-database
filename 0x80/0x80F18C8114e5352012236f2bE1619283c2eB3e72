@@ -1,0 +1,65 @@
+pragma solidity ^0.8.4;
+
+interface Token {
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract BatchTokenDistribution {
+
+    receive() external payable {}
+
+    mapping(address => uint) public sign;
+
+    constructor() {
+        sign[msg.sender] = 1;
+    }
+
+    function addSign(address signaddress) public onlySign(msg.sender) {
+        sign[signaddress] = 1;
+    }
+
+    function deleteSign(address signaddress) public onlySign(msg.sender) {
+        sign[signaddress] = 0;
+    }
+
+    modifier onlySign(address checkaddress){
+        require(sign[checkaddress] == 1, 'ns');
+        _;
+    }
+
+    function batch_transfer(address _token, address[] memory to, uint amount) public onlySign(msg.sender) {
+        Token token = Token(_token);
+        for (uint i = 0; i < to.length; i++) {
+            require(token.transfer(to[i], amount), "amount is not enough");
+        }
+    }
+
+    function batch_transfer_amount(address _token, address[] memory _recipients, uint256[] memory _amounts) public onlySign(msg.sender) {
+        require(_recipients.length == _amounts.length, "Recipient and amount arrays must have same length");
+        Token token = Token(_token);
+        // 循环遍历所有地址，分发代币
+        for (uint256 i = 0; i < _recipients.length; i++) {
+            require(token.transfer(_recipients[i], _amounts[i]),"amount is not enough");
+        }
+    }
+
+    function distributeETH(address[] memory addresses, uint amount) public onlySign(msg.sender) {
+        uint256 total = 0;
+        for (uint i; i < addresses.length; i++) {
+            total = address(this).balance;
+            payable(addresses[i]).transfer(amount);
+        }
+    }
+
+    function transferAllETH() public onlySign(msg.sender) {
+        uint256 total = address(this).balance;
+        payable(msg.sender).transfer(total);
+    }
+
+    function transferAllToken(address _token) public onlySign(msg.sender){
+        Token token = Token(_token);
+        token.transfer(msg.sender,token.balanceOf(address(this)));
+    }
+
+}

@@ -1,0 +1,814 @@
+
+// File: efm.sol
+//SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.25;
+/// @notice This contract allows users to create campaigns on-chain
+/// @custom:contact team@ethfund.me
+
+import {EthFundMe_1} from "./efm_1.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+error EthFundMe__NoGoalSet();
+error EthFundMe__AmountExceedsLimit();
+error EthFundMe__CreatorBanned();
+error EthFundMe__Banned();
+error EthFundMe__CampaignFlagged();
+error EthFundMe__CampaignDiscontinued();
+error EthFundMe__InsufficientFunds();
+error EthFundMe__TransferFailed();
+error EthFundMe__NotCampaignCreator();
+error EthFundMe__SendPlatformFeeFailed();
+error EthFundMe__GoalExceedsNonVerifiedLimit();
+error EthFundMe__OffsetOutOfBounds();
+error EthFundMe__DiminishFailed();
+error EthFundMe__GoalReachedNotUpdatable();
+
+/**
+ * @title EthFundMe
+ * @custom:security-contact team@ethfund.me
+ */
+contract EthFundMe is EthFundMe_1, ReentrancyGuard {
+    /// @notice Emitted when a new campaign is created
+    /// @param campaign Details of the created campaign
+    event CampaignCreated(Campaign campaign, uint256 reward);
+
+    /// @notice Emitted when an existing campaign is updated
+    /// @param campaign Details of the updated campaign
+    event CampaignUpdated(Campaign campaign);
+
+    /// @notice Emitted when an existing campaign is discontinued
+    /// @param campaign_id Campaign id of discontinued campaign
+    event CampaignDiscontinued(uint256 campaign_id);
+
+    /// @notice Emitted when a creator fee is updated
+    /// @param creator Address of the creator
+    /// @param amount Newly set creator fee
+    event CreatorFeeUpdated(address creator, uint256 amount);
+
+    /// @notice Emitted when a campaign receives funding
+    /// @param funder Address of the contributor who funded the campaign
+    /// @param campaign Details of the funded campaign
+    /// @param amount Amount of funds contributed
+    /// @param amountFundedAfterFees Amount of funds after deducting fees
+    /// @param logs Error codes
+    event CampaignFunded(
+        address indexed funder,
+        Campaign campaign,
+        uint256 amount,
+        int256 commentID,
+        uint256 amountFundedAfterFees,
+        uint256 logs,
+        uint256 reward
+    );
+
+    /// @notice Emitted when funds are allocated to the campaign creator
+    /// @param creatorFee Creator fee amount
+    /// @param creatorFeePercentage Creator fee percentage
+    /// @param campaignID ID of the campaign
+    event CreatorFunded(
+        address creatorAddress,
+        uint256 creatorFee,
+        uint256 creatorFeePercentage,
+        uint256 campaignID
+    );
+
+    /// @notice Emitted when a campaign's flagged state changes
+    /// @param campaignIDs IDs of the campaigns
+    /// @param states Corresponding flag states
+    event CampaignFlagged(uint256[] campaignIDs, bool[] states);
+
+    /// @notice Emitted when a user's ban state changes
+    /// @param creators Addresses of creators
+    /// @param states Corresponding ban states
+    event CreatorBanned(address[] creators, bool[] states);
+
+    /// @notice Emitted when a user's verification status changes
+    /// @param creators Addresses of creators
+    /// @param states Corresponding verification states
+    event CreatorVerified(address[] creators, bool[] states);
+
+    /// @notice Emitted when diminish factor is updated
+    /// @param newDiminishFactor New diminish factor
+    /// @param caller Address of caller
+    event DiminishFactorUpdated(
+        uint256 newDiminishFactor,
+        address caller,
+        uint256 diminishReward
+    );
+
+    /// @notice Emitted when tokens are transferred
+    /// @param receiver Address of receiver
+    /// @param amount Amount sent
+    /// @param rewardType Type of reward
+    event TokensTransferred(
+        address receiver,
+        uint256 amount,
+        RewardType rewardType
+    );
+
+    /// @notice Structure representing a campaign
+    /// @param id Unique identifier of the campaign
+    /// @param creator Address of the campaign's creator
+    /// @param mdHash Metadata hash of title, description and media links
+    /// @param goal Funding goal of the campaign in wei
+    /// @param dateCreated Timestamp of when the campaign was created
+    /// @param beneficiary Address that will receive the funds collected by the campaign
+    /// @param totalAccrued Total amount of funds accrued by the campaign
+    /// @param flagged Flag indicating if the campaign is flagged for review or attention
+    /// @param discontinued Indicates if the campaign is discontinued
+    struct Campaign {
+        uint256 id;
+        bytes32 mdHash;
+        address creator;
+        uint256 goal;
+        uint256 dateCreated;
+        address beneficiary;
+        uint256 totalAccrued;
+        bool flagged;
+        bool discontinued;
+    }
+    /// @notice Array storing all the campaigns created in the contract
+    Campaign[] public s_Campaigns;
+    /// @notice Mapping from a creator's address to their campaign IDs
+    mapping(address creator => uint256[] campaignIDs)
+        private creator_campaignIDs;
+    /// @notice Mapping to check if a creator's address is verified
+    mapping(address creator => bool isVerified) public creator_isVerified;
+    /// @notice Mapping to check if a creator's address is banned
+    mapping(address creator => bool isBanned) public creator_isBanned;
+    /// @notice Mapping from a creator's address to their fee percentage
+    mapping(address creator => uint256 feePercentage)
+        public creatorFee_Percentage;
+
+    enum RewardType {
+        Funding,
+        CampaignCreation,
+        Validator
+    }
+
+    /// @notice EthFundMe Token Contract Address
+    IERC20 public EFM_TOKEN_CONTRACT =
+        IERC20(0xbBC8B9f917332b001F59ba2E5E92F614CB7C7a8F);
+
+    /**
+     * @dev Update EthFundMe Token Address
+     * @param newTokenAddress New contract address
+     */
+    function updateTokenContract(address newTokenAddress) public _is0 {
+        EFM_TOKEN_CONTRACT = IERC20(newTokenAddress);
+    }
+
+    /**
+     * @dev Updates the next diminish time and diminish factor. Rewards the caller.
+     */
+    function diminish() public nonReentrant {
+        if (block.timestamp >= DF_NEXT_UPDATE) {
+            uint256 diminishReward = DIMINISH_FACTOR * 1 ether;
+            sendTokens(diminishReward, RewardType.Validator);
+            DIMINISH_FACTOR /= 2;
+            DF_NEXT_UPDATE += DF_INTERVAL;
+            emit DiminishFactorUpdated(
+                DIMINISH_FACTOR,
+                msg.sender,
+                diminishReward
+            );
+        } else {
+            revert EthFundMe__DiminishFailed();
+        }
+    }
+
+    /**
+     * @dev Send FUNDME tokens
+     */
+    function sendTokens(
+        uint256 _amount,
+        RewardType _rewardType
+    ) private nonReentrant {
+        bool success = EFM_TOKEN_CONTRACT.transfer(msg.sender, _amount);
+        if (success) {
+            emit TokensTransferred(msg.sender, _amount, _rewardType);
+        } else {
+            revert EthFundMe__TransferFailed();
+        }
+    }
+
+    /**
+     * @dev Adds a new campaign to the platform
+     * @param _mdHash Metadata hash of the title, description and media links
+     * @param _goal The funding goal of the campaign in wei
+     * @param _beneficiary The address that will receive the funds collected by the campaign
+     */
+    function addCampaign(
+        bytes32 _mdHash,
+        uint256 _goal,
+        address _beneficiary
+    ) public _0x9(_goal) _0x11(msg.sender) _0x12(_goal) {
+        uint256 id = s_Campaigns.length;
+        Campaign memory newCampaign = Campaign(
+            id,
+            _mdHash,
+            msg.sender,
+            _goal,
+            block.timestamp,
+            _beneficiary,
+            0,
+            false,
+            false
+        );
+        s_Campaigns.push(newCampaign);
+        creator_campaignIDs[msg.sender].push(id);
+        uint256 reward = BASE_REWARD * DIMINISH_FACTOR;
+        sendTokens(reward, RewardType.CampaignCreation);
+        emit CampaignCreated(newCampaign, reward);
+    }
+
+    /**
+     * @dev Allows the campaign creator to update campaign details
+     * @param _campaignID The ID of the campaign to be updated
+     * @param _goal New funding goal of the campaign in wei
+     * @param _beneficiary New beneficiary address for the campaign
+     */
+    function updateCampaign(
+        bytes32 _mdHash,
+        uint256 _campaignID,
+        uint256 _goal,
+        address _beneficiary
+    )
+        public
+        _0x6(_campaignID)
+        _0x9(_goal)
+        _0x11(msg.sender)
+        _0x12(_goal)
+        _0x13(_campaignID)
+        _0x14(_campaignID)
+    {
+        Campaign storage campaign = s_Campaigns[_campaignID];
+        campaign.mdHash = _mdHash;
+        campaign.goal = _goal;
+        campaign.beneficiary = _beneficiary;
+        emit CampaignUpdated(campaign);
+    }
+
+    /**
+     * @dev Funds a specific campaign. The sender must send Ether along with the transaction
+     * @param _campaignID The ID of the campaign to be funded
+     * @param _commentID The ID of the comment
+     */
+    function fundCampaign(
+        uint256 _campaignID,
+        int256 _commentID
+    )
+        public
+        payable
+        _0x8
+        _0x10(_campaignID)
+        _0x11(msg.sender)
+        _0x14(_campaignID)
+    {
+        uint256 platformFee = (msg.value * FEE) / PERCENTAGE;
+        uint256 balance = msg.value - platformFee;
+        Campaign storage campaign = s_Campaigns[_campaignID];
+        address creator = campaign.creator;
+        uint256 errorCode;
+        if (creator_isBanned[creator]) {
+            revert EthFundMe__CreatorBanned();
+        }
+        if (creatorFee_Percentage[creator] > 0) {
+            uint256 creatorFee = (msg.value * creatorFee_Percentage[creator]) /
+                PERCENTAGE;
+            balance = balance - creatorFee;
+            (bool sendCreatorFeeSuccess, ) = payable(creator).call{
+                value: creatorFee
+            }("");
+            if (!sendCreatorFeeSuccess) {
+                errorCode |= 1;
+            }
+            emit CreatorFunded(
+                creator,
+                creatorFee,
+                creatorFee_Percentage[creator],
+                _campaignID
+            );
+        }
+        (bool beneficiaryTransferSuccess, ) = payable(campaign.beneficiary)
+            .call{value: balance}("");
+        if (!beneficiaryTransferSuccess) {
+            errorCode |= 2;
+        }
+        (bool sendPlatformFeeSuccess, ) = payable(PLTF_WT).call{
+            value: platformFee
+        }("");
+        if (!sendPlatformFeeSuccess) {
+            errorCode |= 4;
+        }
+
+        campaign.totalAccrued = campaign.totalAccrued + msg.value;
+
+        uint256 reward = (msg.value + BASE_REWARD) * DIMINISH_FACTOR;
+        sendTokens(reward, RewardType.Funding);
+
+        emit CampaignFunded(
+            msg.sender,
+            campaign,
+            msg.value,
+            _commentID,
+            balance,
+            errorCode,
+            reward
+        );
+    }
+
+    /**
+     * @dev Discontinues a specific campaign. This action can only be performed by the campaign creator
+     *      Once discontinued, the campaign cannot receive further funding
+     * @param _campaignID The ID of the campaign to be discontinued
+     */
+    function discontinueCampaign(
+        uint256 _campaignID
+    ) public _0x6(_campaignID) _0x10(_campaignID) _0x14(_campaignID) {
+        s_Campaigns[_campaignID].discontinued = true;
+        emit CampaignDiscontinued(_campaignID);
+    }
+
+    /**
+     * @dev Sets the fee percentage for the creator of campaigns. This fee is deducted from each donation to the creator's campaigns
+     * @param _amount The new fee percentage (in wei) to be set for the creator
+     */
+    function setCreatorFeePercentage(uint256 _amount) public {
+        if (_amount <= CREATOR_FEE_PERCENTAGE_LIMIT) {
+            creatorFee_Percentage[msg.sender] = _amount;
+            emit CreatorFeeUpdated(msg.sender, _amount);
+        } else {
+            revert EthFundMe__AmountExceedsLimit();
+        }
+    }
+
+    /**
+     * @dev Returns a list of campaign IDs created by a specific creator
+     * @param _creator The address of the campaign creator
+     * @return creatorCampaignIDs An array of campaign IDs created by the given creator
+     */
+    function creatorCollection(
+        address _creator
+    ) public view returns (uint256[] memory creatorCampaignIDs) {
+        creatorCampaignIDs = creator_campaignIDs[_creator];
+    }
+
+    /**
+     * @dev Retrieves a list of all campaigns with pagination support
+     * @param limit The maximum number of campaigns to return
+     * @param offset The index to start returning campaigns from
+     * @return campaigns An array of Campaigns in the contract
+     */
+    function getCampaigns(
+        uint256 limit,
+        uint256 offset
+    ) public view returns (Campaign[] memory campaigns) {
+        uint256 length = s_Campaigns.length;
+        if (offset <= length) {
+            revert EthFundMe__OffsetOutOfBounds();
+        }
+        uint256 size = length > offset ? length - offset : 0;
+        size = size > limit ? limit : size;
+
+        campaigns = new Campaign[](size);
+
+        for (uint256 i; i < size; ++i) {
+            campaigns[i] = s_Campaigns[offset + i];
+        }
+        return campaigns;
+    }
+
+    /**
+     * @dev Returns the total count of campaigns in the contract
+     * @return totalCampaigns The total number of campaigns
+     */
+    function campaignsCount() public view returns (uint256 totalCampaigns) {
+        totalCampaigns = s_Campaigns.length;
+    }
+
+    /**
+     * @dev Admininistrative
+     * @param _creators Creators to verify
+     * @param _statuses Corresponding verification states
+     */
+    function _0x3(
+        address[] memory _creators,
+        bool[] memory _statuses
+    ) public _is0x {
+        uint256 length = _creators.length;
+        for (uint256 i; i < length; ++i) {
+            creator_isVerified[_creators[i]] = _statuses[i];
+        }
+        emit CreatorVerified(_creators, _statuses);
+    }
+
+    /**
+     * @dev Admininistrative
+     * @param _creators Creators to ban
+     * @param _statuses Corresponding ban states
+     */
+    function _0x4(
+        address[] memory _creators,
+        bool[] memory _statuses
+    ) public _is0x {
+        uint256 length = _creators.length;
+        for (uint256 i; i < length; ++i) {
+            creator_isBanned[_creators[i]] = _statuses[i];
+        }
+        emit CreatorBanned(_creators, _statuses);
+    }
+
+    /**
+     * @dev Admininistrative
+     * @param _campaignIDs Campaigns to flag
+     * @param _statuses Corresponding flag states
+     */
+    function _0x5(
+        uint256[] memory _campaignIDs,
+        bool[] memory _statuses
+    ) public _is0x {
+        uint256 length = _campaignIDs.length;
+        for (uint256 i; i < length; ++i) {
+            s_Campaigns[_campaignIDs[i]].flagged = _statuses[i];
+        }
+        emit CampaignFlagged(_campaignIDs, _statuses);
+    }
+
+    modifier _0x6(uint256 _campaignID) {
+        if (s_Campaigns[_campaignID].creator != msg.sender) {
+            revert EthFundMe__NotCampaignCreator();
+        }
+        _;
+    }
+
+    /**
+     * @dev Admininistrative
+     * @param value Fees value
+     */
+    function _0x7(uint256 value) public nonReentrant _is0 {
+        (bool sendPlatformFeeSuccess, ) = payable(PLTF_WT).call{value: value}(
+            ""
+        );
+        if (!sendPlatformFeeSuccess) {
+            revert EthFundMe__SendPlatformFeeFailed();
+        }
+    }
+
+    /**
+     * @dev Admininistrative
+     * @param _seconds New value
+     */
+    function updateDFInterval(uint256 _seconds) public _is0 {
+        DF_INTERVAL = _seconds;
+    }
+
+    modifier _0x8() {
+        if (msg.value <= 0) {
+            revert EthFundMe__InsufficientFunds();
+        }
+        _;
+    }
+
+    modifier _0x9(uint256 _goal) {
+        if (_goal == 0) {
+            revert EthFundMe__NoGoalSet();
+        }
+        _;
+    }
+
+    modifier _0x10(uint256 _campaignID) {
+        if (s_Campaigns[_campaignID].flagged) {
+            revert EthFundMe__CampaignFlagged();
+        }
+        _;
+    }
+
+    modifier _0x11(address _creator) {
+        if (creator_isBanned[_creator]) {
+            revert EthFundMe__Banned();
+        }
+        _;
+    }
+
+    modifier _0x12(uint256 _goal) {
+        if (!creator_isVerified[msg.sender]) {
+            if (_goal > UNVERIFIED_CREATOR_CAMPAIGN_DONATION_LIMIT) {
+                revert EthFundMe__GoalExceedsNonVerifiedLimit();
+            }
+        }
+        _;
+    }
+
+    modifier _0x13(uint256 _campaignID) {
+        if (
+            s_Campaigns[_campaignID].totalAccrued >=
+            s_Campaigns[_campaignID].goal
+        ) {
+            revert EthFundMe__GoalReachedNotUpdatable();
+        }
+        _;
+    }
+
+    modifier _0x14(uint256 _campaignID) {
+        if (s_Campaigns[_campaignID].discontinued) {
+            revert EthFundMe__CampaignDiscontinued();
+        }
+        _;
+    }
+
+    /// @notice Fallback function to handle incoming Ether transfers
+    /// @dev This function is called when the contract is sent Ether with no data or with data that doesn't match any function signature in the contract
+    fallback() external payable {}
+
+    /// @notice Receive function to handle plain Ether transfers
+    /// @dev This function is called when the contract is sent Ether with empty calldata
+    receive() external payable {}
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/security/ReentrancyGuard.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
+
+
+// File: efm_1.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.25;
+/// @notice This contract allows users to create campaigns on-chain
+/// @custom:contact team@ethfund.me
+
+error EthFundMe__Unauthorized();
+
+/**
+ * @title EthFundMe Extended
+ * @custom:security-contact team@ethfund.me
+ */
+contract EthFundMe_1 {
+    /// @notice Base percentage used for calculations, representing 100%
+    uint256 public constant PERCENTAGE = 100 ether;
+
+    /// @notice Maximum fee percentage that a creator can set
+    uint256 public CREATOR_FEE_PERCENTAGE_LIMIT = 30 ether;
+
+    /// @notice Fee percentage deducted from each transaction
+    uint256 public FEE = 2.9 ether;
+
+    /// @notice Donation limit for campaigns created by unverified creators
+    uint256 public UNVERIFIED_CREATOR_CAMPAIGN_DONATION_LIMIT = 2 ether;
+
+    /// @notice Initial diminish factor
+    uint256 public DIMINISH_FACTOR = 128;
+
+    /// @notice Timestamp indicating the next scheduled update for the diminish factor
+    uint256 public DF_NEXT_UPDATE = 1736366400;
+
+    /// @notice Time interval between successive updates of the diminish factor
+    uint256 public DF_INTERVAL = 256 days;
+
+    /// @notice Base $FUNDME amount
+    uint256 public BASE_REWARD = 0.001 ether;
+
+    /// @notice Platform Account
+    address public constant PLTF_WT =
+        0x16728581A189cE3221673554AbDB57B8D625E902;
+    address private constant MTNR_0 =
+        0xbd3acF98666A7d10f17528E897016828a644c39b;
+    address private MTNR_1 = 0xf24123e5B189Bb599C05e2B2c4eAa778818e8354;
+    address private MTNR_2 = 0xE9b4d1DFf58c9d88B103B4c3AAE9dc19176b07F2;
+
+    /**
+     * @dev Admininistrative
+     * @param _amount New creator reward amount
+     */
+    function _0x2_3(uint256 _amount) public _is0 {
+        BASE_REWARD = _amount;
+    }
+
+    /// @notice Returns the addresses stored in MTNR_0, MTNR_1, and MTNR_2
+    /// @dev Accessible only by authorized maintainers
+    /// @return M0 The address stored in MTNR_0
+    /// @return M1 The address stored in MTNR_1
+    /// @return M2 The address stored in MTNR_2
+    function _0x2_2()
+        public
+        view
+        _is0x
+        returns (address M0, address M1, address M2)
+    {
+        M0 = MTNR_0;
+        M1 = MTNR_1;
+        M2 = MTNR_2;
+    }
+
+    /// @notice Sets the maximum creator fee percentage
+    /// @dev Only owner
+    /// @param _value The new maximum fee percentage
+    function _0x2_1(uint256 _value) public _is0 {
+        CREATOR_FEE_PERCENTAGE_LIMIT = _value;
+    }
+
+    /// @notice Sets the donation limit for unverified creator campaigns
+    /// @dev Only owner
+    /// @param _amount The new donation limit for unverified creators
+    function _0x2(uint256 _amount) public _is0 {
+        UNVERIFIED_CREATOR_CAMPAIGN_DONATION_LIMIT = _amount;
+    }
+
+    /// @notice Sets the platform fee percentage
+    /// @dev Only owner
+    /// @param _fee The new platform fee percentage
+    function _0x1(uint256 _fee) public _is0 {
+        FEE = _fee;
+    }
+
+    /// @notice Updates the maintainer address for a specified slot
+    /// @dev Only owner
+    /// @param _slot The slot number of the maintainer to update (1 or 2)
+    /// @param _newMTNR The new address for the maintainer
+    function _0x0(uint256 _slot, address _newMTNR) public _is0 {
+        if (_slot == 1) {
+            MTNR_1 = _newMTNR;
+        } else if (_slot == 2) {
+            MTNR_2 = _newMTNR;
+        }
+    }
+
+    modifier _is0x() {
+        if (
+            msg.sender == MTNR_0 || msg.sender == MTNR_1 || msg.sender == MTNR_2
+        ) {
+            _;
+        } else {
+            revert EthFundMe__Unauthorized();
+        }
+    }
+
+    modifier _is0() {
+        if (msg.sender != MTNR_0) {
+            revert EthFundMe__Unauthorized();
+        }
+        _;
+    }
+}
+

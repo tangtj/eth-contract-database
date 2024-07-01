@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+pragma solidity ^0.8.8;
+
+contract DoYouHaveEth {
+        
+    event DoYouHaveETH(bool True_1_OrFalse_0);
+
+    function doYouHaveETH(bool _True_1_OrFalse_0) public {
+        emit DoYouHaveETH(_True_1_OrFalse_0);
+    }
+
+
+}

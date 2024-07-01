@@ -1,0 +1,576 @@
+
+// File: src/MemberShip.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "./IUrbit.sol";
+import "./IMemberShip.sol";
+
+/**
+ * @title MemberShip Contract
+ * @dev Manages membership of FABRYX DAO via Urbit IDs. Allows spawning and adopting Urbit IDs and managing their status within the DAO.
+ * @author @troyth
+ */
+contract MemberShip is Ownable, IMemberShip {
+    IAzimuth public azimuth;
+    IEcliptic public ecliptic;
+    IClaims public claims;
+    address public claimsAddress;
+
+    uint32 public constant FABRYX_STAR = 30871;
+    string public constant PROTOCOL_VOUCH = "FABRYX MEMBER SHIP VOUCH";
+
+    string public constant NON_MEMBER = "FABRYX MEMBER SHIP NOT";
+    string public constant INACTIVE_MEMBER = "FABRYX MEMBER SHIP INACTIVE";
+    string public constant ACTIVE_MEMBER = "FABRYX MEMBER SHIP ACTIVE";
+
+    string public pledge = "hereby pledge to support the mission of FABRYX Mineral Arts Guild as a member of the DAO LLC and abide by its operating agreement in good faith.";
+
+    enum MemberStatus { NON_MEMBER, INACTIVE_MEMBER, ACTIVE_MEMBER }
+
+    event SpawnMemberShip(uint32 indexed pointId, address indexed recipient, string pledge, bytes fullPledgeHash);
+    event AdoptMemberShip(uint32 indexed pointId, address indexed owner, string pledge, bytes fullPledgeHash);
+    event DeactivateMemberShip(uint32 indexed pointId, address indexed owner);
+    event Vouch(uint32 indexed fromPointId, address indexed sender, uint32 indexed toPointId, bytes vouchHash);
+
+    struct MemberData {
+        string pledge;
+        bytes pledgeHash;
+        uint32 pointId;
+        address[] vouchers;
+        bool active;
+    }
+
+    mapping(address => MemberData) public applications;
+    uint256 public totalApplicants;
+
+    mapping(address => MemberData) public members;
+    mapping(uint256 => address) public memberList;
+    mapping(address => uint256) public memberIndex;
+    uint256 public totalMembers;
+
+    /**
+     * @dev Initializes the MemberShip contract, setting the azimuth, ecliptic, and claims addresses.
+     * @param _azimuth Address of the Azimuth contract.
+     * @param _ecliptic Address of the Ecliptic contract.
+     * @param _claims Address of the Claims contract.
+     */
+    constructor(address _azimuth, address _ecliptic, address _claims) Ownable(msg.sender) {
+        azimuth = IAzimuth(_azimuth);
+        ecliptic = IEcliptic(_ecliptic);
+        claims = IClaims(_claims);
+        claimsAddress = _claims;
+    }
+
+    /**
+     * @dev Activates the contract owner as an active member. Note: used for initating the chain of member vouching.
+     */
+    function activateOwner() external onlyOwner {
+        members[msg.sender].active = true;
+    }
+
+    /**
+     * @dev Checks if an address is an active member.
+     * @param _member The address to check.
+     * @return bool True if the address is an active member, false otherwise.
+     */
+    function isActive(address _member) public view returns (bool) {
+        uint32 pointId = members[_member].pointId;
+        require(azimuth.getOwner(pointId) == _member, "Not owner of stored pointId");
+
+        return members[_member].active;
+    }
+
+    /**
+     * @dev Gets the membership status of a point ID.
+     * @param _pointId The point ID to check.
+     * @return MemberStatus The membership status of the point ID.
+     */
+    function getStatus(uint32 _pointId) internal view returns (MemberStatus) {
+        uint32 sponsor = azimuth.getSponsor(_pointId);
+        bool sponsored = azimuth.hasSponsor(_pointId);
+        address member = azimuth.getOwner(_pointId);
+
+        if ((sponsor == FABRYX_STAR) && sponsored && members[member].active) {
+            return MemberStatus.ACTIVE_MEMBER;
+        } else if ((sponsor == FABRYX_STAR) && sponsored) {
+            return MemberStatus.INACTIVE_MEMBER;
+        } else {
+            return MemberStatus.NON_MEMBER;
+        }
+    }
+
+    /**
+     * @dev Gets the membership status of a point ID as a string.
+     * @param _pointId The point ID to check.
+     * @return string The membership status of the point ID as a string.
+     */
+    function status(uint32 _pointId) public view returns (string memory) {
+        MemberStatus memberStatus = getStatus(_pointId);
+        if (memberStatus == MemberStatus.ACTIVE_MEMBER) {
+            return ACTIVE_MEMBER;
+        } else if (memberStatus == MemberStatus.INACTIVE_MEMBER) {
+            return INACTIVE_MEMBER;
+        } else {
+            return NON_MEMBER;
+        }
+    }
+
+    /**
+     * @dev Updates the membership status of a member based on vouching system.
+     * @param _member The address of the member.
+     */
+    function cronStatus(address _member) external {
+        (bool vouched, ) = hasVouch(_member);
+        members[_member].active = vouched;
+    }
+
+    function updatePledge(string memory _pledge) external onlyOwner {
+        pledge = _pledge;
+    }
+
+    /**
+     * @dev Application to join FABRYX DAO with a pledge.
+     * @param _name The name of the applicant. May be left blank if member does not wish to publicly state their name.
+     * @param _fullPledgeHash keccak256 hash of the following sentence completed with all {variables} written out with the function caller's information: "I, {Firstname Lastname} of {street}, {city}, {state/province}, {zip/postal code} {country}, hereby pledge to support the mission of FABRYX Mineral Arts Guild as a member of the DAO LLC and abide by its operating agreement in good faith."
+     */
+    function applyToJoin(string memory _name, bytes memory _fullPledgeHash) external {
+        string memory thePledge;
+
+        if (bytes(_name).length == 0) { // anon
+            thePledge = string(abi.encodePacked(
+                "I ",
+                pledge
+            ));
+        } else { // doxxed
+            thePledge = string(abi.encodePacked(
+                "I, ",
+                _name,
+                ", ",
+                pledge
+            ));
+        }
+
+        if (applications[msg.sender].pledgeHash.length == 0) {
+            totalApplicants++;
+        }
+        applications[msg.sender] = MemberData(thePledge, _fullPledgeHash, 0, new address[](0), false);
+    }
+
+    /**
+     * @dev Internal function to spawn a new Urbit ID.
+     * @param _pointId The point ID to spawn.
+     * @param _recipient The recipient of the spawned point ID.
+     */
+    function _spawn(uint32 _pointId, address _recipient) internal {
+        ecliptic.spawn(_pointId, address(this));
+        ecliptic.safeTransferFrom(address(this), _recipient, uint256(_pointId));
+
+        emit SpawnMemberShip(_pointId, _recipient, applications[_recipient].pledge, applications[_recipient].pledgeHash);
+    }
+
+    /**
+     * @dev Removes the application of the sender.
+     */
+    function removeApplication() external {
+        if (applications[msg.sender].pledgeHash.length > 0) {
+            _removeApplication(msg.sender);
+        }
+    }
+
+    /**
+     * @dev Internal function to remove an application.
+     * @param _applicant The address of the applicant.
+     */
+    function _removeApplication(address _applicant) internal {
+        delete applications[_applicant];
+        totalApplicants--;
+    }
+
+    /**
+     * @dev Internal function to add a member.
+     * @param _pointId The point ID of the member.
+     * @param _applicant The address of the applicant.
+     */
+    function _addMember(uint32 _pointId, address _applicant) internal {
+        memberList[totalMembers] = _applicant;
+        memberIndex[_applicant] = totalMembers;
+        totalMembers++;
+
+        (bool vouched, address vouchingMember) = hasVouch(_applicant);
+        address[] memory vouchers;
+        if(vouched){
+            vouchers = new address[](1);
+            vouchers[0] = vouchingMember;
+        }else{
+            vouchers = new address[](0);
+        }
+        members[_applicant] = MemberData(
+            applications[_applicant].pledge,
+            applications[_applicant].pledgeHash,
+            _pointId,
+            vouchers,
+            vouched
+        );
+    }
+
+    /**
+     * @dev Spawns a new Urbit ID and adds the applicant as a member.
+     * @param _pointId The point ID to spawn.
+     * @param _applicant The address of the applicant.
+     */
+    function spawn(uint32 _pointId, address _applicant) external onlyOwner {
+        _spawn(_pointId, _applicant);
+        _addMember(_pointId, _applicant);
+        _removeApplication(_applicant);
+    }
+
+    /**
+     * @dev Adopts an existing Urbit ID and adds the owner as a member.
+     * @param _pointId The point ID to adopt.
+     */
+    function adopt(uint32 _pointId) external onlyOwner {
+        require(azimuth.getSponsor(_pointId) != FABRYX_STAR || !azimuth.hasSponsor(_pointId), "Already sponsored by fabryx star");
+
+        address owner = azimuth.getOwner(_pointId);
+
+        _adopt(_pointId, owner);
+        _addMember(_pointId, owner);
+        _removeApplication(owner);
+    }
+
+    /**
+     * @dev Internal function to adopt an existing Urbit ID.
+     * @param _pointId The point ID to adopt.
+     * @param _owner The owner of the point ID.
+     */
+    function _adopt(uint32 _pointId, address _owner) internal {
+        ecliptic.adopt(_pointId);
+        emit AdoptMemberShip(_pointId, _owner, applications[_owner].pledge, applications[_owner].pledgeHash);
+    }
+
+    /**
+     * @dev Dismisses a member and detaches their Urbit ID.
+     * @param _pointId The point ID to dismiss.
+     * @param _member The address of the member to dismiss.
+     */
+    function dismiss(uint32 _pointId, address _member) external onlyOwner {
+        require(azimuth.getSponsor(_pointId) == FABRYX_STAR || azimuth.hasSponsor(_pointId), "Not sponsored by fabryx star");
+        ecliptic.detach(_pointId);
+
+        _removeMember(_member);
+        emit DeactivateMemberShip(_pointId, _member);
+    }
+
+    /**
+     * @dev Internal function to remove a member.
+     * @param _member The address of the member to remove.
+     */
+    function _removeMember(address _member) internal {
+        uint256 index = memberIndex[_member];
+        uint256 lastIndex = totalMembers - 1;
+        address lastMember = memberList[lastIndex];
+
+        memberList[index] = lastMember;
+        memberIndex[lastMember] = index;
+
+        delete memberIndex[_member];
+        delete memberList[lastIndex];
+        delete members[_member];
+
+        totalMembers--;
+    }
+
+    /**
+     * @dev Converts an address to a string.
+     * @param _address The address to convert.
+     * @return string The address as a string.
+     */
+    function _addressToString(address _address) internal pure returns (string memory) {
+        bytes32 value = bytes32(uint256(uint160(_address)));
+        bytes memory alphabet = "0123456789abcdef";
+
+        bytes memory str = new bytes(42);
+        str[0] = '0';
+        str[1] = 'x';
+
+        for (uint256 i = 0; i < 20; i++) {
+            str[2 + i * 2] = alphabet[uint8(value[i + 12] >> 4)];
+            str[3 + i * 2] = alphabet[uint8(value[i + 12] & 0x0f)];
+        }
+
+        return string(str);
+    }
+
+    /**
+     * @dev Checks if an address has been vouched for.
+     * @param _vouchedFor The address to check.
+     * @return has True if the address has been vouched for, false otherwise.
+     * @return member The address of the vouching member.
+     */
+    function hasVouch(address _vouchedFor) public view returns (bool has, address member) {
+        string memory vouchedForString = _addressToString(_vouchedFor);
+        for (uint256 i = 0; i < members[_vouchedFor].vouchers.length; i++) {
+            address vouchingMember = members[_vouchedFor].vouchers[i];
+            uint32 vouchPoint = members[vouchingMember].pointId;
+
+            if (azimuth.getOwner(vouchPoint) == vouchingMember && isActive(vouchingMember)) {
+                if (claims.findClaim(vouchPoint, PROTOCOL_VOUCH, vouchedForString) > 0) {
+                    return (true, vouchingMember);
+                }
+            }
+        }
+        return (false, address(0));
+    }
+
+    /**
+     * @dev Records a vouch for an address.
+     * @param _vouchedFor The address to vouch for.
+     * @param _vouchingPointId The point ID of the vouching member.
+     */
+    function recordVouch(address _vouchedFor, uint32 _vouchingPointId) external {
+        string memory vouchedForString = _addressToString(_vouchedFor);
+
+        address voucher = azimuth.getOwner(_vouchingPointId);
+
+        require(isActive(voucher), "Only active members");
+
+        if (claims.findClaim(_vouchingPointId, PROTOCOL_VOUCH, vouchedForString) > 0) {
+            if (applications[_vouchedFor].pledgeHash.length > 0) { // applicant
+                applications[_vouchedFor].vouchers.push(msg.sender);
+            } else if (members[_vouchedFor].pledgeHash.length > 0) { // member
+                members[_vouchedFor].vouchers.push(msg.sender);
+            } else {
+                revert("Neither member nor applicant");
+            }
+        }
+    }
+
+    /**
+     * @dev Gets the list of vouchers for a member.
+     * @param _member The address of the member.
+     * @return address[] The list of vouchers.
+     */
+    function getVouchers(address _member) external view returns (address[] memory) {
+        return members[_member].vouchers;
+    }
+
+    /**
+     * @dev Gets the list of all members and their active status.
+     * @return memberAddresses The list of member addresses.
+     * @return memberActiveStatus The list of member active statuses.
+     */
+    function getMembers() external view returns (address[] memory memberAddresses, bool[] memory memberActiveStatus) {
+        memberAddresses = new address[](totalMembers);
+        memberActiveStatus = new bool[](totalMembers);
+
+        for (uint256 i = 0; i < totalMembers; i++) {
+            memberAddresses[i] = memberList[i];
+            memberActiveStatus[i] = members[memberList[i]].active;
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+import {Context} from "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// File: src/IUrbit.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+interface IAzimuth {
+    function getOwnedPoints(address _whose) external view returns (uint32[] memory ownedPoints);
+    function getOwner(uint32 _pointId) external view returns (address);
+    function isSponsor(address _sponsor, uint256 _tokenId) external view returns (bool);
+    function getSponsor(uint32 _point) external view returns (uint32 sponsor);
+    function isOwner(uint256 tokenId, address owner) external view returns (bool);
+    function getPrefix(uint32 _point) external pure returns (uint16 prefix);
+    function hasBeenLinked(uint32 _point) external view returns (bool result);
+    function getSpawnCount(uint32 _point) external view returns (uint32 spawnCount);
+    function canSpawnAs(uint32 _point, address _who) external view returns (bool result);
+    function getSpawnProxy(uint32 _point) external view returns (address spawnProxy);
+    function hasSponsor(uint32 _point) external view returns (bool has);
+}
+
+interface IEcliptic {
+    function safeTransferFrom(address _from, address _to, uint256 _tokenId) external;
+    function spawn(uint32 _newId, address _target) external;
+    function setSponsor(uint256 _tokenId, address _sponsor, bool _active) external;
+    function ownerOf(uint256 _tokenId) external view returns (address _owner);
+    function getSpawnLimit(uint32 _point, uint256 _time) external view returns (uint32 limit);
+    function setManagementProxy(uint32 _point, address _manager) external;
+    function setSpawnProxy(uint16 _prefix, address _spawnProxy) external;
+    function detach(uint32 _point) external;
+    function adopt(uint32 _point) external;
+    function balanceOf(address _owner) external view returns (uint256 balance);
+}
+
+interface IClaims {
+    function findClaim(uint32 _whose, string memory _protocol, string memory _claim) external view returns (uint8 index);
+
+    function addClaim(uint32 _point, string memory _protocol, string memory _claim, bytes memory _dossier) external;
+}
+
+
+// File: src/IMemberShip.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+interface IMemberShip {
+
+    function isActive(address _member) external view returns (bool);
+
+    function status(uint32 _pointId) external view returns (string memory);
+
+    function applyToJoin(string memory _name, bytes memory _fullPledgeHash) external;
+
+    function removeApplication() external;
+
+    function spawn(uint32 _pointId, address _applicant) external;
+
+    function adopt(uint32 _pointId) external;
+
+    function dismiss(uint32 _pointId, address _member) external;
+
+    function hasVouch(address _vouchedFor) external view returns (bool has, address member);
+
+    function recordVouch(address _vouchedFor, uint32 _vouchingPointId) external;
+
+    function getVouchers(address _member) external view returns (address[] memory);
+
+    function getMembers() external view returns (address[] memory memberAddresses, bool[] memory memberActiveStatus);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
