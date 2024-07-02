@@ -1,0 +1,210 @@
+/**
+ *Submitted for verification at Etherscan.io on 2024-06-05
+*/
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^ 0.8.26;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(
+            newOwner != address(0),
+            "Ownable: new owner is the zero address"
+        );
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+interface IToken {
+  function balanceOf(address _user) external view returns(uint256);
+  function transfer(address _user, uint256 amount) external returns (bool);  
+}
+contract Presale is Ownable {
+  struct UserData {
+    uint256 buyTokenAmount;
+    uint256 payEtherAmount;
+    uint256 price;
+    uint256 limitTokens;
+    uint256 timeStamp;
+    uint256 duration;
+  }
+  IToken public token;
+  uint256 public PRESALE_ENTRIES = 1000 ether;
+  uint256 private whitelistPrice = 0.00003 ether;
+  uint256 public saleAmount; 
+  uint256 public LimitTokens;
+  enum STAGES { PENDING, PRESALE, FINISH }
+  STAGES public stage = STAGES.PENDING;
+  mapping(address => bool) public whitelisted;
+  mapping(address => UserData) private userData;
+  uint256 public whitelistAccessCount;
+  mapping(uint256 => address) private AddressList;
+
+  constructor(address tokenAddress, uint256 price, uint256 presale_limit, uint256 tokens_limit) {
+    token = IToken(tokenAddress );
+    whitelistPrice = price;
+    PRESALE_ENTRIES = presale_limit;
+    LimitTokens = tokens_limit;
+  }
+
+  function buy(uint256 _amount) external payable {
+    require(stage == STAGES.PRESALE, "Presale not started yet.");
+    require(saleAmount + _amount <= PRESALE_ENTRIES, "PRESALE LIMIT EXCEED");
+    require(userData[msg.sender].buyTokenAmount + _amount  <= userData[msg.sender].limitTokens, "Presale Limit Exceed");    
+    require(whitelisted[msg.sender], "You are not the member of Whitelist");
+    require(msg.value >= userData[msg.sender].price * _amount / 1e18, "need more money");
+    token.transfer(msg.sender, _amount);
+    payable(owner()).transfer(msg.value);
+    userData[msg.sender].buyTokenAmount += _amount;
+    userData[msg.sender].payEtherAmount += msg.value;
+    saleAmount += _amount;
+  }
+
+  function getUserData(address _account) public view returns(UserData memory) {
+    return userData[_account];
+  }
+
+  function setPresaleEntries(uint256 preentries) external onlyOwner {
+    require(stage != STAGES.FINISH, "Presale is already closed");
+    PRESALE_ENTRIES = preentries;
+  }
+
+  function setProposal(uint256 _price, uint256 dura) external {
+    require(stage == STAGES.PRESALE, "Presale is not opened.");
+    require(_price >= whitelistPrice, "Price is smaller than Limit");
+    userData[msg.sender].timeStamp = block.timestamp;
+    userData[msg.sender].price = _price;
+    userData[msg.sender].duration = dura;
+    if(!whitelisted[msg.sender]) {
+      AddressList[whitelistAccessCount] = msg.sender;   
+      userData[msg.sender].buyTokenAmount = 0;
+      userData[msg.sender].payEtherAmount = 0;      
+      whitelisted[msg.sender] = true;
+      userData[msg.sender].limitTokens = LimitTokens;   
+      whitelistAccessCount++;
+    }
+  }
+
+  function removeWhiteListAddress(address addr) external onlyOwner {
+    _remoteWhiteListAddress(addr);
+  }
+
+  function _remoteWhiteListAddress(address addr) internal {
+    require(stage != STAGES.FINISH, "Presale is already closed"); 
+      if(whitelisted[addr]) {  
+        for(uint8 i = 0; i < whitelistAccessCount; i++)
+          if(AddressList[i] == addr) {
+            for(uint j = i + 1; j < whitelistAccessCount; j++) {
+              AddressList[j - 1] = AddressList[j];
+            }
+            whitelistAccessCount--;
+            break;
+          }
+        whitelisted[addr] = false;
+      }    
+  }
+
+  function setLimitTokens(address _account, uint256 _amount) external {
+        require(stage != STAGES.FINISH, "Presale is already closed");
+    userData[_account].limitTokens = _amount;
+  }  
+
+  function setWhitelistPrice(uint256 rePrice) external onlyOwner {
+    require(stage != STAGES.FINISH, "Presale is already closed");    
+    whitelistPrice = rePrice;
+  }
+
+  function setLimit(uint256 limit) external onlyOwner {
+    require(stage != STAGES.FINISH, "Presale is already closed");    
+    LimitTokens = limit;    
+  }
+
+  function getWhitelistPrice() public view returns(uint256) {
+    return whitelistPrice;
+  }
+  function getLimitTokens() public view returns(uint256) {
+    return LimitTokens;
+  }  
+
+  function getAddressList() public onlyOwner view returns (address[] memory){
+    address[] memory result = new address[](whitelistAccessCount);
+    for (uint i = 0;  i < whitelistAccessCount; i++) {
+        result[i] = AddressList[i];
+    }
+    return result;    
+  }
+
+  function startSale() external onlyOwner {
+    require(stage == STAGES.PENDING, "Not in pending stage.");
+    for(uint i = 0; i < whitelistAccessCount; i++) {
+      userData[AddressList[i]].timeStamp = block.timestamp;
+    }
+    stage = STAGES.PRESALE;
+  }
+
+  function endSale() external onlyOwner {
+    require(stage == STAGES.PRESALE, "Still in pending stage");
+    stage = STAGES.FINISH;
+  }
+
+  function setSale(uint256 i) external onlyOwner {
+    if(i == 0)stage = STAGES.PENDING;
+    if(i == 1)stage = STAGES.PRESALE;
+    if(i == 2)stage = STAGES.FINISH;
+  }
+
+  function recoverCurrency(uint256 amount) public onlyOwner {
+    bool success;
+    (success, ) = payable(owner()).call{value: amount}("");
+    require(success);
+  }
+
+  function recoverToken(uint256 tokenAmount) public onlyOwner {
+    token.transfer(owner(), tokenAmount * 1e18);
+  }
+}

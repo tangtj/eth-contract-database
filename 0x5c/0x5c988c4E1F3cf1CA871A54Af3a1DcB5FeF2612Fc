@@ -1,0 +1,1273 @@
+
+// File: contracts/rewards/PrelaunchRewardsPool.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.11;
+
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+import { ICrvDepositor } from "../interfaces/ICrvDepositor.sol";
+import { ILitDepositorHelper } from "../interfaces/ILitDepositorHelper.sol";
+import { ICrvVoteEscrow } from "../interfaces/ICrvVoteEscrow.sol";
+
+import { Math } from "../utils/Math.sol";
+
+/**
+ * @title   PrelaunchRewardsPool
+ * @author  LiquisFinance
+ * @notice  Staking rewards contract for the prelaunch of Liquis Protocol.
+ */
+contract PrelaunchRewardsPool {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    IERC20 public rewardToken;
+    IERC20 public immutable stakingToken;
+    IERC20 public immutable lit;
+    uint256 public constant duration = 7 days;
+
+    address public owner;
+    address public crvDepositor;
+    address public litConvertor;
+    address public voterProxy;
+    address public immutable escrow;
+
+    uint256 public periodFinish = 0;
+    uint256 public rewardRate = 0;
+    uint256 public lastUpdateTime;
+    uint256 public rewardPerTokenStored;
+    uint256 public currentRewards = 0;
+    uint256 public historicalRewards = 0;
+
+    uint256 public totalSupply;
+
+    uint256 public immutable START_WITHDRAWALS;
+    uint256 public immutable START_VESTING_DATE;
+    uint256 public immutable END_VESTING_DATE;
+
+    uint256 public totalRenounced;
+
+    mapping(address => uint256) public userRewardPerTokenPaid;
+    mapping(address => uint256) public rewards;
+    mapping(address => uint256) public balances;
+    mapping(address => uint256) public claimed;
+    mapping(address => bool) public isVestingUser;
+
+    event Staked(address indexed user, uint256 amount);
+    event Converted(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
+    event Claimed(address indexed user, uint256 reward);
+    event Recovered(address token, uint256 amount);
+    event RewardAdded(uint256 reward);
+    event OwnerUpdated(address newOwner);
+    event CrvDepositorUpdated(address indexed crvDepositor);
+    event VoterProxyUpdated(address indexed voterProxy);
+    event RewardTokenUpdated(address indexed rewardToken);
+
+    /**
+     * @dev Initializes variables, approves lit and sets target dates.
+     * @param _stakingToken  BPT token BAL 20-80 WETH/LIT
+     * @param _rewardToken   LIQ
+     * @param _litConvertor  Contract that converts LIT to BPT
+     * @param _lit           LIT
+     * @param _crvDepositor  Contract that locks BPT for liqLIT
+     * @param _voterProxy    Contract that holds veLIT voting power (is whitelisted on veLIT)
+     * @param _escrow        veLIT
+     */
+    constructor(
+        address _stakingToken,
+        address _rewardToken,
+        address _litConvertor,
+        address _lit,
+        address _crvDepositor,
+        address _voterProxy,
+        address _escrow
+    ) {
+        owner = msg.sender;
+
+        stakingToken = IERC20(_stakingToken);
+        rewardToken = IERC20(_rewardToken);
+
+        litConvertor = _litConvertor;
+        crvDepositor = _crvDepositor;
+        voterProxy = _voterProxy;
+        escrow = _escrow;
+
+        lit = IERC20(_lit);
+        lit.safeApprove(litConvertor, type(uint256).max);
+
+        START_VESTING_DATE = block.timestamp + 28 days;
+        END_VESTING_DATE = START_VESTING_DATE + 180 days;
+
+        START_WITHDRAWALS = START_VESTING_DATE + 60 days;
+    }
+
+    // ----- Reward Functions ----- //
+
+    modifier updateReward(address account) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = lastTimeRewardApplicable();
+        if (account != address(0)) {
+            rewards[account] = earned(account);
+            userRewardPerTokenPaid[account] = rewardPerTokenStored;
+        }
+        _;
+    }
+
+    /**
+     * @dev Returns how many rewards a given account has earned
+     * @param account    Address for which the request is made
+     */
+    function earned(address account) public view returns (uint256) {
+        return (balances[account] * (rewardPerToken() - userRewardPerTokenPaid[account])) / 1e18 + rewards[account];
+    }
+
+    function rewardPerToken() public view returns (uint256) {
+        if (totalSupply == 0) {
+            return rewardPerTokenStored;
+        }
+        return
+            rewardPerTokenStored + (((lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * 1e18) / totalSupply);
+    }
+
+    function lastTimeRewardApplicable() public view returns (uint256) {
+        return Math.min(block.timestamp, periodFinish);
+    }
+
+    // ----- Stake Functions ----- //
+
+    function stake(uint256 _amount) public returns (bool) {
+        // pull tokens from msg.sender
+        stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
+
+        _processStake(_amount, msg.sender);
+        return true;
+    }
+
+    function stakeAll() external returns (bool) {
+        uint256 balance = stakingToken.balanceOf(msg.sender);
+
+        stake(balance);
+        return true;
+    }
+
+    function stakeFor(address _for, uint256 _amount) external returns (bool) {
+        // pull tokens from msg.sender
+        stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
+
+        _processStake(_amount, _for);
+        return true;
+    }
+
+    /**
+     * @dev Converts user LIT into BPT and stakes it, reward is updated in low level func _processStake
+     */
+    function stakeLit(uint256 amount, uint256 minOut) external {
+        lit.safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 bptReceived = ILitDepositorHelper(litConvertor).convertLitToBpt(amount, minOut);
+
+        _processStake(bptReceived, msg.sender);
+    }
+
+    /**
+     * @dev Generic internal staking function that updates rewards based on previous balances, then update balances
+     * @param _amount    Units to add to the users balance
+     * @param _receiver  Address of user who will receive the stake
+     */
+    function _processStake(uint256 _amount, address _receiver) internal updateReward(_receiver) {
+        require(_amount > 0, "Cannot stake 0");
+
+        // update storage variables
+        totalSupply = totalSupply + _amount;
+        balances[_receiver] = balances[_receiver] + _amount;
+
+        emit Staked(_receiver, _amount);
+    }
+
+    /**
+     * @dev Called by a staker to convert all their staked BPT balance to liqLIT (if target address set)
+     * Note crvDepositor address should be populated after rewards have ended
+     */
+    function convert() external updateReward(msg.sender) onlyAfterDate(START_VESTING_DATE) {
+        require(ICrvVoteEscrow(escrow).balanceOf(voterProxy) > 0, "Not activated");
+
+        uint256 userStake = balances[msg.sender];
+
+        // update state variables
+        totalSupply = totalSupply - userStake;
+        balances[msg.sender] = 0;
+
+        // deposit to crvDepositor for the user, liqLit is sent directly to the user
+        ICrvDepositor(crvDepositor).depositFor(msg.sender, userStake, true, address(0));
+
+        // register the user as vesting user
+        isVestingUser[msg.sender] = true;
+
+        emit Converted(msg.sender, userStake);
+    }
+
+    // ----- Withdraw Functions ----- //
+
+    /**
+     * @dev Called by a staker to withdraw all their BPT stake
+     * Note Rewards accumulated are renounced, users that withdraw are not eligible for rewards vesting
+     */
+    function withdraw() external updateReward(msg.sender) onlyAfterDate(START_WITHDRAWALS) {
+        require(ICrvVoteEscrow(escrow).balanceOf(voterProxy) == 0, "Activated");
+
+        uint256 userStake = balances[msg.sender];
+
+        require(userStake > 0, "Cannot withdraw 0");
+
+        totalSupply = totalSupply - userStake;
+        balances[msg.sender] = 0;
+
+        // track renounced reward balances from users that withdraw
+        uint256 rewardAccrued = rewards[msg.sender];
+        totalRenounced += rewardAccrued;
+        rewards[msg.sender] = 0;
+
+        stakingToken.safeTransfer(msg.sender, userStake);
+
+        emit Withdrawn(msg.sender, userStake);
+    }
+
+    // ----- Vesting Functions ----- //
+
+    /**
+     * @dev Called by a staker to get their vested LIQ rewards
+     * Note In convertStakeToLiqLit() we make sure that rewards[msg.sender] mapping reflects all rewards
+     */
+    function claim() external onlyAfterDate(START_VESTING_DATE) {
+        require(isVestingUser[msg.sender], "Not vesting User");
+
+        uint256 unclaimedAmount = getClaimableLiqVesting(msg.sender);
+        if (unclaimedAmount == 0) return;
+
+        // update rewards claimed mapping
+        claimed[msg.sender] += unclaimedAmount;
+
+        rewardToken.safeTransfer(msg.sender, unclaimedAmount);
+
+        emit Claimed(msg.sender, unclaimedAmount);
+    }
+
+    function getClaimableLiqVesting(address _account) public view returns (uint256 claimable) {
+        if (block.timestamp < START_VESTING_DATE) return 0;
+
+        if (block.timestamp >= END_VESTING_DATE) {
+            claimable = rewards[_account] - claimed[_account];
+        } else {
+            claimable =
+                ((rewards[_account] * (block.timestamp - START_VESTING_DATE)) /
+                    (END_VESTING_DATE - START_VESTING_DATE)) -
+                claimed[_account];
+        }
+    }
+
+    // ----- Protected Functions ----- //
+
+    /**
+     * @dev Called by authorized addresses to allocate new LIQ rewards to this pool
+     *      Rewards need to be first sent and subsequently call notifyRewardAmount
+     *      There is no pull method in the function
+     *      Can only be called before START_VESTING_DATE
+     */
+    function notifyRewardAmount(uint256 reward)
+        external
+        updateReward(address(0))
+        onlyAuthorized
+        onlyBeforeDate(START_VESTING_DATE)
+    {
+        rewardToken.safeTransferFrom(msg.sender, address(this), reward);
+
+        historicalRewards = historicalRewards + reward;
+
+        if (block.timestamp >= periodFinish) {
+            rewardRate = reward / duration;
+        } else {
+            uint256 remaining = periodFinish - block.timestamp;
+            uint256 leftover = remaining * rewardRate;
+            reward = reward + leftover;
+            rewardRate = reward / duration;
+        }
+
+        // Ensure the provided reward amount is not more than the balance in the contract.
+        // This keeps the reward rate in the right range, preventing overflows due to
+        // very high values of rewardRate in the earned and rewardsPerToken functions;
+        // Reward + leftover must be less than 2^256 / 10^18 to avoid overflow.
+        uint256 balance = rewardToken.balanceOf(address(this));
+        require(rewardRate <= balance.div(duration), "Provided reward too high");
+
+        currentRewards = reward;
+        lastUpdateTime = block.timestamp;
+        periodFinish = block.timestamp + duration;
+
+        emit RewardAdded(reward);
+    }
+
+    function setOwner(address _owner) external onlyAuthorized {
+        owner = _owner;
+
+        emit OwnerUpdated(_owner);
+    }
+
+    function setCrvDepositor(address _crvDepositor) external onlyAuthorized {
+        crvDepositor = _crvDepositor;
+
+        // approve crvDepositor to convert contract BPT to liqLIT
+        IERC20(stakingToken).safeApprove(crvDepositor, type(uint256).max);
+
+        emit CrvDepositorUpdated(_crvDepositor);
+    }
+
+    function setVoterProxy(address _voterProxy) external onlyAuthorized {
+        voterProxy = _voterProxy;
+
+        emit VoterProxyUpdated(_voterProxy);
+    }
+
+    function setRewardToken(address _rewardToken) external onlyAuthorized {
+        IERC20(_rewardToken).safeTransferFrom(owner, address(this), rewardToken.balanceOf(address(this)));
+
+        rewardToken = IERC20(_rewardToken);
+
+        emit RewardTokenUpdated(_rewardToken);
+    }
+
+    /**
+     * @dev Allows the owner to pull the renounced balances from people that withdrew
+     */
+    function recoverRenouncedLiq() external onlyAuthorized {
+        uint256 _totalRenounced = totalRenounced;
+
+        totalRenounced = 0;
+        rewardToken.safeTransfer(msg.sender, _totalRenounced);
+
+        emit Recovered(address(rewardToken), _totalRenounced);
+    }
+
+    /**
+     * @dev Allows the owner to recover other ERC20s mistakingly sent to this contract
+     */
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyAuthorized {
+        require(tokenAddress != address(stakingToken) && tokenAddress != address(rewardToken), "Not valid token");
+        IERC20(tokenAddress).safeTransfer(owner, tokenAmount);
+
+        emit Recovered(tokenAddress, tokenAmount);
+    }
+
+    // ----- Modifiers ----- //
+
+    modifier onlyAuthorized() {
+        require(msg.sender == owner, "!auth");
+        _;
+    }
+
+    modifier onlyAfterDate(uint256 limitDate) {
+        require(block.timestamp > limitDate, "Currently not possible");
+        _;
+    }
+
+    modifier onlyBeforeDate(uint256 limitDate) {
+        require(block.timestamp < limitDate, "No longer possible");
+        _;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/math/SafeMath.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/SafeMath.sol)
+
+pragma solidity ^0.8.0;
+
+// CAUTION
+// This version of SafeMath should only be used with Solidity 0.8 or later,
+// because it relies on the compiler's built in overflow checks.
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations.
+ *
+ * NOTE: `SafeMath` is generally not needed starting with Solidity 0.8, since the compiler
+ * now has built in overflow checking.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a - b;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a * b;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator.
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a / b;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a % b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {trySub}.
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b <= a, errorMessage);
+            return a - b;
+        }
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a / b;
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting with custom message when dividing by zero.
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {tryMod}.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a % b;
+        }
+    }
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: @openzeppelin/contracts/utils/Address.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../extensions/IERC20Permit.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20 token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Compatible with tokens that require the approval to be set to
+     * 0 before setting it to a non-zero value.
+     */
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && Address.isContract(address(token));
+    }
+}
+
+
+// File: contracts/interfaces/ICrvDepositor.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.11;
+
+interface ICrvDepositor {
+    function depositFor(
+        address to,
+        uint256 _amount,
+        bool _lock,
+        address _stakeAddress
+    ) external;
+}
+
+
+// File: contracts/interfaces/ILitDepositorHelper.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.11;
+
+interface ILitDepositorHelper {
+    function deposit(
+        uint256 _amount,
+        uint256 _minOut,
+        bool _lock,
+        address _stakeAddress
+    ) external returns (uint256 bptOut);
+
+    function depositFor(
+        address _for,
+        uint256 _amount,
+        uint256 _minOut,
+        bool _lock,
+        address _stakeAddress
+    ) external returns (uint256 bptOut);
+
+    function convertLitToBpt(uint256 _amount, uint256 _minOut) external returns (uint256 bptOut);
+}
+
+
+// File: contracts/interfaces/ICrvVoteEscrow.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.11;
+
+interface ICrvVoteEscrow {
+    function balanceOf(address) external view returns (uint256);
+}
+
+
+// File: contracts/utils/Math.sol
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.11;
+
+/// @notice A library for performing overflow-/underflow-safe math,
+/// updated with awesomeness from of DappHub (https://github.com/dapphub/ds-math).
+library Math {
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function add(uint256 a, uint256 b) internal pure returns (uint256 c) {
+        c = a + b;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256 c) {
+        c = a - b;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256 c) {
+        c = a * b;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a / b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow, so we distribute.
+        return (a / 2) + (b / 2) + (((a % 2) + (b % 2)) / 2);
+    }
+
+    function to224(uint256 a) internal pure returns (uint224 c) {
+        require(a <= type(uint224).max, "Math: uint224 Overflow");
+        c = uint224(a);
+    }
+
+    function to128(uint256 a) internal pure returns (uint128 c) {
+        require(a <= type(uint128).max, "Math: uint128 Overflow");
+        c = uint128(a);
+    }
+
+    function to112(uint256 a) internal pure returns (uint112 c) {
+        require(a <= type(uint112).max, "Math: uint112 Overflow");
+        c = uint112(a);
+    }
+
+    function to96(uint256 a) internal pure returns (uint96 c) {
+        require(a <= type(uint96).max, "Math: uint96 Overflow");
+        c = uint96(a);
+    }
+
+    function to32(uint256 a) internal pure returns (uint32 c) {
+        require(a <= type(uint32).max, "Math: uint32 Overflow");
+        c = uint32(a);
+    }
+}
+
+/// @notice A library for performing overflow-/underflow-safe addition and subtraction on uint32.
+library Math32 {
+    function sub(uint32 a, uint32 b) internal pure returns (uint32 c) {
+        c = a - b;
+    }
+}
+
+/// @notice A library for performing overflow-/underflow-safe addition and subtraction on uint112.
+library Math112 {
+    function add(uint112 a, uint112 b) internal pure returns (uint112 c) {
+        c = a + b;
+    }
+
+    function sub(uint112 a, uint112 b) internal pure returns (uint112 c) {
+        c = a - b;
+    }
+}
+
+/// @notice A library for performing overflow-/underflow-safe addition and subtraction on uint224.
+library Math224 {
+    function add(uint224 a, uint224 b) internal pure returns (uint224 c) {
+        c = a + b;
+    }
+}
+
+
+// File: @openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+

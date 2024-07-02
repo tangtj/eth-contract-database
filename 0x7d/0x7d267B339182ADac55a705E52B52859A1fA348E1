@@ -1,0 +1,741 @@
+
+// File: contracts/bridge/SourceBridge.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+import "contracts/interfaces/IAxelarGateway.sol";
+import "contracts/interfaces/IAxelarGasService.sol";
+import "contracts/interfaces/IMulticall.sol";
+import "contracts/interfaces/IRWALike.sol";
+import {AddressToString} from "contracts/external/axelar/StringAddressUtils.sol";
+import "contracts/external/openzeppelin/contracts/access/Ownable.sol";
+import "contracts/external/openzeppelin/contracts/security/Pausable.sol";
+
+contract SourceBridge is Ownable, Pausable, IMulticall {
+  /// @notice Mapping from destination chain to bridge address on that chain
+  /// @dev Axelar uses the string representation of addresses, hence we store
+  ///      the address as a string
+  mapping(string => string) public destChainToContractAddr;
+
+  /// @notice Token contract bridged by this contract
+  IRWALike public immutable TOKEN;
+
+  /// @notice Pointer  to AxelarGateway contract
+  IAxelarGateway public immutable AXELAR_GATEWAY;
+
+  /// @notice Pointer to AxelarGasService contract
+  IAxelarGasService public immutable GAS_RECEIVER;
+
+  /// @notice Versioning for payload
+  bytes32 public constant VERSION = "1.0";
+
+  /// @notice Monotonically increasing nonce for each transaction
+  uint256 public nonce;
+
+  /// @notice src Chain Id, used to salt txnHash on dst Chain
+  uint256 public immutable CHAIN_ID;
+
+  /**
+   * @notice Constructor
+   *
+   * @param _token The address of the token bridged
+   * @param _axelarGateway The address of the AxelarGateway contract
+   * @param _gasService The address of the AxelarGasService contract
+   * @param owner The owner of the contract
+   */
+  constructor(
+    address _token,
+    address _axelarGateway,
+    address _gasService,
+    address owner
+  ) {
+    TOKEN = IRWALike(_token);
+    AXELAR_GATEWAY = IAxelarGateway(_axelarGateway);
+    GAS_RECEIVER = IAxelarGasService(_gasService);
+    _transferOwnership(owner);
+    CHAIN_ID = block.chainid;
+  }
+
+  /**
+   * @notice Burns tokens on the source Chain and calls AxelarGateway contract
+   *         to mint tokens on the destination chain
+   *
+   * @param amount The amount of tokens to burn
+   * @param destinationChain The destination chain to mint tokens on
+   *
+   * @dev The amount of tokens to mint is the same as the amount burned
+   * @dev User must approve `amount` tokens to this contract before bridging
+   */
+  function burnAndCallAxelar(
+    uint256 amount,
+    string calldata destinationChain
+  ) external payable whenNotPaused {
+    // Ensure that some gas is sent
+    if (msg.value == 0) {
+      revert GasFeeTooLow();
+    }
+
+    // Ensure that amount bridged is not zero
+    if (amount == 0) {
+      revert CannotBridgeZero();
+    }
+
+    // Check destinationChain is correct
+    string memory destContract = destChainToContractAddr[destinationChain];
+
+    if (bytes(destContract).length == 0) {
+      revert DestinationNotSupported();
+    }
+
+    // burn amount
+    TOKEN.burnFrom(msg.sender, amount);
+
+    bytes memory payload = abi.encode(
+      VERSION,
+      CHAIN_ID,
+      msg.sender,
+      amount,
+      nonce++
+    );
+
+    _payGasAndCallContract(destinationChain, destContract, payload);
+    emit BridgeInitiated(msg.sender, nonce - 1, CHAIN_ID, VERSION, amount);
+  }
+
+  /**
+   * @notice Helper function that pays gas and calls the AxelarGateway contract
+   *
+   * @param destinationChain The destination chain to mint tokens on
+   * @param destContract The contract address on the destination chain
+   * @param payload The payload to send to the AxelarGateway contract
+   */
+  function _payGasAndCallContract(
+    string calldata destinationChain,
+    string memory destContract,
+    bytes memory payload
+  ) private {
+    GAS_RECEIVER.payNativeGasForContractCall{value: msg.value}(
+      address(this),
+      destinationChain,
+      destContract,
+      payload,
+      msg.sender
+    );
+
+    // Send all information to AxelarGateway contract.
+    AXELAR_GATEWAY.callContract(destinationChain, destContract, payload);
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                          Admin Functions
+  //////////////////////////////////////////////////////////////*/
+
+  /**
+   * @notice Sets the destination chain to contract address mapping
+   *
+   * @param destinationChain The destination chain
+   * @param contractAddress The contract address on the destination chain
+   *
+   * @dev Chain name must come from list of supported chains
+   *      at https://docs.axelar.dev/dev/reference/mainnet-chain-names
+   */
+  function setDestinationChainContractAddress(
+    string calldata destinationChain,
+    address contractAddress
+  ) external onlyOwner {
+    destChainToContractAddr[destinationChain] = AddressToString.toString(
+      contractAddress
+    );
+    emit DestinationChainContractAddressSet(destinationChain, contractAddress);
+  }
+
+  /**
+   * @notice Deletes an entry w/n the destination chain to contract address
+   *         mapping
+   *
+   * @param destinationChain The destination chain to disallow
+   */
+  function removeDestinationChainContractAddress(
+    string calldata destinationChain
+  ) external onlyOwner {
+    delete destChainToContractAddr[destinationChain];
+    emit ChainSupportRemoved(destinationChain);
+  }
+
+  /**
+   * @notice Admin function to pause the contract
+   *
+   * @dev Only used for bridge functions
+   */
+  function pause() external onlyOwner {
+    _pause();
+  }
+
+  /**
+   * @notice Admin function to unpause the contract
+   *
+   * @dev Only used for bridge functions
+   */
+  function unpause() external onlyOwner {
+    _unpause();
+  }
+
+  /**
+   * @notice Allows for arbitrary batched calls
+   *
+   * @dev All external calls made through this function will
+   *      msg.sender == contract address
+   *
+   * @param exCallData Struct consisting of
+   *       1) target - contract to call
+   *       2) data - data to call target with
+   *       3) value - eth value to call target with
+   */
+  function multiexcall(
+    ExCallData[] calldata exCallData
+  ) external payable override onlyOwner returns (bytes[] memory results) {
+    results = new bytes[](exCallData.length);
+    for (uint256 i = 0; i < exCallData.length; ++i) {
+      (bool success, bytes memory ret) = address(exCallData[i].target).call{
+        value: exCallData[i].value
+      }(exCallData[i].data);
+      require(success, "Call Failed");
+      results[i] = ret;
+    }
+  }
+
+  /*//////////////////////////////////////////////////////////////
+                           Events & Errors
+  //////////////////////////////////////////////////////////////*/
+
+  /**
+   * @notice Event emitted when the destination chain to contract address mapping is set
+   *
+   * @param destinationChain The destination chain
+   * @param contractAddress The contract address on the destination chain
+   */
+  event DestinationChainContractAddressSet(
+    string indexed destinationChain,
+    address contractAddress
+  );
+
+  /**
+   * @notice Event emitted when a message is passed to an Axelar gateway
+   *
+   * @param user    The account initiating the msg pass
+   * @param nonce   The nonce of the src bridge for this msg pass
+   * @param chainId The chainId of the chain which the src bridge is deployed to
+   * @param version The payload version
+   * @param amount  The amount field in the msg being passed
+   */
+  event BridgeInitiated(
+    address indexed user,
+    uint256 indexed nonce,
+    uint256 indexed chainId,
+    bytes32 version,
+    uint256 amount
+  );
+  /**
+   * @notice Event emitted when the destination chain to contract address mapping is
+   *         deleted
+   *
+   * @param destinationChain The destination chain to be removed;
+   */
+  event ChainSupportRemoved(string indexed destinationChain);
+
+  // Errors
+  error DestinationNotSupported();
+  error GasFeeTooLow();
+  error CannotBridgeZero();
+}
+
+
+// File: contracts/external/axelar/StringAddressUtils.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+library StringToAddress {
+  error InvalidAddressString();
+
+  function toAddress(
+    string memory addressString
+  ) internal pure returns (address) {
+    bytes memory stringBytes = bytes(addressString);
+    uint160 addressNumber = 0;
+    uint8 stringByte;
+
+    if (
+      stringBytes.length != 42 || stringBytes[0] != "0" || stringBytes[1] != "x"
+    ) revert InvalidAddressString();
+
+    for (uint256 i = 2; i < 42; ++i) {
+      stringByte = uint8(stringBytes[i]);
+
+      if ((stringByte >= 97) && (stringByte <= 102)) stringByte -= 87;
+      else if ((stringByte >= 65) && (stringByte <= 70)) stringByte -= 55;
+      else if ((stringByte >= 48) && (stringByte <= 57)) stringByte -= 48;
+      else revert InvalidAddressString();
+
+      addressNumber |= uint160(uint256(stringByte) << ((41 - i) << 2));
+    }
+    return address(addressNumber);
+  }
+}
+
+library AddressToString {
+  function toString(address addr) internal pure returns (string memory) {
+    bytes memory addressBytes = abi.encodePacked(addr);
+    uint256 length = addressBytes.length;
+    bytes memory characters = "0123456789abcdef";
+    bytes memory stringBytes = new bytes(2 + addressBytes.length * 2);
+
+    stringBytes[0] = "0";
+    stringBytes[1] = "x";
+
+    for (uint256 i; i < length; ++i) {
+      stringBytes[2 + i * 2] = characters[uint8(addressBytes[i] >> 4)];
+      stringBytes[3 + i * 2] = characters[uint8(addressBytes[i] & 0x0f)];
+    }
+    return string(stringBytes);
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/access/Ownable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+  address private _owner;
+
+  event OwnershipTransferred(
+    address indexed previousOwner,
+    address indexed newOwner
+  );
+
+  /**
+   * @dev Initializes the contract setting the deployer as the initial owner.
+   */
+  constructor() {
+    _transferOwnership(_msgSender());
+  }
+
+  /**
+   * @dev Returns the address of the current owner.
+   */
+  function owner() public view virtual returns (address) {
+    return _owner;
+  }
+
+  /**
+   * @dev Throws if called by any account other than the owner.
+   */
+  modifier onlyOwner() {
+    require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    _;
+  }
+
+  /**
+   * @dev Leaves the contract without owner. It will not be possible to call
+   * `onlyOwner` functions anymore. Can only be called by the current owner.
+   *
+   * NOTE: Renouncing ownership will leave the contract without an owner,
+   * thereby removing any functionality that is only available to the owner.
+   */
+  function renounceOwnership() public virtual onlyOwner {
+    _transferOwnership(address(0));
+  }
+
+  /**
+   * @dev Transfers ownership of the contract to a new account (`newOwner`).
+   * Can only be called by the current owner.
+   */
+  function transferOwnership(address newOwner) public virtual onlyOwner {
+    require(newOwner != address(0), "Ownable: new owner is the zero address");
+    _transferOwnership(newOwner);
+  }
+
+  /**
+   * @dev Transfers ownership of the contract to a new account (`newOwner`).
+   * Internal function without access restriction.
+   */
+  function _transferOwnership(address newOwner) internal virtual {
+    address oldOwner = _owner;
+    _owner = newOwner;
+    emit OwnershipTransferred(oldOwner, newOwner);
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/security/Pausable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (security/Pausable.sol)
+
+pragma solidity ^0.8.0;
+
+import "contracts/external/openzeppelin/contracts/utils/Context.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+  /**
+   * @dev Emitted when the pause is triggered by `account`.
+   */
+  event Paused(address account);
+
+  /**
+   * @dev Emitted when the pause is lifted by `account`.
+   */
+  event Unpaused(address account);
+
+  bool private _paused;
+
+  /**
+   * @dev Initializes the contract in unpaused state.
+   */
+  constructor() {
+    _paused = false;
+  }
+
+  /**
+   * @dev Returns true if the contract is paused, and false otherwise.
+   */
+  function paused() public view virtual returns (bool) {
+    return _paused;
+  }
+
+  /**
+   * @dev Modifier to make a function callable only when the contract is not paused.
+   *
+   * Requirements:
+   *
+   * - The contract must not be paused.
+   */
+  modifier whenNotPaused() {
+    require(!paused(), "Pausable: paused");
+    _;
+  }
+
+  /**
+   * @dev Modifier to make a function callable only when the contract is paused.
+   *
+   * Requirements:
+   *
+   * - The contract must be paused.
+   */
+  modifier whenPaused() {
+    require(paused(), "Pausable: not paused");
+    _;
+  }
+
+  /**
+   * @dev Triggers stopped state.
+   *
+   * Requirements:
+   *
+   * - The contract must not be paused.
+   */
+  function _pause() internal virtual whenNotPaused {
+    _paused = true;
+    emit Paused(_msgSender());
+  }
+
+  /**
+   * @dev Returns to normal state.
+   *
+   * Requirements:
+   *
+   * - The contract must be paused.
+   */
+  function _unpause() internal virtual whenPaused {
+    _paused = false;
+    emit Unpaused(_msgSender());
+  }
+}
+
+
+// File: contracts/external/openzeppelin/contracts/token/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+  /**
+   * @dev Returns the amount of tokens in existence.
+   */
+  function totalSupply() external view returns (uint256);
+
+  /**
+   * @dev Returns the amount of tokens owned by `account`.
+   */
+  function balanceOf(address account) external view returns (uint256);
+
+  /**
+   * @dev Moves `amount` tokens from the caller's account to `to`.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transfer(address to, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Returns the remaining number of tokens that `spender` will be
+   * allowed to spend on behalf of `owner` through {transferFrom}. This is
+   * zero by default.
+   *
+   * This value changes when {approve} or {transferFrom} are called.
+   */
+  function allowance(address owner, address spender)
+    external
+    view
+    returns (uint256);
+
+  /**
+   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * IMPORTANT: Beware that changing an allowance with this method brings the risk
+   * that someone may use both the old and the new allowance by unfortunate
+   * transaction ordering. One possible solution to mitigate this race
+   * condition is to first reduce the spender's allowance to 0 and set the
+   * desired value afterwards:
+   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+   *
+   * Emits an {Approval} event.
+   */
+  function approve(address spender, uint256 amount) external returns (bool);
+
+  /**
+   * @dev Moves `amount` tokens from `from` to `to` using the
+   * allowance mechanism. `amount` is then deducted from the caller's
+   * allowance.
+   *
+   * Returns a boolean value indicating whether the operation succeeded.
+   *
+   * Emits a {Transfer} event.
+   */
+  function transferFrom(
+    address from,
+    address to,
+    uint256 amount
+  ) external returns (bool);
+
+  /**
+   * @dev Emitted when `value` tokens are moved from one account (`from`) to
+   * another (`to`).
+   *
+   * Note that `value` may be zero.
+   */
+  event Transfer(address indexed from, address indexed to, uint256 value);
+
+  /**
+   * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+   * a call to {approve}. `value` is the new allowance.
+   */
+  event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+
+// File: contracts/external/openzeppelin/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+  function _msgSender() internal view virtual returns (address) {
+    return msg.sender;
+  }
+
+  function _msgData() internal view virtual returns (bytes calldata) {
+    return msg.data;
+  }
+}
+
+
+// File: contracts/interfaces/IAxelarGasService.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+// This should be owned by the microservice that is paying for gas.
+interface IAxelarGasService {
+  // This is called on the source chain before calling the gateway to execute a remote contract.
+  function payNativeGasForContractCall(
+    address sender,
+    string calldata destinationChain,
+    string calldata destinationAddress,
+    bytes calldata payload,
+    address refundAddress
+  ) external payable;
+}
+
+
+// File: contracts/interfaces/IAxelarGateway.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IAxelarGateway {
+  function callContract(
+    string calldata destinationChain,
+    string calldata contractAddress,
+    bytes calldata payload
+  ) external;
+
+  function validateContractCall(
+    bytes32 commandId,
+    string calldata sourceChain,
+    string calldata sourceAddress,
+    bytes32 payloadHash
+  ) external returns (bool);
+
+  function validateContractCallAndMint(
+    bytes32 commandId,
+    string calldata sourceChain,
+    string calldata sourceAddress,
+    bytes32 payloadHash,
+    string calldata symbol,
+    uint256 amount
+  ) external returns (bool);
+}
+
+
+// File: contracts/interfaces/IMulticall.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+
+ */
+pragma solidity 0.8.16;
+
+/**
+ * @title IMulticall
+ * @author Ondo Finance
+ * @notice This interface dictates the required external functions for Ondo's
+ *         multicall contract.
+ */
+interface IMulticall {
+  /// @dev External call data structure
+  struct ExCallData {
+    // The contract we intend to call
+    address target;
+    // The encoded function data for the call
+    bytes data;
+    // The ether value to be sent in the call
+    uint256 value;
+  }
+
+  /**
+   * @notice Batches multiple function calls to different target contracts
+   *         and returns the resulting data provided all calls were successful
+   *
+   * @dev The `msg.sender` is always the contract from which this function
+   *      is being called
+   *
+   * @param exdata The ExCallData struct array containing the information
+   *               regarding which contract to call, what data to call with,
+   *               and what ether value to send along with the call
+   *
+   * @return results The resulting data returned from each call made
+   */
+  function multiexcall(
+    ExCallData[] calldata exdata
+  ) external payable returns (bytes[] memory results);
+}
+
+
+// File: contracts/interfaces/IRWALike.sol
+/**SPDX-License-Identifier: BUSL-1.1
+
+      ▄▄█████████▄
+   ╓██▀└ ,╓▄▄▄, '▀██▄
+  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,
+ ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,
+██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌
+██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██
+╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀
+ ██ "██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`
+  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬
+   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀
+      ╙▀▀██████R⌐
+ */
+pragma solidity 0.8.16;
+
+// This interface is not inherited directly by RWA, instead, it is a
+// subset of functions provided by all RWA tokens that the RWA Hub
+// Client uses.
+import "contracts/external/openzeppelin/contracts/token/IERC20.sol";
+
+interface IRWALike is IERC20 {
+  function mint(address to, uint256 amount) external;
+
+  function burn(uint256 amount) external;
+
+  function burnFrom(address from, uint256 amount) external;
+}
+

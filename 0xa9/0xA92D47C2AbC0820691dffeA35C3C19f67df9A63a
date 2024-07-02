@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: MIT
+// Twitter: https://x.com/ModularismEth
+// Telegram: https://t.me/Modularismeth
+// Website: https://modularism.io/
+// Github: https://github.com/Modularismio/modularismv1/tree/main
+
+// { ERC-M } Modularism allows you to create modular Solidity contracts, providing low transaction fees and secure systems.
+// The Modularism Smart Contract provides low-cost and secure token transfers and spending allowance management on the Ethereum network. Token transfers and balances are managed with BalanceContract, while spending allowances are managed with ApproveContract. This modular structure makes transactions easy and secure.
+pragma solidity ^0.8.26;
+
+interface IApproveContract {
+    function approve(address owner, address spender, uint256 amount, address ca) external returns (bool);
+    function allowance(address owner, address spender, address ca) external view returns (uint256);
+}
+
+interface IBalanceContract {
+    function transfer(address sender, address recipient, uint256 amount, address ca) external returns (bool);
+    function balanceOf(address account, address ca) external view returns (uint256);
+    function register(address ca, uint256 totalSupply) external;
+}
+
+contract MainContract {
+    string public constant name = "Modularism v2";
+    string public constant symbol = "Modularismv2";
+    uint8 public constant decimals = 18;
+
+    uint256 public totalSupply = 100000 * (10 ** uint256(decimals));
+
+    IApproveContract private _approveContract;
+    IBalanceContract private _balanceContract;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    constructor(address approveAddress, address balanceAddress) {
+        _approveContract = IApproveContract(approveAddress);
+        _balanceContract = IBalanceContract(balanceAddress);
+        _balanceContract.register(address(this), totalSupply);
+        emit Transfer(address(0), msg.sender, totalSupply);
+
+    }
+
+    function transfer(address to, uint256 amount) public returns (bool) {
+        emit Transfer(msg.sender, to, amount);
+        bool success = _balanceContract.transfer(msg.sender, to, amount, address(this));
+        require(success, "Transfer failed.");
+        return success;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public returns (bool) {
+        uint256 currentAllowance = _approveContract.allowance(from, msg.sender, address(this));
+        require(currentAllowance >= amount, "Transfer amount exceeds allowance");
+        bool success = _balanceContract.transfer(from, to, amount, address(this));
+        require(success, "Transfer failed.");
+        _approveContract.approve(from, msg.sender, currentAllowance - amount, address(this));
+        emit Transfer(from, to, amount);
+        return success;
+    }
+
+    function balanceOf(address account) public view returns (uint256) {
+        return _balanceContract.balanceOf(account, address(this));
+    }
+
+    function approve(address spender, uint256 amount) public returns (bool) {
+        emit Approval(msg.sender, spender, amount);
+        return _approveContract.approve(msg.sender, spender, amount, address(this));
+    }
+
+    function allowance(address owner, address spender) public view returns (uint256) {
+        return _approveContract.allowance(owner, spender, address(this));
+    }
+}

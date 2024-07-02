@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract DoYouLikeBitCOIN {
+        
+    event DoYouLikeBitCoin(bool UseTrue_1_OrFalse_0);
+
+    function doYouLikeBitCoin(bool _useTrue_1_OrFalse_0) public {
+        emit DoYouLikeBitCoin(_useTrue_1_OrFalse_0);
+    }
+
+
+}
