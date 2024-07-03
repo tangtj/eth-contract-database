@@ -1,0 +1,1580 @@
+
+// File: github/resolverworks/TheOffchainResolver.sol/src/TOR.sol
+/// @author raffy.eth
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+// interfaces
+import {ENS} from "@ensdomains/ens-contracts/contracts/registry/ENS.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {IExtendedResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/IExtendedResolver.sol";
+import {IExtendedDNSResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/IExtendedDNSResolver.sol";
+import {IAddrResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/IAddrResolver.sol";
+import {IAddressResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/IAddressResolver.sol";
+import {ITextResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/ITextResolver.sol";
+import {INameResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/INameResolver.sol";
+import {IPubkeyResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/IPubkeyResolver.sol";
+import {IContentHashResolver} from "@ensdomains/ens-contracts/contracts/resolvers/profiles/IContentHashResolver.sol";
+import {IMulticallable} from "@ensdomains/ens-contracts/contracts/resolvers/IMulticallable.sol";
+import {INameWrapper} from "@ensdomains/ens-contracts/contracts/wrapper/INameWrapper.sol";
+import {IReverseRegistrar} from "@ensdomains/ens-contracts/contracts/reverseRegistrar/IReverseRegistrar.sol";
+
+// libraries
+//import {ECDSA} from "./ECDSA.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {BytesUtils} from "@ensdomains/ens-contracts/contracts/wrapper/BytesUtils.sol";
+import {HexUtils} from "@ensdomains/ens-contracts/contracts/utils/HexUtils.sol";
+
+// https://eips.ethereum.org/EIPS/eip-3668
+error OffchainLookup(address from, string[] urls, bytes request, bytes4 callback, bytes carry);
+
+interface IOnchainResolver {
+	function onchain(bytes32 node) external view returns (bool);
+	event OnchainChanged(bytes32 indexed node, bool on);
+}
+
+contract TOR is IERC165, ITextResolver, IAddrResolver, IAddressResolver, IPubkeyResolver, IContentHashResolver, 
+		IMulticallable, IExtendedResolver, IExtendedDNSResolver, IOnchainResolver, INameResolver {
+	using BytesUtils for bytes;
+	using HexUtils for bytes;
+
+	error Unauthorized(address owner); // not operator of node
+	error InvalidContext(bytes context); // context too short or invalid signer
+	error Unreachable(bytes name);
+	error CCIPReadExpired(uint256 t); // ccip response is stale
+	error CCIPReadUntrusted(address signed, address expect);
+	error NodeCheck(bytes32 node);
+
+	uint256 constant COIN_TYPE_ETH = 60;
+	bytes32 constant ADDR_REVERSE_NODE = 0x91d1777781884d03a6757a803996e38de2a42967fb37eeaca72729271025a9e2; // https://adraffy.github.io/keccak.js/test/demo.html#algo=namehash&s=addr.reverse&escape=1&encoding=utf8	
+	uint256 constant COIN_TYPE_FALLBACK = 0xb32cdf4d3c016cb0f079f205ad61c36b1a837fb3e95c70a94bdedfca0518a010; // https://adraffy.github.io/keccak.js/test/demo.html#algo=keccak-256&s=fallback&escape=1&encoding=utf8
+	string constant TEXT_CONTEXT = "ccip.context";
+	bool constant REPLACE_WITH_ONCHAIN = true;
+	bool constant OFFCHAIN_ONLY = false;
+	bool constant CALL_WITH_NULL_NODE = true;
+	bool constant CALL_UNMODIFIED = false;
+	bytes4 constant PREFIX_ONLY_OFF = 0x000000FF;
+	bytes4 constant PREFIX_ONLY_ON = ~PREFIX_ONLY_OFF;
+	uint256 constant ERC165_GAS_LIMIT = 30000; // https://eips.ethereum.org/EIPS/eip-165
+	
+	ENS immutable ens;
+	INameWrapper immutable wrapper;
+	constructor(ENS _ens, INameWrapper _wrapper) {
+		ens = _ens; // wrapper.ens();
+		wrapper = _wrapper;
+		address owner = ens.owner(ADDR_REVERSE_NODE);
+		if (owner != address(0)) {
+			IReverseRegistrar(owner).claimWithResolver(msg.sender, address(this));
+		}
+	}
+
+	function supportsInterface(bytes4 x) external pure returns (bool) {
+		return x == type(IERC165).interfaceId
+			|| x == type(ITextResolver).interfaceId
+			|| x == type(IAddrResolver).interfaceId
+			|| x == type(IAddressResolver).interfaceId
+			|| x == type(IPubkeyResolver).interfaceId
+			|| x == type(IContentHashResolver).interfaceId
+			|| x == type(INameResolver).interfaceId
+			|| x == type(IMulticallable).interfaceId
+			|| x == type(IExtendedResolver).interfaceId
+			|| x == type(IExtendedDNSResolver).interfaceId
+			|| x == type(IOnchainResolver).interfaceId
+			|| x == 0x73302a25; // https://adraffy.github.io/keccak.js/test/demo.html#algo=evm&s=ccip.context&escape=1&encoding=utf8
+	}
+
+	// utils
+	modifier requireOperator(bytes32 node) {
+		address owner = ens.owner(node);
+		if (owner == address(wrapper) ? !wrapper.canModifyName(node, msg.sender) : (owner != msg.sender && !ens.isApprovedForAll(owner, msg.sender))) {
+			revert Unauthorized(owner); 
+		}
+		_;
+	}
+	function slotForCoin(bytes32 node, uint256 cty) internal pure returns (uint256) {
+		return uint256(keccak256(abi.encodeCall(IAddressResolver.addr, (node, cty))));
+	}
+	function slotForText(bytes32 node, string memory key) internal pure returns (uint256) {
+		return uint256(keccak256(abi.encodeCall(ITextResolver.text, (node, key))));
+	}
+	function slotForSelector(bytes4 selector, bytes32 node) internal pure returns (uint256) {
+		return uint256(keccak256(abi.encodeWithSelector(selector, node)));
+	}
+
+	// getters (structured)
+	function addr(bytes32 node) external view returns (address payable a) {
+		(bytes32 extnode, address resolver) = determineExternalFallback(node);
+		if (resolver != address(0) && IERC165(resolver).supportsInterface{gas: ERC165_GAS_LIMIT}(type(IAddrResolver).interfaceId)) {
+			a = IAddrResolver(resolver).addr(extnode);
+		}
+		if (a == address(0)) {
+			a = payable(address(bytes20(getTiny(slotForCoin(node, COIN_TYPE_ETH)))));
+		}
+	}
+	function pubkey(bytes32 node) external view returns (bytes32 x, bytes32 y) {
+		(bytes32 extnode, address resolver) = determineExternalFallback(node);
+		if (resolver != address(0) && IERC165(resolver).supportsInterface{gas: ERC165_GAS_LIMIT}(type(IPubkeyResolver).interfaceId)) {
+			(x, y) = IPubkeyResolver(resolver).pubkey(extnode);
+		}
+		if (x == 0 && y == 0) {
+			bytes memory v = getTiny(slotForSelector(IPubkeyResolver.pubkey.selector, node));
+			if (v.length == 64) (x, y) = abi.decode(v, (bytes32, bytes32));
+		}
+	}
+
+	// getters (bytes-like)
+	function addr(bytes32, uint256) external view returns (bytes memory) {
+		return reflectGetBytes(msg.data);
+	}
+	function text(bytes32, string calldata) external view returns (string memory) {
+		return string(reflectGetBytes(msg.data));
+	}
+	function contenthash(bytes32) external view returns (bytes memory) {
+		return reflectGetBytes(msg.data);
+	}
+	function name(bytes32) external view returns (string memory) {
+		return string(reflectGetBytes(msg.data));
+	}
+	function reflectGetBytes(bytes memory request) internal view returns (bytes memory v) {
+		bytes32 node;
+		assembly { node := mload(add(request, 36)) }
+		uint256 slot = uint256(keccak256(request)); // hash before we mangle
+		v = getTiny(slot);
+		if (v.length == 0) {
+			(bytes32 extnode, address resolver) = determineExternalFallback(node);
+			if (resolver != address(0)) {
+				assembly { mstore(add(request, 36), extnode) } // mangled
+				(bool ok, bytes memory u) = resolver.staticcall(request);
+				if (ok) {
+					v = abi.decode(u, (bytes));
+				}
+			}
+		}
+	}
+
+	// TOR helpers
+	function parseContext(bytes memory v) internal pure returns (string[] memory urls, address signer) {
+		// {SIGNER} {ENDPOINT}
+		// "0x51050ec063d393217B436747617aD1C2285Aeeee http://a" => (2 + 40 + 1 + 8)
+		if (v.length < 51) revert InvalidContext(v);
+		bool valid;
+		(signer, valid) = v.hexToAddress(2, 42); // unchecked 0x-prefix
+		if (!valid) revert InvalidContext(v);
+		assembly {
+			let size := mload(v)
+			v := add(v, 43) // drop address
+			mstore(v, sub(size, 43))
+		}
+		urls = new string[](1); // TODO: support multiple URLs
+		urls[0] = string(v);
+	}
+	function verifyOffchain(bytes calldata ccip, bytes memory carry) internal view returns (bytes memory request, bytes memory response, bool replace) {
+		bytes memory sig;
+		uint64 expires;
+		(sig, expires, response) = abi.decode(ccip, (bytes, uint64, bytes));
+		if (expires < block.timestamp) revert CCIPReadExpired(expires);
+		address signer;
+		(request, signer, replace) = abi.decode(carry, (bytes, address, bool));
+		bytes32 hash = keccak256(abi.encodePacked(address(this), expires, keccak256(request), keccak256(response)));
+		address signed = ECDSA.recover(hash, sig);
+		if (signed != signer) revert CCIPReadUntrusted(signed, signer);
+	}
+
+	// IExtendedDNSResolver
+	function resolve(bytes calldata dnsname, bytes calldata data, bytes calldata context) external view returns (bytes memory) {
+		(string[] memory urls, address signer) = parseContext(context);
+		bytes memory request = abi.encodeWithSelector(IExtendedResolver.resolve.selector, dnsname, data);
+		revert OffchainLookup(address(this), urls, request, this.buggedCallback.selector, abi.encode(abi.encode(request, signer, false), address(this)));
+	}
+	function buggedCallback(bytes calldata response, bytes calldata buggedExtraData) external view returns (bytes memory v) {
+		(, v, ) = verifyOffchain(response, abi.decode(buggedExtraData, (bytes)));
+	}
+
+	// IExtendedResolver
+	function resolve(bytes calldata dnsname, bytes calldata data) external view returns (bytes memory) {
+		unchecked {
+			bytes32 node = dnsname.namehash(0);
+			if (bytes4(data) == PREFIX_ONLY_ON) {
+				return resolveOnchain(data[4:], CALL_UNMODIFIED);
+			} else if (bytes4(data) == PREFIX_ONLY_OFF) {
+				if (onchain(node)) {
+					return resolveOnchain(data[4:], CALL_WITH_NULL_NODE);
+				} else {
+					resolveOffchain(dnsname, data[4:], OFFCHAIN_ONLY);
+				}
+			} else if (onchain(node)) { // manditory on-chain
+				return resolveOnchain(data, CALL_UNMODIFIED);
+			} else { // off-chain then replace with on-chain
+				if (bytes4(data) == IMulticallable.multicall.selector) {
+					bytes[] memory a = abi.decode(data[4:], (bytes[]));
+					bytes[] memory b = new bytes[](a.length);
+					// if one record is missing, go off-chain
+					for (uint256 i; i < a.length; i += 1) {
+						bytes memory v = getEncodedFallbackValue(a[i]);
+						if (v.length == 0) resolveOffchain(dnsname, data, REPLACE_WITH_ONCHAIN);
+						b[i] = v;
+					}
+					return abi.encode(b); // multi-answerable on-chain
+				} else {
+					bytes memory v = getEncodedFallbackValue(data);
+					if (v.length != 0) return v; // answerable on-chain
+					resolveOffchain(dnsname, data, OFFCHAIN_ONLY);
+				}
+			}
+		}
+	}
+	function resolveOnchain(bytes calldata data, bool clear) internal view returns (bytes memory result) {
+		if (bytes4(data) == IMulticallable.multicall.selector) {
+			bytes[] memory a = abi.decode(data[4:], (bytes[]));
+			for (uint256 i; i < a.length; i += 1) {
+				bytes memory v = a[i];
+				if (clear) assembly { mstore(add(v, 36), 0) } // clear the node
+				(, a[i]) = address(this).staticcall(v);
+			}
+			result = abi.encode(a);
+		} else {
+			bytes memory v = data;
+			if (clear) assembly { mstore(add(v, 36), 0) } // clear the node
+			(, result) = address(this).staticcall(v);
+		}
+	}
+	function resolveOffchain(bytes calldata dnsname, bytes calldata data, bool replace) internal view {
+		(string[] memory urls, address signer) = parseContext(findContext(dnsname));
+		bytes memory request = abi.encodeWithSelector(IExtendedResolver.resolve.selector, dnsname, data);
+		revert OffchainLookup(address(this), urls, request, this.ensCallback.selector, abi.encode(request, signer, replace));
+	}
+	function findContext(bytes calldata dnsname) internal view returns (bytes memory context) {
+		unchecked {
+			uint256 offset;
+			while (true) {
+				// find the first node in direct lineage...
+				bytes32 node = dnsname.namehash(offset);
+				if (ens.resolver(node) == address(this)) { // ...that is TOR
+					context = getTiny(slotForText(node, TEXT_CONTEXT));
+					if (context.length != 0) break; // ...and has non-null context
+				}
+				uint256 size = uint256(uint8(dnsname[offset]));
+				if (size == 0) revert Unreachable(dnsname);
+				offset += 1 + size;
+			}
+		}
+	}
+	function ensCallback(bytes calldata ccip, bytes calldata carry) external view returns (bytes memory) {
+		unchecked {
+			(bytes memory request, bytes memory response, bool replace) = verifyOffchain(ccip, carry);
+			// single record calls that had on-chain values would of been answered on-chain
+			// so we only need to handle multicall() replacement 
+			if (!replace) return response;
+			assembly {
+				mstore(add(request, 4), sub(mload(request), 4)) // trim resolve() selector
+				request := add(request, 4)
+			}
+			(, request) = abi.decode(request, (bytes, bytes));
+			assembly {
+				mstore(add(request, 4), sub(mload(request), 4)) // trim multicall() selector
+				request := add(request, 4)
+			}
+			bytes[] memory a = abi.decode(request,  (bytes[]));
+			bytes[] memory b = abi.decode(response, (bytes[]));
+			for (uint256 i; i < a.length; i += 1) {
+				bytes memory v = getEncodedFallbackValue(a[i]);
+				if (v.length != 0) b[i] = v; // replace with on-chain
+			}
+			return abi.encode(b);
+		}
+	}
+	function determineExternalFallback(bytes32 node) internal view returns (bytes32 extnode, address resolver) {
+		bytes memory v = getTiny(slotForCoin(node, COIN_TYPE_FALLBACK));
+		if (v.length == 20) { // resolver using same node
+			extnode = node;
+			resolver = address(bytes20(v));
+		} else {
+			if (v.length == 32) { // different node 
+				extnode = bytes32(v);
+			} else if (v.length != 0) { // external fallback disabled
+				// extnode = 0 => resolver = 0
+			} else { // default
+				// derived: namehash("_" + node)
+				// https://adraffy.github.io/keccak.js/test/demo.html#algo=keccak-256&s=_&escape=1&encoding=utf8
+				extnode = keccak256(abi.encode(node, 0xcd5edcba1904ce1b09e94c8a2d2a85375599856ca21c793571193054498b51d7));
+			}
+			// Q: should this be ENSIP-10?
+			// A: no, since we're calling on-chain methods
+			resolver = ens.resolver(extnode); 
+		}
+	}
+	function getEncodedFallbackValue(bytes memory request) internal view returns (bytes memory encoded) {
+		(bool ok, bytes memory v) = address(this).staticcall(request);
+		if (ok && !isNullAssumingPadded(v)) {
+			// unfortunately it is impossible to determine if an arbitrary abi-encoded response is null
+			// abi.encode('') = 0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000
+			// https://adraffy.github.io/keccak.js/test/demo.html#algo=keccak-256&s=0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000&escape=1&encoding=hex
+			if (keccak256(v) != 0x569e75fc77c1a856f6daaf9e69d8a9566ca34aa47f9133711ce065a571af0cfd) {
+				encoded = v;
+			}
+		}
+	}
+	function isNullAssumingPadded(bytes memory v) internal pure returns (bool ret) {
+		assembly {
+			let p := add(v, 32)
+			let e := add(p, mload(v))
+			for { ret := 1 } lt(p, e) { p := add(p, 32) } {
+				if iszero(iszero(mload(p))) { // != 0
+					ret := 0
+					break
+				}
+			}
+		}
+	}
+
+	// multicall (for efficient multi-record writes)
+	// Q: allow ccip-read through this mechanism?
+	// A: no, too complex (mixed targets) and not ENSIP-10 compatible
+	function multicall(bytes[] calldata calls) external returns (bytes[] memory) {
+		return _multicall(0, calls);
+	}
+	function multicallWithNodeCheck(bytes32 nodehash, bytes[] calldata calls) external returns (bytes[] memory) {
+		return _multicall(nodehash, calls);
+	}
+	function _multicall(bytes32 node, bytes[] calldata calls) internal returns (bytes[] memory answers) {
+		unchecked {
+			answers = new bytes[](calls.length);
+			for (uint256 i; i < calls.length; i += 1) {
+				if (node != 0) {
+					bytes32 check = bytes32(calls[i][4:36]);
+					if (check != node) revert NodeCheck(check);
+				}
+				(bool ok, bytes memory v) = address(this).delegatecall(calls[i]);
+				require(ok);
+				answers[i] = v;
+			}
+		}
+	}
+
+	// setters
+	function setAddr(bytes32 node, address a) external {
+		setAddr(node, COIN_TYPE_ETH, a == address(0) ? bytes('') : abi.encodePacked(a));
+	}
+	function setAddr(bytes32 node, uint256 cty, bytes memory v) requireOperator(node) public {
+		setTiny(slotForCoin(node, cty), v);
+		emit AddressChanged(node, cty, v);
+		if (cty == COIN_TYPE_ETH) emit AddrChanged(node, address(bytes20(v)));
+	}
+	function setText(bytes32 node, string calldata key, string calldata s) requireOperator(node) external {
+		setTiny(slotForText(node, key), bytes(s));
+		emit TextChanged(node, key, key, s);
+	}
+	function setContenthash(bytes32 node, bytes calldata v) requireOperator(node) external {
+		setTiny(slotForSelector(IContentHashResolver.contenthash.selector, node), v);
+		emit ContenthashChanged(node, v);
+	}
+	function setPubkey(bytes32 node, bytes32 x, bytes32 y) requireOperator(node) external {
+		setTiny(slotForSelector(IPubkeyResolver.pubkey.selector, node), x == 0 && y == 0 ? bytes('') : abi.encode(x, y));
+		emit PubkeyChanged(node, x, y);
+	}
+	function setName(bytes32 node, string calldata s) requireOperator(node) external {
+		setTiny(slotForSelector(INameResolver.name.selector, node), bytes(s));
+		emit NameChanged(node, s);
+	}
+
+	// IOnchainResolver
+	function toggleOnchain(bytes32 node) requireOperator(node) external {
+		uint256 slot = slotForSelector(IOnchainResolver.onchain.selector, node);
+		bool on;
+		assembly { 
+			on := iszero(sload(slot))
+			sstore(slot, on)
+		}
+		emit OnchainChanged(node, on);
+	}
+	function onchain(bytes32 node) public view returns (bool) {		
+		uint256 slot = slotForSelector(IOnchainResolver.onchain.selector, node);
+		assembly { slot := sload(slot) }
+		return slot != 0;
+	}
+	
+	// ************************************************************
+	// TinyKV.sol: https://github.com/adraffy/TinyKV.sol
+
+	// header: first 4 bytes
+	// [00000000_00000000000000000000000000000000000000000000000000000000] // null (0 slot)
+	// [00000001_XX000000000000000000000000000000000000000000000000000000] // 1 byte (1 slot)
+	// [0000001C_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX] // 28 bytes (1 slot
+	// [0000001D_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX][XX000000...] // 29 bytes (2 slots)
+	function tinySlots(uint256 size) internal pure returns (uint256) {
+		unchecked {
+			return size != 0 ? (size + 35) >> 5 : 0; // ceil((4 + size) / 32)
+		}
+	}
+	function setTiny(uint256 slot, bytes memory v) internal {
+		unchecked {
+			uint256 head;
+			assembly { head := sload(slot) }
+			uint256 size;
+			assembly { size := mload(v) }
+			uint256 n0 = tinySlots(head >> 224);
+			uint256 n1 = tinySlots(size);
+			assembly {
+				// overwrite
+				if gt(n1, 0) {
+					sstore(slot, or(shl(224, size), shr(32, mload(add(v, 32)))))
+					let ptr := add(v, 60)
+					for { let i := 1 } lt(i, n1) { i := add(i, 1) } {
+						sstore(add(slot, i), mload(ptr))
+						ptr := add(ptr, 32)
+					}
+				}
+				// clear unused
+				for { let i := n1 } lt(i, n0) { i := add(i, 1) } {
+					sstore(add(slot, i), 0)
+				}
+			}
+		}
+	}
+	function getTiny(uint256 slot) internal view returns (bytes memory v) {
+		unchecked {
+			uint256 head;
+			assembly { head := sload(slot) }
+			uint256 size = head >> 224;
+			if (size != 0) {
+				v = new bytes(size);
+				uint256 n = tinySlots(size);
+				assembly {
+					mstore(add(v, 32), shl(32, head))
+					let p := add(v, 60)
+					for { let i := 1 } lt(i, n) { i := add(i, 1) } {
+						mstore(p, sload(add(slot, i)))
+						p := add(p, 32)
+					}
+				}
+			}
+		}
+	}
+
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/utils/HexUtils.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+library HexUtils {
+    /**
+     * @dev Attempts to parse bytes32 from a hex string
+     * @param str The string to parse
+     * @param idx The offset to start parsing at
+     * @param lastIdx The (exclusive) last index in `str` to consider. Use `str.length` to scan the whole string.
+     */
+    function hexStringToBytes32(
+        bytes memory str,
+        uint256 idx,
+        uint256 lastIdx
+    ) internal pure returns (bytes32 r, bool valid) {
+        uint256 hexLength = lastIdx - idx;
+        if ((hexLength != 64 && hexLength != 40) || hexLength % 2 == 1) {
+            revert("Invalid string length");
+        }
+        valid = true;
+        assembly {
+            // check that the index to read to is not past the end of the string
+            if gt(lastIdx, mload(str)) {
+                revert(0, 0)
+            }
+
+            function getHex(c) -> ascii {
+                // chars 48-57: 0-9
+                if and(gt(c, 47), lt(c, 58)) {
+                    ascii := sub(c, 48)
+                    leave
+                }
+                // chars 65-70: A-F
+                if and(gt(c, 64), lt(c, 71)) {
+                    ascii := add(sub(c, 65), 10)
+                    leave
+                }
+                // chars 97-102: a-f
+                if and(gt(c, 96), lt(c, 103)) {
+                    ascii := add(sub(c, 97), 10)
+                    leave
+                }
+                // invalid char
+                ascii := 0xff
+            }
+
+            let ptr := add(str, 32)
+            for {
+                let i := idx
+            } lt(i, lastIdx) {
+                i := add(i, 2)
+            } {
+                let byte1 := getHex(byte(0, mload(add(ptr, i))))
+                let byte2 := getHex(byte(0, mload(add(ptr, add(i, 1)))))
+                // if either byte is invalid, set invalid and break loop
+                if or(eq(byte1, 0xff), eq(byte2, 0xff)) {
+                    valid := false
+                    break
+                }
+                let combined := or(shl(4, byte1), byte2)
+                r := or(shl(8, r), combined)
+            }
+        }
+    }
+
+    /**
+     * @dev Attempts to parse an address from a hex string
+     * @param str The string to parse
+     * @param idx The offset to start parsing at
+     * @param lastIdx The (exclusive) last index in `str` to consider. Use `str.length` to scan the whole string.
+     */
+    function hexToAddress(
+        bytes memory str,
+        uint256 idx,
+        uint256 lastIdx
+    ) internal pure returns (address, bool) {
+        if (lastIdx - idx < 40) return (address(0x0), false);
+        (bytes32 r, bool valid) = hexStringToBytes32(str, idx, lastIdx);
+        return (address(uint160(uint256(r))), valid);
+    }
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/wrapper/BytesUtils.sol
+//SPDX-License-Identifier: MIT
+pragma solidity ~0.8.17;
+
+library BytesUtils {
+    /*
+     * @dev Returns the keccak-256 hash of a byte range.
+     * @param self The byte string to hash.
+     * @param offset The position to start hashing at.
+     * @param len The number of bytes to hash.
+     * @return The hash of the byte range.
+     */
+    function keccak(
+        bytes memory self,
+        uint256 offset,
+        uint256 len
+    ) internal pure returns (bytes32 ret) {
+        require(offset + len <= self.length);
+        assembly {
+            ret := keccak256(add(add(self, 32), offset), len)
+        }
+    }
+
+    /**
+     * @dev Returns the ENS namehash of a DNS-encoded name.
+     * @param self The DNS-encoded name to hash.
+     * @param offset The offset at which to start hashing.
+     * @return The namehash of the name.
+     */
+    function namehash(
+        bytes memory self,
+        uint256 offset
+    ) internal pure returns (bytes32) {
+        (bytes32 labelhash, uint256 newOffset) = readLabel(self, offset);
+        if (labelhash == bytes32(0)) {
+            require(offset == self.length - 1, "namehash: Junk at end of name");
+            return bytes32(0);
+        }
+        return
+            keccak256(abi.encodePacked(namehash(self, newOffset), labelhash));
+    }
+
+    /**
+     * @dev Returns the keccak-256 hash of a DNS-encoded label, and the offset to the start of the next label.
+     * @param self The byte string to read a label from.
+     * @param idx The index to read a label at.
+     * @return labelhash The hash of the label at the specified index, or 0 if it is the last label.
+     * @return newIdx The index of the start of the next label.
+     */
+    function readLabel(
+        bytes memory self,
+        uint256 idx
+    ) internal pure returns (bytes32 labelhash, uint256 newIdx) {
+        require(idx < self.length, "readLabel: Index out of bounds");
+        uint256 len = uint256(uint8(self[idx]));
+        if (len > 0) {
+            labelhash = keccak(self, idx + 1, len);
+        } else {
+            labelhash = bytes32(0);
+        }
+        newIdx = idx + len + 1;
+    }
+}
+
+
+// File: @openzeppelin/contracts/utils/cryptography/ECDSA.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/ECDSA.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.
+ *
+ * These functions can be used to verify that a message was signed by the holder
+ * of the private keys of a given address.
+ */
+library ECDSA {
+    enum RecoverError {
+        NoError,
+        InvalidSignature,
+        InvalidSignatureLength,
+        InvalidSignatureS
+    }
+
+    /**
+     * @dev The signature derives the `address(0)`.
+     */
+    error ECDSAInvalidSignature();
+
+    /**
+     * @dev The signature has an invalid length.
+     */
+    error ECDSAInvalidSignatureLength(uint256 length);
+
+    /**
+     * @dev The signature has an S value that is in the upper half order.
+     */
+    error ECDSAInvalidSignatureS(bytes32 s);
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with `signature` or an error. This will not
+     * return address(0) without also returning an error description. Errors are documented using an enum (error type)
+     * and a bytes32 providing additional information about the error.
+     *
+     * If no error is returned, then the address can be used for verification purposes.
+     *
+     * The `ecrecover` EVM precompile allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {MessageHashUtils-toEthSignedMessageHash} on it.
+     *
+     * Documentation for signature generation:
+     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]
+     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]
+     */
+    function tryRecover(bytes32 hash, bytes memory signature) internal pure returns (address, RecoverError, bytes32) {
+        if (signature.length == 65) {
+            bytes32 r;
+            bytes32 s;
+            uint8 v;
+            // ecrecover takes the signature parameters, and the only way to get them
+            // currently is to use assembly.
+            /// @solidity memory-safe-assembly
+            assembly {
+                r := mload(add(signature, 0x20))
+                s := mload(add(signature, 0x40))
+                v := byte(0, mload(add(signature, 0x60)))
+            }
+            return tryRecover(hash, v, r, s);
+        } else {
+            return (address(0), RecoverError.InvalidSignatureLength, bytes32(signature.length));
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature`. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM precompile allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {MessageHashUtils-toEthSignedMessageHash} on it.
+     */
+    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {
+        (address recovered, RecoverError error, bytes32 errorArg) = tryRecover(hash, signature);
+        _throwError(error, errorArg);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.
+     *
+     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]
+     */
+    function tryRecover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address, RecoverError, bytes32) {
+        unchecked {
+            bytes32 s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+            // We do not check for an overflow here since the shift operation results in 0 or 1.
+            uint8 v = uint8((uint256(vs) >> 255) + 27);
+            return tryRecover(hash, v, r, s);
+        }
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.
+     */
+    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {
+        (address recovered, RecoverError error, bytes32 errorArg) = tryRecover(hash, r, vs);
+        _throwError(error, errorArg);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     */
+    function tryRecover(
+        bytes32 hash,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal pure returns (address, RecoverError, bytes32) {
+        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature
+        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines
+        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most
+        // signatures from current libraries generate a unique signature with an s-value in the lower half order.
+        //
+        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept
+        // these malleable signatures as well.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return (address(0), RecoverError.InvalidSignatureS, s);
+        }
+
+        // If the signature is valid (and not malleable), return the signer address
+        address signer = ecrecover(hash, v, r, s);
+        if (signer == address(0)) {
+            return (address(0), RecoverError.InvalidSignature, bytes32(0));
+        }
+
+        return (signer, RecoverError.NoError, bytes32(0));
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     */
+    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {
+        (address recovered, RecoverError error, bytes32 errorArg) = tryRecover(hash, v, r, s);
+        _throwError(error, errorArg);
+        return recovered;
+    }
+
+    /**
+     * @dev Optionally reverts with the corresponding custom error according to the `error` argument provided.
+     */
+    function _throwError(RecoverError error, bytes32 errorArg) private pure {
+        if (error == RecoverError.NoError) {
+            return; // no error: do nothing
+        } else if (error == RecoverError.InvalidSignature) {
+            revert ECDSAInvalidSignature();
+        } else if (error == RecoverError.InvalidSignatureLength) {
+            revert ECDSAInvalidSignatureLength(uint256(errorArg));
+        } else if (error == RecoverError.InvalidSignatureS) {
+            revert ECDSAInvalidSignatureS(errorArg);
+        }
+    }
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/reverseRegistrar/IReverseRegistrar.sol
+pragma solidity >=0.8.4;
+
+interface IReverseRegistrar {
+    function setDefaultResolver(address resolver) external;
+
+    function claim(address owner) external returns (bytes32);
+
+    function claimForAddr(
+        address addr,
+        address owner,
+        address resolver
+    ) external returns (bytes32);
+
+    function claimWithResolver(
+        address owner,
+        address resolver
+    ) external returns (bytes32);
+
+    function setName(string memory name) external returns (bytes32);
+
+    function setNameForAddr(
+        address addr,
+        address owner,
+        address resolver,
+        string memory name
+    ) external returns (bytes32);
+
+    function node(address addr) external pure returns (bytes32);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/wrapper/INameWrapper.sol
+//SPDX-License-Identifier: MIT
+pragma solidity ~0.8.17;
+
+import "../registry/ENS.sol";
+import "../ethregistrar/IBaseRegistrar.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "./IMetadataService.sol";
+import "./INameWrapperUpgrade.sol";
+
+uint32 constant CANNOT_UNWRAP = 1;
+uint32 constant CANNOT_BURN_FUSES = 2;
+uint32 constant CANNOT_TRANSFER = 4;
+uint32 constant CANNOT_SET_RESOLVER = 8;
+uint32 constant CANNOT_SET_TTL = 16;
+uint32 constant CANNOT_CREATE_SUBDOMAIN = 32;
+uint32 constant CANNOT_APPROVE = 64;
+//uint16 reserved for parent controlled fuses from bit 17 to bit 32
+uint32 constant PARENT_CANNOT_CONTROL = 1 << 16;
+uint32 constant IS_DOT_ETH = 1 << 17;
+uint32 constant CAN_EXTEND_EXPIRY = 1 << 18;
+uint32 constant CAN_DO_EVERYTHING = 0;
+uint32 constant PARENT_CONTROLLED_FUSES = 0xFFFF0000;
+// all fuses apart from IS_DOT_ETH
+uint32 constant USER_SETTABLE_FUSES = 0xFFFDFFFF;
+
+interface INameWrapper is IERC1155 {
+    event NameWrapped(
+        bytes32 indexed node,
+        bytes name,
+        address owner,
+        uint32 fuses,
+        uint64 expiry
+    );
+
+    event NameUnwrapped(bytes32 indexed node, address owner);
+
+    event FusesSet(bytes32 indexed node, uint32 fuses);
+    event ExpiryExtended(bytes32 indexed node, uint64 expiry);
+
+    function ens() external view returns (ENS);
+
+    function registrar() external view returns (IBaseRegistrar);
+
+    function metadataService() external view returns (IMetadataService);
+
+    function names(bytes32) external view returns (bytes memory);
+
+    function name() external view returns (string memory);
+
+    function upgradeContract() external view returns (INameWrapperUpgrade);
+
+    function supportsInterface(bytes4 interfaceID) external view returns (bool);
+
+    function wrap(
+        bytes calldata name,
+        address wrappedOwner,
+        address resolver
+    ) external;
+
+    function wrapETH2LD(
+        string calldata label,
+        address wrappedOwner,
+        uint16 ownerControlledFuses,
+        address resolver
+    ) external returns (uint64 expires);
+
+    function registerAndWrapETH2LD(
+        string calldata label,
+        address wrappedOwner,
+        uint256 duration,
+        address resolver,
+        uint16 ownerControlledFuses
+    ) external returns (uint256 registrarExpiry);
+
+    function renew(
+        uint256 labelHash,
+        uint256 duration
+    ) external returns (uint256 expires);
+
+    function unwrap(bytes32 node, bytes32 label, address owner) external;
+
+    function unwrapETH2LD(
+        bytes32 label,
+        address newRegistrant,
+        address newController
+    ) external;
+
+    function upgrade(bytes calldata name, bytes calldata extraData) external;
+
+    function setFuses(
+        bytes32 node,
+        uint16 ownerControlledFuses
+    ) external returns (uint32 newFuses);
+
+    function setChildFuses(
+        bytes32 parentNode,
+        bytes32 labelhash,
+        uint32 fuses,
+        uint64 expiry
+    ) external;
+
+    function setSubnodeRecord(
+        bytes32 node,
+        string calldata label,
+        address owner,
+        address resolver,
+        uint64 ttl,
+        uint32 fuses,
+        uint64 expiry
+    ) external returns (bytes32);
+
+    function setRecord(
+        bytes32 node,
+        address owner,
+        address resolver,
+        uint64 ttl
+    ) external;
+
+    function setSubnodeOwner(
+        bytes32 node,
+        string calldata label,
+        address newOwner,
+        uint32 fuses,
+        uint64 expiry
+    ) external returns (bytes32);
+
+    function extendExpiry(
+        bytes32 node,
+        bytes32 labelhash,
+        uint64 expiry
+    ) external returns (uint64);
+
+    function canModifyName(
+        bytes32 node,
+        address addr
+    ) external view returns (bool);
+
+    function setResolver(bytes32 node, address resolver) external;
+
+    function setTTL(bytes32 node, uint64 ttl) external;
+
+    function ownerOf(uint256 id) external view returns (address owner);
+
+    function approve(address to, uint256 tokenId) external;
+
+    function getApproved(uint256 tokenId) external view returns (address);
+
+    function getData(
+        uint256 id
+    ) external view returns (address, uint32, uint64);
+
+    function setMetadataService(IMetadataService _metadataService) external;
+
+    function uri(uint256 tokenId) external view returns (string memory);
+
+    function setUpgradeContract(INameWrapperUpgrade _upgradeAddress) external;
+
+    function allFusesBurned(
+        bytes32 node,
+        uint32 fuseMask
+    ) external view returns (bool);
+
+    function isWrapped(bytes32) external view returns (bool);
+
+    function isWrapped(bytes32, bytes32) external view returns (bool);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/IMulticallable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IMulticallable {
+    function multicall(
+        bytes[] calldata data
+    ) external returns (bytes[] memory results);
+
+    function multicallWithNodeCheck(
+        bytes32,
+        bytes[] calldata data
+    ) external returns (bytes[] memory results);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/IContentHashResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.4;
+
+interface IContentHashResolver {
+    event ContenthashChanged(bytes32 indexed node, bytes hash);
+
+    /**
+     * Returns the contenthash associated with an ENS node.
+     * @param node The ENS node to query.
+     * @return The associated contenthash.
+     */
+    function contenthash(bytes32 node) external view returns (bytes memory);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/IPubkeyResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.4;
+
+interface IPubkeyResolver {
+    event PubkeyChanged(bytes32 indexed node, bytes32 x, bytes32 y);
+
+    /**
+     * Returns the SECP256k1 public key associated with an ENS node.
+     * Defined in EIP 619.
+     * @param node The ENS node to query
+     * @return x The X coordinate of the curve point for the public key.
+     * @return y The Y coordinate of the curve point for the public key.
+     */
+    function pubkey(bytes32 node) external view returns (bytes32 x, bytes32 y);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/INameResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.4;
+
+interface INameResolver {
+    event NameChanged(bytes32 indexed node, string name);
+
+    /**
+     * Returns the name associated with an ENS node, for reverse records.
+     * Defined in EIP181.
+     * @param node The ENS node to query.
+     * @return The associated name.
+     */
+    function name(bytes32 node) external view returns (string memory);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/ITextResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.4;
+
+interface ITextResolver {
+    event TextChanged(
+        bytes32 indexed node,
+        string indexed indexedKey,
+        string key,
+        string value
+    );
+
+    /**
+     * Returns the text data associated with an ENS node and key.
+     * @param node The ENS node to query.
+     * @param key The text data key to query.
+     * @return The associated text data.
+     */
+    function text(
+        bytes32 node,
+        string calldata key
+    ) external view returns (string memory);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/IAddressResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.4;
+
+/**
+ * Interface for the new (multicoin) addr function.
+ */
+interface IAddressResolver {
+    event AddressChanged(
+        bytes32 indexed node,
+        uint256 coinType,
+        bytes newAddress
+    );
+
+    function addr(
+        bytes32 node,
+        uint256 coinType
+    ) external view returns (bytes memory);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/IAddrResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.4;
+
+/**
+ * Interface for the legacy (ETH-only) addr function.
+ */
+interface IAddrResolver {
+    event AddrChanged(bytes32 indexed node, address a);
+
+    /**
+     * Returns the address associated with an ENS node.
+     * @param node The ENS node to query.
+     * @return The associated address.
+     */
+    function addr(bytes32 node) external view returns (address payable);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/IExtendedDNSResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IExtendedDNSResolver {
+    function resolve(
+        bytes memory name,
+        bytes memory data,
+        bytes memory context
+    ) external view returns (bytes memory);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/resolvers/profiles/IExtendedResolver.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IExtendedResolver {
+    function resolve(
+        bytes memory name,
+        bytes memory data
+    ) external view returns (bytes memory);
+}
+
+
+// File: @openzeppelin/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/registry/ENS.sol
+pragma solidity >=0.8.4;
+
+interface ENS {
+    // Logged when the owner of a node assigns a new owner to a subnode.
+    event NewOwner(bytes32 indexed node, bytes32 indexed label, address owner);
+
+    // Logged when the owner of a node transfers ownership to a new account.
+    event Transfer(bytes32 indexed node, address owner);
+
+    // Logged when the resolver for a node changes.
+    event NewResolver(bytes32 indexed node, address resolver);
+
+    // Logged when the TTL of a node changes
+    event NewTTL(bytes32 indexed node, uint64 ttl);
+
+    // Logged when an operator is added or removed.
+    event ApprovalForAll(
+        address indexed owner,
+        address indexed operator,
+        bool approved
+    );
+
+    function setRecord(
+        bytes32 node,
+        address owner,
+        address resolver,
+        uint64 ttl
+    ) external;
+
+    function setSubnodeRecord(
+        bytes32 node,
+        bytes32 label,
+        address owner,
+        address resolver,
+        uint64 ttl
+    ) external;
+
+    function setSubnodeOwner(
+        bytes32 node,
+        bytes32 label,
+        address owner
+    ) external returns (bytes32);
+
+    function setResolver(bytes32 node, address resolver) external;
+
+    function setOwner(bytes32 node, address owner) external;
+
+    function setTTL(bytes32 node, uint64 ttl) external;
+
+    function setApprovalForAll(address operator, bool approved) external;
+
+    function owner(bytes32 node) external view returns (address);
+
+    function resolver(bytes32 node) external view returns (address);
+
+    function ttl(bytes32 node) external view returns (uint64);
+
+    function recordExists(bytes32 node) external view returns (bool);
+
+    function isApprovedForAll(
+        address owner,
+        address operator
+    ) external view returns (bool);
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/wrapper/INameWrapperUpgrade.sol
+//SPDX-License-Identifier: MIT
+pragma solidity ~0.8.17;
+
+interface INameWrapperUpgrade {
+    function wrapFromUpgrade(
+        bytes calldata name,
+        address wrappedOwner,
+        uint32 fuses,
+        uint64 expiry,
+        address approved,
+        bytes calldata extraData
+    ) external;
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/wrapper/IMetadataService.sol
+//SPDX-License-Identifier: MIT
+pragma solidity ~0.8.17;
+
+interface IMetadataService {
+    function uri(uint256) external view returns (string memory);
+}
+
+
+// File: @openzeppelin/contracts/token/ERC1155/IERC1155.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.1) (token/ERC1155/IERC1155.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC1155 compliant contract, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-1155[EIP].
+ */
+interface IERC1155 is IERC165 {
+    /**
+     * @dev Emitted when `value` amount of tokens of type `id` are transferred from `from` to `to` by `operator`.
+     */
+    event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
+
+    /**
+     * @dev Equivalent to multiple {TransferSingle} events, where `operator`, `from` and `to` are the same for all
+     * transfers.
+     */
+    event TransferBatch(
+        address indexed operator,
+        address indexed from,
+        address indexed to,
+        uint256[] ids,
+        uint256[] values
+    );
+
+    /**
+     * @dev Emitted when `account` grants or revokes permission to `operator` to transfer their tokens, according to
+     * `approved`.
+     */
+    event ApprovalForAll(address indexed account, address indexed operator, bool approved);
+
+    /**
+     * @dev Emitted when the URI for token type `id` changes to `value`, if it is a non-programmatic URI.
+     *
+     * If an {URI} event was emitted for `id`, the standard
+     * https://eips.ethereum.org/EIPS/eip-1155#metadata-extensions[guarantees] that `value` will equal the value
+     * returned by {IERC1155MetadataURI-uri}.
+     */
+    event URI(string value, uint256 indexed id);
+
+    /**
+     * @dev Returns the value of tokens of token type `id` owned by `account`.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {balanceOf}.
+     *
+     * Requirements:
+     *
+     * - `accounts` and `ids` must have the same length.
+     */
+    function balanceOfBatch(
+        address[] calldata accounts,
+        uint256[] calldata ids
+    ) external view returns (uint256[] memory);
+
+    /**
+     * @dev Grants or revokes permission to `operator` to transfer the caller's tokens, according to `approved`,
+     *
+     * Emits an {ApprovalForAll} event.
+     *
+     * Requirements:
+     *
+     * - `operator` cannot be the caller.
+     */
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /**
+     * @dev Returns true if `operator` is approved to transfer ``account``'s tokens.
+     *
+     * See {setApprovalForAll}.
+     */
+    function isApprovedForAll(address account, address operator) external view returns (bool);
+
+    /**
+     * @dev Transfers a `value` amount of tokens of type `id` from `from` to `to`.
+     *
+     * WARNING: This function can potentially allow a reentrancy attack when transferring tokens
+     * to an untrusted contract, when invoking {onERC1155Received} on the receiver.
+     * Ensure to follow the checks-effects-interactions pattern and consider employing
+     * reentrancy guards when interacting with untrusted contracts.
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - If the caller is not `from`, it must have been approved to spend ``from``'s tokens via {setApprovalForAll}.
+     * - `from` must have a balance of tokens of type `id` of at least `value` amount.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155Received} and return the
+     * acceptance magic value.
+     */
+    function safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes calldata data) external;
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {safeTransferFrom}.
+     *
+     * WARNING: This function can potentially allow a reentrancy attack when transferring tokens
+     * to an untrusted contract, when invoking {onERC1155BatchReceived} on the receiver.
+     * Ensure to follow the checks-effects-interactions pattern and consider employing
+     * reentrancy guards when interacting with untrusted contracts.
+     *
+     * Emits either a {TransferSingle} or a {TransferBatch} event, depending on the length of the array arguments.
+     *
+     * Requirements:
+     *
+     * - `ids` and `values` must have the same length.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155BatchReceived} and return the
+     * acceptance magic value.
+     */
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] calldata ids,
+        uint256[] calldata values,
+        bytes calldata data
+    ) external;
+}
+
+
+// File: @ensdomains/ens-contracts/contracts/ethregistrar/IBaseRegistrar.sol
+import "../registry/ENS.sol";
+import "./IBaseRegistrar.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+
+interface IBaseRegistrar is IERC721 {
+    event ControllerAdded(address indexed controller);
+    event ControllerRemoved(address indexed controller);
+    event NameMigrated(
+        uint256 indexed id,
+        address indexed owner,
+        uint256 expires
+    );
+    event NameRegistered(
+        uint256 indexed id,
+        address indexed owner,
+        uint256 expires
+    );
+    event NameRenewed(uint256 indexed id, uint256 expires);
+
+    // Authorises a controller, who can register and renew domains.
+    function addController(address controller) external;
+
+    // Revoke controller permission for an address.
+    function removeController(address controller) external;
+
+    // Set the resolver for the TLD this registrar manages.
+    function setResolver(address resolver) external;
+
+    // Returns the expiration timestamp of the specified label hash.
+    function nameExpires(uint256 id) external view returns (uint256);
+
+    // Returns true if the specified name is available for registration.
+    function available(uint256 id) external view returns (bool);
+
+    /**
+     * @dev Register a name.
+     */
+    function register(
+        uint256 id,
+        address owner,
+        uint256 duration
+    ) external returns (uint256);
+
+    function renew(uint256 id, uint256 duration) external returns (uint256);
+
+    /**
+     * @dev Reclaim ownership of a name in ENS, if you own it in the registrar.
+     */
+    function reclaim(uint256 id, address owner) external;
+}
+
+
+// File: @openzeppelin/contracts/token/ERC721/IERC721.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC721/IERC721.sol)
+
+pragma solidity ^0.8.20;
+
+import {IERC165} from "../../utils/introspection/IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC721 compliant contract.
+ */
+interface IERC721 is IERC165 {
+    /**
+     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.
+     */
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.
+     */
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /**
+     * @dev Returns the number of tokens in ``owner``'s account.
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon
+     *   a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC721 protocol to prevent tokens from being forever locked.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or
+     *   {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon
+     *   a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+
+    /**
+     * @dev Transfers `tokenId` token from `from` to `to`.
+     *
+     * WARNING: Note that the caller is responsible to confirm that the recipient is capable of receiving ERC721
+     * or else they may be permanently lost. Usage of {safeTransferFrom} prevents loss, though the caller must
+     * understand this adds an external call which potentially creates a reentrancy vulnerability.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 tokenId) external;
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) external;
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the address zero.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) external view returns (address operator);
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}
+     */
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+}
+

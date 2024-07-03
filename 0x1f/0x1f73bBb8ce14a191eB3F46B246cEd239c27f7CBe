@@ -1,0 +1,1839 @@
+
+// File: contracts/factories/VestingCloneFactory.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+
+pragma solidity 0.8.23;
+
+import "../Vesting.sol";
+import "./CloneFactory.sol";
+
+/**
+ * @title VestingCloneFactory
+ * @author malteish
+ * @notice Create clones of a Vesting contract with deterministic addresses
+ */
+contract VestingCloneFactory is CloneFactory {
+    constructor(address _implementation) CloneFactory(_implementation) {}
+
+    /**
+     * Create and initialize a clone
+     * @param _rawSalt value that influences the address of the clone, but not the initialization
+     * @param _trustedForwarder the trusted forwarder (ERC2771) can not be changed, but is checked for security
+     * @param _owner address that will own the new clone
+     * @param _token address of the token to be vested
+     * @return address of the clone that was created
+     */
+    function createVestingClone(
+        bytes32 _rawSalt,
+        address _trustedForwarder,
+        address _owner,
+        address _token
+    ) public returns (address) {
+        bytes32 salt = keccak256(abi.encode(_rawSalt, _trustedForwarder, _owner, _token));
+        address clone = Clones.cloneDeterministic(implementation, salt);
+        Vesting vesting = Vesting(clone);
+        require(vesting.isTrustedForwarder(_trustedForwarder), "VestingCloneFactory: Unexpected trustedForwarder");
+        vesting.initialize(_owner, _token);
+        emit NewClone(clone);
+        return clone;
+    }
+
+    /**
+     * Create a new vesting clone with a lockup plan. The contract ownership can be renounced in the same transaction,
+     * leaving the contract without an owner and thus without any way to change the vesting plan or add other plans.
+     * @dev This function creates a transferrable vesting plan.
+     * @param _rawSalt value that influences the address of the clone, but not the initialization
+     * @param _trustedForwarder the trusted forwarder (ERC2771) can not be changed, but is checked for security
+     * @param _owner future owner of the vesting contract. If 0, the contract will not have an owner.
+     * @param _token token to vest
+     * @param _allocation amount of tokens to vest
+     * @param _beneficiary address receiving the tokens
+     * @param _start start date of the vesting
+     * @param _cliff cliff duration
+     * @param _duration total duration
+     */
+    function createVestingCloneWithLockupPlan(
+        bytes32 _rawSalt,
+        address _trustedForwarder,
+        address _owner,
+        address _token,
+        uint256 _allocation,
+        address _beneficiary,
+        uint64 _start,
+        uint64 _cliff,
+        uint64 _duration
+    ) external returns (address) {
+        // generate salt from all parameters
+        bytes32 salt = keccak256(
+            abi.encode(
+                _rawSalt,
+                _trustedForwarder,
+                _owner,
+                _token,
+                _allocation,
+                _beneficiary,
+                _start,
+                _cliff,
+                _duration
+            )
+        );
+        // deploy the vesting contract
+        Vesting vesting = Vesting(createVestingClone(salt, _trustedForwarder, address(this), _token));
+
+        // create the vesting plan
+        vesting.createVesting(_allocation, _beneficiary, _start, _cliff, _duration, false); // this plan is not mintable
+
+        // remove the manager role from the vesting contract
+        vesting.removeManager(address(this));
+
+        // transfer ownership of the vesting contract
+        if (_owner == address(0)) {
+            // if the owner is 0, the vesting contract will not have an owner. So no one can interfere with the vesting.
+            vesting.renounceOwnership();
+        } else {
+            vesting.transferOwnership(_owner);
+        }
+
+        return address(vesting);
+    }
+
+    /**
+     * Calculate the address a clone will have using the given parameters
+     * @param _rawSalt value that influences the address of the clone, but not the initialization
+     * @param _trustedForwarder the trusted forwarder (ERC2771) can not be changed, but is checked for security
+     * @param _owner owner of the clone
+     * @param _token token to vest
+     */
+    function predictCloneAddress(
+        bytes32 _rawSalt,
+        address _trustedForwarder,
+        address _owner,
+        address _token
+    ) external view returns (address) {
+        require(
+            Vesting(implementation).isTrustedForwarder(_trustedForwarder),
+            "VestingCloneFactory: Unexpected trustedForwarder"
+        );
+        bytes32 salt = keccak256(abi.encode(_rawSalt, _trustedForwarder, _owner, _token));
+        return Clones.predictDeterministicAddress(implementation, salt);
+    }
+
+    /**
+     * Calculate the address a clone will have using the given parameters of the contract and the lockup plan
+     * @param _rawSalt value that influences the address of the clone, but not the initialization
+     * @param _trustedForwarder the trusted forwarder (ERC2771) can not be changed, but is checked for security
+     * @param _owner future owner of the vesting contract. If 0, the contract will not have an owner.
+     * @param _token token to vest
+     * @param _allocation amount of tokens to vest
+     * @param _beneficiary address receiving the tokens
+     * @param _start start date of the vesting
+     * @param _cliff cliff duration
+     * @param _duration total duration
+     */
+    function predictCloneAddressWithLockupPlan(
+        bytes32 _rawSalt,
+        address _trustedForwarder,
+        address _owner,
+        address _token,
+        uint256 _allocation,
+        address _beneficiary,
+        uint64 _start,
+        uint64 _cliff,
+        uint64 _duration
+    ) external view returns (address) {
+        require(
+            Vesting(implementation).isTrustedForwarder(_trustedForwarder),
+            "VestingCloneFactory: Unexpected trustedForwarder"
+        );
+        bytes32 salt = keccak256(
+            abi.encode(
+                _rawSalt,
+                _trustedForwarder,
+                _owner,
+                _token,
+                _allocation,
+                _beneficiary,
+                _start,
+                _cliff,
+                _duration
+            )
+        );
+        salt = keccak256(abi.encode(salt, _trustedForwarder, address(this), _token));
+        return Clones.predictDeterministicAddress(implementation, salt);
+    }
+}
+
+
+// File: contracts/Vesting.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+// derived from OpenZeppelin Contracts (last updated v4.9.0) (finance/VestingWallet.sol)
+/// @author cjentzsch, malteish
+
+pragma solidity 0.8.23;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+/**
+ * @dev a token must implement this interface to be used with the Vesting contract and mintable vestings
+ */
+interface ERC20Mintable {
+    function mint(address, uint256) external;
+}
+
+/// Struct that holds all information about a single vesting plan.
+struct VestingPlan {
+    /// the amount of tokens to be vested
+    uint256 allocation;
+    /// the amount of tokens already released
+    uint256 released;
+    /// the beneficiary who will receive the vested tokens
+    address beneficiary;
+    /// the start time of the vesting
+    uint64 start;
+    /// the cliff duration of the vesting - beneficiary gets no tokens before this duration has passed
+    uint64 cliff;
+    /// the duration of the vesting - after this duration all tokens can be released
+    uint64 duration;
+    /// if true, the token can be claimed through minting, otherwise the tokens are owned by the contract and can be transferred
+    bool isMintable;
+}
+
+/**
+ * @title Vesting
+ * @dev This contract handles the vesting ERC20 tokens for a set of beneficiaries.
+ * Two types of token custody are supported: The contract can either hold ERC20 tokens directly, or mint tokens on release.
+ * The vesting plans are created by managers, of which there can be multiple.
+ * Vesting happens linearly over time, with a cliff and a total duration.
+ * The vesting plans can be created in two ways: transparently (revealing all details immediately) or privately (by
+ * committing to a vesting plan without revealing the details). In the latter case, the details can be revealed later, which
+ * must happen before the tokens can be released.
+ */
+contract Vesting is Initializable, ERC2771ContextUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    event Commit(bytes32 hash);
+    event ERC20Released(uint64 id, uint256 amount);
+    event Revoke(bytes32 hash, uint64 endVestingTime);
+    event Reveal(bytes32 hash, uint64 id);
+    event VestingCreated(uint64 id);
+    event VestingStopped(uint64 id, uint64 endTime);
+    event ManagerAdded(address manager);
+    event ManagerRemoved(address manager);
+    event BeneficiaryChanged(uint64 id, address newBeneficiary);
+
+    /// token to be vested
+    address public token;
+    /// stores who create and stop vestings (both public and private)
+    mapping(address => bool) public managers;
+    /// stores all vesting plans
+    mapping(uint64 => VestingPlan) public vestings;
+    /// stores promises without revealing the details. value = maximum end date of vesting
+    mapping(bytes32 => uint64) public commitments;
+    /// total amount of vesting plans created
+    uint64 public ids;
+
+    /**
+     * This contract will be used through clones, so the constructor only initializes
+     * the logic contract.
+     * @param trustedForwarder address of the trusted forwarder that can relay ERC2771 transactions
+     */
+    constructor(address trustedForwarder) ERC2771ContextUpgradeable(trustedForwarder) {
+        _disableInitializers();
+    }
+
+    /**
+     * @dev Initializes the contract.
+     * @param _owner address of the owner of the contract
+     * @param _token address of the token to be vested
+     */
+    function initialize(address _owner, address _token) public initializer {
+        require(_owner != address(0), "Owner must not be zero address");
+        require(_token != address(0), "Token must not be zero address");
+        __Ownable_init();
+        transferOwnership(_owner);
+        managers[_owner] = true;
+        token = _token;
+    }
+
+    /**
+     * @dev Total amount of tokens that belong to the vesting plan with the given id.
+     */
+    function allocation(uint64 _id) public view returns (uint256) {
+        return vestings[_id].allocation;
+    }
+
+    /**
+     * @dev Amount of tokens already released.
+     */
+    function released(uint64 _id) public view returns (uint256) {
+        return vestings[_id].released;
+    }
+
+    /**
+     * @dev Address that will receive the vested tokens.
+     */
+    function beneficiary(uint64 _id) public view returns (address) {
+        return vestings[_id].beneficiary;
+    }
+
+    /**
+     * @dev Start date of the vesting plan.
+     * The cliff duration and total duration are measured from this date.
+     */
+    function start(uint64 _id) public view returns (uint64) {
+        return vestings[_id].start;
+    }
+
+    /**
+     * @dev Cliff duration of the vesting plan.
+     * The beneficiary gets no tokens before this duration has passed.
+     */
+    function cliff(uint64 _id) public view returns (uint64) {
+        return vestings[_id].cliff;
+    }
+
+    /**
+     * @dev Total duration of the vesting plan.
+     * After this duration all tokens can be released.
+     */
+    function duration(uint64 _id) public view returns (uint64) {
+        return vestings[_id].duration;
+    }
+
+    /**
+     * @dev Getter for type of withdraw.
+     * isMintable == true means that tokens are minted form the token contract.
+     * isMintable == false means the tokens need to be held by the vesting contract directly.
+     */
+    function isMintable(uint64 _id) public view returns (bool) {
+        return vestings[_id].isMintable;
+    }
+
+    /**
+     * @dev Amount of tokens that could be released right now.
+     */
+    function releasable(uint64 _id) public view returns (uint256) {
+        return vestedAmount(_id, uint64(block.timestamp)) - released(_id);
+    }
+
+    /**
+     * @dev Amount of tokens that could be released at a given time.
+     */
+    function releasable(uint64 _id, uint64 _time) public view returns (uint256) {
+        return vestedAmount(_id, _time) - released(_id);
+    }
+
+    /**
+     * Managers can commit to a vesting plan without revealing its details.
+     * The parameters are hashed and this hash is stored in the commitments mapping.
+     * Anyone can then reveal the vesting plan by providing the parameters and the salt.
+     * @param _hash commitment hash
+     */
+    function commit(bytes32 _hash) external onlyManager {
+        require(_hash != bytes32(0), "hash must not be zero");
+        // the value is interpreted as maximum end date of the vesting
+        // for real world use cases, type(uint64).max is "unlimited"
+        commitments[_hash] = type(uint64).max;
+        emit Commit(_hash);
+    }
+
+    /**
+     * Managers can revoke a commitment by providing the hash and a new latest end date.
+     * @param _hash commitment hash
+     * @param _end new latest end date
+     */
+    function revoke(bytes32 _hash, uint64 _end) external onlyManager {
+        require(commitments[_hash] != 0, "invalid-hash");
+        // already vested tokens can not be taken away (except of burning in the token contract itself)
+        _end = uint64(block.timestamp) > _end ? uint64(block.timestamp) : _end;
+        commitments[_hash] = _end;
+        emit Revoke(_hash, _end);
+    }
+
+    /**
+     * Create a public transparent vesting plan from a commitment.
+     * @param _hash  commitment hash
+     * @param _allocation total token amount
+     * @param _beneficiary address receiving the tokens
+     * @param _start start date
+     * @param _cliff cliff duration
+     * @param _duration total duration
+     * @param _isMintable true = tokens minted on release, false = tokens held by vesting contract
+     * @param _salt salt for privacy
+     */
+    function reveal(
+        bytes32 _hash,
+        uint256 _allocation,
+        address _beneficiary,
+        uint64 _start,
+        uint64 _cliff,
+        uint64 _duration,
+        bool _isMintable,
+        bytes32 _salt
+    ) public returns (uint64 id) {
+        require(
+            _hash ==
+                keccak256(abi.encodePacked(_allocation, _beneficiary, _start, _cliff, _duration, _isMintable, _salt)),
+            "invalid-hash"
+        );
+        uint64 maxEndDate = commitments[_hash];
+        require(maxEndDate > 0, "invalid-hash");
+        // if a commitment has been revoked with end date before cliff, it can never be revealed
+        require(_start + _cliff <= maxEndDate, "commitment revoked before cliff ended");
+
+        if (_start + _duration <= maxEndDate) {
+            // the commitment has not been revoked, or the end date of the commitment is after the end of the vesting
+            // create the vesting using the original parameters
+            id = _createVesting(_allocation, _beneficiary, _start, _cliff, _duration, _isMintable);
+        } else {
+            // the commitment has been revoked with a new end date of maxEndDate
+            // we need to override the duration to be the difference between _start and maxEndDate
+            uint64 durationOverride = maxEndDate - _start;
+            uint256 allocationOverride = (_allocation * durationOverride) / _duration;
+            id = _createVesting(allocationOverride, _beneficiary, _start, _cliff, durationOverride, _isMintable);
+        }
+
+        commitments[_hash] = 0; // delete commitment
+        emit Reveal(_hash, id);
+    }
+
+    /**
+     * Create a public transparent vesting plan from a commitment and release the tokens immediately.
+     * @param _hash  commitment hash
+     * @param _allocation total token amount
+     * @param _beneficiary address receiving the tokens
+     * @param _start start date
+     * @param _cliff cliff duration
+     * @param _duration total duration
+     * @param _isMintable true = tokens minted on release, false = tokens held by vesting contract
+     * @param _salt salt for privacy
+     * @param _maxAmount maximum amount of tokens to be released
+     */
+    function revealAndRelease(
+        bytes32 _hash,
+        uint256 _allocation,
+        address _beneficiary,
+        uint64 _start,
+        uint64 _cliff,
+        uint64 _duration,
+        bool _isMintable,
+        bytes32 _salt,
+        uint256 _maxAmount
+    ) external returns (uint64 id) {
+        id = reveal(_hash, _allocation, _beneficiary, _start, _cliff, _duration, _isMintable, _salt);
+        release(id, _maxAmount);
+    }
+
+    /**
+     * Create a public vesting plan
+     * @param _allocation total token amount
+     * @param _beneficiary address receiving the tokens
+     * @param _start start date of the vesting
+     * @param _cliff cliff duration
+     * @param _duration total duration
+     * @param _isMintable true = tokens minted on release, false = tokens held by vesting contract
+     */
+    function createVesting(
+        uint256 _allocation,
+        address _beneficiary,
+        uint64 _start,
+        uint64 _cliff,
+        uint64 _duration,
+        bool _isMintable
+    ) external onlyManager returns (uint64 id) {
+        return _createVesting(_allocation, _beneficiary, _start, _cliff, _duration, _isMintable);
+    }
+
+    /**
+     * Internal function used to create all public vesting plans.
+     * @param _allocation total token amount
+     * @param _beneficiary address receiving the tokens
+     * @param _start start date of the vesting
+     * @param _cliff cliff duration
+     * @param _duration total duration
+     * @param _isMintable true = tokens minted on release, false = tokens held by vesting contract
+     */
+    function _createVesting(
+        uint256 _allocation,
+        address _beneficiary,
+        uint64 _start,
+        uint64 _cliff,
+        uint64 _duration,
+        bool _isMintable
+    ) internal returns (uint64 id) {
+        require(_allocation > 0, "Allocation must be greater than zero");
+        require(_beneficiary != address(0), "Beneficiary must not be zero address");
+
+        // cliff longer than duration is not valid and can only happen by mistake.
+        // We heal this by extending the duration to match the cliff, thus balancing
+        // the interests of the beneficiary (be able to reveal the vesting plan)
+        // and the token holder (not giving away tokens too early).
+        _duration = _duration > _cliff ? _duration : _cliff;
+
+        id = ++ids;
+        vestings[id] = VestingPlan({
+            allocation: _allocation,
+            released: 0,
+            beneficiary: _beneficiary,
+            start: _start,
+            cliff: _cliff,
+            duration: _duration,
+            isMintable: _isMintable
+        });
+
+        emit VestingCreated(id);
+    }
+
+    /**
+     * Stops a vesting plan before it is finished.
+     * @param _id ID of the vesting plan
+     * @param _endTime When the plan should end.
+     */
+    function stopVesting(uint64 _id, uint64 _endTime) public onlyManager {
+        // already vested tokens can not be taken away (except of burning in the token contract itself)
+        _endTime = _endTime < uint64(block.timestamp) ? uint64(block.timestamp) : _endTime;
+        require(_endTime < start(_id) + duration(_id), "endTime must be before vesting end");
+
+        if (start(_id) + cliff(_id) > _endTime) {
+            delete vestings[_id];
+        } else {
+            vestings[_id].allocation = vestedAmount(_id, _endTime);
+            vestings[_id].duration = _endTime - start(_id);
+        }
+        emit VestingStopped(_id, _endTime);
+    }
+
+    /**
+     * Pausing a vesting plan: consists of stopping the old vesting and creating a new one. The total allocation
+     * remains the same, but the cliff and duration are adjusted. This is a convenience function to make handling
+     * of prolonged absences of beneficiaries easier.
+     * @param _id vestin plan id
+     * @param _endTime when to end the original vesting
+     * @param _newStartTime when to start the new vesting
+     */
+    function pauseVesting(
+        uint64 _id,
+        uint64 _endTime,
+        uint64 _newStartTime
+    ) external onlyManager returns (uint64 newId) {
+        require(_endTime > uint64(block.timestamp), "endTime must be in the future");
+        require(_endTime < start(_id) + duration(_id), "endTime must be before vesting end");
+        require(_newStartTime > _endTime, "newStartTime must be after endTime");
+
+        uint256 allocationRemainder = allocation(_id) - vestedAmount(_id, _endTime);
+        uint64 timeVested = _endTime - start(_id);
+        uint64 cliffRemainder = timeVested >= cliff(_id) ? 0 : cliff(_id) - timeVested;
+        uint64 durationRemainder = duration(_id) - timeVested;
+
+        // create new vesting
+        newId = _createVesting(
+            allocationRemainder,
+            beneficiary(_id),
+            _newStartTime,
+            cliffRemainder,
+            durationRemainder,
+            isMintable(_id)
+        );
+
+        // stop old vesting
+        stopVesting(_id, _endTime);
+    }
+
+    /**
+     * @dev Release the tokens that have already vested.
+     * @param _id ID of the vesting plan
+     */
+    function release(uint64 _id) public {
+        release(_id, type(uint256).max);
+    }
+
+    /**
+     * @dev Release the tokens that have already vested, but not more than the given amount.
+     * @param _id ID of the vesting plan
+     * @param _amount maximum amount of tokens to be released
+     */
+    function release(uint64 _id, uint256 _amount) public nonReentrant {
+        require(_msgSender() == beneficiary(_id), "Only beneficiary can release tokens");
+        _amount = releasable(_id) < _amount ? releasable(_id) : _amount;
+        vestings[_id].released += _amount;
+        if (isMintable(_id)) {
+            ERC20Mintable(token).mint(beneficiary(_id), _amount);
+        } else {
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(token), beneficiary(_id), _amount);
+        }
+        emit ERC20Released(_id, _amount);
+    }
+
+    /**
+     * @dev Calculates the amount of tokens that have already vested. Implements a linear vesting curve.
+     * @notice In this context, "vested" means "belong to the beneficiary". The vested amount
+     * is also the sum of the released amount and the releasable amount.
+     * @param _id ID of the vesting plan
+     * @param _timestamp point in time for which the vested amount is calculated
+     * @return amount of vested tokens
+     */
+    function vestedAmount(uint64 _id, uint64 _timestamp) public view returns (uint256) {
+        if (_timestamp < start(_id) + cliff(_id)) {
+            return 0;
+        } else if (_timestamp > start(_id) + duration(_id)) {
+            return allocation(_id);
+        } else {
+            return (allocation(_id) * (_timestamp - start(_id))) / duration(_id);
+        }
+    }
+
+    /**
+     * @dev Changes the beneficiary to a new one. Only callable by current beneficiary,
+     * or the owner one year after the vesting's plan end. The owner being able to update
+     * the beneficiary address is a compromise between security and usability:
+     * If the beneficiary ever loses access to their address, the owner can update it, but only
+     * after this timeout has passed.
+     * @param _id ID of the vesting plan
+     * @param _newBeneficiary new beneficiary address
+     */
+    function changeBeneficiary(uint64 _id, address _newBeneficiary) external {
+        require(
+            _msgSender() == beneficiary(_id) ||
+                ((_msgSender() == owner()) && uint64(block.timestamp) > start(_id) + duration(_id) + 365 days),
+            "Only beneficiary can change beneficiary, or owner 1 year after vesting end"
+        );
+        require(_newBeneficiary != address(0), "Beneficiary must not be zero address");
+        vestings[_id].beneficiary = _newBeneficiary;
+        emit BeneficiaryChanged(_id, _newBeneficiary);
+    }
+
+    /**
+     * Can be called by the owner to grant manager status to an address.
+     * @param _manager address of the manager
+     */
+    function addManager(address _manager) external onlyOwner {
+        managers[_manager] = true;
+        emit ManagerAdded(_manager);
+    }
+
+    /**
+     * Can be called by the owner to revoke manager status from an address.
+     * @param _manager address of the manager
+     */
+    function removeManager(address _manager) external onlyOwner {
+        managers[_manager] = false;
+        emit ManagerRemoved(_manager);
+    }
+
+    /**
+     * @dev Throws if called by an account that is not a manager.
+     */
+    modifier onlyManager() {
+        require(managers[_msgSender()], "Caller is not a manager");
+        _;
+    }
+
+    /**
+     * @dev both ContextUpgradeable and ERC2771ContextUpgradeable have a _msgSender() function, so we need to override and select which one to use.
+     */
+    function _msgSender() internal view override(ContextUpgradeable, ERC2771ContextUpgradeable) returns (address) {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    /**
+     * @dev both ERC20Pausable and ERC2771Context have a _msgData() function, so we need to override and select which one to use.
+     */
+    function _msgData() internal view override(ContextUpgradeable, ERC2771ContextUpgradeable) returns (bytes calldata) {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    /**
+     * @dev both Ownable and ERC2771Context have a _contextSuffixLength() function, so we need to override and select which one to use.
+     */
+    function _contextSuffixLength()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (uint256)
+    {
+        return ERC2771ContextUpgradeable._contextSuffixLength();
+    }
+}
+
+
+// File: contracts/factories/CloneFactory.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.23;
+
+import "@openzeppelin/contracts/proxy/Clones.sol";
+import "./Factory.sol";
+
+/**
+ * @title CloneFactory
+ * @dev Inherit from this contract to allow creation of Clones of a specific contract.
+ * @author malteish
+ */
+
+abstract contract CloneFactory is Factory {
+    event NewClone(address clone);
+
+    constructor(address _implementation) Factory(_implementation) {}
+
+    /**
+     * @notice Predicts the address of a clone that will be created
+     * @param salt The salt used to deterministically generate the clone address
+     * @return The address of the clone that will be created
+     * @dev This function does not check if the clone has already been created
+     */
+    function predictCloneAddress(bytes32 salt) public view returns (address) {
+        return Clones.predictDeterministicAddress(implementation, salt);
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.3) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20Upgradeable.sol";
+import "../extensions/IERC20PermitUpgradeable.sol";
+import "../../../utils/AddressUpgradeable.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20Upgradeable {
+    using AddressUpgradeable for address;
+
+    /**
+     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeTransfer(IERC20Upgradeable token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    /**
+     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the
+     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.
+     */
+    function safeTransferFrom(IERC20Upgradeable token, address from, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(IERC20Upgradeable token, address spender, uint256 value) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    /**
+     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeIncreaseAllowance(IERC20Upgradeable token, address spender, uint256 value) internal {
+        uint256 oldAllowance = token.allowance(address(this), spender);
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance + value));
+    }
+
+    /**
+     * @dev Decrease the calling contract's allowance toward `spender` by `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful.
+     */
+    function safeDecreaseAllowance(IERC20Upgradeable token, address spender, uint256 value) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, oldAllowance - value));
+        }
+    }
+
+    /**
+     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,
+     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval
+     * to be set to zero before setting it to a non-zero value, such as USDT.
+     */
+    function forceApprove(IERC20Upgradeable token, address spender, uint256 value) internal {
+        bytes memory approvalCall = abi.encodeWithSelector(token.approve.selector, spender, value);
+
+        if (!_callOptionalReturnBool(token, approvalCall)) {
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+            _callOptionalReturn(token, approvalCall);
+        }
+    }
+
+    /**
+     * @dev Use a ERC-2612 signature to set the `owner` approval toward `spender` on `token`.
+     * Revert on invalid signature.
+     */
+    function safePermit(
+        IERC20PermitUpgradeable token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20Upgradeable token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        require(returndata.length == 0 || abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     *
+     * This is a variant of {_callOptionalReturn} that silents catches all reverts and returns a bool instead.
+     */
+    function _callOptionalReturnBool(IERC20Upgradeable token, bytes memory data) private returns (bool) {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We cannot use {Address-functionCall} here since this should return false
+        // and not revert is the subcall reverts.
+
+        (bool success, bytes memory returndata) = address(token).call(data);
+        return
+            success && (returndata.length == 0 || abi.decode(returndata, (bool))) && AddressUpgradeable.isContract(address(token));
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.4) (metatx/ERC2771Context.sol)
+
+pragma solidity ^0.8.9;
+
+import "../utils/ContextUpgradeable.sol";
+import {Initializable} from "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Context variant with ERC2771 support.
+ *
+ * WARNING: The usage of `delegatecall` in this contract is dangerous and may result in context corruption.
+ * Any forwarded request to this contract triggering a `delegatecall` to itself will result in an invalid {_msgSender}
+ * recovery.
+ */
+abstract contract ERC2771ContextUpgradeable is Initializable, ContextUpgradeable {
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    address private immutable _trustedForwarder;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor(address trustedForwarder) {
+        _trustedForwarder = trustedForwarder;
+    }
+
+    function isTrustedForwarder(address forwarder) public view virtual returns (bool) {
+        return forwarder == _trustedForwarder;
+    }
+
+    function _msgSender() internal view virtual override returns (address) {
+        uint256 calldataLength = msg.data.length;
+        uint256 contextSuffixLength = _contextSuffixLength();
+        if (isTrustedForwarder(msg.sender) && calldataLength >= contextSuffixLength) {
+            return address(bytes20(msg.data[calldataLength - contextSuffixLength:]));
+        } else {
+            return super._msgSender();
+        }
+    }
+
+    function _msgData() internal view virtual override returns (bytes calldata) {
+        uint256 calldataLength = msg.data.length;
+        uint256 contextSuffixLength = _contextSuffixLength();
+        if (isTrustedForwarder(msg.sender) && calldataLength >= contextSuffixLength) {
+            return msg.data[:calldataLength - contextSuffixLength];
+        } else {
+            return super._msgData();
+        }
+    }
+
+    /**
+     * @dev ERC-2771 specifies the context as being a single address (20 bytes).
+     */
+    function _contextSuffixLength() internal view virtual override returns (uint256) {
+        return 20;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/ContextUpgradeable.sol";
+import {Initializable} from "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract OwnableUpgradeable is Initializable, ContextUpgradeable {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    function __Ownable_init() internal onlyInitializing {
+        __Ownable_init_unchained();
+    }
+
+    function __Ownable_init_unchained() internal onlyInitializing {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (proxy/utils/Initializable.sol)
+
+pragma solidity ^0.8.2;
+
+import "../../utils/AddressUpgradeable.sol";
+
+/**
+ * @dev This is a base contract to aid in writing upgradeable contracts, or any kind of contract that will be deployed
+ * behind a proxy. Since proxied contracts do not make use of a constructor, it's common to move constructor logic to an
+ * external initializer function, usually called `initialize`. It then becomes necessary to protect this initializer
+ * function so it can only be called once. The {initializer} modifier provided by this contract will have this effect.
+ *
+ * The initialization functions use a version number. Once a version number is used, it is consumed and cannot be
+ * reused. This mechanism prevents re-execution of each "step" but allows the creation of new initialization steps in
+ * case an upgrade adds a module that needs to be initialized.
+ *
+ * For example:
+ *
+ * [.hljs-theme-light.nopadding]
+ * ```solidity
+ * contract MyToken is ERC20Upgradeable {
+ *     function initialize() initializer public {
+ *         __ERC20_init("MyToken", "MTK");
+ *     }
+ * }
+ *
+ * contract MyTokenV2 is MyToken, ERC20PermitUpgradeable {
+ *     function initializeV2() reinitializer(2) public {
+ *         __ERC20Permit_init("MyToken");
+ *     }
+ * }
+ * ```
+ *
+ * TIP: To avoid leaving the proxy in an uninitialized state, the initializer function should be called as early as
+ * possible by providing the encoded function call as the `_data` argument to {ERC1967Proxy-constructor}.
+ *
+ * CAUTION: When used with inheritance, manual care must be taken to not invoke a parent initializer twice, or to ensure
+ * that all initializers are idempotent. This is not verified automatically as constructors are by Solidity.
+ *
+ * [CAUTION]
+ * ====
+ * Avoid leaving a contract uninitialized.
+ *
+ * An uninitialized contract can be taken over by an attacker. This applies to both a proxy and its implementation
+ * contract, which may impact the proxy. To prevent the implementation contract from being used, you should invoke
+ * the {_disableInitializers} function in the constructor to automatically lock it when it is deployed:
+ *
+ * [.hljs-theme-light.nopadding]
+ * ```
+ * /// @custom:oz-upgrades-unsafe-allow constructor
+ * constructor() {
+ *     _disableInitializers();
+ * }
+ * ```
+ * ====
+ */
+abstract contract Initializable {
+    /**
+     * @dev Indicates that the contract has been initialized.
+     * @custom:oz-retyped-from bool
+     */
+    uint8 private _initialized;
+
+    /**
+     * @dev Indicates that the contract is in the process of being initialized.
+     */
+    bool private _initializing;
+
+    /**
+     * @dev Triggered when the contract has been initialized or reinitialized.
+     */
+    event Initialized(uint8 version);
+
+    /**
+     * @dev A modifier that defines a protected initializer function that can be invoked at most once. In its scope,
+     * `onlyInitializing` functions can be used to initialize parent contracts.
+     *
+     * Similar to `reinitializer(1)`, except that functions marked with `initializer` can be nested in the context of a
+     * constructor.
+     *
+     * Emits an {Initialized} event.
+     */
+    modifier initializer() {
+        bool isTopLevelCall = !_initializing;
+        require(
+            (isTopLevelCall && _initialized < 1) || (!AddressUpgradeable.isContract(address(this)) && _initialized == 1),
+            "Initializable: contract is already initialized"
+        );
+        _initialized = 1;
+        if (isTopLevelCall) {
+            _initializing = true;
+        }
+        _;
+        if (isTopLevelCall) {
+            _initializing = false;
+            emit Initialized(1);
+        }
+    }
+
+    /**
+     * @dev A modifier that defines a protected reinitializer function that can be invoked at most once, and only if the
+     * contract hasn't been initialized to a greater version before. In its scope, `onlyInitializing` functions can be
+     * used to initialize parent contracts.
+     *
+     * A reinitializer may be used after the original initialization step. This is essential to configure modules that
+     * are added through upgrades and that require initialization.
+     *
+     * When `version` is 1, this modifier is similar to `initializer`, except that functions marked with `reinitializer`
+     * cannot be nested. If one is invoked in the context of another, execution will revert.
+     *
+     * Note that versions can jump in increments greater than 1; this implies that if multiple reinitializers coexist in
+     * a contract, executing them in the right order is up to the developer or operator.
+     *
+     * WARNING: setting the version to 255 will prevent any future reinitialization.
+     *
+     * Emits an {Initialized} event.
+     */
+    modifier reinitializer(uint8 version) {
+        require(!_initializing && _initialized < version, "Initializable: contract is already initialized");
+        _initialized = version;
+        _initializing = true;
+        _;
+        _initializing = false;
+        emit Initialized(version);
+    }
+
+    /**
+     * @dev Modifier to protect an initialization function so that it can only be invoked by functions with the
+     * {initializer} and {reinitializer} modifiers, directly or indirectly.
+     */
+    modifier onlyInitializing() {
+        require(_initializing, "Initializable: contract is not initializing");
+        _;
+    }
+
+    /**
+     * @dev Locks the contract, preventing any future reinitialization. This cannot be part of an initializer call.
+     * Calling this in the constructor of a contract will prevent that contract from being initialized or reinitialized
+     * to any version. It is recommended to use this to lock implementation contracts that are designed to be called
+     * through proxies.
+     *
+     * Emits an {Initialized} event the first time it is successfully executed.
+     */
+    function _disableInitializers() internal virtual {
+        require(!_initializing, "Initializable: contract is initializing");
+        if (_initialized != type(uint8).max) {
+            _initialized = type(uint8).max;
+            emit Initialized(type(uint8).max);
+        }
+    }
+
+    /**
+     * @dev Returns the highest version that has been initialized. See {reinitializer}.
+     */
+    function _getInitializedVersion() internal view returns (uint8) {
+        return _initialized;
+    }
+
+    /**
+     * @dev Returns `true` if the contract is currently initializing. See {onlyInitializing}.
+     */
+    function _isInitializing() internal view returns (bool) {
+        return _initializing;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+import {Initializable} from "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuardUpgradeable is Initializable {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    function __ReentrancyGuard_init() internal onlyInitializing {
+        __ReentrancyGuard_init_unchained();
+    }
+
+    function __ReentrancyGuard_init_unchained() internal onlyInitializing {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+
+// File: node_modules/@openzeppelin/contracts/proxy/Clones.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (proxy/Clones.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for
+ * deploying minimal proxy contracts, also known as "clones".
+ *
+ * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies
+ * > a minimal bytecode implementation that delegates all calls to a known, fixed address.
+ *
+ * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`
+ * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the
+ * deterministic method.
+ *
+ * _Available since v3.4._
+ */
+library Clones {
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create opcode, which should never revert.
+     */
+    function clone(address implementation) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create(0, 0x09, 0x37)
+        }
+        require(instance != address(0), "ERC1167: create failed");
+    }
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create2 opcode and a `salt` to deterministically deploy
+     * the clone. Using the same `implementation` and `salt` multiple time will revert, since
+     * the clones cannot be deployed twice at the same address.
+     */
+    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create2(0, 0x09, 0x37, salt)
+        }
+        require(instance != address(0), "ERC1167: create2 failed");
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt,
+        address deployer
+    ) internal pure returns (address predicted) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(add(ptr, 0x38), deployer)
+            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)
+            mstore(add(ptr, 0x14), implementation)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)
+            mstore(add(ptr, 0x58), salt)
+            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))
+            predicted := keccak256(add(ptr, 0x43), 0x55)
+        }
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt
+    ) internal view returns (address predicted) {
+        return predictDeterministicAddress(implementation, salt, address(this));
+    }
+}
+
+
+// File: contracts/factories/Factory.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.23;
+
+/**
+ * @title Factory
+ * @author malteish
+ * @notice inherit from this contract to create a factory for a specific contract
+ */
+
+abstract contract Factory {
+    /// The address of the implementation contract
+    address public immutable implementation;
+
+    constructor(address _implementation) {
+        require(_implementation != address(0), "Factory: implementation can not be zero");
+        implementation = _implementation;
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20Upgradeable {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/token/ERC20/extensions/IERC20PermitUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.4) (token/ERC20/extensions/IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ *
+ * ==== Security Considerations
+ *
+ * There are two important considerations concerning the use of `permit`. The first is that a valid permit signature
+ * expresses an allowance, and it should not be assumed to convey additional meaning. In particular, it should not be
+ * considered as an intention to spend the allowance in any specific way. The second is that because permits have
+ * built-in replay protection and can be submitted by anyone, they can be frontrun. A protocol that uses permits should
+ * take this into consideration and allow a `permit` call to fail. Combining these two aspects, a pattern that may be
+ * generally recommended is:
+ *
+ * ```solidity
+ * function doThingWithPermit(..., uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) public {
+ *     try token.permit(msg.sender, address(this), value, deadline, v, r, s) {} catch {}
+ *     doThing(..., value);
+ * }
+ *
+ * function doThing(..., uint256 value) public {
+ *     token.safeTransferFrom(msg.sender, address(this), value);
+ *     ...
+ * }
+ * ```
+ *
+ * Observe that: 1) `msg.sender` is used as the owner, leaving no ambiguity as to the signer intent, and 2) the use of
+ * `try/catch` allows the permit to fail and makes the code tolerant to frontrunning. (See also
+ * {SafeERC20-safeTransferFrom}).
+ *
+ * Additionally, note that smart contract wallets (such as Argent or Safe) are not able to produce permit signatures, so
+ * contracts should have entry points that don't rely on permit.
+ */
+interface IERC20PermitUpgradeable {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     *
+     * CAUTION: See Security Considerations above.
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library AddressUpgradeable {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     *
+     * Furthermore, `isContract` will also return true if the target contract within
+     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,
+     * which only has an effect at the end of a transaction.
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.0/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling
+     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.
+     *
+     * _Available since v4.8._
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        if (success) {
+            if (returndata.length == 0) {
+                // only check isContract if the call was successful and the return data is empty
+                // otherwise we already know that it was a contract
+                require(isContract(target), "Address: call to non-contract");
+            }
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason or using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            _revert(returndata, errorMessage);
+        }
+    }
+
+    function _revert(bytes memory returndata, string memory errorMessage) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            /// @solidity memory-safe-assembly
+            assembly {
+                let returndata_size := mload(returndata)
+                revert(add(32, returndata), returndata_size)
+            }
+        } else {
+            revert(errorMessage);
+        }
+    }
+}
+
+
+// File: node_modules/@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.4) (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+import {Initializable} from "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract ContextUpgradeable is Initializable {
+    function __Context_init() internal onlyInitializing {
+    }
+
+    function __Context_init_unchained() internal onlyInitializing {
+    }
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+

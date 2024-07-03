@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity 0.8.0;
+
+contract WhatDoYouWantToSayToWeb3 {
+
+    event WhatDoYouWantToSayToWEB3(string anyString);
+
+    function whatDoYouWantToSayToWEB3(string memory _anyString) public {
+        emit WhatDoYouWantToSayToWEB3(_anyString);
+    }
+
+}

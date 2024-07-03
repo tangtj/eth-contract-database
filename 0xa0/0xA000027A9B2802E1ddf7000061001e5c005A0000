@@ -1,0 +1,2165 @@
+
+// File: src/StrictAuthorizedTransferSecurityRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {
+    ListTypes,
+    TransferSecurityLevels,
+    IStrictAuthorizedTransferSecurityRegistry
+} from "./interfaces/IStrictAuthorizedTransferSecurityRegistry.sol";
+
+import {
+    ICreatorTokenTransferValidator
+} from "./interfaces/ICreatorTokenTransferValidator.sol";
+
+import { IOwnable } from "./interfaces/IOwnable.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import { ERC165 } from "@openzeppelin/contracts/utils/introspection/ERC165.sol";
+
+import { Tstorish } from "tstorish/Tstorish.sol";
+
+import { IEOARegistry } from "./interfaces/IEOARegistry.sol";
+
+import {
+    StrictAuthorizedTransferSecurityRegistryExtraViewFns
+} from "./StrictAuthorizedTransferSecurityRegistryExtraViewFns.sol";
+
+/// @title StrictAuthorizedTransferSecurityRegistry
+/// @dev Implementation of a simplified version of the Transfer Security Registry that only
+///      supports authorizers and whitelisted operators, and allows collections to disable
+///      direct transfers (where caller == from) and contract recipients (requiring EOA
+///      registration by providing a signature). Note that a number of view functions on
+///      collections that add this validator will not work.
+contract StrictAuthorizedTransferSecurityRegistry is Tstorish, IStrictAuthorizedTransferSecurityRegistry, ERC165 {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    /**
+     * @dev This struct is used internally to represent an enumerable list of accounts.
+     */
+    struct AccountList {
+        EnumerableSet.AddressSet enumerableAccounts;
+        mapping (address => bool) nonEnumerableAccounts;
+    }
+
+    /**
+     * @dev This struct is used internally for the storage of authorizer + operator lists.
+     */
+    struct List {
+        address owner;
+        AccountList authorizers;
+        AccountList operators;
+        AccountList blacklist;
+    }
+
+    struct CollectionConfiguration {
+        uint120 listId;
+        bool policyBypassed;
+        bool blacklistBased;
+        bool directTransfersDisabled;
+        bool contractRecipientsDisabled;
+        bool signatureRegistrationRequired;
+    }
+    
+    /// @dev The default admin role value for contracts that implement access control.
+    bytes32 private constant DEFAULT_ACCESS_CONTROL_ADMIN_ROLE = 0x00;
+
+    /// @notice Keeps track of the most recently created list id.
+    uint120 public lastListId;
+
+    /// @dev Mapping of list ids to list settings
+    mapping (uint120 => List) private lists;
+
+    /// @dev Mapping of collection addresses to list ids & security policies.
+    mapping (address => CollectionConfiguration) private collectionConfiguration;
+
+    // TSTORE slot: scope ++ 8 empty bytes ++ collection
+    bytes4 private constant _AUTHORIZED_OPERATOR_SCOPE = 0x596a397a;
+
+    // TSTORE slot: keccak256(scope ++ identifier ++ collection)
+    bytes4 private constant _AUTHORIZED_IDENTIFIER_SCOPE = 0x7e746c61;
+
+    // TSTORE slot: keccak256(scope ++ identifier ++ collection)
+    bytes4 private constant _AUTHORIZED_AMOUNT_SCOPE = 0x71836d45;
+
+    address private immutable _EXTRA_VIEW_FUNCTIONS;
+
+    IEOARegistry private immutable _EOA_REGISTRY;
+
+    /**
+     * @dev This modifier restricts a function call to the owner of the list `id`.
+     * @dev Throws when the caller is not the list owner.
+     */
+    modifier onlyListOwner(uint120 id) {
+        _requireCallerOwnsList(id);
+        _;
+    }
+
+    /**
+     * @dev This modifier reverts a transaction if the supplied array has a zero length.
+     * @dev Throws when the array parameter has a zero length.
+     */
+    modifier notZero(uint256 value) {
+        if (value == 0) {
+            revert StrictAuthorizedTransferSecurityRegistry__ArrayLengthCannotBeZero();
+        }
+        _;
+    }
+
+    constructor(address defaultOwner, address eoaRegistry) {
+        uint120 id = 0;
+
+        lists[id].owner = defaultOwner;
+
+        emit CreatedList(id, "DEFAULT LIST");
+        emit ReassignedListOwnership(id, defaultOwner);
+
+        // Deploy a contract containing legacy view functions.
+        _EXTRA_VIEW_FUNCTIONS = address(new StrictAuthorizedTransferSecurityRegistryExtraViewFns());
+
+        _EOA_REGISTRY = IEOARegistry(eoaRegistry);
+    }
+
+    // Delegatecall to contract with legacy view functions in the fallback.
+    fallback() external {
+        address target = _EXTRA_VIEW_FUNCTIONS;
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let status := delegatecall(gas(), target, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch status
+            case 0 {
+                revert(0, returndatasize())
+            }
+            default {
+                return(0, returndatasize())
+            }
+        }
+    }
+
+    /// Manage lists of authorizers & operators that can be applied to collections
+    function createList(string calldata name) external returns (uint120) {
+        uint120 id = ++lastListId;
+
+        lists[id].owner = msg.sender;
+
+        emit CreatedList(id, name);
+        emit ReassignedListOwnership(id, msg.sender);
+
+        return id;
+    }
+
+    function createListCopy(string calldata name, uint120 sourceListId) external override returns (uint120) {
+        uint120 id = ++lastListId;
+
+        unchecked {
+            if (sourceListId > id - 1) {
+                revert StrictAuthorizedTransferSecurityRegistry__ListDoesNotExist();
+            }
+        }
+        List storage sourceList = lists[sourceListId];
+        List storage targetList = lists[id];
+
+        targetList.owner = msg.sender;
+
+        emit CreatedList(id, name);
+        emit ReassignedListOwnership(id, msg.sender);
+
+        _copyAddressSet(ListTypes.AuthorizerList, id, sourceList.authorizers, targetList.authorizers);
+        _copyAddressSet(ListTypes.OperatorList, id, sourceList.operators, targetList.operators);
+        _copyAddressSet(ListTypes.OperatorRequiringAuthorizationList, id, sourceList.blacklist, targetList.blacklist);
+
+        return id;
+    }
+
+    function reassignOwnershipOfList(uint120 id, address newOwner) external onlyListOwner(id) {
+        if (newOwner == address(0)) {
+            revert StrictAuthorizedTransferSecurityRegistry__ListOwnershipCannotBeTransferredToZeroAddress();
+        }
+
+        lists[id].owner = newOwner;
+
+        emit ReassignedListOwnership(id, newOwner);
+    }
+
+    function renounceOwnershipOfList(uint120 id) external onlyListOwner(id) {
+        lists[id].owner = address(0);
+
+        emit ReassignedListOwnership(id, address(0));
+    }
+
+    function applyListToCollection(address collection, uint120 id) external {
+        _requireCallerIsNFTOrContractOwnerOrAdmin(collection);
+
+        if (id > lastListId) {
+            revert StrictAuthorizedTransferSecurityRegistry__ListDoesNotExist();
+        }
+
+        collectionConfiguration[collection].listId = id;
+
+        emit AppliedListToCollection(collection, id);
+    }
+
+    function listOwners(uint120 id) external view returns (address) {
+        return lists[id].owner;
+    }
+
+    /// Manage and query for authorizers on lists
+    function addAccountToAuthorizers(uint120 id, address account) external onlyListOwner(id) {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        _addAccounts(id, accounts, lists[id].authorizers, ListTypes.AuthorizerList);
+    }
+
+    function addAccountsToAuthorizers(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _addAccounts(id, accounts, lists[id].authorizers, ListTypes.AuthorizerList);
+    }
+
+    function addAuthorizers(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _addAccounts(id, accounts, lists[id].authorizers, ListTypes.AuthorizerList);
+    }
+
+    function removeAccountFromAuthorizers(uint120 id, address account) external onlyListOwner(id) {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        _removeAccounts(id, accounts, lists[id].authorizers, ListTypes.AuthorizerList);
+    }
+    
+    function removeAccountsFromAuthorizers(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _removeAccounts(id, accounts, lists[id].authorizers, ListTypes.AuthorizerList);
+    }
+
+    function getAuthorizerAccounts(uint120 id) external view returns (address[] memory) {
+        return lists[id].authorizers.enumerableAccounts.values();
+    }
+
+    function isAccountAuthorizer(uint120 id, address account) external view returns (bool) {
+        return lists[id].authorizers.nonEnumerableAccounts[account];
+    }
+
+    function getAuthorizerAccountsByCollection(address collection) external view returns (address[] memory) {
+        return lists[collectionConfiguration[collection].listId].authorizers.enumerableAccounts.values();
+    }
+
+    function isAccountAuthorizerOfCollection(address collection, address account) external view returns (bool) {
+        return lists[collectionConfiguration[collection].listId].authorizers.nonEnumerableAccounts[account];
+    }
+
+    function _ensureCallerIsCollectionAuthorizer(address collection) internal view {
+        if (!lists[collectionConfiguration[collection].listId].authorizers.nonEnumerableAccounts[msg.sender]) {
+            revert StrictAuthorizedTransferSecurityRegistry__CallerIsNotValidAuthorizer();
+        }
+    }
+
+    /// Manage and query for operators on lists
+    function addAccountToWhitelist(uint120 id, address account) external onlyListOwner(id) {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        _addAccounts(id, accounts, lists[id].operators, ListTypes.OperatorList);
+    }
+
+    function addAccountsToWhitelist(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _addAccounts(id, accounts, lists[id].operators, ListTypes.OperatorList);
+    }
+
+    function addOperators(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _addAccounts(id, accounts, lists[id].operators, ListTypes.OperatorList);
+    }
+
+    function removeAccountFromWhitelist(uint120 id, address account) external onlyListOwner(id) {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        _removeAccounts(id, accounts, lists[id].operators, ListTypes.OperatorList);
+    }
+
+    function removeAccountsFromWhitelist(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _removeAccounts(id, accounts, lists[id].operators, ListTypes.OperatorList);
+    }
+    
+    function getWhitelistedAccounts(uint120 id) external view returns (address[] memory) {
+        return lists[id].operators.enumerableAccounts.values();
+    }
+
+    function isAccountWhitelisted(uint120 id, address account) external view returns (bool) {
+        return lists[id].operators.nonEnumerableAccounts[account];
+    }
+    function getWhitelistedAccountsByCollection(address collection) external view returns (address[] memory) {
+        return lists[collectionConfiguration[collection].listId].operators.enumerableAccounts.values();
+    }
+
+    function isAccountWhitelistedByCollection(address collection, address account) external view returns (bool) {
+        return lists[collectionConfiguration[collection].listId].operators.nonEnumerableAccounts[account];
+    }
+
+    /// Manage and query for blacklists on lists
+    function addAccountToBlacklist(uint120 id, address account) external onlyListOwner(id) {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        _addAccounts(id, accounts, lists[id].blacklist, ListTypes.OperatorRequiringAuthorizationList);
+    }
+
+    function addAccountsToBlacklist(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _addAccounts(id, accounts, lists[id].blacklist, ListTypes.OperatorRequiringAuthorizationList);
+    }
+
+    function removeAccountFromBlacklist(uint120 id, address account) external onlyListOwner(id) {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        _removeAccounts(id, accounts, lists[id].blacklist, ListTypes.OperatorRequiringAuthorizationList);
+    }
+
+    function removeAccountsFromBlacklist(uint120 id, address[] calldata accounts) external onlyListOwner(id) notZero(accounts.length) {
+        _removeAccounts(id, accounts, lists[id].blacklist, ListTypes.OperatorRequiringAuthorizationList);
+    } 
+
+    function getBlacklistedAccounts(uint120 id) external view returns (address[] memory) {
+        return lists[id].blacklist.enumerableAccounts.values();
+    }
+
+    function isAccountBlacklisted(uint120 id, address account) external view returns (bool) {
+        return lists[id].blacklist.nonEnumerableAccounts[account];
+    }
+    function getBlacklistedAccountsByCollection(address collection) external view returns (address[] memory) {
+        return lists[collectionConfiguration[collection].listId].blacklist.enumerableAccounts.values();
+    }
+
+    function isAccountBlacklistedByCollection(address collection, address account) external view returns (bool) {
+        return lists[collectionConfiguration[collection].listId].blacklist.nonEnumerableAccounts[account];
+    }
+
+    /// Ensure that a specific operator has been authorized to transfer tokens
+    function validateTransfer(address caller, address from, address to) external view {
+        _validateTransfer(caller, from, to);
+    }
+
+    /// Ensure that a transfer has been authorized for a specific tokenId
+    function validateTransfer(address caller, address from, address to, uint256 tokenId) external view {
+        _validateTransferByIdentifer(caller, from, to, tokenId);
+    }
+
+    /// Ensure that a transfer has been authorized for a specific amount of a specific tokenId, and
+    /// reduce the transferable amount remaining
+    function validateTransfer(address caller, address from, address to, uint256 tokenId, uint256 amount) external {
+        _validateTransferByAmount(caller, from, to, tokenId, amount);
+    }
+
+    /// Legacy alias for validateTransfer (address caller, address from, address to)
+    function applyCollectionTransferPolicy(address caller, address from, address to) external view {
+        _validateTransfer(caller, from, to);
+    }
+
+    /// Temporarily assign a specific allowed operator for a given collection
+    function beforeAuthorizedTransfer(address operator, address token) external {
+        _ensureCallerIsCollectionAuthorizer(token);
+
+        _setTstorish(
+            _getAuthorizedOperatorSlot(token),
+            uint256(uint160(operator))
+        );
+    }
+
+    /// Clear assignment of a specific allowed operator for a given collection
+    function afterAuthorizedTransfer(address token) external {
+        _ensureCallerIsCollectionAuthorizer(token);
+
+        _clearTstorish(_getAuthorizedOperatorSlot(token));
+    }
+
+    /// Temporarily allow a specific tokenId from a given collection to be transferred
+    function beforeAuthorizedTransfer(address token, uint256 tokenId) external {
+        _ensureCallerIsCollectionAuthorizer(token);
+
+        _setTstorish(
+            _getAuthorizedIdentifierSlot(token, tokenId),
+            1
+        );
+    }
+
+    /// Clear assignment of an specific tokenId's transfer allowance
+    function afterAuthorizedTransfer(address token, uint256 tokenId) external {
+        _ensureCallerIsCollectionAuthorizer(token);
+
+        _clearTstorish(_getAuthorizedIdentifierSlot(token, tokenId));
+    }
+
+    /// Temporarily allow a specific amount of a specific tokenId from a given collection to be transferred
+    function beforeAuthorizedTransferWithAmount(address token, uint256 tokenId, uint256 amount) external {
+        _ensureCallerIsCollectionAuthorizer(token);
+
+        uint256 slot = _getAuthorizedAmountSlot(token, tokenId);
+
+        uint256 currentAmount = _getTstorish(slot);
+
+        uint256 newAmount = currentAmount + amount;
+
+        _setTstorish(slot, newAmount);
+    }
+
+    /// Clear assignment of a tokenId's transfer allowance for a specific amount
+    function afterAuthorizedTransferWithAmount(address token, uint256 tokenId) external {
+        _ensureCallerIsCollectionAuthorizer(token);
+
+        _clearTstorish(_getAuthorizedAmountSlot(token, tokenId));
+    }
+
+    function setTransferSecurityLevelOfCollection(
+        address collection,
+        uint8 level,
+        bool enableAuthorizationMode,
+        bool authorizersCanSetWildcardOperators,
+        bool enableAccountFreezingMode
+    ) external {
+        if (!enableAuthorizationMode || !authorizersCanSetWildcardOperators || enableAccountFreezingMode) {
+            revert StrictAuthorizedTransferSecurityRegistry__UnsupportedSecurityLevelDetail();
+        }
+
+        _setTransferSecurityLevelOfCollection(collection, TransferSecurityLevels(level));
+    }
+
+    function setTransferSecurityLevelOfCollection(
+        address collection,
+        TransferSecurityLevels level
+    ) external {
+        _setTransferSecurityLevelOfCollection(collection, level);
+    }
+
+    function isVerifiedEOA(address account) external view returns (bool) {
+        return _EOA_REGISTRY.isVerifiedEOA(account);
+    }
+
+    /// @notice ERC-165 Interface Support
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165) returns (bool) {
+        return
+            interfaceId == type(ICreatorTokenTransferValidator).interfaceId ||
+            interfaceId == type(IStrictAuthorizedTransferSecurityRegistry).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    function _setTransferSecurityLevelOfCollection(
+        address collection,
+        TransferSecurityLevels level
+    ) internal {
+        _requireCallerIsNFTOrContractOwnerOrAdmin(collection);
+
+        if (level == TransferSecurityLevels.Recommended) {
+            level = TransferSecurityLevels.Three;
+        }
+
+        CollectionConfiguration storage config = collectionConfiguration[collection];
+        
+        if (level == TransferSecurityLevels.One) {
+            config.policyBypassed = true;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = false;
+            config.contractRecipientsDisabled = false;
+            config.signatureRegistrationRequired = false;
+        } else if (level == TransferSecurityLevels.Two) {
+            config.policyBypassed = false;
+            config.blacklistBased = true;
+            config.directTransfersDisabled = false;
+            config.contractRecipientsDisabled = false;
+            config.signatureRegistrationRequired = false;
+        } else if (level == TransferSecurityLevels.Three) {
+            config.policyBypassed = false;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = false;
+            config.contractRecipientsDisabled = false;
+            config.signatureRegistrationRequired = false;
+        } else if (level == TransferSecurityLevels.Four) {
+            config.policyBypassed = false;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = true;
+            config.contractRecipientsDisabled = false;
+            config.signatureRegistrationRequired = false;
+        } else if (level == TransferSecurityLevels.Five) {
+            config.policyBypassed = false;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = false;
+            config.contractRecipientsDisabled = true;
+            config.signatureRegistrationRequired = false;
+        } else if (level == TransferSecurityLevels.Six) {
+            config.policyBypassed = false;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = false;
+            config.contractRecipientsDisabled = false;
+            config.signatureRegistrationRequired = true;
+        } else if (level == TransferSecurityLevels.Seven) {
+            config.policyBypassed = false;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = true;
+            config.contractRecipientsDisabled = true;
+            config.signatureRegistrationRequired = false;
+        } else if (level == TransferSecurityLevels.Eight) {
+            config.policyBypassed = false;
+            config.blacklistBased = false;
+            config.directTransfersDisabled = true;
+            config.contractRecipientsDisabled = false;
+            config.signatureRegistrationRequired = true;
+        } else {
+            revert StrictAuthorizedTransferSecurityRegistry__UnsupportedSecurityLevel();
+        }
+
+        emit SetTransferSecurityLevel(collection, level);
+    }
+
+    /**
+     * @notice Copies all addresses in `ptrFromList` to `ptrToList`.
+     * 
+     * @dev    This function will copy all addresses from one list to another list.
+     * @dev    Note: If used to copy adddresses to an existing list the current list contents will not be
+     * @dev    deleted before copying. New addresses will be appeneded to the end of the list and the
+     * @dev    non-enumerable mapping key value will be set to true.
+     * 
+     * @dev <h4>Postconditions:</h4>
+     *      1. Addresses in from list that are not already present in to list are added to the to list.
+     *      2. Emits an `AddedAccountToList` event for each address copied to the list.
+     * 
+     * @param  listType          The type of list addresses are being copied from and to.
+     * @param  destinationListId The id of the list being copied to.
+     * @param  ptrFromList       The storage pointer for the list being copied from.
+     * @param  ptrToList         The storage pointer for the list being copied to.
+     */
+    function _copyAddressSet(
+        ListTypes listType,
+        uint120 destinationListId,
+        AccountList storage ptrFromList,
+        AccountList storage ptrToList
+    ) private {
+        EnumerableSet.AddressSet storage ptrFromSet = ptrFromList.enumerableAccounts;
+        EnumerableSet.AddressSet storage ptrToSet = ptrToList.enumerableAccounts;
+        mapping (address => bool) storage ptrToNonEnumerableSet = ptrToList.nonEnumerableAccounts;
+        uint256 sourceLength = ptrFromSet.length();
+        address account;
+        for (uint256 i = 0; i < sourceLength;) {
+            account = ptrFromSet.at(i); 
+            if (ptrToSet.add(account)) {
+                emit AddedAccountToList(listType, destinationListId, account);
+                ptrToNonEnumerableSet[account] = true;
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Requires the caller to be the owner of list `id`.
+     * 
+     * @dev    Throws when the caller is not the owner of the list.
+     */
+    function _requireCallerOwnsList(uint120 id) private view {
+        if (msg.sender != lists[id].owner) {
+            revert StrictAuthorizedTransferSecurityRegistry__CallerDoesNotOwnList();
+        }
+    }
+
+    /**
+     * @notice Reverts the transaction if the caller is not the owner or assigned the default
+     * @notice admin role of the contract at `tokenAddress`.
+     *
+     * @dev    Throws when the caller is neither owner nor assigned the default admin role.
+     * 
+     * @param tokenAddress The contract address of the token to check permissions for.
+     */
+    function _requireCallerIsNFTOrContractOwnerOrAdmin(address tokenAddress) internal view {
+        if (msg.sender == tokenAddress) {
+            return;
+        }
+
+        if (msg.sender == _safeOwner(tokenAddress)) {
+            return;
+        }
+
+        if (!_safeHasRole(tokenAddress)) {
+            revert StrictAuthorizedTransferSecurityRegistry__CallerMustHaveElevatedPermissionsForSpecifiedNFT();
+        }
+    }
+
+    /**
+     * @dev A gas efficient, and fallback-safe way to call the owner function on a token contract.
+     *      This will get the owner if it exists - and when the function is unimplemented, the
+     *      presence of a fallback function will not result in halted execution.
+     */
+    function _safeOwner(
+        address tokenAddress
+    ) internal view returns(address owner) {
+        assembly {
+            mstore(0x00, 0x8da5cb5b)
+            let status := staticcall(gas(), tokenAddress, 0x1c, 0x04, 0x00, 0x20)
+            if and(iszero(lt(returndatasize(), 0x20)), status) {
+                owner := mload(0x00)
+            }
+        }
+    }
+    
+    /**
+     * @dev A gas efficient, and fallback-safe way to call the hasRole function on a token contract.
+     *      This will check if the account `hasRole` if `hasRole` exists - and when the function is unimplemented, the
+     *      presence of a fallback function will not result in halted execution.
+     */
+    function _safeHasRole(
+        address tokenAddress
+    ) internal view returns(bool hasRole) {
+        assembly {
+            let ptr := mload(0x40)
+            mstore(0x40, add(ptr, 0x60))
+            mstore(ptr, 0x91d14854)
+            mstore(add(0x20, ptr), DEFAULT_ACCESS_CONTROL_ADMIN_ROLE)
+            mstore(add(0x40, ptr), caller())
+            let status := staticcall(gas(), tokenAddress, add(ptr, 0x1c), 0x44, 0x00, 0x20)
+            if and(iszero(lt(returndatasize(), 0x20)), status) {
+                hasRole := mload(0x00)
+            }
+        }
+    }
+
+
+    /**
+     * @dev Internal function used to efficiently retrieve the code length of `account`.
+     * 
+     * @param account The address to get the deployed code length for.
+     * 
+     * @return length The length of deployed code at the address.
+     */
+    function _getCodeLengthAsm(address account) internal view returns (uint256 length) {
+        assembly { length := extcodesize(account) }
+    }
+
+    function _addAccounts(
+        uint120 id,
+        address[] memory accounts,
+        AccountList storage accountList,
+        ListTypes listType
+    ) internal {
+        address account;
+        for (uint256 i = 0; i < accounts.length;) {
+            account = accounts[i];
+
+            if (account == address(0)) {
+                revert StrictAuthorizedTransferSecurityRegistry__ZeroAddressNotAllowed();
+            }
+
+            if (accountList.enumerableAccounts.add(account)) {
+                emit AddedAccountToList(listType, id, account);
+                accountList.nonEnumerableAccounts[account] = true;
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _removeAccounts(
+        uint120 id,
+        address[] memory accounts,
+        AccountList storage accountList,
+        ListTypes listType
+    ) internal {
+        address account;
+        for (uint256 i = 0; i < accounts.length;) {
+            account = accounts[i];
+
+            if (accountList.enumerableAccounts.remove(account)) {
+                emit RemovedAccountFromList(listType, id, account);
+                delete accountList.nonEnumerableAccounts[account];
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _validateTransfer(address operator, address from, address to) internal view {
+        CollectionConfiguration memory config = collectionConfiguration[msg.sender];
+
+        if (config.policyBypassed) {
+            return;
+        }
+
+        if (config.contractRecipientsDisabled) {
+            if (to.code.length != 0) {
+                revert StrictAuthorizedTransferSecurityRegistry__ReceiverMustNotHaveDeployedCode();
+            }
+        }
+        
+        if (config.signatureRegistrationRequired) {
+            if (!_EOA_REGISTRY.isVerifiedEOA(to)) {
+                revert StrictAuthorizedTransferSecurityRegistry__ReceiverProofOfEOASignatureUnverified();
+            }
+        }
+
+        if (operator == from) {
+            if (config.directTransfersDisabled) {
+                revert StrictAuthorizedTransferSecurityRegistry__CallerMustBeWhitelistedOperator();
+            }
+
+            return;
+        }
+
+        uint256 slot = _getAuthorizedOperatorSlot(msg.sender);
+
+        if (operator == address(uint160(_getTstorish(slot)))) {
+            return;
+        }
+
+        if (config.blacklistBased) {
+            if (lists[config.listId].blacklist.nonEnumerableAccounts[operator]) {
+                revert StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+            }
+        } else {
+            if (!lists[config.listId].operators.nonEnumerableAccounts[operator]) {
+                revert StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+            }
+        }
+    }
+
+    function _validateTransferByIdentifer(address operator, address from, address to, uint256 identifier) internal view {
+        CollectionConfiguration memory config = collectionConfiguration[msg.sender];
+
+        if (config.policyBypassed) {
+            return;
+        }
+
+        if (config.contractRecipientsDisabled) {
+            if (to.code.length != 0) {
+                revert StrictAuthorizedTransferSecurityRegistry__ReceiverMustNotHaveDeployedCode();
+            }
+        }
+        
+        if (config.signatureRegistrationRequired) {
+            if (!_EOA_REGISTRY.isVerifiedEOA(to)) {
+                revert StrictAuthorizedTransferSecurityRegistry__ReceiverProofOfEOASignatureUnverified();
+            }
+        }
+
+        if (operator == from) {
+            if (config.directTransfersDisabled) {
+                revert StrictAuthorizedTransferSecurityRegistry__CallerMustBeWhitelistedOperator();
+            }
+
+            return;
+        }
+
+        uint256 slot = _getAuthorizedIdentifierSlot(msg.sender, identifier);
+
+        uint256 authorizedIdentifier = _getTstorish(slot);
+
+        if (authorizedIdentifier != 0) {
+            return;
+        }
+
+        if (config.blacklistBased) {
+            if (lists[config.listId].blacklist.nonEnumerableAccounts[operator]) {
+                revert StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+            }
+        } else {
+            if (!lists[config.listId].operators.nonEnumerableAccounts[operator]) {
+                revert StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+            }
+        }
+    }
+
+    function _validateTransferByAmount(address operator, address from, address to, uint256 identifier, uint256 amount) internal {
+        CollectionConfiguration memory config = collectionConfiguration[msg.sender];
+
+        if (config.policyBypassed) {
+            return;
+        }
+
+        if (config.contractRecipientsDisabled) {
+            if (to.code.length != 0) {
+                revert StrictAuthorizedTransferSecurityRegistry__ReceiverMustNotHaveDeployedCode();
+            }
+        }
+        
+        if (config.signatureRegistrationRequired) {
+            if (!_EOA_REGISTRY.isVerifiedEOA(to)) {
+                revert StrictAuthorizedTransferSecurityRegistry__ReceiverProofOfEOASignatureUnverified();
+            }
+        }
+
+        if (operator == from) {
+            if (config.directTransfersDisabled) {
+                revert StrictAuthorizedTransferSecurityRegistry__CallerMustBeWhitelistedOperator();
+            }
+
+            return;
+        }
+
+        uint256 slot = _getAuthorizedAmountSlot(msg.sender, identifier);
+
+        uint256 authorizedAmount = _getTstorish(slot);
+        if (authorizedAmount >= amount) {
+            unchecked {
+                _setTstorish(slot, authorizedAmount - amount);
+            }
+
+            return;
+        }
+
+        if (config.blacklistBased) {
+            if (lists[config.listId].blacklist.nonEnumerableAccounts[operator]) {
+                revert StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+            }
+        } else {
+            if (!lists[config.listId].operators.nonEnumerableAccounts[operator]) {
+                revert StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+            }
+        }
+    }
+
+    function _getAuthorizedOperatorSlot(
+        address collection
+    ) internal pure returns (uint256 slot) {
+        bytes4 authorizedOperatorScope = _AUTHORIZED_OPERATOR_SCOPE;
+        assembly {
+            slot := or(
+                authorizedOperatorScope,
+                and(collection, 0xffffffffffffffffffffffffffffffffffffffff)
+            )
+        }
+    }
+
+    function _getAuthorizedIdentifierSlot(
+        address collection,
+        uint256 identifier
+    ) internal pure returns (uint256 slot) {
+        bytes4 authorizedIdentifierScope = _AUTHORIZED_IDENTIFIER_SCOPE;
+        assembly {
+            mstore(0x0, authorizedIdentifierScope)
+            mstore(0x18, collection)
+            mstore(0x04, identifier)
+            slot := keccak256(0x0, 0x38)
+        }
+    }
+
+    function _getAuthorizedAmountSlot(
+        address collection,
+        uint256 identifier
+    ) internal pure returns (uint256 slot) {
+        bytes4 authorizedAmountScope = _AUTHORIZED_AMOUNT_SCOPE;
+        assembly {
+            mstore(0x0, authorizedAmountScope)
+            mstore(0x18, collection)
+            mstore(0x04, identifier)
+            slot := keccak256(0x0, 0x38)
+        }
+    }
+}
+
+
+// File: src/interfaces/IStrictAuthorizedTransferSecurityRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+enum ListTypes {
+    AuthorizerList,
+    OperatorList,
+    OperatorRequiringAuthorizationList
+}
+
+enum TransferSecurityLevels {
+    Recommended,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight
+}
+
+/// @title IStrictAuthorizedTransferSecurityRegistry
+/// @dev Interface for the Authorized Transfer Security Registry, a simplified version of the Transfer
+///      Security Registry that only supports authorizers and whitelisted operators, and assumes a
+///      security level of OperatorWhitelistEnableOTC + authorizers for all collections that use it.
+///      Note that a number of view functions on collections that add this validator will not work.
+interface IStrictAuthorizedTransferSecurityRegistry {
+    event CreatedList(uint256 indexed id, string name);
+    event AppliedListToCollection(address indexed collection, uint120 indexed id);
+    event ReassignedListOwnership(uint256 indexed id, address indexed newOwner);
+    event AddedAccountToList(ListTypes indexed kind, uint256 indexed id, address indexed account);
+    event RemovedAccountFromList(ListTypes indexed kind, uint256 indexed id, address indexed account);
+    event SetTransferSecurityLevel(address collection, TransferSecurityLevels level);
+
+    error StrictAuthorizedTransferSecurityRegistry__ListDoesNotExist();
+    error StrictAuthorizedTransferSecurityRegistry__CallerDoesNotOwnList();
+    error StrictAuthorizedTransferSecurityRegistry__ArrayLengthCannotBeZero();
+    error StrictAuthorizedTransferSecurityRegistry__CallerMustHaveElevatedPermissionsForSpecifiedNFT();
+    error StrictAuthorizedTransferSecurityRegistry__ListOwnershipCannotBeTransferredToZeroAddress();
+    error StrictAuthorizedTransferSecurityRegistry__ZeroAddressNotAllowed();
+    error StrictAuthorizedTransferSecurityRegistry__UnauthorizedTransfer();
+    error StrictAuthorizedTransferSecurityRegistry__CallerIsNotValidAuthorizer();
+    error StrictAuthorizedTransferSecurityRegistry__UnsupportedSecurityLevel();
+    error StrictAuthorizedTransferSecurityRegistry__UnsupportedSecurityLevelDetail();
+    error StrictAuthorizedTransferSecurityRegistry__CallerMustBeWhitelistedOperator();
+    error StrictAuthorizedTransferSecurityRegistry__ReceiverMustNotHaveDeployedCode();
+    error StrictAuthorizedTransferSecurityRegistry__ReceiverProofOfEOASignatureUnverified();
+
+    /// Manage lists of authorizers & operators that can be applied to collections
+    function createList(string calldata name) external returns (uint120);
+    function createListCopy(string calldata name, uint120 sourceListId) external returns (uint120);
+    function reassignOwnershipOfList(uint120 id, address newOwner) external;
+    function renounceOwnershipOfList(uint120 id) external;
+    function applyListToCollection(address collection, uint120 id) external;
+    function listOwners(uint120 id) external view returns (address);
+
+    /// Manage and query for authorizers on lists
+    function addAccountToAuthorizers(uint120 id, address account) external;
+
+    function addAccountsToAuthorizers(uint120 id, address[] calldata accounts) external;
+
+    function addAuthorizers(uint120 id, address[] calldata accounts) external;
+
+    function removeAccountFromAuthorizers(uint120 id, address account) external;
+    
+    function removeAccountsFromAuthorizers(uint120 id, address[] calldata accounts) external;
+
+    function getAuthorizerAccounts(uint120 id) external view returns (address[] memory);
+
+    function isAccountAuthorizer(uint120 id, address account) external view returns (bool);
+
+    function getAuthorizerAccountsByCollection(address collection) external view returns (address[] memory);
+
+    function isAccountAuthorizerOfCollection(address collection, address account) external view returns (bool);
+
+    /// Manage and query for operators on lists
+    function addAccountToWhitelist(uint120 id, address account) external;
+
+    function addAccountsToWhitelist(uint120 id, address[] calldata accounts) external;
+
+    function addOperators(uint120 id, address[] calldata accounts) external;
+
+    function removeAccountFromWhitelist(uint120 id, address account) external;
+
+    function removeAccountsFromWhitelist(uint120 id, address[] calldata accounts) external;
+    
+    function getWhitelistedAccounts(uint120 id) external view returns (address[] memory);
+
+    function isAccountWhitelisted(uint120 id, address account) external view returns (bool);
+    function getWhitelistedAccountsByCollection(address collection) external view returns (address[] memory);
+
+    function isAccountWhitelistedByCollection(address collection, address account) external view returns (bool);
+
+    /// Manage and query for blacklists on lists
+    function addAccountToBlacklist(uint120 id, address account) external;
+
+    function addAccountsToBlacklist(uint120 id, address[] calldata accounts) external;
+
+    function removeAccountFromBlacklist(uint120 id, address account) external;
+
+    function removeAccountsFromBlacklist(uint120 id, address[] calldata accounts) external;
+
+    function getBlacklistedAccounts(uint120 id) external view returns (address[] memory);
+
+    function isAccountBlacklisted(uint120 id, address account) external view returns (bool);
+    function getBlacklistedAccountsByCollection(address collection) external view returns (address[] memory);
+
+    function isAccountBlacklistedByCollection(address collection, address account) external view returns (bool);
+
+    function setTransferSecurityLevelOfCollection(
+        address collection,
+        uint8 level,
+        bool enableAuthorizationMode,
+        bool authorizersCanSetWildcardOperators,
+        bool enableAccountFreezingMode
+    ) external;
+
+    function setTransferSecurityLevelOfCollection(
+        address collection,
+        TransferSecurityLevels level
+    ) external;
+
+    function isVerifiedEOA(address account) external view returns (bool);
+
+    /// Ensure that a specific operator has been authorized to transfer tokens
+    function validateTransfer(address caller, address from, address to) external view;
+
+    /// Ensure that a transfer has been authorized for a specific tokenId
+    function validateTransfer(address caller, address from, address to, uint256 tokenId) external view;
+
+    /// Ensure that a transfer has been authorized for a specific amount of a specific tokenId, and
+    /// reduce the transferable amount remaining
+    function validateTransfer(address caller, address from, address to, uint256 tokenId, uint256 amount) external;
+
+    /// Legacy alias for validateTransfer (address caller, address from, address to)
+    function applyCollectionTransferPolicy(address caller, address from, address to) external view;
+
+    /// Temporarily assign a specific allowed operator for a given collection
+    function beforeAuthorizedTransfer(address operator, address token) external;
+
+    /// Clear assignment of a specific allowed operator for a given collection
+    function afterAuthorizedTransfer(address token) external;
+
+    /// Temporarily allow a specific tokenId from a given collection to be transferred
+    function beforeAuthorizedTransfer(address token, uint256 tokenId) external;
+
+    /// Clear assignment of an specific tokenId's transfer allowance
+    function afterAuthorizedTransfer(address token, uint256 tokenId) external;
+
+    /// Temporarily allow a specific amount of a specific tokenId from a given collection to be transferred
+    function beforeAuthorizedTransferWithAmount(address token, uint256 tokenId, uint256 amount) external;
+
+    /// Clear assignment of a tokenId's transfer allowance for a specific amount
+    function afterAuthorizedTransferWithAmount(address token, uint256 tokenId) external;
+}
+
+// File: src/interfaces/ICreatorTokenTransferValidator.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "./IEOARegistry.sol";
+import "./ITransferSecurityRegistry.sol";
+import "./ITransferValidator.sol";
+
+interface ICreatorTokenTransferValidator is ITransferSecurityRegistry, ITransferValidator, IEOARegistry {}
+
+// File: src/interfaces/IOwnable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IOwnable {
+    function owner() external view returns (address);
+}
+
+// File: lib/openzeppelin-contracts/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     *
+     * _Available since v3.1._
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     */
+    function renounceRole(bytes32 role, address account) external;
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position of the value in the `values` array, plus 1 because index 0
+        // means a value is not in the set.
+        mapping(bytes32 => uint256) _indexes;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._indexes[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We read and store the value's index to prevent multiple reads from the same storage slot
+        uint256 valueIndex = set._indexes[value];
+
+        if (valueIndex != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 toDeleteIndex = valueIndex - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (lastIndex != toDeleteIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the last value to the index where the value to delete is
+                set._values[toDeleteIndex] = lastValue;
+                // Update the index for the moved value
+                set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the index for the deleted slot
+            delete set._indexes[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._indexes[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/ERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ *
+ * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.
+ */
+abstract contract ERC165 is IERC165 {
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+
+// File: lib/tstorish/src/Tstorish.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+contract Tstorish {
+    // Declare a storage variable indicating if TSTORE support has been
+    // activated post-deployment.
+    bool private _tstoreSupport;
+
+    /*
+     * ------------------------------------------------------------------------+
+     * Opcode      | Mnemonic         | Stack              | Memory            |
+     * ------------------------------------------------------------------------|
+     * 60 0x02     | PUSH1 0x02       | 0x02               |                   |
+     * 60 0x1e     | PUSH1 0x1e       | 0x1e 0x02          |                   |
+     * 61 0x3d5c   | PUSH2 0x3d5c     | 0x3d5c 0x1e 0x02   |                   |
+     * 3d          | RETURNDATASIZE   | 0 0x3d5c 0x1e 0x02 |                   |
+     *                                                                         |
+     * :: store deployed bytecode in memory: (3d) RETURNDATASIZE (5c) TLOAD :: |
+     * 52          | MSTORE           | 0x1e 0x02          | [0..0x20): 0x3d5c |
+     * f3          | RETURN           |                    | [0..0x20): 0x3d5c |
+     * ------------------------------------------------------------------------+
+     */
+    uint256 constant _TLOAD_TEST_PAYLOAD = 0x6002_601e_613d5c_3d_52_f3;
+    uint256 constant _TLOAD_TEST_PAYLOAD_LENGTH = 0x0a;
+    uint256 constant _TLOAD_TEST_PAYLOAD_OFFSET = 0x16;
+
+    // Declare an immutable variable to store the tstore test contract address.
+    address private immutable _tloadTestContract;
+
+    // Declare an immutable variable to store the initial TSTORE support status.
+    bool private immutable _tstoreInitialSupport;
+
+    // Declare an immutable function type variable for the _setTstorish function
+    // based on chain support for tstore at time of deployment.
+    function(uint256,uint256) internal immutable _setTstorish;
+
+    // Declare an immutable function type variable for the _getTstorish function
+    // based on chain support for tstore at time of deployment.
+    function(uint256) view returns (uint256) internal immutable _getTstorish;
+
+    // Declare an immutable function type variable for the _clearTstorish function
+    // based on chain support for tstore at time of deployment.
+    function(uint256) internal immutable _clearTstorish;
+
+    // Declare a few custom revert error types.
+    error TStoreAlreadyActivated();
+    error TStoreNotSupported();
+    error TloadTestContractDeploymentFailed();
+    error OnlyDirectCalls();
+
+    /**
+     * @dev Determine TSTORE availability during deployment. This involves
+     *      attempting to deploy a contract that utilizes TLOAD as part of the
+     *      contract construction bytecode, and configuring initial support for
+     *      using TSTORE in place of SSTORE based on the result.
+     */
+    constructor() {
+        // Deploy the contract testing TLOAD support and store the address.
+        address tloadTestContract = _prepareTloadTest();
+
+        // Ensure the deployment was successful.
+        if (tloadTestContract == address(0)) {
+            revert TloadTestContractDeploymentFailed();
+        }
+
+        // Determine if TSTORE is supported.
+        bool tstoreInitialSupport = _testTload(tloadTestContract);
+
+        if (tstoreInitialSupport) {
+            // If TSTORE is supported, set functions to their versions that use
+            // tstore/tload directly without support checks.
+            _setTstorish = _setTstore;
+            _getTstorish = _getTstore;
+            _clearTstorish = _clearTstore;
+        } else {
+            // If TSTORE is not supported, set functions to their versions that 
+            // fallback to sstore/sload until _tstoreSupport is true.
+            _setTstorish = _setTstorishWithSstoreFallback;
+            _getTstorish = _getTstorishWithSloadFallback;
+            _clearTstorish = _clearTstorishWithSstoreFallback;
+        }
+
+        _tstoreInitialSupport = tstoreInitialSupport;
+
+        // Set the address of the deployed TLOAD test contract as an immutable.
+        _tloadTestContract = tloadTestContract;
+    }
+
+    /**
+     * @dev External function to activate TSTORE usage. Does not need to be
+     *      called if TSTORE is supported from deployment, and only needs to be
+     *      called once. Reverts if TSTORE has already been activated or if the
+     *      opcode is not available. Note that this must be called directly from
+     *      an externally-owned account to avoid potential reentrancy issues.
+     */
+    function __activateTstore() external {
+        // Ensure this function is triggered from an externally-owned account.
+        if (msg.sender != tx.origin) {
+            revert OnlyDirectCalls();
+        }
+
+        // Determine if TSTORE can potentially be activated.
+        if (_tstoreInitialSupport || _tstoreSupport) {
+            revert TStoreAlreadyActivated();
+        }
+
+        // Determine if TSTORE can be activated and revert if not.
+        if (!_testTload(_tloadTestContract)) {
+            revert TStoreNotSupported();
+        }
+
+        // Mark TSTORE as activated.
+        _tstoreSupport = true;
+    }
+
+    /**
+     * @dev Private function to set a TSTORISH value. Assigned to _setTstorish 
+     *      internal function variable at construction if chain has tstore support.
+     *
+     * @param storageSlot The slot to write the TSTORISH value to.
+     * @param value       The value to write to the given storage slot.
+     */
+    function _setTstore(uint256 storageSlot, uint256 value) private {
+        assembly {
+            tstore(storageSlot, value)
+        }
+    }
+
+    /**
+     * @dev Private function to set a TSTORISH value with sstore fallback. 
+     *      Assigned to _setTstorish internal function variable at construction
+     *      if chain does not have tstore support.
+     *
+     * @param storageSlot The slot to write the TSTORISH value to.
+     * @param value       The value to write to the given storage slot.
+     */
+    function _setTstorishWithSstoreFallback(uint256 storageSlot, uint256 value) private {
+        if (_tstoreSupport) {
+            assembly {
+                tstore(storageSlot, value)
+            }
+        } else {
+            assembly {
+                sstore(storageSlot, value)
+            }
+        }
+    }
+
+    /**
+     * @dev Private function to read a TSTORISH value. Assigned to _getTstorish
+     *      internal function variable at construction if chain has tstore support.
+     *
+     * @param storageSlot The slot to read the TSTORISH value from.
+     *
+     * @return value The TSTORISH value at the given storage slot.
+     */
+    function _getTstore(
+        uint256 storageSlot
+    ) private view returns (uint256 value) {
+        assembly {
+            value := tload(storageSlot)
+        }
+    }
+
+    /**
+     * @dev Private function to read a TSTORISH value with sload fallback. 
+     *      Assigned to _getTstorish internal function variable at construction
+     *      if chain does not have tstore support.
+     *
+     * @param storageSlot The slot to read the TSTORISH value from.
+     *
+     * @return value The TSTORISH value at the given storage slot.
+     */
+    function _getTstorishWithSloadFallback(
+        uint256 storageSlot
+    ) private view returns (uint256 value) {
+        if (_tstoreSupport) {
+            assembly {
+                value := tload(storageSlot)
+            }
+        } else {
+            assembly {
+                value := sload(storageSlot)
+            }
+        }
+    }
+
+    /**
+     * @dev Private function to clear a TSTORISH value. Assigned to _clearTstorish internal 
+     *      function variable at construction if chain has tstore support.
+     *
+     * @param storageSlot The slot to clear the TSTORISH value for.
+     */
+    function _clearTstore(uint256 storageSlot) private {
+        assembly {
+            tstore(storageSlot, 0)
+        }
+    }
+
+    /**
+     * @dev Private function to clear a TSTORISH value with sstore fallback. 
+     *      Assigned to _clearTstorish internal function variable at construction
+     *      if chain does not have tstore support.
+     *
+     * @param storageSlot The slot to clear the TSTORISH value for.
+     */
+    function _clearTstorishWithSstoreFallback(uint256 storageSlot) private {
+        if (_tstoreSupport) {
+            assembly {
+                tstore(storageSlot, 0)
+            }
+        } else {
+            assembly {
+                sstore(storageSlot, 0)
+            }
+        }
+    }
+
+    /**
+     * @dev Private function to deploy a test contract that utilizes TLOAD as
+     *      part of its fallback logic.
+     */
+    function _prepareTloadTest() private returns (address contractAddress) {
+        // Utilize assembly to deploy a contract testing TLOAD support.
+        assembly {
+            // Write the contract deployment code payload to scratch space.
+            mstore(0, _TLOAD_TEST_PAYLOAD)
+
+            // Deploy the contract.
+            contractAddress := create(
+                0,
+                _TLOAD_TEST_PAYLOAD_OFFSET,
+                _TLOAD_TEST_PAYLOAD_LENGTH
+            )
+        }
+    }
+
+    /**
+     * @dev Private view function to determine if TSTORE/TLOAD are supported by
+     *      the current EVM implementation by attempting to call the test
+     *      contract, which utilizes TLOAD as part of its fallback logic.
+     */
+    function _testTload(
+        address tloadTestContract
+    ) private view returns (bool ok) {
+        // Call the test contract, which will perform a TLOAD test. If the call
+        // does not revert, then TLOAD/TSTORE is supported. Do not forward all
+        // available gas, as all forwarded gas will be consumed on revert.
+        (ok, ) = tloadTestContract.staticcall{ gas: gasleft() / 10 }("");
+    }
+}
+
+
+// File: src/interfaces/IEOARegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+
+interface IEOARegistry is IERC165 {
+    function isVerifiedEOA(address account) external view returns (bool);
+}
+
+// File: src/StrictAuthorizedTransferSecurityRegistryExtraViewFns.sol
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
+import { Tstorish } from "tstorish/Tstorish.sol";
+
+import { TransferSecurityLevels } from "./interfaces/IStrictAuthorizedTransferSecurityRegistry.sol";
+
+/// @title StrictAuthorizedTransferSecurityRegistryExtraViewFns
+/// @dev Additional view functions, called by StrictAuthorizedTransferSecurityRegistry
+///      via delegatecall in the fallback.
+contract StrictAuthorizedTransferSecurityRegistryExtraViewFns is Tstorish {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    error StrictAuthorizedTransferSecurityRegistry__NotImplemented();
+
+    struct CollectionSecurityPolicy {
+        TransferSecurityLevels transferSecurityLevel;
+        uint120 operatorWhitelistId;
+        uint120 permittedContractReceiversId;
+    }
+
+    struct AccountList {
+        EnumerableSet.AddressSet enumerableAccounts;
+        mapping (address => bool) nonEnumerableAccounts;
+    }
+
+    struct List {
+        address owner;
+        AccountList authorizers;
+        AccountList operators;
+    }
+
+    struct CollectionConfiguration {
+        uint120 listId;
+        bool policyBypassed;
+        bool blacklistBased;
+        bool directTransfersDisabled;
+        bool contractRecipientsDisabled;
+        bool signatureRegistrationRequired;
+    }
+
+    uint120 private UNUSED_lastListId;
+
+    mapping (uint120 => List) private lists;
+
+    /// @dev Mapping of collection addresses to list ids & security policies.
+    mapping (address => CollectionConfiguration) private collectionConfiguration;
+
+    // view functions from other transfer security registries, included for completeness
+    function getBlacklistedAccounts(uint120) external pure returns (address[] memory) {}
+    function getWhitelistedAccounts(uint120 id) external view returns (address[] memory) {
+        return lists[id].operators.enumerableAccounts.values();
+    }
+    function getBlacklistedCodeHashes(uint120) external pure returns (bytes32[] memory) {}
+    function getWhitelistedCodeHashes(uint120) external pure returns (bytes32[] memory) {}
+    function isAccountBlacklisted(uint120, address) external pure returns (bool) {
+        return false;
+    }
+    function isAccountWhitelisted(uint120 id, address account) external view returns (bool) {
+        return lists[id].operators.nonEnumerableAccounts[account];
+    }
+    function isCodeHashBlacklisted(uint120, bytes32) external pure returns (bool) {
+        return false;
+    }
+    function isCodeHashWhitelisted(uint120, bytes32) external pure returns (bool) {
+        return false;
+    }
+    function getBlacklistedAccountsByCollection(address) external pure returns (address[] memory) {}
+    function getWhitelistedAccountsByCollection(address collection) external view returns (address[] memory) {
+        return lists[collectionConfiguration[collection].listId].operators.enumerableAccounts.values();
+    }
+    function getBlacklistedCodeHashesByCollection(address) external pure returns (bytes32[] memory) {}
+    function getWhitelistedCodeHashesByCollection(address) external pure returns (bytes32[] memory) {}
+    function isAccountBlacklistedByCollection(address, address) external pure returns (bool) {
+        return false;
+    }
+    function isAccountWhitelistedByCollection(
+        address collection, address account
+    ) external view returns (bool) {
+        return lists[collectionConfiguration[collection].listId].operators.nonEnumerableAccounts[account];
+    }
+    function isCodeHashBlacklistedByCollection(address, bytes32) external pure returns (bool) {
+        return false;
+    }
+    function isCodeHashWhitelistedByCollection(address, bytes32) external pure returns (bool) {
+        return false;
+    }
+    function getCollectionSecurityPolicy(
+        address collection
+    ) external view returns (CollectionSecurityPolicy memory) {
+        CollectionConfiguration memory config = collectionConfiguration[collection];
+
+        return CollectionSecurityPolicy({
+            transferSecurityLevel: _getSecurityLevel(config),
+            operatorWhitelistId: config.listId,
+            permittedContractReceiversId: 0
+        });
+    }
+    function getWhitelistedOperators(uint120 id) external view returns (address[] memory) {
+        return lists[id].operators.enumerableAccounts.values();
+    }
+    function getPermittedContractReceivers(uint120) external pure returns (address[] memory) {}
+    function isOperatorWhitelisted(uint120 id, address operator) external view returns (bool) {
+        return lists[id].operators.nonEnumerableAccounts[operator];
+    }
+    function isContractReceiverPermitted(uint120, address) external pure returns (bool) {
+        return true;
+    }
+
+    function _getSecurityLevel(
+        CollectionConfiguration memory config
+    ) internal pure returns (TransferSecurityLevels level) {
+        bool policyBypassed = config.policyBypassed;
+        bool blacklistBased = config.blacklistBased;
+        bool directTransfersDisabled = config.directTransfersDisabled;
+        bool contractRecipientsDisabled = config.contractRecipientsDisabled;
+        bool signatureRegistrationRequired = config.signatureRegistrationRequired;
+
+        if (policyBypassed) {
+            return TransferSecurityLevels.One;
+        }
+
+        if (blacklistBased) {
+            return TransferSecurityLevels.Two;
+        }
+
+        if (directTransfersDisabled) {
+            if (signatureRegistrationRequired) {
+                return TransferSecurityLevels.Eight;
+            } else if (contractRecipientsDisabled) {
+                return TransferSecurityLevels.Seven;
+            }
+
+            return TransferSecurityLevels.Four;
+        }
+
+        if (signatureRegistrationRequired) {
+            return TransferSecurityLevels.Six;
+        } else if (contractRecipientsDisabled) {
+            return TransferSecurityLevels.Five;
+        }
+
+        return TransferSecurityLevels.Three;
+    }
+
+    fallback() external {
+        revert StrictAuthorizedTransferSecurityRegistry__NotImplemented();
+    }
+}
+
+// File: src/interfaces/ITransferSecurityRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../utils/TransferPolicy.sol";
+
+interface ITransferSecurityRegistry {
+    event AddedToAllowlist(AllowlistTypes indexed kind, uint256 indexed id, address indexed account);
+    event CreatedAllowlist(AllowlistTypes indexed kind, uint256 indexed id, string indexed name);
+    event ReassignedAllowlistOwnership(AllowlistTypes indexed kind, uint256 indexed id, address indexed newOwner);
+    event RemovedFromAllowlist(AllowlistTypes indexed kind, uint256 indexed id, address indexed account);
+    event SetAllowlist(AllowlistTypes indexed kind, address indexed collection, uint120 indexed id);
+    event SetTransferSecurityLevel(address indexed collection, TransferSecurityLevels level);
+
+    function createOperatorWhitelist(string calldata name) external returns (uint120);
+    function createPermittedContractReceiverAllowlist(string calldata name) external returns (uint120);
+    function reassignOwnershipOfOperatorWhitelist(uint120 id, address newOwner) external;
+    function reassignOwnershipOfPermittedContractReceiverAllowlist(uint120 id, address newOwner) external;
+    function renounceOwnershipOfOperatorWhitelist(uint120 id) external;
+    function renounceOwnershipOfPermittedContractReceiverAllowlist(uint120 id) external;
+    function setTransferSecurityLevelOfCollection(address collection, TransferSecurityLevels level) external;
+    function setOperatorWhitelistOfCollection(address collection, uint120 id) external;
+    function setPermittedContractReceiverAllowlistOfCollection(address collection, uint120 id) external;
+    function addOperatorToWhitelist(uint120 id, address operator) external;
+    function addPermittedContractReceiverToAllowlist(uint120 id, address receiver) external;
+    function removeOperatorFromWhitelist(uint120 id, address operator) external;
+    function removePermittedContractReceiverFromAllowlist(uint120 id, address receiver) external;
+    function getCollectionSecurityPolicy(address collection) external view returns (CollectionSecurityPolicy memory);
+    function getWhitelistedOperators(uint120 id) external view returns (address[] memory);
+    function getPermittedContractReceivers(uint120 id) external view returns (address[] memory);
+    function isOperatorWhitelisted(uint120 id, address operator) external view returns (bool);
+    function isContractReceiverPermitted(uint120 id, address receiver) external view returns (bool);
+}
+
+// File: src/interfaces/ITransferValidator.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../utils/TransferPolicy.sol";
+
+interface ITransferValidator {
+    function applyCollectionTransferPolicy(address caller, address from, address to) external view;
+}
+
+// File: lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+
+// File: src/utils/TransferPolicy.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/** 
+ * @dev Used in events to indicate the list type that an account or 
+ * @dev codehash is being added to or removed from.
+ * 
+ * @dev Used in Creator Token Standards V2.
+ */
+enum ListTypes {
+    // 0: List type that will block a matching address/codehash that is on the list.
+    Blacklist,
+
+    // 1: List type that will block any matching address/codehash that is not on the list.
+    Whitelist
+}
+
+/** 
+ * @dev Used in events to indicate the list type that event relates to.
+ * 
+ * @dev Used in Creator Token Standards V1.
+ */
+enum AllowlistTypes {
+    // 0: List type that defines the allowed operator addresses.
+    Operators,
+
+    // 1: List type that defines the allowed contract receivers.
+    PermittedContractReceivers
+}
+
+/**
+ @dev Defines the constraints that will be applied for receipt of tokens.
+ */
+enum ReceiverConstraints {
+    // 0: Any address may receive tokens.
+    None,
+
+    // 1: Address must not have deployed bytecode.
+    NoCode,
+
+    // 2: Address must verify a signature with the EOA Registry to prove it is an EOA.
+    EOA
+}
+
+/**
+ * @dev Defines the constraints that will be applied to the transfer caller.
+ */
+enum CallerConstraints {
+    // 0: Any address may transfer tokens.
+    None,
+
+    // 1: Addresses and codehashes not on the blacklist may transfer tokens.
+    OperatorBlacklistEnableOTC,
+
+    // 2: Addresses and codehashes on the whitelist and the owner of the token may transfer tokens.
+    OperatorWhitelistEnableOTC,
+
+    // 3: Addresses and codehashes on the whitelist may transfer tokens.
+    OperatorWhitelistDisableOTC
+}
+
+/**
+ * @dev Defines constraints for staking tokens in token wrapper contracts.
+ */
+enum StakerConstraints {
+    // 0: No constraints applied to staker.
+    None,
+
+    // 1: Transaction originator must be the address that will receive the wrapped tokens.
+    CallerIsTxOrigin,
+
+    // 2: Address that will receive the wrapped tokens must be a verified EOA.
+    EOA
+}
+
+/**
+ * @dev Used in both Creator Token Standards V1 and V2.
+ * @dev Levels may have different transfer restrictions in V1 and V2. Refer to the 
+ * @dev Creator Token Transfer Validator implementation for the version being utilized
+ * @dev to determine the effect of the selected level.
+ */
+enum TransferSecurityLevels {
+    Recommended,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight
+}
+
+/**
+ * @dev Defines the caller and receiver constraints for a transfer security level.
+ * @dev Used in Creator Token Standards V1.
+ * 
+ * @dev **callerConstraints**: The restrictions applied to the transfer caller.
+ * @dev **receiverConstraints**: The restrictions applied to the transfer recipient.
+ */
+struct TransferSecurityPolicy {
+    CallerConstraints callerConstraints;
+    ReceiverConstraints receiverConstraints;
+}
+
+/**
+ * @dev Defines the security policy for a token collection in Creator Token Standards V1.
+ * 
+ * @dev **transferSecurityLevel**: The transfer security level set for the collection.
+ * @dev **operatorWhitelistId**: The list id for the operator whitelist.
+ * @dev **permittedContractReceiversId: The list id for the contracts that are allowed to receive tokens.
+ */
+struct CollectionSecurityPolicy {
+    TransferSecurityLevels transferSecurityLevel;
+    uint120 operatorWhitelistId;
+    uint120 permittedContractReceiversId;
+}
+
+/**
+ * @dev Defines the security policy for a token collection in Creator Token Standards V2.
+ * 
+ * @dev **transferSecurityLevel**: The transfer security level set for the collection.
+ * @dev **listId**: The list id that contains the blacklist and whitelist to apply to the collection.
+ */
+struct CollectionSecurityPolicyV2 {
+    TransferSecurityLevels transferSecurityLevel;
+    uint120 listId;
+}
+
+/** 
+ * @dev Used internally in the Creator Token Base V2 contract to pack transfer validator configuration.
+ * 
+ * @dev **isInitialized**: If not initialized by the collection owner or admin the default validator will be used.
+ * @dev **version**: The transfer validator version.
+ * @dev **transferValidator**: The address of the transfer validator to use for applying collection security settings.
+ */
+struct TransferValidatorReference {
+    bool isInitialized;
+    uint16 version;
+    address transferValidator;
+}

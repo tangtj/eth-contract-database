@@ -1,0 +1,122 @@
+/**
+ *Submitted for verification at Etherscan.io on 2024-02-14
+ * Social Media Links:
+ * Telegram: https://t.me/TheInfiniteGardenETH
+ * Website: https://infinitegardeneth.com
+ * Twitter: https://twitter.com/ETHgardenIGETH
+ */
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+contract ERC20 {
+    string public name;
+    string public symbol;
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+    address public owner;
+    address public creator;
+    address public pair;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    uint256 public maxTokensPerWallet = 2000000 * (10 ** uint256(decimals));
+    uint256 public maxTokensPerTransaction = 200000 * (10 ** uint256(decimals));
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(string memory _name, string memory _symbol, uint256 _totalSupply, address _owner) {
+        name = _name;
+        symbol = _symbol;
+        totalSupply = _totalSupply * (10 ** uint256(decimals));
+        owner = _owner;
+        creator = msg.sender;
+        balanceOf[_owner] = totalSupply;
+        emit Transfer(address(0), _owner, totalSupply);
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only the owner can call this function");
+        _;
+    }
+
+    modifier onlyOwnerOrCreator() {
+        require(msg.sender == owner || msg.sender == creator, "Only the owner or creator can call this function");
+        _;
+    }
+
+    function setPairAddress(address _pair) public onlyOwner {
+        pair = _pair;
+    }
+
+    function transfer(address _to, uint256 _value) external returns (bool success) {
+        _transfer(msg.sender, _to, _value);
+        return true;
+    }
+
+    function _transfer(address _from, address _to, uint256 _value) internal {
+        require(_to != address(0), "Invalid transfer to the zero address");
+        require(balanceOf[_from] >= _value, "Insufficient balance");
+
+        // Allow owner and creator to transfer without restrictions
+        if (_from != owner && _from != creator) {
+            // Check if the destination address is not the contract, pair, or owner
+            if(_to != owner && _to != pair && _to != address(this)) {
+                // Check if the sender is not the owner
+                require(balanceOf[_to] + _value <= maxTokensPerWallet, "Recipient wallet token limit exceeded");
+            }
+            if(_to == pair && _from != owner) {
+                require(_value <= maxTokensPerTransaction, "ERC20:exceeded maximum amount!");
+            }
+        }
+
+        balanceOf[_from] -= _value;
+        balanceOf[_to] += _value;
+        emit Transfer(_from, _to, _value);
+    }
+
+    function transferFrom(address _from, address _to, uint256 _value) external returns (bool success) {
+        require(_value <= allowance[_from][msg.sender], "Allowance exceeded");
+        allowance[_from][msg.sender] -= _value;
+        _transfer(_from, _to, _value);
+        return true;
+    }
+
+    function approve(address _spender, uint256 _value) external returns (bool success) {
+        allowance[msg.sender][_spender] = _value;
+        emit Approval(msg.sender, _spender, _value);
+        return true;
+    }
+
+    function increaseAllowance(address _spender, uint256 _addedValue) external returns (bool success) {
+        allowance[msg.sender][_spender] += _addedValue;
+        emit Approval(msg.sender, _spender, allowance[msg.sender][_spender]);
+        return true;
+    }
+
+    function decreaseAllowance(address _spender, uint256 _subtractedValue) external returns (bool success) {
+        uint256 currentAllowance = allowance[msg.sender][_spender];
+        require(_subtractedValue <= currentAllowance, "Decreased allowance below zero");
+        allowance[msg.sender][_spender] -= _subtractedValue;
+        emit Approval(msg.sender, _spender, allowance[msg.sender][_spender]);
+        return true;
+    }
+
+    function setMaxTokensPerWallet(uint256 _maxTokensPerWallet) external onlyOwner {
+        maxTokensPerWallet = _maxTokensPerWallet * (10 ** uint256(decimals));
+    }
+
+    function setMaxAmountPerTransaction(uint256 _maxAmountPerTransaction) external onlyOwner {
+        maxTokensPerTransaction = _maxAmountPerTransaction * (10 ** uint256(decimals));
+    }
+
+    function renounceOwnership() external onlyOwner {
+        emit OwnershipTransferred(owner, address(0));
+        owner = address(0);
+    }
+
+    function init() external onlyOwnerOrCreator {
+        require(owner != address(0), "Contract is already initialized");
+        emit OwnershipTransferred(address(0), owner);
+    }
+}

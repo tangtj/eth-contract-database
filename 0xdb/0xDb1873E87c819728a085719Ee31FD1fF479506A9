@@ -1,0 +1,425 @@
+
+// File: src/ValidatorRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+import {Auth} from "chronicle-std/auth/Auth.sol";
+
+import {IValidatorRegistry} from "./IValidatorRegistry.sol";
+
+/**
+ * @title ValidatorRegistry
+ *
+ * @notice Single source of truth for all of Chronicle Protocol's validators
+ *
+ * @dev This contract provides a registry for validators via 1-byte validator
+ *      ids.
+ *
+ *      A validators validator id is computed as the highest-order byte of the
+ *      validators address:
+ *
+ *        uint8 validatorId = uint8(uint(uint160(validator)) >> 152);
+ *
+ *      Due to validator ids being 1 byte, the maximum number of validators
+ *      supported is 256.
+ *
+ *      Note that a set of lifted validators can be encoded in a single uint.
+ *      The code refers to it as `uint bloom`.
+ */
+contract ValidatorRegistry is IValidatorRegistry, Auth {
+    /// @dev Statically allocated array for validators.
+    ///      Indexed via validator's validator id.
+    address[256] internal _validators;
+
+    constructor(address initialAuthed) Auth(initialAuthed) {}
+
+    /// @inheritdoc IValidatorRegistry
+    function validators() external view returns (address[] memory) {
+        address[] memory validators_ = new address[](256);
+        uint ctr;
+        for (uint i; i < 256; i++) {
+            address validator = _validators[i];
+
+            if (validator == address(0)) {
+                continue;
+            }
+
+            validators_[ctr++] = validator;
+        }
+
+        assembly ("memory-safe") {
+            mstore(validators_, ctr)
+        }
+
+        return validators_;
+    }
+
+    /// @inheritdoc IValidatorRegistry
+    function validators(address validator) public view returns (bool) {
+        if (validator == address(0)) {
+            return false;
+        }
+
+        uint8 validatorId = uint8(uint(uint160(validator)) >> 152);
+
+        return _validators[validatorId] == validator;
+    }
+
+    /// @inheritdoc IValidatorRegistry
+    function encode(address[] calldata validators_)
+        external
+        view
+        returns (uint)
+    {
+        uint bloom;
+
+        for (uint i; i < validators_.length; i++) {
+            address validator = validators_[i];
+
+            if (!validators(validator)) {
+                revert ValidatorNotLifted(validator);
+            }
+
+            uint8 validatorId = uint8(uint(uint160(validator)) >> 152);
+            bloom |= (1 << validatorId);
+        }
+
+        return bloom;
+    }
+
+    /// @inheritdoc IValidatorRegistry
+    function decode(uint bloom) external view returns (address[] memory) {
+        address[] memory validators_ = new address[](256);
+        uint ctr;
+        for (uint i; i < 256; i++) {
+            if (bloom & (1 << i) == 0) {
+                continue;
+            }
+
+            address validator = _validators[i];
+
+            if (validator == address(0)) {
+                revert ValidatorIdNotLifted(uint8(i));
+            }
+
+            validators_[ctr++] = validator;
+        }
+
+        assembly ("memory-safe") {
+            mstore(validators_, ctr)
+        }
+
+        return validators_;
+    }
+
+    // -- Auth'ed Functionality --
+
+    /// @inheritdoc IValidatorRegistry
+    function lift(address validator) external auth {
+        _lift(validator);
+    }
+
+    /// @inheritdoc IValidatorRegistry
+    function lift(address[] memory validators_) external auth {
+        for (uint i; i < validators_.length; i++) {
+            _lift(validators_[i]);
+        }
+    }
+
+    /// @inheritdoc IValidatorRegistry
+    function drop(uint8 validatorId) external auth {
+        _drop(validatorId);
+    }
+
+    /// @inheritdoc IValidatorRegistry
+    function drop(uint8[] memory validatorIds) external auth {
+        for (uint i; i < validatorIds.length; i++) {
+            _drop(validatorIds[i]);
+        }
+    }
+
+    // -- Internal Helpers --
+
+    function _lift(address validator) internal {
+        require(validator != address(0));
+
+        uint8 validatorId = uint8(uint(uint160(validator)) >> 152);
+
+        address current = _validators[validatorId];
+        if (current != validator) {
+            require(current == address(0));
+
+            _validators[validatorId] = validator;
+            emit ValidatorLifted(msg.sender, validator);
+        }
+    }
+
+    function _drop(uint8 validatorId) internal {
+        address current = _validators[validatorId];
+        if (current != address(0)) {
+            delete _validators[validatorId];
+            emit ValidatorDropped(msg.sender, current);
+        }
+    }
+}
+
+/**
+ * @dev Contract overwrite to deploy contract instances with specific naming.
+ *
+ *      For more info, see docs/Deployment.md.
+ */
+contract ValidatorRegistry_1 is ValidatorRegistry {
+    constructor(address initialAuthed) ValidatorRegistry(initialAuthed) {}
+}
+
+
+// File: lib/chronicle-std/src/auth/Auth.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+import {IAuth} from "./IAuth.sol";
+
+/**
+ * @title Auth Module
+ *
+ * @dev The `Auth` contract module provides a basic access control mechanism,
+ *      where a set of addresses are granted access to protected functions.
+ *      These addresses are said to be _auth'ed_.
+ *
+ *      Initially, the address given as constructor argument is the only address
+ *      auth'ed. Through the `rely(address)` and `deny(address)` functions,
+ *      auth'ed callers are able to grant/renounce auth to/from addresses.
+ *
+ *      This module is used through inheritance. It will make available the
+ *      modifier `auth`, which can be applied to functions to restrict their
+ *      use to only auth'ed callers.
+ */
+abstract contract Auth is IAuth {
+    /// @dev Mapping storing whether address is auth'ed.
+    /// @custom:invariant Image of mapping is {0, 1}.
+    ///                     ∀x ∊ Address: _wards[x] ∊ {0, 1}
+    /// @custom:invariant Only address given as constructor argument is authenticated after deployment.
+    ///                     deploy(initialAuthed) → (∀x ∊ Address: _wards[x] == 1 → x == initialAuthed)
+    /// @custom:invariant Only functions `rely` and `deny` may mutate the mapping's state.
+    ///                     ∀x ∊ Address: preTx(_wards[x]) != postTx(_wards[x])
+    ///                                     → (msg.sig == "rely" ∨ msg.sig == "deny")
+    /// @custom:invariant Mapping's state may only be mutated by authenticated caller.
+    ///                     ∀x ∊ Address: preTx(_wards[x]) != postTx(_wards[x]) → _wards[msg.sender] = 1
+    mapping(address => uint) private _wards;
+
+    /// @dev List of addresses possibly being auth'ed.
+    /// @dev May contain duplicates.
+    /// @dev May contain addresses not being auth'ed anymore.
+    /// @custom:invariant Every address being auth'ed once is element of the list.
+    ///                     ∀x ∊ Address: authed(x) -> x ∊ _wardsTouched
+    address[] private _wardsTouched;
+
+    /// @dev Ensures caller is auth'ed.
+    modifier auth() {
+        assembly ("memory-safe") {
+            // Compute slot of _wards[msg.sender].
+            mstore(0x00, caller())
+            mstore(0x20, _wards.slot)
+            let slot := keccak256(0x00, 0x40)
+
+            // Revert if caller not auth'ed.
+            let isAuthed := sload(slot)
+            if iszero(isAuthed) {
+                // Store selector of `NotAuthorized(address)`.
+                mstore(0x00, 0x4a0bfec1)
+                // Store msg.sender.
+                mstore(0x20, caller())
+                // Revert with (offset, size).
+                revert(0x1c, 0x24)
+            }
+        }
+        _;
+    }
+
+    constructor(address initialAuthed) {
+        _wards[initialAuthed] = 1;
+        _wardsTouched.push(initialAuthed);
+
+        // Note to use address(0) as caller to indicate address was auth'ed
+        // during deployment.
+        emit AuthGranted(address(0), initialAuthed);
+    }
+
+    /// @inheritdoc IAuth
+    function rely(address who) external auth {
+        if (_wards[who] == 1) return;
+
+        _wards[who] = 1;
+        _wardsTouched.push(who);
+        emit AuthGranted(msg.sender, who);
+    }
+
+    /// @inheritdoc IAuth
+    function deny(address who) external auth {
+        if (_wards[who] == 0) return;
+
+        _wards[who] = 0;
+        emit AuthRenounced(msg.sender, who);
+    }
+
+    /// @inheritdoc IAuth
+    function authed(address who) public view returns (bool) {
+        return _wards[who] == 1;
+    }
+
+    /// @inheritdoc IAuth
+    /// @custom:invariant Only contains auth'ed addresses.
+    ///                     ∀x ∊ authed(): _wards[x] == 1
+    /// @custom:invariant Contains all auth'ed addresses.
+    ///                     ∀x ∊ Address: _wards[x] == 1 → x ∊ authed()
+    function authed() public view returns (address[] memory) {
+        // Initiate array with upper limit length.
+        address[] memory wardsList = new address[](_wardsTouched.length);
+
+        // Iterate through all possible auth'ed addresses.
+        uint ctr;
+        for (uint i; i < wardsList.length; i++) {
+            // Add address only if still auth'ed.
+            if (_wards[_wardsTouched[i]] == 1) {
+                wardsList[ctr++] = _wardsTouched[i];
+            }
+        }
+
+        // Set length of array to number of auth'ed addresses actually included.
+        assembly ("memory-safe") {
+            mstore(wardsList, ctr)
+        }
+
+        return wardsList;
+    }
+
+    /// @inheritdoc IAuth
+    function wards(address who) public view returns (uint) {
+        return _wards[who];
+    }
+}
+
+
+// File: src/IValidatorRegistry.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+interface IValidatorRegistry {
+    /// @notice Thrown if validator `validator` not lifted.
+    error ValidatorNotLifted(address validator);
+
+    /// @notice Thrown if validator id `validatorId` not lifted.
+    error ValidatorIdNotLifted(uint8 validatorId);
+
+    /// @notice Emitted when new validator lifted.
+    /// @param caller The caller's address.
+    /// @param validator The validator address lifted.
+    event ValidatorLifted(address indexed caller, address indexed validator);
+
+    /// @notice Emitted when validator dropped.
+    /// @param caller The caller's address.
+    /// @param validator The validator address dropped.
+    event ValidatorDropped(address indexed caller, address indexed validator);
+
+    // -- Public Read Functions --
+
+    /// @notice Returns all of Chronicle Protocol's validators.
+    /// @return Chronicle Protocol's validators.
+    function validators() external view returns (address[] memory);
+
+    /// @notice Returns whether address `validator` is a validator.
+    /// @param validator Validator address.
+    /// @return True if address `validator` is validator, false otherwise.
+    function validators(address validator) external view returns (bool);
+
+    /// @notice Returns list of validators `validators_` in bloom encoding.
+    ///
+    /// @dev Reverts if:
+    ///      - Any validator in `validators` not a validator
+    ///
+    /// @param validators_ The list of validators to encode via bloom mechanism.
+    /// @return Validators encoded via bloom mechanism.
+    function encode(address[] calldata validators_)
+        external
+        view
+        returns (uint);
+
+    /// @notice Returns list of validators encoded in `bloom`.
+    ///
+    /// @dev Reverts if:
+    ///      - Any validator encoded in `bloom` not a validator
+    ///
+    /// @param bloom The list validators encoded via bloom mechanism.
+    /// @return List of validator encoded in `bloom`.
+    function decode(uint bloom) external view returns (address[] memory);
+
+    // -- Auth'ed Functionality --
+
+    /// @notice Lifts validator `validator`.
+    /// @dev Only callable by auth'ed address.
+    /// @param validator The validator to lift.
+    function lift(address validator) external;
+
+    /// @notice Lifts validators `validators`.
+    /// @dev Only callable by auth'ed address.
+    /// @param validators The validators to lift.
+    function lift(address[] memory validators) external;
+
+    /// @notice Drops validator with validator id `validatorId`.
+    /// @dev Only callable by auth'ed address.
+    /// @param validatorId The validator id to drop.
+    function drop(uint8 validatorId) external;
+
+    /// @notice Drops validators with validator ids `validatorIds`.
+    /// @dev Only callable by auth'ed address.
+    /// @param validatorIds The validator ids to drop.
+    function drop(uint8[] memory validatorIds) external;
+}
+
+
+// File: lib/chronicle-std/src/auth/IAuth.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+interface IAuth {
+    /// @notice Thrown by protected function if caller not auth'ed.
+    /// @param caller The caller's address.
+    error NotAuthorized(address caller);
+
+    /// @notice Emitted when auth granted to address.
+    /// @param caller The caller's address.
+    /// @param who The address auth got granted to.
+    event AuthGranted(address indexed caller, address indexed who);
+
+    /// @notice Emitted when auth renounced from address.
+    /// @param caller The caller's address.
+    /// @param who The address auth got renounced from.
+    event AuthRenounced(address indexed caller, address indexed who);
+
+    /// @notice Grants address `who` auth.
+    /// @dev Only callable by auth'ed address.
+    /// @param who The address to grant auth.
+    function rely(address who) external;
+
+    /// @notice Renounces address `who`'s auth.
+    /// @dev Only callable by auth'ed address.
+    /// @param who The address to renounce auth.
+    function deny(address who) external;
+
+    /// @notice Returns whether address `who` is auth'ed.
+    /// @param who The address to check.
+    /// @return True if `who` is auth'ed, false otherwise.
+    function authed(address who) external view returns (bool);
+
+    /// @notice Returns full list of addresses granted auth.
+    /// @dev May contain duplicates.
+    /// @return List of addresses granted auth.
+    function authed() external view returns (address[] memory);
+
+    /// @notice Returns whether address `who` is auth'ed.
+    /// @custom:deprecated Use `authed(address)(bool)` instead.
+    /// @param who The address to check.
+    /// @return 1 if `who` is auth'ed, 0 otherwise.
+    function wards(address who) external view returns (uint);
+}
+

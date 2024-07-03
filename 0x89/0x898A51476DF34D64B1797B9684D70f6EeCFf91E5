@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.0;
+
+contract DoYouLoveBTC {
+
+    event Vote_DoYouLoveBTC(bool isBTC);
+
+    function doYouLoveBTC(bool _isBTC) public {
+        emit Vote_DoYouLoveBTC(_isBTC);
+    }
+
+}

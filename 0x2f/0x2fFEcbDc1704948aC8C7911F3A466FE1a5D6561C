@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.19;
+
+interface IL1NativeMessenger {
+
+    function sendMessage(
+        address target,
+        uint256 value,
+        bytes calldata message,
+        uint256 gasLimit
+    ) external payable;
+
+}
+
+interface IL1ERC20Messenger {
+    function depositERC20(
+        address _token,
+        address _to,
+        uint256 _amount,
+        uint256 _gasLimit
+    ) external payable;
+}
+
+interface IL2NativeMessenger {
+    function sendMessage(
+        address target,
+        uint256 value,
+        bytes calldata message,
+        uint256 gasLimit
+    ) external payable;
+}
+
+interface IL2ERC20Messenger {
+    function withdrawERC20(
+        address token,
+        address to,
+        uint256 amount,
+        uint256 gasLimit
+    ) external payable;
+}
+
+interface IWETH {
+    function deposit() external payable;
+    function transfer(address to, uint value) external returns (bool);
+    function withdraw(uint) external;
+}
+
+contract FoundationEthereum {
+
+    address public owner;
+    address public caller;
+    mapping(address=>bool) public whitelist;
+
+    event OnSetOwner(address owner);
+    event OnSetCaller(address caller);
+    event OnSetWhitelist(address[] callers, bool status);
+    event OnSetAllowance(address[] tokens, address spender, uint256 amount);
+    event OnRefund(address token, address receiver, uint256 amount);
+    event OnWithdraw(address token, address receiver, uint256 amount);
+    
+    address internal constant WETH_ADDRESS = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant ZERO_ADDRESS = 0x0000000000000000000000000000000000000000;
+
+    address internal constant ERC20_MESSAGER = 0xF8B1378579659D8F7EE5f3C929c2f3E332E41Fd6;
+    address internal constant NATIVE_MESSAGER = 0x6774Bcbd5ceCeF1336b5300fb5186a12DDD8b367;
+
+    constructor() {
+        owner = msg.sender;
+        caller = msg.sender;
+    }
+
+    receive() external payable {}
+
+    // check owner
+    modifier onlyOwner() {
+        require(msg.sender==owner,"NOT_OWNER");
+        _;
+    }
+
+    // check caller
+    modifier onlyCaller() {
+        require(msg.sender==caller,"NOT_CALLER");
+        _;
+    }
+
+    // wrap eth to weth
+    function wrap() external onlyCaller() {
+        IWETH(WETH_ADDRESS).deposit{value: address(this).balance }();
+    }
+
+    // unwrap weth to eth
+    function unwrap(uint256 amount) external onlyCaller() {
+        IWETH(WETH_ADDRESS).withdraw(amount);
+    }
+
+    // transfer to bridge
+    function bridge(address token, address receiver, uint256 amount) external payable onlyCaller() {
+        require(whitelist[receiver],"NOT_IN_WHITELIST");
+        if (token==ZERO_ADDRESS) {
+            IL1NativeMessenger(NATIVE_MESSAGER).sendMessage{value: amount}(receiver, amount, new bytes(0), 168000);
+        }else{
+            IL1ERC20Messenger(ERC20_MESSAGER).depositERC20{value: msg.value}(token, receiver, amount, 180000);
+        }
+    }
+
+    // transfer to cex
+    function withdraw(address token, address receiver, uint256 amount) external onlyCaller() {
+        require(whitelist[receiver],"NOT_IN_WHITELIST");
+        if (token == address(0)) {
+            require(payable(receiver).send(amount), "FAILED");
+        }else{
+            if(token==WETH_ADDRESS){
+                IWETH(WETH_ADDRESS).withdraw(amount);
+                require(payable(receiver).send(amount), "FAILED");
+            }else{
+                safeTransfer(token, receiver, amount);
+            }
+        }
+        emit OnWithdraw(token, receiver, amount);
+    }
+
+    // transfer to owner
+    function refund(address token, address receiver, uint256 amount) external onlyOwner {
+        if (token == address(0)) {
+            require(payable(receiver).send(amount), "FAILED");
+        }else{
+            if(token==WETH_ADDRESS){
+                IWETH(WETH_ADDRESS).withdraw(amount);
+                require(payable(receiver).send(amount), "FAILED");
+            }else{
+                safeTransfer(token, receiver, amount);
+            }
+        }
+        emit OnRefund(token, receiver, amount);
+    }
+
+    // set owner
+    function setOwner(address user) external onlyOwner {
+        owner = user;
+        emit OnSetOwner(user);
+    }
+
+    // set caller
+    function setCaller(address user) external onlyOwner {
+        caller = user;
+        emit OnSetCaller(user);
+    }
+
+    // set witelist
+    function setWhitelist(address[] memory callers, bool status) external onlyOwner {
+        for (uint8 i=0;i<callers.length;i++) {
+            whitelist[callers[i]] = status;
+        }
+        emit OnSetWhitelist(callers, status);
+    }
+
+    // set allowance
+    function setAllowance(address[] memory tokens, address spender, uint256 amount) external onlyOwner() {
+        for (uint8 i=0;i<tokens.length;i++) {
+            safeApprove(tokens[i],spender,amount);
+        }
+        emit OnSetAllowance(tokens, spender, amount);
+    }
+    
+    // safe approve
+    function safeApprove(address token, address spender, uint value) internal {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'APPROVE_FAILED');
+    }
+    
+    // safe transfer
+    function safeTransfer(address token, address receiver, uint value) internal {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, receiver, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'TRANSFER_FAILED');
+    }
+}
