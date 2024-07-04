@@ -1,0 +1,414 @@
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.13;
+
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+// OpenZeppelin Contracts v4.4.1 (access/Ownable.sol)
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "You are not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(
+            newOwner != address(0),
+            "Ownable: new owner is the zero address"
+        );
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+contract VerifySignature {
+    /* 1. Unlock MetaMask account
+    ethereum.enable()
+    */
+
+    /* 2. Get message hash to sign
+    getMessageHash(
+        0x14723A09ACff6D2A60DcdF7aA4AFf308FDDC160C,
+        123,
+        "coffee and donuts",
+        1
+    )
+
+    hash = "0xcf36ac4f97dc10d91fc2cbb20d718e94a8cbfe0f82eaedc6a4aa38946fb797cd"
+    */
+    function getMessageHash(
+        address _to,
+        uint256 _payment,
+        uint256 _amount,
+        uint256 _usdAmount,
+        uint256 _nonce,
+        uint256 _tokenPrice
+    ) public pure returns (bytes32) {
+        return
+            keccak256(
+                abi.encodePacked(_to, _payment, _amount, _usdAmount, _nonce, _tokenPrice)
+            );
+    }
+
+    /* 3. Sign message hash
+    # using browser
+    account = "copy paste account of signer here"
+    ethereum.request({ method: "personal_sign", params: [account, hash]}).then(console.log)
+
+    # using web3
+    web3.personal.sign(hash, web3.eth.defaultAccount, console.log)
+
+    Signature will be different for different accounts
+    0x993dab3dd91f5c6dc28e17439be475478f5635c92a56e17e82349d3fb2f166196f466c0b4e0c146f285204f0dcb13e5ae67bc33f4b888ec32dfe0a063e8f3f781b
+    */
+    function getEthSignedMessageHash(
+        bytes32 _messageHash
+    ) public pure returns (bytes32) {
+        /*
+        Signature is produced by signing a keccak256 hash with the following format:
+        "\x19Ethereum Signed Message\n" + len(msg) + msg
+        */
+        return
+            keccak256(
+                abi.encodePacked(
+                    "\x19Ethereum Signed Message:\n32",
+                    _messageHash
+                )
+            );
+    }
+
+    /* 4. Verify signature
+    signer = 0xB273216C05A8c0D4F0a4Dd0d7Bae1D2EfFE636dd
+    to = 0x14723A09ACff6D2A60DcdF7aA4AFf308FDDC160C
+    amount = 123
+    message = "coffee and donuts"
+    nonce = 1
+    signature =
+        0x993dab3dd91f5c6dc28e17439be475478f5635c92a56e17e82349d3fb2f166196f466c0b4e0c146f285204f0dcb13e5ae67bc33f4b888ec32dfe0a063e8f3f781b
+    */
+    function verify(
+        address _signer,
+        address _to,
+        uint256 _payment,
+        uint256 _amount,
+        uint256 _usdAmount,
+        uint256 _nonce,
+        uint256 _tokenPrice,
+        bytes memory signature
+    ) public pure returns (bool) {
+        bytes32 messageHash = getMessageHash(
+            _to,
+            _payment,
+            _amount,
+            _usdAmount,
+            _nonce,
+            _tokenPrice
+        );
+        bytes32 ethSignedMessageHash = getEthSignedMessageHash(messageHash);
+
+        return recoverSigner(ethSignedMessageHash, signature) == _signer;
+    }
+
+    function recoverSigner(
+        bytes32 _ethSignedMessageHash,
+        bytes memory _signature
+    ) public pure returns (address) {
+        (bytes32 r, bytes32 s, uint8 v) = splitSignature(_signature);
+
+        return ecrecover(_ethSignedMessageHash, v, r, s);
+    }
+
+    function splitSignature(
+        bytes memory sig
+    ) public pure returns (bytes32 r, bytes32 s, uint8 v) {
+        require(sig.length == 65, "invalid signature length");
+
+        assembly {
+            /*
+            First 32 bytes stores the length of the signature
+
+            add(sig, 32) = pointer of sig + 32
+            effectively, skips first 32 bytes of signature
+
+            mload(p) loads next 32 bytes starting at the memory address p into memory
+            */
+
+            // first 32 bytes, after the length prefix
+            r := mload(add(sig, 32))
+            // second 32 bytes
+            s := mload(add(sig, 64))
+            // final byte (first byte of the next 32 bytes)
+            v := byte(0, mload(add(sig, 96)))
+        }
+
+        // implicitly return (r, s, v)
+    }
+}
+
+interface IERC20 {
+    function decimals() external view returns (uint8);
+}
+
+contract DeboardTokenLP is VerifySignature, Ownable {
+    event Buy(
+        address indexed sender,
+        address indexed rerecipient,
+        uint256 amount,
+        uint256 tokenAmount,
+        address indexed ref,
+        uint256 refAmount
+    );
+
+    uint256 public tokenPrice = 0.003 ether; // x dollar per token
+    address public devAddress = 0x6018Bf3073EcfD69ad49033E01dB3b6F7f61eD96;
+
+    address public usdt = address(0);
+    address public usdc = address(0);
+
+    uint256 public refPercent = 10;
+
+    uint256 public refTokenPercent = 5;
+
+    struct Ref {
+        uint256 usdAmount;
+        uint256 count;
+        uint256 tokenAmount;
+    }
+
+    struct Buyer {
+        uint256 tokenAmount;
+        uint256 usdAmount;
+        uint256 totalUsd;
+    }
+
+    mapping(address => Ref) public refs;
+
+    mapping(address => uint256) public specialRefs;
+
+    mapping(address => Buyer) public buyers;
+
+    uint256 public totalToken;
+    uint256 public totalUsd;
+
+    constructor(address _usdt, address _usdc) {
+        require(_usdc != address(0) && _usdt != address(0));
+        usdt = _usdt;
+        usdc = _usdc;
+        devAddress = devAddress == address(0) ? msg.sender : devAddress;
+        require(devAddress != address(0));
+    }
+
+    function safeTransferETH(address to, uint256 value) internal {
+        (bool success, ) = to.call{value: value}(new bytes(0));
+        require(success, "TransferHelper: ETH_TRANSFER_FAILED");
+    }
+    function safeTransferFrom(
+        address token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(0x23b872dd, from, to, value)
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "TransferHelper: TRANSFER_FROM_FAILED"
+        );
+    }
+
+    function withdraw() public onlyOwner {
+        require(address(this).balance > 0, "Invalid amount");
+        safeTransferETH(msg.sender, address(this).balance);
+    }
+
+    function setRefPercent(uint256 _percent) public onlyOwner {
+        refPercent = _percent;
+    }
+
+    function setRefTokenPercent(uint256 _refTokenPercent) public  onlyOwner{
+        refTokenPercent = _refTokenPercent;
+    }
+
+    function setSpecialRef(address _ref, uint256 _percent) public onlyOwner {
+        specialRefs[_ref] = _percent;
+    }
+
+    function setTokenPrice(uint256 _price) public onlyOwner {
+        tokenPrice = _price;
+    }
+    mapping(uint256 => bool) public usedNonce;
+
+    function buy(
+        address _ref,
+        uint256 _amount,
+        uint256 _usdAmount,
+        uint256 _payment,
+        uint256 _nonce,
+        address _recipient,
+        uint256 _tokenPrice,
+        bytes calldata _signature
+    ) public payable {
+        require(
+            verify(
+                owner(),
+                msg.sender,
+                _payment,
+                _amount,
+                _usdAmount,
+                _nonce,
+                _tokenPrice,
+                _signature
+            ) && usedNonce[_nonce] == false,
+            "Invalid mint"
+        );
+        if (_tokenPrice == 0) {
+            _tokenPrice = tokenPrice;
+        }
+
+        if (_recipient == address(0)) {
+            _recipient = msg.sender;
+        }
+
+        uint256 tokenAmount = 10**18 * 10**18 * _usdAmount / (_tokenPrice * 10**6);
+        uint256 refAmount = 0;
+        refAmount += transferToRef(_ref, _amount, _payment, msg.sender, _usdAmount, tokenAmount);
+        safeTransfer(_amount - refAmount, _payment, msg.sender, devAddress);
+        
+        buyers[_recipient].usdAmount +=_usdAmount;
+        buyers[_recipient].tokenAmount += tokenAmount;
+        
+        totalToken += tokenAmount;
+
+        totalUsd += _usdAmount; //10**6
+        buyers[_recipient].totalUsd += _usdAmount; //10**6
+
+        emit Buy(msg.sender, _recipient, _amount, tokenAmount, _ref, refAmount);
+    }
+
+    function safeTransfer(
+        uint256 _amount,
+        uint256 _payment,
+        address _sender,
+        address _receiver
+    ) internal {
+        if (_payment == 1) {
+            safeTransferETH(_receiver, _amount);
+        } else {
+            safeTransferFrom(
+                _payment == 2 ? usdt : usdc,
+                _sender,
+                _receiver,
+                _amount
+            );
+        }
+    }
+
+    function transferToRef(
+        address _ref,
+        uint256 _amount,
+        uint256 _payment,
+        address _sender,
+        uint256 _usdAmount,
+        uint256 _tokenAmount
+    ) internal returns (uint256 refAmount) {
+        if (_ref != address(0) && _ref != _sender) {
+            uint256 percent = specialRefs[_ref] > 0
+                ? specialRefs[_ref]
+                : refPercent;
+            if (percent > 0) {
+                refAmount = _amount * percent / 100;
+                refs[_ref].usdAmount += _usdAmount* percent / 100;
+                refs[_ref].count += 1;
+                safeTransfer(refAmount, _payment, _sender, _ref);
+            }
+            
+            refs[_ref].tokenAmount += (_tokenAmount * refTokenPercent/100);
+            return refAmount;
+        }
+    }
+
+    receive() external payable {}
+}

@@ -1,0 +1,898 @@
+// File: @openzeppelin/contracts/utils/Context.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+// File: @openzeppelin/contracts/access/Ownable.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.20;
+
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * The initial owner is set to the address provided by the deployer. This can
+ * later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    /**
+     * @dev The caller account is not authorized to perform an operation.
+     */
+    error OwnableUnauthorizedAccount(address account);
+
+    /**
+     * @dev The owner is not a valid owner account. (eg. `address(0)`)
+     */
+    error OwnableInvalidOwner(address owner);
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.
+     */
+    constructor(address initialOwner) {
+        if (initialOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        if (owner() != _msgSender()) {
+            revert OwnableUnauthorizedAccount(_msgSender());
+        }
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby disabling any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        if (newOwner == address(0)) {
+            revert OwnableInvalidOwner(address(0));
+        }
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// File: @openzeppelin/contracts/security/Pausable.sol
+
+
+// OpenZeppelin Contracts (last updated v4.7.0) (security/Pausable.sol)
+
+pragma solidity ^0.8.0;
+
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract Pausable is Context {
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    bool private _paused;
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    constructor() {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        require(!paused(), "Pausable: paused");
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        require(paused(), "Pausable: not paused");
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+}
+
+// File: @openzeppelin/contracts/utils/math/SafeMath.sol
+
+
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/SafeMath.sol)
+
+pragma solidity ^0.8.0;
+
+// CAUTION
+// This version of SafeMath should only be used with Solidity 0.8 or later,
+// because it relies on the compiler's built in overflow checks.
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations.
+ *
+ * NOTE: `SafeMath` is generally not needed starting with Solidity 0.8, since the compiler
+ * now has built in overflow checking.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a - b;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a * b;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator.
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a / b;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a % b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {trySub}.
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b <= a, errorMessage);
+            return a - b;
+        }
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a / b;
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting with custom message when dividing by zero.
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {tryMod}.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a % b;
+        }
+    }
+}
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+
+
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+// File: TCash.sol
+
+//SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.26;
+
+
+
+
+
+interface Factory {
+    function createPair(address tokenA, address tokenB)
+        external
+        returns (address pair);
+}
+
+interface Router {
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 amountToken,
+            uint256 amountETH,
+            uint256 liquidity
+        );
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+contract TCASH is IERC20, Ownable, Pausable {
+    using SafeMath for uint256;
+    Router public router = Router(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+
+    string _name = "Trump Cash";
+    string _symbol = "TCASH";
+
+    uint256 _totalSupply = 21000000000000000;
+
+    mapping(address => uint256) _balances;
+    mapping(address => mapping(address => uint256)) _allowances;
+
+    mapping(address => bool) public isFeeExempt;
+
+    uint256 public liquidityFee = 1;
+    uint256 public marketingFee = 1;
+    uint256 public claimFee = 1;
+    uint256 public extraFeeOnSell = 3;
+
+    uint256 public totalFee = 3;
+    uint256 public totalFeeIfSelling = 6;
+
+    address public marketingWallet = 0xEaEE4625dF4CD677569e8DCe02bA771790a0b215;
+    address public claimWallet = 0x56F97b7Ccf63a1264c61D3aACE01f18F63Fe4619;
+
+    address public pair;
+
+    uint256 public launchedAt;
+
+    bool inSwapAndLiquify;
+    bool public swapAndLiquifyEnabled = true;
+
+    uint256 public swapThreshold = 2100000000000;
+
+    modifier lockTheSwap() {
+        inSwapAndLiquify = true;
+        _;
+        inSwapAndLiquify = false;
+    }
+
+    constructor() Ownable(msg.sender) {
+        pair = Factory(router.factory()).createPair(
+            router.WETH(),
+            address(this)
+        );
+
+        _allowances[address(this)][address(router)] = type(uint256).max;
+
+        isFeeExempt[msg.sender] = true;
+
+        isFeeExempt[address(this)] = true;
+
+        _balances[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+    }
+
+    receive() external payable {}
+
+    //========== TOKEN FUNCTIONS ==========\\
+    function name() external view returns (string memory) {
+        return _name;
+    }
+
+    function symbol() external view returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public pure returns (uint8) {
+        return 9;
+    }
+
+    function totalSupply() public view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    function getCirculatingSupply() public view returns (uint256) {
+        return
+            _totalSupply
+                .sub(balanceOf(0x000000000000000000000000000000000000dEaD))
+                .sub(balanceOf(0x0000000000000000000000000000000000000000));
+    }
+
+    function balanceOf(address _account)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        return _balances[_account];
+    }
+
+    function allowance(address _holder, address _spender)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        return _allowances[_holder][_spender];
+    }
+
+    function approve(address _spender, uint256 _amount)
+        public
+        override
+        returns (bool)
+    {
+        _allowances[msg.sender][_spender] = _amount;
+        emit Approval(msg.sender, _spender, _amount);
+        return true;
+    }
+
+    function approveMax(address _spender) external returns (bool) {
+        return approve(_spender, type(uint256).max);
+    }
+
+    //========== LAUNCH FUNCTIONS ==========\\
+    function launchToken() external onlyOwner {
+        require(!launched(), "Token is launched");
+        launch();
+    }
+
+    function pauseTransfers() external onlyOwner {
+        _pause();
+    }
+
+    function unpauseTransfers() external onlyOwner {
+        _unpause();
+    }
+
+    //========== TAX FUNCTIONS ==========\\
+    function changeIsFeeExempt(address _holder, bool _exempt) public onlyOwner {
+        isFeeExempt[_holder] = _exempt;
+    }
+
+    function changeSwapThreshold(uint256 _newLimit) external onlyOwner {
+        swapThreshold = _newLimit;
+    }
+
+    function changeFees(
+        uint256 _lpFee,
+        uint256 _claimFee,
+        uint256 _marketingFee,
+        uint256 _sellFee
+    ) external onlyOwner {
+        liquidityFee = _lpFee;
+        claimFee = _claimFee;
+        marketingFee = _marketingFee;
+        extraFeeOnSell = _sellFee;
+
+        totalFee = liquidityFee.add(marketingFee).add(claimFee);
+        totalFeeIfSelling = totalFee.add(extraFeeOnSell);
+    }
+
+    function changeFeeReceiver(
+        address _newMarketingWallet,
+        address _newClaimWallet
+    ) external onlyOwner {
+        marketingWallet = _newMarketingWallet;
+        claimWallet = _newClaimWallet;
+    }
+
+    //========== TRANSFER FUNCTIONS ==========\\
+    function transfer(address recipient, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        return _transferFrom(msg.sender, recipient, amount);
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        if (_allowances[sender][msg.sender] != type(uint256).max) {
+            _allowances[sender][msg.sender] = _allowances[sender][msg.sender]
+                .sub(amount, "Insufficient Allowance");
+        }
+        return _transferFrom(sender, recipient, amount);
+    }
+
+    //========== INTERNAL FUNCTIONS ==========\\
+    function _transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal returns (bool) {
+        require(
+            sender == owner() || (launched() && !paused()),
+            "Token must be launched and not paused"
+        );
+
+        if (inSwapAndLiquify) {
+            return _basicTransfer(sender, recipient, amount);
+        }
+
+        if (
+            msg.sender != pair &&
+            !inSwapAndLiquify &&
+            swapAndLiquifyEnabled &&
+            _balances[address(this)] >= swapThreshold
+        ) {
+            swapBack();
+        }
+
+        _balances[sender] = _balances[sender].sub(
+            amount,
+            "Insufficient Balance"
+        );
+
+        uint256 finalAmount = isFeeExempt[sender] ||
+            isFeeExempt[recipient] ||
+            (recipient != pair && sender != pair)
+            ? amount
+            : takeFee(sender, recipient, amount);
+
+        _balances[recipient] = _balances[recipient].add(finalAmount);
+
+        emit Transfer(sender, recipient, finalAmount);
+        return true;
+    }
+
+    function _basicTransfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal returns (bool) {
+        _balances[sender] = _balances[sender].sub(
+            amount,
+            "Insufficient Balance"
+        );
+        _balances[recipient] = _balances[recipient].add(amount);
+        emit Transfer(sender, recipient, amount);
+        return true;
+    }
+
+    function takeFee(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal returns (uint256) {
+        uint256 feeApplicable = pair == recipient
+            ? totalFeeIfSelling
+            : totalFee;
+        uint256 feeAmount = amount.mul(feeApplicable).div(100);
+
+        _balances[address(this)] = _balances[address(this)].add(feeAmount);
+        emit Transfer(sender, address(this), feeAmount);
+        return amount.sub(feeAmount);
+    }
+
+    function swapBack() internal lockTheSwap {
+        uint256 ttl = _balances[address(this)]; //total tokens built as taxes
+        uint256 atl = ttl.mul(liquidityFee).div(totalFee).div(2); //the tokens to keep to make liq
+
+        uint256 ats = ttl.sub(atl); //rest of the tokens left over
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = router.WETH();
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            ats,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        ); //swap the tokens
+
+        uint256 eth = address(this).balance;
+
+        uint256 teth = totalFee.sub(liquidityFee.div(2));
+
+        uint256 lp = eth.mul(liquidityFee).div(teth).div(2);
+
+        uint256 c = eth.mul(claimFee).div(teth);
+        uint256 m = eth.sub(lp).sub(c);
+
+        (bool tmpSuccess, ) = payable(claimWallet).call{value: c, gas: 30000}(
+            ""
+        );
+
+        (bool tmpSuccess1, ) = payable(marketingWallet).call{
+            value: m,
+            gas: 30000
+        }("");
+
+        tmpSuccess = false;
+        tmpSuccess1 = false;
+
+        if (atl > 0) {
+            router.addLiquidityETH{value: lp}(
+                address(this),
+                atl,
+                0,
+                0,
+                marketingWallet,
+                block.timestamp
+            );
+            emit AutoLiquify(lp, atl);
+        }
+    }
+
+    function launched() internal view returns (bool) {
+        return launchedAt != 0;
+    }
+
+    function launch() internal {
+        launchedAt = block.number;
+    }
+
+    //========== EVENTS ==========\\
+    event AutoLiquify(uint256 amountETH, uint256 amountTOKEN);
+}

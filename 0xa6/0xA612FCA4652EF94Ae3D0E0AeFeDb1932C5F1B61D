@@ -1,0 +1,1623 @@
+
+// File: src/EIP712Coordinator.sol
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+pragma solidity ^0.8.4;
+
+import {ECDSA} from "solady/utils/ECDSA.sol";
+import {Coordinator} from "./Coordinator.sol";
+import {EIP712} from "solady/utils/EIP712.sol";
+import {Delegator} from "./pattern/Delegator.sol";
+
+/// @title EIP712Coordinator
+/// @notice Coordinator enhanced with ability to created subscriptions via off-chain EIP-712 signature
+/// @dev Allows creating a subscription on behalf of a contract via delegatee EOA signature
+/// @dev Allows nodes to atomically create subscriptions and deliver compute responses
+contract EIP712Coordinator is EIP712, Coordinator {
+    /*//////////////////////////////////////////////////////////////
+                               CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice EIP-712 signing domain major version
+    string public constant EIP712_VERSION = "1";
+
+    /// @notice EIP-712 signing domain name
+    string public constant EIP712_NAME = "InfernetCoordinator";
+
+    /// @notice Gas overhead in wei to retrieve cached subscriptionId for existing delegatee-created subscription
+    /// @dev A uint16 is sufficient but increases control plane costs. While we can pack this and the subsequent uint24
+    ///      in contract storage to save data plane costs, we prioritize control plane and instead simply use a uint256
+    uint256 public constant DELEGATEE_OVERHEAD_CACHED_WEI = 600 wei;
+
+    /// @notice Gas overhead in wei to create a new subscription via delegatee signature
+    /// @dev Make note that this does not account for gas costs of dynamic inputs (containerId, inputs), just base overhead
+    /// @dev Can fit within uint24, see comment for `DELEGATEE_OVERHEAD_CACHED_WEI` for details
+    uint256 public constant DELEGATEE_OVERHEAD_CREATE_WEI = 91_200 wei;
+
+    /// @notice EIP-712 struct(Subscription) typeHash
+    bytes32 private constant EIP712_SUBSCRIPTION_TYPEHASH = keccak256(
+        "Subscription(address owner,uint32 activeAt,uint32 period,uint32 frequency,uint16 redundancy,uint48 maxGasPrice,uint32 maxGasLimit,string containerId,bytes inputs)"
+    );
+
+    /// @notice EIP-712 struct(DelegateSubscription) typeHash
+    /// @dev struct(DelegateSubscription) == { uint32 nonce, uint32 expiry, Subscription sub }
+    /// @dev The `nonce` represents the nonce of the subscribing contract (sub-owner); prevents signature replay
+    /// @dev The `expiry` is when the delegated subscription signature expires and can no longer be used
+    bytes32 private constant EIP712_DELEGATE_SUBSCRIPTION_TYPEHASH = keccak256(
+        "DelegateSubscription(uint32 nonce,uint32 expiry,Subscription sub)Subscription(address owner,uint32 activeAt,uint32 period,uint32 frequency,uint16 redundancy,uint48 maxGasPrice,uint32 maxGasLimit,string containerId,bytes inputs)"
+    );
+
+    /*//////////////////////////////////////////////////////////////
+                                MUTABLE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Subscribing contract => maximum seen nonce
+    /// @dev The nonce is a uint32 size(4.2B) which would take > 100 years of incrementing nonce per second to overflow
+    mapping(address => uint32) public maxSubscriberNonce;
+
+    /// @notice hash(subscribing contract, nonce) => subscriptionId
+    /// @notice Allows lookup between a delegated subscription creation (unique(subscriber, nonce)) and subscriptionId
+    mapping(bytes32 => uint32) public delegateCreatedIds;
+
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Thrown by `createSubscriptionDelegatee()` if subscription signature does not match contract delegatee
+    /// @dev 4-byte signature: `0x10c74b03`
+    error SignerMismatch();
+
+    /// @notice Thrown by `createSubscriptionDelegatee()` if signature for delegated subscription has expired
+    /// @dev 4-byte signature: `0x0819bdcd`
+    error SignatureExpired();
+
+    /*//////////////////////////////////////////////////////////////
+                           OVERRIDE FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Overrides Solady.EIP712._domainNameAndVersion to return EIP712-compatible domain name, version
+    function _domainNameAndVersion() internal pure override returns (string memory, string memory) {
+        return (EIP712_NAME, EIP712_VERSION);
+    }
+
+    /// @notice Overrides Solady.EIP712._domainNameAndVersionMayChange to always return false since the domain params are not updateable
+    function _domainNameAndVersionMayChange() internal pure override returns (bool) {
+        return false;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Allows a delegatee to create a subscription on behalf of a subscribing contract (sub.owner)
+    /// @dev Unlike `Coordinator.createSubscription()`, offers maximum flexibility to set subscription parameters
+    /// @param nonce subscribing contract nonce (included in signature)
+    /// @param expiry delegated subscription signature expiry (included in signature)
+    /// @param sub subscription to create
+    /// @param v ECDSA recovery id
+    /// @param r ECDSA signature output (r)
+    /// @param s ECDSA signature output (s)
+    /// @return 0: subscriptionId (if subscription exists, returns existing ID, else returns new ID),
+    ///         1: exists (true if returning existing subscription, else false)
+    function createSubscriptionDelegatee(
+        uint32 nonce,
+        uint32 expiry,
+        Subscription calldata sub,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public returns (uint32, bool) {
+        // Check if subscription already exists via delegate-created lookup table
+        bytes32 key = keccak256(abi.encode(sub.owner, nonce));
+        uint32 subscriptionId = delegateCreatedIds[key];
+
+        // If subscription exists, return existing subscriptionId
+        // This implicitly prevents nonce replay because if the nonce was already used, a subscription would exist
+        if (subscriptionId != 0) {
+            return (subscriptionId, true);
+        }
+
+        // Else, if subscription does not exist
+        // First, verify that signature has not expired
+        if (uint32(block.timestamp) >= expiry) {
+            revert SignatureExpired();
+        }
+
+        // Generate EIP-712 data
+        bytes32 digest = _hashTypedData(
+            keccak256(
+                // Encode(DelegateSubscription, nonce, expiry, sub)
+                abi.encode(
+                    EIP712_DELEGATE_SUBSCRIPTION_TYPEHASH,
+                    nonce,
+                    expiry,
+                    // Encode(Subscription, sub)
+                    keccak256(
+                        abi.encode(
+                            EIP712_SUBSCRIPTION_TYPEHASH,
+                            sub.owner,
+                            sub.activeAt,
+                            sub.period,
+                            sub.frequency,
+                            sub.redundancy,
+                            sub.maxGasPrice,
+                            sub.maxGasLimit,
+                            // Hash dynamic values
+                            keccak256(bytes(sub.containerId)),
+                            keccak256(sub.inputs)
+                        )
+                    )
+                )
+            )
+        );
+
+        // Get recovered signer from data
+        // Throws `InvalidSignature()` (4-byte signature: `0x8baa579f`) if can't recover signer
+        address recoveredSigner = ECDSA.recover(digest, v, r, s);
+
+        // Collect delegated signer from subscribing contract
+        address delegatedSigner = Delegator(sub.owner).signer();
+
+        // Verify signatures (recoveredSigner should equal delegatedSigner)
+        if (recoveredSigner != delegatedSigner) {
+            revert SignerMismatch();
+        }
+
+        // By this point, the signer is verified and a net-new subscription can be created
+        // Assign new subscription id
+        // Unlikely this will ever overflow so we can toss in unchecked
+        unchecked {
+            subscriptionId = id++;
+        }
+
+        // Store provided subscription as-is
+        subscriptions[subscriptionId] = sub;
+
+        // Update delegate-created ID lookup table
+        delegateCreatedIds[key] = subscriptionId;
+
+        // Emit new subscription
+        emit SubscriptionCreated(subscriptionId);
+
+        // Update max known subscriber nonce (useful for off-chain signing utilities to prevent nonce-collision)
+        if (nonce > maxSubscriberNonce[sub.owner]) {
+            maxSubscriberNonce[sub.owner] = nonce;
+        }
+
+        // Explicitly return subscriptionId
+        return (subscriptionId, false);
+    }
+
+    /// @notice Allows active nodes to (1) atomically create or collect subscription via signed EIP-712 message,
+    ///         (2) deliver container compute responses for created or collected subscription
+    /// @param nonce subscribing contract nonce (included in signature)
+    /// @param expiry delegated subscription signature expiry (included in signature)
+    /// @param sub subscription to create
+    /// @param v ECDSA recovery id
+    /// @param r ECDSA signature output (r)
+    /// @param s ECDSA signature output (s)
+    /// @param deliveryInterval subscription `interval`
+    /// @param input optional off-chain input recorded by Infernet node (empty, hashed input, processed input, or both)
+    /// @param output optional off-chain container output (empty, hashed output, processed output, both, or fallback: all encodeable data)
+    /// @param proof optional container execution proof (or arbitrary metadata)
+    function deliverComputeDelegatee(
+        uint32 nonce,
+        uint32 expiry,
+        Subscription calldata sub,
+        uint8 v,
+        bytes32 r,
+        bytes32 s,
+        uint32 deliveryInterval,
+        bytes calldata input,
+        bytes calldata output,
+        bytes calldata proof
+    ) external onlyActiveNode {
+        // Create subscriptionId via delegatee creation + or collect if subscription already exists
+        (uint32 subscriptionId, bool cached) = createSubscriptionDelegatee(nonce, expiry, sub, v, r, s);
+
+        // Calculate additional gas overhead imposed from delivering container compute response via delegatee function
+        uint256 overhead;
+        if (cached) {
+            // Subscription exists, cost to retrieve subscriptionId
+            overhead = DELEGATEE_OVERHEAD_CACHED_WEI;
+        } else {
+            // Subscription does not exist, cost to create subscription w/ delegatee signature
+            overhead = DELEGATEE_OVERHEAD_CREATE_WEI;
+        }
+
+        // Deliver subscription response
+        _deliverComputeWithOverhead(subscriptionId, deliveryInterval, input, output, proof, overhead);
+    }
+}
+
+
+// File: lib/solady/src/utils/ECDSA.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Gas optimized ECDSA wrapper.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/ECDSA.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/ECDSA.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/ECDSA.sol)
+///
+/// @dev Note:
+/// - The recovery functions use the ecrecover precompile (0x1).
+/// - As of Solady version 0.0.68, the `recover` variants will revert upon recovery failure.
+///   This is for more safety by default.
+///   Use the `tryRecover` variants if you need to get the zero address back
+///   upon recovery failure instead.
+/// - As of Solady version 0.0.134, all `bytes signature` variants accept both
+///   regular 65-byte `(r, s, v)` and EIP-2098 `(r, vs)` short form signatures.
+///   See: https://eips.ethereum.org/EIPS/eip-2098
+///   This is for calldata efficiency on smart accounts prevalent on L2s.
+///
+/// WARNING! Do NOT use signatures as unique identifiers:
+/// - Use a nonce in the digest to prevent replay attacks on the same contract.
+/// - Use EIP-712 for the digest to prevent replay attacks across different chains and contracts.
+///   EIP-712 also enables readable signing of typed data for better user safety.
+/// This implementation does NOT check if a signature is non-malleable.
+library ECDSA {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        CUSTOM ERRORS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The signature is invalid.
+    error InvalidSignature();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    RECOVERY OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Recovers the signer's address from a message digest `hash`, and the `signature`.
+    function recover(bytes32 hash, bytes memory signature) internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := 1
+            let m := mload(0x40) // Cache the free memory pointer.
+            for {} 1 {} {
+                mstore(0x00, hash)
+                mstore(0x40, mload(add(signature, 0x20))) // `r`.
+                if eq(mload(signature), 64) {
+                    let vs := mload(add(signature, 0x40))
+                    mstore(0x20, add(shr(255, vs), 27)) // `v`.
+                    mstore(0x60, shr(1, shl(1, vs))) // `s`.
+                    break
+                }
+                if eq(mload(signature), 65) {
+                    mstore(0x20, byte(0, mload(add(signature, 0x60)))) // `v`.
+                    mstore(0x60, mload(add(signature, 0x40))) // `s`.
+                    break
+                }
+                result := 0
+                break
+            }
+            result :=
+                mload(
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        result, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                )
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`, and the `signature`.
+    function recoverCalldata(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := 1
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            for {} 1 {} {
+                if eq(signature.length, 64) {
+                    let vs := calldataload(add(signature.offset, 0x20))
+                    mstore(0x20, add(shr(255, vs), 27)) // `v`.
+                    mstore(0x40, calldataload(signature.offset)) // `r`.
+                    mstore(0x60, shr(1, shl(1, vs))) // `s`.
+                    break
+                }
+                if eq(signature.length, 65) {
+                    mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40)))) // `v`.
+                    calldatacopy(0x40, signature.offset, 0x40) // Copy `r` and `s`.
+                    break
+                }
+                result := 0
+                break
+            }
+            result :=
+                mload(
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        result, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                )
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the EIP-2098 short form signature defined by `r` and `vs`.
+    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, add(shr(255, vs), 27)) // `v`.
+            mstore(0x40, r)
+            mstore(0x60, shr(1, shl(1, vs))) // `s`.
+            result :=
+                mload(
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        1, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                )
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the signature defined by `v`, `r`, `s`.
+    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, and(v, 0xff))
+            mstore(0x40, r)
+            mstore(0x60, s)
+            result :=
+                mload(
+                    staticcall(
+                        gas(), // Amount of gas left for the transaction.
+                        1, // Address of `ecrecover`.
+                        0x00, // Start of input.
+                        0x80, // Size of input.
+                        0x01, // Start of output.
+                        0x20 // Size of output.
+                    )
+                )
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   TRY-RECOVER OPERATIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // WARNING!
+    // These functions will NOT revert upon recovery failure.
+    // Instead, they will return the zero address upon recovery failure.
+    // It is critical that the returned address is NEVER compared against
+    // a zero address (e.g. an uninitialized address variable).
+
+    /// @dev Recovers the signer's address from a message digest `hash`, and the `signature`.
+    function tryRecover(bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := 1
+            let m := mload(0x40) // Cache the free memory pointer.
+            for {} 1 {} {
+                mstore(0x00, hash)
+                mstore(0x40, mload(add(signature, 0x20))) // `r`.
+                if eq(mload(signature), 64) {
+                    let vs := mload(add(signature, 0x40))
+                    mstore(0x20, add(shr(255, vs), 27)) // `v`.
+                    mstore(0x60, shr(1, shl(1, vs))) // `s`.
+                    break
+                }
+                if eq(mload(signature), 65) {
+                    mstore(0x20, byte(0, mload(add(signature, 0x60)))) // `v`.
+                    mstore(0x60, mload(add(signature, 0x40))) // `s`.
+                    break
+                }
+                result := 0
+                break
+            }
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    result, // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`, and the `signature`.
+    function tryRecoverCalldata(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := 1
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            for {} 1 {} {
+                if eq(signature.length, 64) {
+                    let vs := calldataload(add(signature.offset, 0x20))
+                    mstore(0x20, add(shr(255, vs), 27)) // `v`.
+                    mstore(0x40, calldataload(signature.offset)) // `r`.
+                    mstore(0x60, shr(1, shl(1, vs))) // `s`.
+                    break
+                }
+                if eq(signature.length, 65) {
+                    mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40)))) // `v`.
+                    calldatacopy(0x40, signature.offset, 0x40) // Copy `r` and `s`.
+                    break
+                }
+                result := 0
+                break
+            }
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    result, // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the EIP-2098 short form signature defined by `r` and `vs`.
+    function tryRecover(bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, add(shr(255, vs), 27)) // `v`.
+            mstore(0x40, r)
+            mstore(0x60, shr(1, shl(1, vs))) // `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    1, // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the signature defined by `v`, `r`, `s`.
+    function tryRecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, and(v, 0xff))
+            mstore(0x40, r)
+            mstore(0x60, s)
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    1, // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an Ethereum Signed Message, created from a `hash`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x20, hash) // Store into scratch space for keccak256.
+            mstore(0x00, "\x00\x00\x00\x00\x19Ethereum Signed Message:\n32") // 28 bytes.
+            result := keccak256(0x04, 0x3c) // `32 * 2 - (32 - 28) = 60 = 0x3c`.
+        }
+    }
+
+    /// @dev Returns an Ethereum Signed Message, created from `s`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    /// Note: Supports lengths of `s` up to 999999 bytes.
+    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let sLength := mload(s)
+            let o := 0x20
+            mstore(o, "\x19Ethereum Signed Message:\n") // 26 bytes, zero-right-padded.
+            mstore(0x00, 0x00)
+            // Convert the `s.length` to ASCII decimal representation: `base10(s.length)`.
+            for { let temp := sLength } 1 {} {
+                o := sub(o, 1)
+                mstore8(o, add(48, mod(temp, 10)))
+                temp := div(temp, 10)
+                if iszero(temp) { break }
+            }
+            let n := sub(0x3a, o) // Header length: `26 + 32 - o`.
+            // Throw an out-of-offset error (consumes all gas) if the header exceeds 32 bytes.
+            returndatacopy(returndatasize(), returndatasize(), gt(n, 0x20))
+            mstore(s, or(mload(0x00), mload(n))) // Temporarily store the header.
+            result := keccak256(add(s, sub(0x20, n)), add(n, sLength))
+            mstore(s, sLength) // Restore the length.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EMPTY CALLDATA HELPERS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an empty calldata bytes.
+    function emptySignature() internal pure returns (bytes calldata signature) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            signature.length := 0
+        }
+    }
+}
+
+
+// File: src/Coordinator.sol
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+pragma solidity ^0.8.4;
+
+import {Manager} from "./Manager.sol";
+import {BaseConsumer} from "./consumer/Base.sol";
+
+/// @title Coordinator
+/// @notice Coordination layer between consuming smart contracts and off-chain Infernet nodes
+/// @dev Allows creating and deleting `Subscription`(s)
+/// @dev Allows nodes with `Manager.NodeStatus.Active` to deliver subscription outputs via off-chain container compute
+contract Coordinator is Manager {
+    /*//////////////////////////////////////////////////////////////
+                                STRUCTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice A subscription is the fundamental unit of Infernet
+    /// @dev A subscription represents some request configuration for off-chain compute via containers on Infernet nodes
+    /// @dev A subscription with `frequency == 1` is a one-time subscription (a callback)
+    /// @dev A subscription with `frequency > 1` is a recurring subscription (many callbacks)
+    /// @dev Tightly-packed struct:
+    ///      - [owner, activeAt, period, frequency]: [32, 160, 32, 32] = 256
+    ///      - [redundancy, maxGasPrice, maxGasLimit]: [16, 48, 32] = 96
+    struct Subscription {
+        /// @notice Subscription owner + recipient
+        /// @dev This is the address called to fulfill a subscription request and must inherit `BaseConsumer`
+        /// @dev Default initializes to `address(0)`
+        address owner;
+        /// @notice Timestamp when subscription is first active and an off-chain Infernet node can respond
+        /// @dev When `period == 0`, the subscription is immediately active
+        /// @dev When `period > 0`, subscription is active at `createdAt + period`
+        uint32 activeAt;
+        /// @notice Time, in seconds, between each subscription interval
+        /// @dev At worst, assuming subscription occurs once/year << uint32
+        uint32 period;
+        /// @notice Number of times a subscription is processed
+        /// @dev At worst, assuming 30 req/min * 60 min * 24 hours * 365 days * 10 years << uint32
+        uint32 frequency;
+        /// @notice Number of unique nodes that can fulfill a subscription at each `interval`
+        /// @dev uint16 allows for >255 nodes (uint8) but <65,535
+        uint16 redundancy;
+        /// @notice Max gas price in wei paid by an Infernet node when fulfilling callback
+        /// @dev uint40 caps out at ~1099 gwei, uint48 allows up to ~281K gwei
+        uint48 maxGasPrice;
+        /// @notice Max gas limit in wei used by an Infernet node when fulfilling callback
+        /// @dev Must be at least equal to the gas limit of your receiving function execution + DELIVERY_OVERHEAD_WEI
+        /// @dev uint24 is too small at ~16.7M (<30M mainnet gas limit), but uint32 is more than enough (~4.2B wei)
+        uint32 maxGasLimit;
+        /// @notice Container identifier used by off-chain Infernet nodes to determine which container is used to fulfill a subscription
+        /// @dev Can be used to specify a linear DAG of containers by seperating container names with a "," delimiter ("A,B,C")
+        /// @dev Better represented by a string[] type but constrained to string to keep struct and functions simple
+        string containerId;
+        /// @notice Optional container input parameters
+        /// @dev If left empty, off-chain Infernet nodes call public view fn: `BaseConsumer(owner).getContainerInputs()`
+        bytes inputs;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Gas overhead in wei to deliver container compute responses
+    /// @dev This is the additional cost of any validation checks performed within the `Coordinator`
+    ///      before delivering responses to consumer contracts
+    /// @dev A uint16 is sufficient but we are not packing variables so control plane cost is higher because of type
+    ///      casting during operations. Thus, we can just stick to uint256
+    uint256 public constant DELIVERY_OVERHEAD_WEI = 56_600 wei;
+
+    /*//////////////////////////////////////////////////////////////
+                                MUTABLE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Current highest subscription ID
+    /// @dev 1-indexed to allow using id as a mapping value (prevent 0-indexed default from being misused)
+    /// @dev uint32 size(4.2B) should be sufficiently large
+    uint32 public id = 1;
+
+    /// @notice hash(subscriptionId, interval, caller) => has caller responded for (sub, interval)?
+    mapping(bytes32 => bool) public nodeResponded;
+
+    /// @notice hash(subscriptionId, interval) => Number of responses for (sub, interval)?
+    /// @dev Limited to type(Subscription.redundancy) == uint16
+    /// @dev Technically, this is not required and we can save an SLOAD if we simply add a uint48 to the subscription
+    ///      struct that represents 32 bits of the interval -> 16 bits of redundancy count, reset each interval change
+    ///      But, this is a little over the optimization:redability line and would make Subscriptions harder to grok
+    mapping(bytes32 => uint16) public redundancyCount;
+
+    /// @notice subscriptionID => Subscription
+    /// @dev 1-indexed, 0th-subscription is empty
+    mapping(uint32 => Subscription) public subscriptions;
+
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when a new subscription is created
+    /// @param id subscription ID
+    event SubscriptionCreated(uint32 indexed id);
+
+    /// @notice Emitted when a subscription is cancelled
+    /// @param id subscription ID
+    event SubscriptionCancelled(uint32 indexed id);
+
+    /// @notice Emitted when a subscription is fulfilled
+    /// @param id subscription ID
+    /// @param node address of fulfilling node
+    event SubscriptionFulfilled(uint32 indexed id, address indexed node);
+
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if delivering tx with gasPrice > subscription maxGasPrice
+    /// @dev E.g. submitting tx with gas price `10 gwei` when network basefee is `11 gwei`
+    /// @dev 4-byte signature: `0x682bad5a`
+    error GasPriceExceeded();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if delivering tx with consumed gas > subscription maxGasLimit
+    /// @dev E.g. submitting tx with gas consumed `200_000 wei` when max allowed by subscription is `175_000 wei`
+    /// @dev 4-byte signature: `0xbe9179a6`
+    error GasLimitExceeded();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if attempting to deliver container compute response for non-current interval
+    /// @dev E.g submitting tx for `interval` < current (period elapsed) or `interval` > current (too early to submit)
+    /// @dev 4-byte signature: `0x4db310c3`
+    error IntervalMismatch();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if `redundancy` has been met for current `interval`
+    /// @dev E.g submitting 4th output tx for a subscription with `redundancy == 3`
+    /// @dev 4-byte signature: `0x2f4ca85b`
+    error IntervalCompleted();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if `node` has already responded this `interval`
+    /// @dev 4-byte signature: `0x88a21e4f`
+    error NodeRespondedAlready();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if attempting to access a subscription that does not exist
+    /// @dev 4-byte signature: `0x1a00354f`
+    error SubscriptionNotFound();
+
+    /// @notice Thrown by `cancelSubscription()` if attempting to modify a subscription not owned by caller
+    /// @dev 4-byte signature: `0xa7fba711`
+    error NotSubscriptionOwner();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if attempting to deliver a completed subscription
+    /// @dev 4-byte signature: `0xae6704a7`
+    error SubscriptionCompleted();
+
+    /// @notice Thrown by `deliverComputeWithOverhead()` if attempting to deliver a subscription before `activeAt`
+    /// @dev 4-byte signature: `0xefb74efe`
+    error SubscriptionNotActive();
+
+    /*//////////////////////////////////////////////////////////////
+                           INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Internal counterpart to `deliverCompute()` w/ ability to set custom gas overhead allowance
+    /// @dev When called by `deliverCompute()`, `callingOverheadWei == 0` because no additional overhead imposed
+    /// @dev When called by `deliverComputeDelegatee()`, `DELEGATEE_OVERHEAD_*_WEI` is imposed
+    /// @param subscriptionId subscription ID to deliver
+    /// @param deliveryInterval subscription `interval` to deliver
+    /// @param input optional off-chain input recorded by Infernet node (empty, hashed input, processed input, or both)
+    /// @param output optional off-chain container output (empty, hashed output, processed output, both, or fallback: all encodeable data)
+    /// @param proof optional container execution proof (or arbitrary metadata)
+    /// @param callingOverheadWei additional overhead gas used for delivery
+    function _deliverComputeWithOverhead(
+        uint32 subscriptionId,
+        uint32 deliveryInterval,
+        bytes calldata input,
+        bytes calldata output,
+        bytes calldata proof,
+        uint256 callingOverheadWei
+    ) internal {
+        // Naively, one would think that loading a subscription into memory via
+        // `Subscription memory subscription = subscriptions[subscriptionId]`
+        // would be cost-effective and most readable.
+
+        // Unfortunately, this is not the case. This function makes no use of
+        // `subscription.containerId` or `subscription.inputs`. Because these
+        // are dynamic types, we are forced to pay to load into memory the length
+        // + content of these parameters. In some cases (say, container input being
+        // 100 uint256's), we are forced to pay 2 SLOAD (length slot containerId, inputs)
+        // + N SLOAD (containerId + inputs byte length / word size) (for example, 100
+        // SLOAD's in the case of 100 uint256's) + N MSTORE (copying into memory)
+        // + memory expansion costs.
+
+        // To avoid this, we can first access memory parameters selectively, copying
+        // just the fixed size params (uint16, etc.) into memory by accessing state via
+        // `subscriptions[subscriptionId].activeAt` syntax.
+
+        // But, with this syntax, while we avoid the significant overhead of copying
+        // from storage, into memory, the unnecessary dynamic parameters, we are now
+        // forced to pay 100 gas for each non-first storage slot read (hot SLOAD).
+
+        // For example, even if accessing two tightly-packed variables in slot 0, we must
+        // pay COLD SLOAD + HOT SLOAD, rather than just COLD SLOAD + MLOAD.
+
+        // To avoid this, we can drop down to assembly and:
+        //      1. Manually SLOAD tightly-packed struct slots
+        //      2. Unpack and MSTORE variables to avoid the hot SLOAD penalty since we
+        //         only copy from storage into memory once (rather than for each variable)
+
+        // Setup parameters in first slot
+        // Note, we could load these variables right before they are used but the MSTORE is cheap and this is cleaner
+        address subOwner;
+        uint32 subActiveAt;
+        uint32 subPeriod;
+        uint32 subFrequency;
+
+        // Store slot identifier for subscriptions[subscriptionId][slot 0]
+        bytes32 storageSlot;
+        assembly ("memory-safe") {
+            // Load address of free-memory pointer
+            let m := mload(0x40)
+
+            // Store subscription ID to first free slot
+            // uint32 automatically consumes full word
+            mstore(m, subscriptionId)
+            // Store subscriptions mapping storage slot (4) to 32 byte (1 word) offset
+            mstore(add(m, 0x20), 4)
+
+            // At this point, memory layout [0 -> 0x20 == subscriptionId, 0x20 -> 0x40 == 4]
+            // Calculate mapping storage slot — hash(key, mapping slot)
+            // Hash data from 0 -> 0x40 (2 words)
+            storageSlot := keccak256(m, 0x40)
+
+            // SLOAD struct data
+            let data := sload(storageSlot)
+
+            // Solidity packs structs right to left (least-significant bits a la little-endian)
+            // MSTORE'ing tightly-packed variables from storage slot data
+            // Erase first 96 bits via AND, grab last 160
+            subOwner := and(data, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)
+            // Grab first 32 bits preceeding owner
+            subActiveAt := and(shr(160, data), 0xFFFFFFFF)
+            // Grab first 32 bits preceeding activeAt
+            subPeriod := and(shr(192, data), 0xFFFFFFFF)
+            // Grab first 32 bits from left
+            subFrequency := shr(224, data)
+        }
+
+        // Revert if subscription does not exist
+        if (subOwner == address(0)) {
+            revert SubscriptionNotFound();
+        }
+
+        // Revert if subscription is not yet active
+        if (block.timestamp < subActiveAt) {
+            revert SubscriptionNotActive();
+        }
+
+        // Calculate subscription interval
+        uint32 interval = getSubscriptionInterval(subActiveAt, subPeriod);
+
+        // Revert if not processing curent interval
+        if (interval != deliveryInterval) {
+            revert IntervalMismatch();
+        }
+
+        // Revert if interval > frequency
+        if (interval > subFrequency) {
+            revert SubscriptionCompleted();
+        }
+
+        // Setup parameters in second slot
+        uint16 subRedundancy;
+        uint48 subMaxGasPrice;
+        uint32 subMaxGasLimit;
+
+        assembly ("memory-safe") {
+            // SLOAD struct data
+            // Second slot is simply offset from first by 1
+            let data := sload(add(storageSlot, 1))
+
+            // MSTORE'ing tightly-packed variables from storage slot data
+            // Grab last 16 bits
+            subRedundancy := and(data, 0xFFFF)
+            // Grab first 48 bits preceeding redundancy
+            subMaxGasPrice := and(shr(16, data), 0xFFFFFFFFFFFF)
+            // Grab first 32 bits from left
+            subMaxGasLimit := and(shr(64, data), 0xFFFFFFFF)
+        }
+
+        // Revert if tx gas price > max subscription allowed
+        if (tx.gasprice > subMaxGasPrice) {
+            revert GasPriceExceeded();
+        }
+
+        // Revert if redundancy requirements for this interval have been met
+        bytes32 key = keccak256(abi.encode(subscriptionId, interval));
+        uint16 numRedundantDeliveries = redundancyCount[key];
+        if (numRedundantDeliveries == subRedundancy) {
+            revert IntervalCompleted();
+        }
+        // Highly unlikely to overflow given incrementing by 1/node
+        unchecked {
+            redundancyCount[key] = numRedundantDeliveries + 1;
+        }
+
+        // Revert if node has already responded this interval
+        key = keccak256(abi.encode(subscriptionId, interval, msg.sender));
+        if (nodeResponded[key]) {
+            revert NodeRespondedAlready();
+        }
+        nodeResponded[key] = true;
+
+        // Deliver container compute output to contract (measuring execution cost)
+        uint256 startingGas = gasleft();
+        BaseConsumer(subOwner).rawReceiveCompute(
+            subscriptionId, interval, numRedundantDeliveries + 1, msg.sender, input, output, proof
+        );
+        uint256 endingGas = gasleft();
+
+        // Revert if gas used > allowed, we can make unchecked:
+        // Gas limit in most networks is usually much below uint256 max, and by this point a decent amount is spent
+        // `callingOverheadWei`, `DELIVERY_OVERHEAD_WEI` both fit in under uint24's
+        // Thus, this operation is unlikely to ever overflow ((uint256 - uint256) + (uint16 + uint24))
+        // Unless the bounds are along the lines of: {startingGas: UINT256_MAX, endingGas: << (callingOverheadWei + DELIVERY_OVERHEAD_WEI)}
+        uint256 executionCost;
+        unchecked {
+            executionCost = startingGas - endingGas + callingOverheadWei + DELIVERY_OVERHEAD_WEI;
+        }
+        if (executionCost > subMaxGasLimit) {
+            revert GasLimitExceeded();
+        }
+
+        // Emit successful delivery
+        emit SubscriptionFulfilled(subscriptionId, msg.sender);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Creates new subscription
+    /// @param containerId compute container identifier used by off-chain Infernet node
+    /// @param inputs optional container inputs
+    /// @param maxGasPrice max gas price in wei paid by an Infernet node when fulfilling callback
+    /// @param maxGasLimit max gas limit in wei paid by an Infernet node in callback tx
+    /// @param frequency max number of times to process subscription (i.e, `frequency == 1` is a one-time request)
+    /// @param period period, in seconds, at which to progress each responding `interval`
+    /// @param redundancy number of unique responding Infernet nodes
+    /// @return subscription ID
+    function createSubscription(
+        string memory containerId,
+        bytes calldata inputs,
+        uint48 maxGasPrice,
+        uint32 maxGasLimit,
+        uint32 frequency,
+        uint32 period,
+        uint16 redundancy
+    ) external returns (uint32) {
+        // Get subscription id and increment
+        // Unlikely this will ever overflow so we can toss in unchecked
+        uint32 subscriptionId;
+        unchecked {
+            subscriptionId = id++;
+        }
+
+        // Store new subscription
+        subscriptions[subscriptionId] = Subscription({
+            // If period is = 0 (one-time), active immediately
+            // Else, next active at first period mark
+            // Probably reasonable to keep the overflow protection here given adding 2 uint32's into a uint32
+            activeAt: uint32(block.timestamp) + period,
+            owner: msg.sender,
+            maxGasPrice: maxGasPrice,
+            redundancy: redundancy,
+            maxGasLimit: maxGasLimit,
+            frequency: frequency,
+            period: period,
+            containerId: containerId,
+            inputs: inputs
+        });
+
+        // Emit new subscription
+        emit SubscriptionCreated(subscriptionId);
+
+        // Explicitly return subscriptionId
+        return subscriptionId;
+    }
+
+    /// @notice Cancel a subscription
+    /// @dev Must be called by `subscriptions[subscriptionId].owner`
+    /// @param subscriptionId subscription ID to cancel
+    function cancelSubscription(uint32 subscriptionId) external {
+        // Throw if owner of subscription is not caller
+        if (subscriptions[subscriptionId].owner != msg.sender) {
+            revert NotSubscriptionOwner();
+        }
+
+        // Nullify subscription
+        delete subscriptions[subscriptionId];
+
+        // Emit cancellation
+        emit SubscriptionCancelled(subscriptionId);
+    }
+
+    /// @notice Calculates subscription `interval` based on `activeAt` and `period`
+    /// @param activeAt when does a subscription start accepting callback responses
+    /// @param period time, in seconds, between each subscription response `interval`
+    /// @return current subscription interval
+    function getSubscriptionInterval(uint32 activeAt, uint32 period) public view returns (uint32) {
+        // If period is 0, we're always at interval 1
+        if (period == 0) {
+            return 1;
+        }
+
+        // Else, interval = ((block.timestamp - activeAt) / period) + 1
+        // This is only called after validating block.timestamp >= activeAt so timestamp can't underflow
+        // We also short-circuit above if period is zero so no need for division by zero checks
+        unchecked {
+            return ((uint32(block.timestamp) - activeAt) / period) + 1;
+        }
+    }
+
+    /// @notice Allows nodes with `Manager.NodeStatus.Active` to deliver container compute responses for a subscription
+    /// @dev Re-entering does not work because only active nodes (max 1 response) can call `deliverCompute`
+    /// @dev Re-entering and delivering via a seperate node `msg.sender` works but is ignored in favor of explicit `maxGasLimit`
+    /// @dev For containers without succinctly-verifiable proofs, the `proof` field can be repurposed for arbitrary metadata
+    /// @dev Enforces an overhead delivery cost of `DELIVERY_OVERHEAD_WEI` and `0` additional overhead
+    /// @param subscriptionId subscription ID to deliver
+    /// @param deliveryInterval subscription `interval` to deliver
+    /// @param input optional off-chain container input recorded by Infernet node (empty, hashed input, processed input, or both)
+    /// @param output optional off-chain container output (empty, hashed output, processed output, both, or fallback: all encodeable data)
+    /// @param proof optional off-chain container execution proof (or arbitrary metadata)
+    function deliverCompute(
+        uint32 subscriptionId,
+        uint32 deliveryInterval,
+        bytes calldata input,
+        bytes calldata output,
+        bytes calldata proof
+    ) external onlyActiveNode {
+        _deliverComputeWithOverhead(subscriptionId, deliveryInterval, input, output, proof, 0);
+    }
+}
+
+
+// File: lib/solady/src/utils/EIP712.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Contract for EIP-712 typed structured data hashing and signing.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/EIP712.sol)
+/// @author Modified from Solbase (https://github.com/Sol-DAO/solbase/blob/main/src/utils/EIP712.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/EIP712.sol)
+///
+/// @dev Note, this implementation:
+/// - Uses `address(this)` for the `verifyingContract` field.
+/// - Does NOT use the optional EIP-712 salt.
+/// - Does NOT use any EIP-712 extensions.
+/// This is for simplicity and to save gas.
+/// If you need to customize, please fork / modify accordingly.
+abstract contract EIP712 {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  CONSTANTS AND IMMUTABLES                  */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`.
+    bytes32 internal constant _DOMAIN_TYPEHASH =
+        0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f;
+
+    uint256 private immutable _cachedThis;
+    uint256 private immutable _cachedChainId;
+    bytes32 private immutable _cachedNameHash;
+    bytes32 private immutable _cachedVersionHash;
+    bytes32 private immutable _cachedDomainSeparator;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        CONSTRUCTOR                         */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Cache the hashes for cheaper runtime gas costs.
+    /// In the case of upgradeable contracts (i.e. proxies),
+    /// or if the chain id changes due to a hard fork,
+    /// the domain separator will be seamlessly calculated on-the-fly.
+    constructor() {
+        _cachedThis = uint256(uint160(address(this)));
+        _cachedChainId = block.chainid;
+
+        string memory name;
+        string memory version;
+        if (!_domainNameAndVersionMayChange()) (name, version) = _domainNameAndVersion();
+        bytes32 nameHash = _domainNameAndVersionMayChange() ? bytes32(0) : keccak256(bytes(name));
+        bytes32 versionHash =
+            _domainNameAndVersionMayChange() ? bytes32(0) : keccak256(bytes(version));
+        _cachedNameHash = nameHash;
+        _cachedVersionHash = versionHash;
+
+        bytes32 separator;
+        if (!_domainNameAndVersionMayChange()) {
+            /// @solidity memory-safe-assembly
+            assembly {
+                let m := mload(0x40) // Load the free memory pointer.
+                mstore(m, _DOMAIN_TYPEHASH)
+                mstore(add(m, 0x20), nameHash)
+                mstore(add(m, 0x40), versionHash)
+                mstore(add(m, 0x60), chainid())
+                mstore(add(m, 0x80), address())
+                separator := keccak256(m, 0xa0)
+            }
+        }
+        _cachedDomainSeparator = separator;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   FUNCTIONS TO OVERRIDE                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Please override this function to return the domain name and version.
+    /// ```
+    ///     function _domainNameAndVersion()
+    ///         internal
+    ///         pure
+    ///         virtual
+    ///         returns (string memory name, string memory version)
+    ///     {
+    ///         name = "Solady";
+    ///         version = "1";
+    ///     }
+    /// ```
+    ///
+    /// Note: If the returned result may change after the contract has been deployed,
+    /// you must override `_domainNameAndVersionMayChange()` to return true.
+    function _domainNameAndVersion()
+        internal
+        view
+        virtual
+        returns (string memory name, string memory version);
+
+    /// @dev Returns if `_domainNameAndVersion()` may change
+    /// after the contract has been deployed (i.e. after the constructor).
+    /// Default: false.
+    function _domainNameAndVersionMayChange() internal pure virtual returns (bool result) {}
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the EIP-712 domain separator.
+    function _domainSeparator() internal view virtual returns (bytes32 separator) {
+        if (_domainNameAndVersionMayChange()) {
+            separator = _buildDomainSeparator();
+        } else {
+            separator = _cachedDomainSeparator;
+            if (_cachedDomainSeparatorInvalidated()) separator = _buildDomainSeparator();
+        }
+    }
+
+    /// @dev Returns the hash of the fully encoded EIP-712 message for this domain,
+    /// given `structHash`, as defined in
+    /// https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct.
+    ///
+    /// The hash can be used together with {ECDSA-recover} to obtain the signer of a message:
+    /// ```
+    ///     bytes32 digest = _hashTypedData(keccak256(abi.encode(
+    ///         keccak256("Mail(address to,string contents)"),
+    ///         mailTo,
+    ///         keccak256(bytes(mailContents))
+    ///     )));
+    ///     address signer = ECDSA.recover(digest, signature);
+    /// ```
+    function _hashTypedData(bytes32 structHash) internal view virtual returns (bytes32 digest) {
+        // We will use `digest` to store the domain separator to save a bit of gas.
+        if (_domainNameAndVersionMayChange()) {
+            digest = _buildDomainSeparator();
+        } else {
+            digest = _cachedDomainSeparator;
+            if (_cachedDomainSeparatorInvalidated()) digest = _buildDomainSeparator();
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the digest.
+            mstore(0x00, 0x1901000000000000) // Store "\x19\x01".
+            mstore(0x1a, digest) // Store the domain separator.
+            mstore(0x3a, structHash) // Store the struct hash.
+            digest := keccak256(0x18, 0x42)
+            // Restore the part of the free memory slot that was overwritten.
+            mstore(0x3a, 0)
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    EIP-5267 OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev See: https://eips.ethereum.org/EIPS/eip-5267
+    function eip712Domain()
+        public
+        view
+        virtual
+        returns (
+            bytes1 fields,
+            string memory name,
+            string memory version,
+            uint256 chainId,
+            address verifyingContract,
+            bytes32 salt,
+            uint256[] memory extensions
+        )
+    {
+        fields = hex"0f"; // `0b01111`.
+        (name, version) = _domainNameAndVersion();
+        chainId = block.chainid;
+        verifyingContract = address(this);
+        salt = salt; // `bytes32(0)`.
+        extensions = extensions; // `new uint256[](0)`.
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                      PRIVATE HELPERS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the EIP-712 domain separator.
+    function _buildDomainSeparator() private view returns (bytes32 separator) {
+        // We will use `separator` to store the name hash to save a bit of gas.
+        bytes32 versionHash;
+        if (_domainNameAndVersionMayChange()) {
+            (string memory name, string memory version) = _domainNameAndVersion();
+            separator = keccak256(bytes(name));
+            versionHash = keccak256(bytes(version));
+        } else {
+            separator = _cachedNameHash;
+            versionHash = _cachedVersionHash;
+        }
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Load the free memory pointer.
+            mstore(m, _DOMAIN_TYPEHASH)
+            mstore(add(m, 0x20), separator) // Name hash.
+            mstore(add(m, 0x40), versionHash)
+            mstore(add(m, 0x60), chainid())
+            mstore(add(m, 0x80), address())
+            separator := keccak256(m, 0xa0)
+        }
+    }
+
+    /// @dev Returns if the cached domain separator has been invalidated.
+    function _cachedDomainSeparatorInvalidated() private view returns (bool result) {
+        uint256 cachedChainId = _cachedChainId;
+        uint256 cachedThis = _cachedThis;
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := iszero(and(eq(chainid(), cachedChainId), eq(address(), cachedThis)))
+        }
+    }
+}
+
+
+// File: src/pattern/Delegator.sol
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+pragma solidity ^0.8.4;
+
+/// @title Delegator
+/// @notice Exposes a `signer` address that allows an authorized EOA to sign off on actions on behalf of a contract
+/// @dev Allows developers to create Coordinator subscriptions off-chain, on behalf of a contract, by signing a
+///      `DelegateSubscription` from `signer` and submitting to `EIP712Coordinator.createSubscriptionDelegatee()`
+abstract contract Delegator {
+    /*//////////////////////////////////////////////////////////////
+                                MUTABLE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Authorized address with signing privileges
+    /// @dev Recommended to use an EOA so that it can sign EIP-712 messages
+    /// @dev Visibility is `public` to automatically generate and expose a getter
+    address public signer;
+
+    /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Initialize new Delegator
+    /// @param signer_ authorized address
+    constructor(address signer_) {
+        signer = signer_;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                           INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Update delegated signer
+    /// @dev No event is emitted given contract is meant to be inherited
+    /// @param newSigner new delegated signer address
+    function _updateSigner(address newSigner) internal {
+        signer = newSigner;
+    }
+}
+
+
+// File: src/Manager.sol
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+pragma solidity ^0.8.4;
+
+/// @title Manager
+/// @notice Manages node lifecycle (registration, activation, deactivation)
+/// @dev Allows anyone to register to become an active node
+/// @dev Allows registered nodes to become active after a `cooldown` seconds waiting period
+/// @dev Allows any node to deactivate itself and return to an inactive state
+/// @dev Exposes an `onlyActiveNode()` modifier used to restrict functions to being called by only active nodes
+/// @dev Restricts addresses to 1 of 3 states: `Inactive`, `Registered`, `Active`
+abstract contract Manager {
+    /*//////////////////////////////////////////////////////////////
+                                STRUCTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Packed information about a node (status, cooldown start)
+    /// @dev Cheaper to use a struct to store `status` + `cooldownStart` rather than SSTORE 2 independent mappings
+    /// @dev Technically, could bitshift pack uint40 of data into single uint256 but readability penalty not worth it
+    /// @dev Tightly-packed (well under 32-byte slot): [uint8, uint32] = 40 bits = 5 bytes
+    struct NodeInfo {
+        /// @notice Node status
+        NodeStatus status;
+        /// @notice Cooldown start timestamp in seconds
+        /// @dev Default initializes to `0`; no cooldown active to start
+        /// @dev Equal to `0` if `status != NodeStatus.Registered`, else equal to cooldown start time
+        /// @dev Is modified by `registerNode()` to initiate `cooldown` holding period
+        /// @dev uint32 allows for a timestamp up to year ~2106, likely far beyond lifecycle of this contract
+        uint32 cooldownStart;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                 ENUMS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Possible node statuses
+    /// @dev Enums in Solidity are unsigned integers capped at 256 members, so Inactive is the 0-initialized default
+    /// @dev Inactive (0): Default status is inactive; no status
+    /// @dev Registered (1): Node has registered to become active, initiating a period of `cooldown`
+    /// @dev Active (2): Node is active, able to fulfill subscriptions, and is part of `modifier(onlyActiveNode)`
+    enum NodeStatus {
+        Inactive,
+        Registered,
+        Active
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Cooldown period, in seconds, before a node with `NodeStatus.Registered` can call `activateNode()`
+    /// @dev type(uint32) is sufficient but we are not packing variables so control plane costs are higher because we
+    ///      need to cast the 32-bit type into the 256-bit type anyways. Thus, we use type(uint256).
+    uint256 public constant cooldown = 1 hours;
+
+    /*//////////////////////////////////////////////////////////////
+                                MUTABLE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Node address => node information
+    mapping(address => NodeInfo) public nodeInfo;
+
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when a node moves from `NodeStatus.Inactive` to `NodeStatus.Registered`
+    /// @dev It's actually slightly more expensive (~6 gas) to emit the uint32 given the explicit conversion needed
+    ///      but this is necessary to have better readability and uniformity across the type (not casting in event)
+    /// @param node newly-registered node address
+    /// @param registerer optional proxy address registering on behalf of node (is equal to node when self-registering)
+    /// @param cooldownStart start timestamp of registration cooldown
+    event NodeRegistered(address indexed node, address indexed registerer, uint32 cooldownStart);
+
+    /// @notice Emitted when a node moves from `NodeStatus.Registered` to `NodeStatus.Active`
+    /// @param node newly-activated node address
+    event NodeActivated(address indexed node);
+
+    /// @notice Emitted when a node moves from any status to `NodeStatus.Inactive`
+    /// @param node newly-deactivated node address
+    event NodeDeactivated(address indexed node);
+
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Thrown if attempting to call function that requires a node to have status `NodeStatus.Active`
+    /// @dev Only used by `modifier(onlyActiveNode)`
+    /// @dev 4-byte signature: `0x8741cbb8`
+    error NodeNotActive();
+
+    /// @notice Thrown by `registerNode()` if attempting to register node with status that is not `NodeStatus.Inactive`
+    /// @dev 4-byte signature: `0x5acfd518`
+    /// @param node address of node attempting to register
+    /// @param status current status of node failing registration
+    error NodeNotRegisterable(address node, NodeStatus status);
+
+    /// @notice Thrown by `activateNode()` if `cooldown` has not elapsed since node was registered
+    /// @dev Like `NodeRegistered`, slightly more expensive to use uint32 over uint256 (~6 gas) but better readability
+    /// @dev 4-byte signature: `0xc84b5bdd`
+    /// @param cooldownStart start timestamp of node cooldown
+    error CooldownActive(uint32 cooldownStart);
+
+    /// @notice Thrown by `activateNode()` if attempting to active node with status that is not `NodeStatus.Registered`
+    /// @dev 4-byte signature: `0x33daa7f9`
+    /// @param status current status of node failing activation
+    error NodeNotActivateable(NodeStatus status);
+
+    /*//////////////////////////////////////////////////////////////
+                               MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Allow only callers that are active nodes
+    modifier onlyActiveNode() {
+        if (nodeInfo[msg.sender].status != NodeStatus.Active) {
+            revert NodeNotActive();
+        }
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Allows registering a node for activation
+    /// @dev First-step of two-step process (followed by `activateNode()`)
+    /// @dev Can call on behalf of other nodes as a proxy registerer
+    /// @dev Node must have `NodeStatus.Inactive` to begin registration
+    /// @param node node address to register
+    function registerNode(address node) external {
+        // SLOAD node info
+        NodeInfo storage info = nodeInfo[node];
+
+        // Ensure node is registerable
+        // Current status must be `NodeStatus.Inactive`
+        if (info.status != NodeStatus.Inactive) {
+            revert NodeNotRegisterable(node, info.status);
+        }
+
+        // Update node status to Registered
+        info.status = NodeStatus.Registered;
+        // Update cooldown start timestamp to now
+        info.cooldownStart = uint32(block.timestamp);
+
+        // Emit new registration event
+        emit NodeRegistered(node, msg.sender, uint32(block.timestamp));
+    }
+
+    /// @notice Allows activating a registered node after `cooldown` has elapsed
+    /// @dev Second-step of two-step process (preceeded by `registerNode()`)
+    /// @dev Must be called by node accepting a pending registration (`msg.sender == node`)
+    /// @dev Must be called at least `cooldown` seconds after `registerNode()`
+    function activateNode() external {
+        // SLOAD node info
+        NodeInfo storage info = nodeInfo[msg.sender];
+
+        // Ensure node is already registered
+        // Technically this check is not needed since the next check would fail anyways, but it provides a useful error
+        if (info.status != NodeStatus.Registered) {
+            revert NodeNotActivateable(info.status);
+        }
+
+        // Ensure node has elapsed required cooldown
+        // Adding a uint32 to a uint32-bounded uint256 and upcasting to a uint256, so can't overflow
+        uint256 cooldownEnd;
+        unchecked {
+            cooldownEnd = info.cooldownStart + cooldown;
+        }
+        if (block.timestamp < cooldownEnd) {
+            revert CooldownActive(info.cooldownStart);
+        }
+
+        // Toggle node status to Active
+        info.status = NodeStatus.Active;
+        // Reset cooldown start timestamp
+        info.cooldownStart = 0;
+
+        // Emit activation event
+        emit NodeActivated(msg.sender);
+    }
+
+    /// @notice Allows deactivating a node
+    /// @dev Can be called to set the status of any node back to `NodeStatus.Inactive` with no cooldown
+    /// @dev Must be called by the node deactivating itself (`msg.sender == node`)
+    function deactivateNode() external {
+        delete nodeInfo[msg.sender];
+
+        // Emit deactivation event
+        emit NodeDeactivated(msg.sender);
+    }
+}
+
+
+// File: src/consumer/Base.sol
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+pragma solidity ^0.8.4;
+
+import {Coordinator} from "../Coordinator.sol";
+
+/// @title BaseConsumer
+/// @notice Handles receiving container compute responses from Infernet coordinator
+/// @dev Contains a single public entrypoint `rawReceiveCompute` callable by only the Infernet coordinator. Once
+///      call origin is verified, parameters are proxied to internal function `_receiveCompute`
+abstract contract BaseConsumer {
+    /*//////////////////////////////////////////////////////////////
+                               IMMUTABLE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Infernet Coordinator
+    /// @dev Internal visibility since COORDINATOR is consumed by inheriting contracts
+    Coordinator internal immutable COORDINATOR;
+
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Thrown if attempting to call `rawReceiveCompute` from a `msg.sender != address(COORDINATOR)`
+    /// @dev 4-byte signature: `0x9ec853e6`
+    error NotCoordinator();
+
+    /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Initialize new BaseConsumer
+    /// @param coordinator coordinator address
+    constructor(address coordinator) {
+        // Setup Coordinator
+        COORDINATOR = Coordinator(coordinator);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                           VIRTUAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Callback entrypoint to receive container compute responses from validated Coordinator source
+    /// @dev Called by `rawReceiveCompute` once validated that `msg.sender == address(COORDINATOR)`
+    /// @dev Same function parameters as `rawReceiveCompute`
+    /// @param subscriptionId id of subscription being responded to
+    /// @param interval subscription interval
+    /// @param redundancy after this call succeeds, how many nodes will have delivered a response for this interval
+    /// @param node address of responding Infernet node
+    /// @param input optional off-chain container input recorded by Infernet node (empty, hashed input, processed input, or both)
+    /// @param output optional off-chain container output (empty, hashed output, processed output, both, or fallback: all encodeable data)
+    /// @param proof optional off-chain container execution proof (or arbitrary metadata)
+    function _receiveCompute(
+        uint32 subscriptionId,
+        uint32 interval,
+        uint16 redundancy,
+        address node,
+        bytes calldata input,
+        bytes calldata output,
+        bytes calldata proof
+    ) internal virtual {}
+
+    /*//////////////////////////////////////////////////////////////
+                               FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Callback entrypoint called by Infernet Coordinator to return container compute responses
+    /// @dev Callable only by `address(COORDINATOR)`, else throws `NotCoordinator()` error
+    /// @param subscriptionId id of subscription being responded to
+    /// @param interval subscription interval
+    /// @param redundancy after this call succeeds, how many nodes will have delivered a response for this interval
+    /// @param node address of responding Infernet node
+    /// @param input optional off-chain container input recorded by Infernet node (empty, hashed input, processed input, or both)
+    /// @param output optional off-chain container output (empty, hashed output, processed output, both, or fallback: all encodeable data)
+    /// @param proof optional off-chain container execution proof (or arbitrary metadata)
+    function rawReceiveCompute(
+        uint32 subscriptionId,
+        uint32 interval,
+        uint16 redundancy,
+        address node,
+        bytes calldata input,
+        bytes calldata output,
+        bytes calldata proof
+    ) external {
+        // Ensure caller is coordinator
+        if (msg.sender != address(COORDINATOR)) {
+            revert NotCoordinator();
+        }
+
+        // Call internal receive function, since caller is validated
+        _receiveCompute(subscriptionId, interval, redundancy, node, input, output, proof);
+    }
+}
+

@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+interface IBot {
+    function withdrawTo(address _to, address _token, uint256 _amount) external;
+}
+
+/**
+ * Staking to MEV bot
+ * Beat Jared. Put your idle coins to work!
+ */
+contract Staking {
+    using SafeMath for uint256;
+
+    mapping(address => mapping(address => uint256)) public stakes;
+    mapping(address => uint256)                     public rewards;
+    mapping(address => address)                     public referrers;
+
+    address constant public BOT_ADDRESS      = 0x429Cf888dAE41D589D57F6Dc685707beC755fe63;
+    address constant public BOT_FEE_ADDRESS  = 0x052EBe64Fe6AB6A1e5C61075012852e2ffb5Ae60;
+
+    uint256 constant public BOT_SHARE      = 25;
+    uint256 constant public OWNER_SHARE    = 50;
+    uint256 constant public REFERRER_SHARE = 25;
+    
+    event Deposit  (address indexed token, uint256 amount, address indexed owner, address indexed referrer);
+    event Withdraw (address indexed token, uint256 amount, address indexed owner);
+
+    struct Reward {
+        address owner;
+        uint256 reward;
+        address referrer;
+    }
+
+    function deposit(address token, uint256 amount, address referrer) public {
+        return depositTo(token, amount, msg.sender, referrer);
+    }
+    function deposit(address token, uint256 amount) public {
+        return depositTo(token, amount, msg.sender, BOT_ADDRESS);
+    }
+    function depositTo(address token, uint256 amount, address owner) public {
+        return depositTo(token, amount, owner, BOT_ADDRESS);
+    }
+
+    function depositTo(address token, uint256 amount, address owner, address referrer) internal {
+        require(amount > 0, "Amount must be greater than 0");
+        require(token != address(0), "Invalid token address");
+        address savedReferrer = referrers[owner];
+        if( savedReferrer == address(0) )
+            referrers[owner] = referrer;
+        else
+            require(savedReferrer == referrer, "Referrer can only be set once");
+
+        uint256 balanceBefore = IERC20(token).balanceOf(address(BOT_ADDRESS));
+        IERC20(token).transferFrom( msg.sender, BOT_ADDRESS, amount );
+        uint256 balanceAfter = IERC20(token).balanceOf(address(BOT_ADDRESS));
+        
+        uint256 actualDeposit = balanceAfter.sub(balanceBefore);
+        stakes[owner][token] = stakes[owner][token].add(actualDeposit);
+        
+        emit Deposit(token, actualDeposit, owner, referrer);
+    }
+    
+    function withdraw(address token, uint256 amount) public {
+        require(amount > 0, "Amount must be greater than 0");
+        
+        uint256 stake = stakes[msg.sender][token];
+        require(stake >= amount, "Amount to withdraw exceeds balance");
+
+        stakes[msg.sender][token] = stake.sub(amount);
+        IBot(BOT_ADDRESS).withdrawTo(msg.sender, token, amount);
+
+        emit Withdraw(token, amount, msg.sender);
+    }
+
+    function addRewards(Reward[] memory rewardsToAdd ) public payable {
+        uint256 totalReward = 0;
+        for(uint i = 0; i < rewardsToAdd.length; i++) {
+            totalReward = totalReward.add( rewardsToAdd[i].reward );
+
+            uint256 ownerShare    = rewardsToAdd[i].reward*OWNER_SHARE / 100;
+            uint256 referrerShare = rewardsToAdd[i].reward*REFERRER_SHARE / 100;
+            uint256 botShare      = rewardsToAdd[i].reward*BOT_SHARE / 100;
+
+            rewards[ rewardsToAdd[i].owner ]    = rewards[ rewardsToAdd[i].owner ].add( ownerShare );
+            rewards[ rewardsToAdd[i].referrer ] = rewards[ rewardsToAdd[i].referrer ].add( referrerShare );
+            rewards[ BOT_FEE_ADDRESS ]          = rewards[ BOT_FEE_ADDRESS ].add( botShare );
+        }
+        require(msg.value == totalReward, "ETH");
+    }
+
+    function claim() public {
+        uint256 reward = rewards[msg.sender];
+        rewards[msg.sender] = 0;
+        payable(msg.sender).transfer(reward);
+    }
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    function sub(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+
+        return c;
+    }
+}
