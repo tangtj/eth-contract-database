@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IStaking {
+    function withdraw(uint256 depositId, address receiver) external;
+    function claimRewards(address _receiver) external;
+    function getDepositsOfLength(address account) external view returns (uint256);
+}
+
+contract Claim {
+    IStaking public staking;
+    
+    constructor(address _staking) {
+        staking = IStaking(_staking);
+    }
+
+    function claimRSS3(address[] calldata addrs) external {
+        for (uint256 i = 0; i < addrs.length; ++i) {
+            _claim(addrs[i]);
+        }
+    }
+
+    function _claim(address addr) internal {
+        uint256 depositLen = staking.getDepositsOfLength(addr);
+        for (uint256 i = 0; i < depositLen; ++i) {
+            staking.withdraw(0, addr);
+        }
+        staking.claimRewards(addr);
+    }
+}

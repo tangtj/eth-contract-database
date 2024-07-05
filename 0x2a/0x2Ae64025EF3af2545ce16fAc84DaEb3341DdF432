@@ -1,0 +1,662 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.8;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function allowance(address owner, address spender)
+        external
+        view
+        returns (uint256);
+
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+contract Context {
+    // an instance of this contract, which should be used via inheritance.
+    constructor() {}
+
+    function _msgSender() internal view returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view returns (bytes memory) {
+        this; // silence state mutability warning without generating bytecode - see https://github.com/ethereum/solidity/issues/2691
+        return msg.data;
+    }
+}
+
+contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public onlyOwner {
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     */
+    function _transferOwnership(address newOwner) internal {
+        require(
+            newOwner != address(0),
+            "Ownable: new owner is the zero address"
+        );
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+    }
+}
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations with added overflow
+ * checks.
+ *
+ * Arithmetic operations in Solidity wrap on overflow. This can easily result
+ * in bugs, because programmers usually assume that an overflow raises an
+ * error, which is the standard behavior in high level programming languages.
+ * `SafeMath` restores this intuition by reverting the transaction when an
+ * operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     * - Subtraction cannot overflow.
+     */
+    function sub(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+        // benefit is lost if 'b' is also tested.
+        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+        if (a == 0) {
+            return 0;
+        }
+
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     */
+    function div(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        // Solidity only automatically asserts when dividing by 0
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        // assert(a == b * c + a % b); // There is no case in which this doesn't hold
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return mod(a, b, "SafeMath: modulo by zero");
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts with custom message when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     */
+    function mod(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        require(b != 0, errorMessage);
+        return a % b;
+    }
+}
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+
+    function description() external view returns (string memory);
+
+    function version() external view returns (uint256);
+
+    function getRoundData(uint80 _roundId)
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
+
+interface IPresale {
+    // function stake(address) external view returns (uint256);
+
+    // function getListStaker() external view returns (address[] memory);
+
+    // function getListBuyer() external view returns (address[] memory);
+
+    // function getTotalStaked() external view returns (uint256);
+
+    // function getStaker(address staker) external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function stakeFromStakeContract(address _buyer, uint256 _amount)
+        external
+        returns (bool);
+
+    function getAddress() external view returns (address);
+}
+
+contract Stake is Ownable {
+    using SafeMath for uint256;
+    address payable public _wallet; 
+    IERC20 public  token; 
+    IPresale presale; 
+    uint256 public currentUpdateNumber;
+    uint256 public lastUpdateBlockNumber;
+
+    mapping(address => uint256) private rewards;
+    mapping(address => uint256) private stakers;
+    mapping(address => bool) isStaker;
+    mapping(address => uint256) private lastestUpdatedNumberStaker;
+    mapping(address => uint256) private lastestBlockNumberStaker;
+    mapping(address => uint256) private timeStartStake;
+    mapping(uint256 => UpdateNumber) private updateNumbers;
+    uint256 public totalReward;
+    uint256 public totalStaked;
+    bool public inWithdrawToken = true;
+
+    address[] public stakerAddressList;
+
+    uint256 _rateAPY = 2628000; //60*60*24*365/12
+    uint256 timeToHoldTokenStake = 2592000; // seconds
+    uint256  public totalTokenRewardPerBlock = 160000000000000000000;
+
+    struct UpdateNumber {
+        uint256 blocknumber;
+        uint256 totalStaked;
+    }
+
+    constructor(IERC20 _token, address payable wallet, IPresale _presale) {
+        _wallet = wallet;
+        token = _token;
+        presale = _presale;
+    }
+
+    function setTotalTokenRewardPerBlock(uint256 _totalTokenRewardPerBlock)
+        public
+        onlyOwner
+    {
+        totalTokenRewardPerBlock = _totalTokenRewardPerBlock;
+    }
+
+    function setWallet(address payable wallet) public  onlyOwner{
+        _wallet = wallet;
+    }
+
+    function getLastestUpdateNumberStaked(address staker)
+        public
+        view
+        returns (uint256)
+    {
+        return lastestUpdatedNumberStaker[staker];
+    }
+
+    function getListStaker() public view returns (address[] memory) {
+        return stakerAddressList;
+    }
+
+    function getStaker(address staker) public view returns (uint256) {
+        return stakers[staker];
+    }
+
+    function getStakeale(address account) public view returns (uint256) {
+        return presale.balanceOf(account);
+    }
+
+    function getReward(address _staker) public view returns (uint256) {
+        return rewards[_staker];
+    }
+
+    function getTotalStaked() public view returns (uint256) {
+        return totalStaked;
+    }
+
+    function getTotalTokenRewardPerBlock() public view returns (uint256) {
+        return totalTokenRewardPerBlock;
+    }
+
+    function getTotalReward() public view returns (uint256) {
+        return totalReward;
+    }
+
+    function getWallet() public view returns (address) {
+        return _wallet;
+    }
+
+    function getUpdateNumber(uint256 updateNumber)
+        public
+        view
+        returns (UpdateNumber memory)
+    {
+        return updateNumbers[updateNumber];
+    }
+
+    function getAddress() public view returns (address) {
+        return address(this);
+    }
+
+    function getPresaleContract() public view returns (IPresale) {
+        return presale;
+    }
+
+    function getPoolPercent(address staker) public view returns (uint256) {
+        return (getStaker(staker) * (100)) / getTotalStaked();
+    }
+
+    function getStartTimeStaker(address staker) public view returns (uint256){
+        return timeStartStake[staker];
+    }
+     function canUnStake(address staker) public view returns (bool){
+        return block.timestamp - timeStartStake[staker] > timeToHoldTokenStake;
+    }
+
+     function getTimeToHoldTokenStaker() public view returns (uint256){
+        return timeToHoldTokenStake;
+    }
+
+    function getAPY() public view returns (uint256) {
+        return _rateAPY * totalTokenRewardPerBlock /  totalStaked;
+    }
+
+    function setPresaleAddress(IPresale presaleAdress) public onlyOwner {
+        presale = presaleAdress;
+    }
+
+    function setInWithdrawToken(bool _inWithdrawToken) public onlyOwner {
+       inWithdrawToken= _inWithdrawToken;
+    }
+
+    function setToken(IERC20 _token) public onlyOwner {
+       token= _token;
+    }
+
+    function setTimeToHoldTokenStake(uint256 newTimeToHoldTokenStake) public onlyOwner {
+        timeToHoldTokenStake = newTimeToHoldTokenStake;
+    }
+
+    function getRewards(address staker) public view returns (uint256) {
+        uint256 blockNumber = block.number;
+        uint256 updateNumberOfStaker = lastestUpdatedNumberStaker[staker];
+        uint256 stakedOfAddress = stakers[staker];
+        if(stakedOfAddress == 0 ){
+            return 0;
+        }
+        uint256 blockNumberStaker = lastestBlockNumberStaker[staker];
+        require(
+            updateNumberOfStaker <= currentUpdateNumber,
+            "address not stake"
+        );
+        uint256 rewardsOfAddress;
+
+        if (lastestUpdatedNumberStaker[staker] == currentUpdateNumber) {
+            rewardsOfAddress =
+                (stakedOfAddress *
+                    totalTokenRewardPerBlock *
+                    (blockNumber - blockNumberStaker)) /
+                totalStaked;
+        } else {
+            // uint256 lastTotalStakedInUpdateNumberSaved;
+            UpdateNumber memory nextUpdateNumberOfStaker = updateNumbers[
+                updateNumberOfStaker + 1
+            ];
+            // Step 1: Reward from blockNumberOfStaker to nextUpdateNumber
+            rewardsOfAddress +=
+                ((nextUpdateNumberOfStaker.blocknumber - blockNumberStaker) *
+                    totalTokenRewardPerBlock *
+                    stakedOfAddress) /
+                updateNumbers[updateNumberOfStaker].totalStaked;
+
+            //Step 2: Reward from nextUpdateNumber to currentUpdateNumber
+            for (
+                uint256 i = updateNumberOfStaker + 1;
+                i < currentUpdateNumber;
+                i++
+            ) {
+                uint256 totalStakedInUpdateNumber = updateNumbers[i]
+                    .totalStaked;
+                uint256 blockNumberInUpdateNumber = updateNumbers[i]
+                    .blocknumber;
+                uint256 blockNumberInNextUpdateNumber = updateNumbers[i + 1]
+                    .blocknumber;
+                rewardsOfAddress +=
+                    ((stakedOfAddress * totalTokenRewardPerBlock) *
+                        (blockNumberInNextUpdateNumber -
+                            blockNumberInUpdateNumber)) /
+                    totalStakedInUpdateNumber;
+            }
+
+            //Step 3: Reward from lastBlockNumber to currentBlockNumber
+            rewardsOfAddress +=
+                ((block.number -
+                    updateNumbers[currentUpdateNumber].blocknumber) *
+                    (stakedOfAddress * totalTokenRewardPerBlock)) /
+                totalStaked;
+        }
+
+        return rewardsOfAddress;
+    }
+
+    function withdrawReward() public returns (bool) {
+        return withdrawReward(msg.sender);
+    }
+
+    function tokenBalanceOfContract() view public returns (uint256){
+        return token.balanceOf(address(this));
+    }
+
+    function withdrawReward(address staker) public returns (bool) {
+        uint256 reward = getRewards(staker);
+        require(
+            token.balanceOf(address(this)) > reward,
+            "Sold out reward token"
+        );
+        bool success = token.transfer(staker, reward);
+
+        require(success, "Reward error");
+        lastestUpdatedNumberStaker[staker] = currentUpdateNumber;
+        lastestBlockNumberStaker[staker] = block.number;
+         totalReward = totalReward.add(reward);
+        return true;
+    }
+
+     function withdrawdAndStakeRewards(address staker) public returns (bool) {
+        uint256 reward = getRewards(staker);
+        require(stakeSuccess(staker, reward), "Withdraw and Stake error");
+        return true;
+    }
+
+    function addStakerToList(address _staker) private {
+        if (isStaker[_staker] == false) {
+            stakerAddressList.push(_staker);
+            isStaker[_staker] = true;
+        }
+    }
+
+    function stake() public returns (bool) {
+        require(msg.sender != address(0), "address is zero");
+        uint256 amount = presale.balanceOf(msg.sender);
+        require(amount > 0, "Amount must not zero");
+        bool success = presale.stakeFromStakeContract(msg.sender, amount);
+        require(success, "Stake error");
+        if (stakers[msg.sender] > 0) {
+            require(withdrawReward(msg.sender), "Withdraw old tokens error");
+        }
+
+        require(stakeSuccess(msg.sender, amount), "Stake error, check again");
+        return true;
+    }
+
+    function stakeFromToken(uint256 _amount) public returns (bool) {
+        require(msg.sender != address(0), "address is zero");
+        require(_amount > 0, "Amount stake must > 0");
+        uint256 balance = token.balanceOf(msg.sender);
+        require(_amount <= balance, "Not enough tokens to stake");
+        if (stakers[msg.sender] > 0) {
+            require(withdrawReward(msg.sender), "Withdraw old tokens error");
+        }
+        require(
+            token.transferFrom(msg.sender, _wallet, _amount),
+            "Stake error"
+        );
+
+        require(stakeSuccess(msg.sender, _amount), "Stake error, check again");
+        return true;
+    }
+
+    function unStake() public returns (bool){
+        return unStake(msg.sender);
+    }
+
+    function unStake(address staker) private returns (bool)  {
+        uint256 amountStaking = stakers[staker];
+        require(amountStaking > 0, "Not have token to unstake");
+        require( (block.timestamp - timeStartStake[staker] ) > timeToHoldTokenStake , "Not time to unstake yet");
+        require(withdrawReward(staker), "Withdraw rewards before unstake error"); 
+        token.transferFrom(_wallet, msg.sender, amountStaking);
+        require(unStakeSuccess(staker,amountStaking), "Unstake fail");
+        return true;
+    }
+
+    function stakeFromPresale(address buyer, uint256 amount)
+        public
+        returns (bool)
+    {
+        require(
+            msg.sender == presale.getAddress(),
+            "Only call from PresaleContract"
+        );
+        require(stakeSuccess(buyer, amount), "Stake error, check again");
+        return true;
+    }
+
+    function stakeSuccess(address _staker, uint256 amount)
+        private
+        returns (bool)
+    {
+        uint256 blockNumber = block.number;
+        stakers[_staker] = stakers[_staker].add(amount);
+        totalStaked = totalStaked.add(amount);
+        if (blockNumber - lastUpdateBlockNumber >= 300 || lastUpdateBlockNumber ==0) {
+            lastUpdateBlockNumber = blockNumber;
+            UpdateNumber memory updateNumber = UpdateNumber(
+                blockNumber,
+                totalStaked
+            );
+            currentUpdateNumber += 1;
+            updateNumbers[currentUpdateNumber] = updateNumber;
+        }
+        lastestUpdatedNumberStaker[_staker] = currentUpdateNumber;
+        lastestBlockNumberStaker[_staker] = block.number;
+        timeStartStake[_staker] = block.timestamp;
+        addStakerToList(_staker);
+        return true;
+    }
+
+    function unStakeSuccess(address staker, uint256 amount) private  returns (bool) {
+        stakers[staker] = stakers[staker].sub(amount);
+        totalStaked = totalStaked.sub(amount);
+        return true;
+    }
+
+    function withdraw() public onlyOwner {
+        token.transfer(msg.sender, token.balanceOf(address(this)));
+    }
+}

@@ -1,0 +1,1366 @@
+
+// File: contracts/core/LiquidationManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+import "contracts/token/ERC20/IERC20.sol";
+import "contracts/interfaces/IStabilityPool.sol";
+import "contracts/interfaces/ISortedTroves.sol";
+import "contracts/interfaces/IBorrowerOperations.sol";
+import "contracts/interfaces/ITroveManager.sol";
+import "contracts/dependencies/PrismaMath.sol";
+import "contracts/dependencies/PrismaBase.sol";
+
+/**
+    @title Prisma Liquidation Manager
+    @notice Based on Liquity's `TroveManager`
+            https://github.com/liquity/dev/blob/main/packages/contracts/contracts/TroveManager.sol
+
+            This contract has a 1:n relationship with `TroveManager`, handling liquidations
+            for every active collateral within the system.
+
+            Anyone can call to liquidate an eligible trove at any time. There is no requirement
+            that liquidations happen in order according to trove ICRs. There are three ways that
+            a liquidation can occur:
+
+            1. ICR <= 100
+               The trove's entire debt and collateral is redistributed between remaining active troves.
+
+            2. 100 < ICR < MCR
+               The trove is liquidated using stability pool deposits. The collateral is distributed
+               amongst stability pool depositors. If the stability pool's balance is insufficient to
+               completely repay the trove, the remaining debt and collateral is redistributed between
+               the remaining active troves.
+
+            3. MCR <= ICR < TCR && TCR < CCR
+               The trove is liquidated using stability pool deposits. Collateral equal to MCR of
+               the value of the debt is distributed between stability pool depositors. The remaining
+               collateral is left claimable by the trove owner.
+ */
+contract LiquidationManager is PrismaBase {
+    IStabilityPool public immutable stabilityPool;
+    IBorrowerOperations public immutable borrowerOperations;
+    address public immutable factory;
+
+    uint256 private constant _100pct = 1000000000000000000; // 1e18 == 100%
+
+    mapping(ITroveManager troveManager => bool enabled) internal _enabledTroveManagers;
+
+    /*
+     * --- Variable container structs for liquidations ---
+     *
+     * These structs are used to hold, return and assign variables inside the liquidation functions,
+     * in order to avoid the error: "CompilerError: Stack too deep".
+     **/
+
+    struct TroveManagerValues {
+        uint256 price;
+        uint256 MCR;
+        bool sunsetting;
+    }
+
+    struct LiquidationValues {
+        uint256 entireTroveDebt;
+        uint256 entireTroveColl;
+        uint256 collGasCompensation;
+        uint256 debtGasCompensation;
+        uint256 debtToOffset;
+        uint256 collToSendToSP;
+        uint256 debtToRedistribute;
+        uint256 collToRedistribute;
+        uint256 collSurplus;
+    }
+
+    struct LiquidationTotals {
+        uint256 totalCollInSequence;
+        uint256 totalDebtInSequence;
+        uint256 totalCollGasCompensation;
+        uint256 totalDebtGasCompensation;
+        uint256 totalDebtToOffset;
+        uint256 totalCollToSendToSP;
+        uint256 totalDebtToRedistribute;
+        uint256 totalCollToRedistribute;
+        uint256 totalCollSurplus;
+    }
+
+    event Liquidation(
+        uint256 _liquidatedDebt,
+        uint256 _liquidatedColl,
+        uint256 _collGasCompensation,
+        uint256 _debtGasCompensation
+    );
+
+    enum TroveManagerOperation {
+        applyPendingRewards,
+        liquidateInNormalMode,
+        liquidateInRecoveryMode,
+        redeemCollateral
+    }
+
+    constructor(
+        IStabilityPool _stabilityPoolAddress,
+        IBorrowerOperations _borrowerOperations,
+        address _factory,
+        uint256 _gasCompensation
+    ) PrismaBase(_gasCompensation) {
+        stabilityPool = _stabilityPoolAddress;
+        borrowerOperations = _borrowerOperations;
+        factory = _factory;
+    }
+
+    function enableTroveManager(ITroveManager _troveManager) external {
+        require(msg.sender == factory, "Not factory");
+        _enabledTroveManagers[_troveManager] = true;
+    }
+
+    // --- Trove Liquidation functions ---
+
+    /**
+        @notice Liquidate a single trove
+        @dev Reverts if the trove is not active, or cannot be liquidated
+        @param borrower Borrower address to liquidate
+     */
+    function liquidate(ITroveManager troveManager, address borrower) external {
+        require(troveManager.getTroveStatus(borrower) == 1, "TroveManager: Trove does not exist or is closed");
+
+        address[] memory borrowers = new address[](1);
+        borrowers[0] = borrower;
+        batchLiquidateTroves(troveManager, borrowers);
+    }
+
+    /**
+        @notice Liquidate a sequence of troves
+        @dev Iterates through troves starting with the lowest ICR
+        @param maxTrovesToLiquidate The maximum number of troves to liquidate
+        @param maxICR Maximum ICR to liquidate. Should be set to MCR if the system
+                      is not in recovery mode, to minimize gas costs for this call.
+     */
+    function liquidateTroves(ITroveManager troveManager, uint256 maxTrovesToLiquidate, uint256 maxICR) external {
+        require(_enabledTroveManagers[troveManager], "TroveManager not approved");
+        IStabilityPool stabilityPoolCached = stabilityPool;
+
+        troveManager.updateBalances();
+
+        ISortedTroves sortedTrovesCached = ISortedTroves(troveManager.sortedTroves());
+
+        LiquidationValues memory singleLiquidation;
+        LiquidationTotals memory totals;
+        TroveManagerValues memory troveManagerValues;
+
+        uint256 trovesRemaining = maxTrovesToLiquidate;
+        uint256 troveCount = troveManager.getTroveOwnersCount();
+        troveManagerValues.price = troveManager.fetchPrice();
+        troveManagerValues.sunsetting = troveManager.sunsetting();
+        troveManagerValues.MCR = troveManager.MCR();
+        uint debtInStabPool = stabilityPoolCached.getTotalDebtTokenDeposits();
+
+        while (trovesRemaining > 0 && troveCount > 1) {
+            address account = sortedTrovesCached.getLast();
+            uint ICR = troveManager.getCurrentICR(account, troveManagerValues.price);
+            if (ICR > maxICR) {
+                // set to 0 to ensure the next if block evaluates false
+                trovesRemaining = 0;
+                break;
+            }
+            if (ICR <= _100pct) {
+                singleLiquidation = _liquidateWithoutSP(troveManager, account);
+                _applyLiquidationValuesToTotals(totals, singleLiquidation);
+            } else if (ICR < troveManagerValues.MCR) {
+                singleLiquidation = _liquidateNormalMode(
+                    troveManager,
+                    account,
+                    debtInStabPool,
+                    troveManagerValues.sunsetting
+                );
+                debtInStabPool -= singleLiquidation.debtToOffset;
+                _applyLiquidationValuesToTotals(totals, singleLiquidation);
+            } else break; // break if the loop reaches a Trove with ICR >= MCR
+            unchecked {
+                --trovesRemaining;
+                --troveCount;
+            }
+        }
+        if (trovesRemaining > 0 && !troveManagerValues.sunsetting && troveCount > 1) {
+            (uint entireSystemColl, uint entireSystemDebt) = borrowerOperations.getGlobalSystemBalances();
+            entireSystemColl -= totals.totalCollToSendToSP * troveManagerValues.price;
+            entireSystemDebt -= totals.totalDebtToOffset;
+            address nextAccount = sortedTrovesCached.getLast();
+            ITroveManager _troveManager = troveManager; //stack too deep workaround
+            while (trovesRemaining > 0 && troveCount > 1) {
+                uint ICR = troveManager.getCurrentICR(nextAccount, troveManagerValues.price);
+                if (ICR > maxICR) break;
+                unchecked {
+                    --trovesRemaining;
+                }
+                address account = nextAccount;
+                nextAccount = sortedTrovesCached.getPrev(account);
+
+                uint256 TCR = PrismaMath._computeCR(entireSystemColl, entireSystemDebt);
+                if (TCR >= CCR || ICR >= TCR) break;
+
+                singleLiquidation = _tryLiquidateWithCap(
+                    _troveManager,
+                    account,
+                    debtInStabPool,
+                    troveManagerValues.MCR,
+                    troveManagerValues.price
+                );
+                if (singleLiquidation.debtToOffset == 0) continue;
+                debtInStabPool -= singleLiquidation.debtToOffset;
+                entireSystemColl -=
+                    (singleLiquidation.collToSendToSP + singleLiquidation.collSurplus) *
+                    troveManagerValues.price;
+                entireSystemDebt -= singleLiquidation.debtToOffset;
+                _applyLiquidationValuesToTotals(totals, singleLiquidation);
+                unchecked {
+                    --troveCount;
+                }
+            }
+        }
+
+        require(totals.totalDebtInSequence > 0, "TroveManager: nothing to liquidate");
+        if (totals.totalDebtToOffset > 0 || totals.totalCollToSendToSP > 0) {
+            // Move liquidated collateral and Debt to the appropriate pools
+            stabilityPoolCached.offset(
+                troveManager.collateralToken(),
+                totals.totalDebtToOffset,
+                totals.totalCollToSendToSP
+            );
+            troveManager.decreaseDebtAndSendCollateral(
+                address(stabilityPoolCached),
+                totals.totalDebtToOffset,
+                totals.totalCollToSendToSP
+            );
+        }
+        troveManager.finalizeLiquidation(
+            msg.sender,
+            totals.totalDebtToRedistribute,
+            totals.totalCollToRedistribute,
+            totals.totalCollSurplus,
+            totals.totalDebtGasCompensation,
+            totals.totalCollGasCompensation
+        );
+
+        emit Liquidation(
+            totals.totalDebtInSequence,
+            totals.totalCollInSequence - totals.totalCollGasCompensation - totals.totalCollSurplus,
+            totals.totalCollGasCompensation,
+            totals.totalDebtGasCompensation
+        );
+    }
+
+    /**
+        @notice Liquidate a custom list of troves
+        @dev Reverts if there is not a single trove that can be liquidated
+        @param _troveArray List of borrower addresses to liquidate. Troves that were already
+                           liquidated, or cannot be liquidated, are ignored.
+     */
+    /*
+     * Attempt to liquidate a custom list of troves provided by the caller.
+     */
+    function batchLiquidateTroves(ITroveManager troveManager, address[] memory _troveArray) public {
+        require(_enabledTroveManagers[troveManager], "TroveManager not approved");
+        require(_troveArray.length != 0, "TroveManager: Calldata address array must not be empty");
+        troveManager.updateBalances();
+
+        LiquidationValues memory singleLiquidation;
+        LiquidationTotals memory totals;
+        TroveManagerValues memory troveManagerValues;
+
+        IStabilityPool stabilityPoolCached = stabilityPool;
+        uint debtInStabPool = stabilityPoolCached.getTotalDebtTokenDeposits();
+        troveManagerValues.price = troveManager.fetchPrice();
+        troveManagerValues.sunsetting = troveManager.sunsetting();
+        troveManagerValues.MCR = troveManager.MCR();
+        uint troveCount = troveManager.getTroveOwnersCount();
+        uint length = _troveArray.length;
+        uint troveIter;
+        while (troveIter < length && troveCount > 1) {
+            // first iteration round, when all liquidated troves have ICR < MCR we do not need to track TCR
+            address account = _troveArray[troveIter];
+
+            // closed / non-existent troves return an ICR of type(uint).max and are ignored
+            uint ICR = troveManager.getCurrentICR(account, troveManagerValues.price);
+            if (ICR <= _100pct) {
+                singleLiquidation = _liquidateWithoutSP(troveManager, account);
+            } else if (ICR < troveManagerValues.MCR) {
+                singleLiquidation = _liquidateNormalMode(
+                    troveManager,
+                    account,
+                    debtInStabPool,
+                    troveManagerValues.sunsetting
+                );
+                debtInStabPool -= singleLiquidation.debtToOffset;
+            } else {
+                // As soon as we find a trove with ICR >= MCR we need to start tracking the global TCR with the next loop
+                break;
+            }
+            _applyLiquidationValuesToTotals(totals, singleLiquidation);
+            unchecked {
+                ++troveIter;
+                --troveCount;
+            }
+        }
+
+        if (troveIter < length && troveCount > 1) {
+            // second iteration round, if we receive a trove with ICR > MCR and need to track TCR
+            (uint256 entireSystemColl, uint256 entireSystemDebt) = borrowerOperations.getGlobalSystemBalances();
+            entireSystemColl -= totals.totalCollToSendToSP * troveManagerValues.price;
+            entireSystemDebt -= totals.totalDebtToOffset;
+            while (troveIter < length && troveCount > 1) {
+                address account = _troveArray[troveIter];
+                uint ICR = troveManager.getCurrentICR(account, troveManagerValues.price);
+                unchecked {
+                    ++troveIter;
+                }
+                if (ICR <= _100pct) {
+                    singleLiquidation = _liquidateWithoutSP(troveManager, account);
+                } else if (ICR < troveManagerValues.MCR) {
+                    singleLiquidation = _liquidateNormalMode(
+                        troveManager,
+                        account,
+                        debtInStabPool,
+                        troveManagerValues.sunsetting
+                    );
+                } else {
+                    if (troveManagerValues.sunsetting) continue;
+                    uint256 TCR = PrismaMath._computeCR(entireSystemColl, entireSystemDebt);
+                    if (TCR >= CCR || ICR >= TCR) continue;
+                    singleLiquidation = _tryLiquidateWithCap(
+                        troveManager,
+                        account,
+                        debtInStabPool,
+                        troveManagerValues.MCR,
+                        troveManagerValues.price
+                    );
+                    if (singleLiquidation.debtToOffset == 0) continue;
+                }
+
+                debtInStabPool -= singleLiquidation.debtToOffset;
+                entireSystemColl -=
+                    (singleLiquidation.collToSendToSP + singleLiquidation.collSurplus) *
+                    troveManagerValues.price;
+                entireSystemDebt -= singleLiquidation.debtToOffset;
+                _applyLiquidationValuesToTotals(totals, singleLiquidation);
+                unchecked {
+                    --troveCount;
+                }
+            }
+        }
+
+        require(totals.totalDebtInSequence > 0, "TroveManager: nothing to liquidate");
+
+        if (totals.totalDebtToOffset > 0 || totals.totalCollToSendToSP > 0) {
+            // Move liquidated collateral and Debt to the appropriate pools
+            stabilityPoolCached.offset(
+                troveManager.collateralToken(),
+                totals.totalDebtToOffset,
+                totals.totalCollToSendToSP
+            );
+            troveManager.decreaseDebtAndSendCollateral(
+                address(stabilityPoolCached),
+                totals.totalDebtToOffset,
+                totals.totalCollToSendToSP
+            );
+        }
+        troveManager.finalizeLiquidation(
+            msg.sender,
+            totals.totalDebtToRedistribute,
+            totals.totalCollToRedistribute,
+            totals.totalCollSurplus,
+            totals.totalDebtGasCompensation,
+            totals.totalCollGasCompensation
+        );
+
+        emit Liquidation(
+            totals.totalDebtInSequence,
+            totals.totalCollInSequence - totals.totalCollGasCompensation - totals.totalCollSurplus,
+            totals.totalCollGasCompensation,
+            totals.totalDebtGasCompensation
+        );
+    }
+
+    /**
+        @dev Perform a "normal" liquidation, where 100% < ICR < MCR. The trove
+             is liquidated as much as possible using the stability pool. Any
+             remaining debt and collateral are redistributed between active troves.
+     */
+    function _liquidateNormalMode(
+        ITroveManager troveManager,
+        address _borrower,
+        uint256 _debtInStabPool,
+        bool sunsetting
+    ) internal returns (LiquidationValues memory singleLiquidation) {
+        uint pendingDebtReward;
+        uint pendingCollReward;
+
+        (
+            singleLiquidation.entireTroveDebt,
+            singleLiquidation.entireTroveColl,
+            pendingDebtReward,
+            pendingCollReward
+        ) = troveManager.getEntireDebtAndColl(_borrower);
+
+        troveManager.movePendingTroveRewardsToActiveBalances(pendingDebtReward, pendingCollReward);
+
+        singleLiquidation.collGasCompensation = _getCollGasCompensation(singleLiquidation.entireTroveColl);
+        singleLiquidation.debtGasCompensation = DEBT_GAS_COMPENSATION;
+        uint256 collToLiquidate = singleLiquidation.entireTroveColl - singleLiquidation.collGasCompensation;
+
+        (
+            singleLiquidation.debtToOffset,
+            singleLiquidation.collToSendToSP,
+            singleLiquidation.debtToRedistribute,
+            singleLiquidation.collToRedistribute
+        ) = _getOffsetAndRedistributionVals(
+            singleLiquidation.entireTroveDebt,
+            collToLiquidate,
+            _debtInStabPool,
+            sunsetting
+        );
+
+        troveManager.closeTroveByLiquidation(_borrower);
+
+        return singleLiquidation;
+    }
+
+    /**
+        @dev Attempt to liquidate a single trove in recovery mode.
+             If MCR <= ICR < current TCR (accounting for the preceding liquidations in the current sequence)
+             and there is Debt in the Stability Pool, only offset, with no redistribution,
+             but at a capped rate of 1.1 and only if the whole debt can be liquidated.
+             The remainder due to the capped rate will be claimable as collateral surplus.
+     */
+    function _tryLiquidateWithCap(
+        ITroveManager troveManager,
+        address _borrower,
+        uint256 _debtInStabPool,
+        uint256 _MCR,
+        uint256 _price
+    ) internal returns (LiquidationValues memory singleLiquidation) {
+        uint entireTroveDebt;
+        uint entireTroveColl;
+        uint pendingDebtReward;
+        uint pendingCollReward;
+
+        (entireTroveDebt, entireTroveColl, pendingDebtReward, pendingCollReward) = troveManager.getEntireDebtAndColl(
+            _borrower
+        );
+
+        if (entireTroveDebt > _debtInStabPool) {
+            // do not liquidate if the entire trove cannot be liquidated via SP
+            return singleLiquidation;
+        }
+
+        troveManager.movePendingTroveRewardsToActiveBalances(pendingDebtReward, pendingCollReward);
+
+        singleLiquidation.entireTroveDebt = entireTroveDebt;
+        singleLiquidation.entireTroveColl = entireTroveColl;
+        uint256 collToOffset = (entireTroveDebt * _MCR) / _price;
+
+        singleLiquidation.collGasCompensation = _getCollGasCompensation(collToOffset);
+        singleLiquidation.debtGasCompensation = DEBT_GAS_COMPENSATION;
+
+        singleLiquidation.debtToOffset = entireTroveDebt;
+        singleLiquidation.collToSendToSP = collToOffset - singleLiquidation.collGasCompensation;
+
+        troveManager.closeTroveByLiquidation(_borrower);
+
+        uint256 collSurplus = entireTroveColl - collToOffset;
+        if (collSurplus > 0) {
+            singleLiquidation.collSurplus = collSurplus;
+            troveManager.addCollateralSurplus(_borrower, collSurplus);
+        }
+
+        return singleLiquidation;
+    }
+
+    /**
+        @dev Liquidate a trove without using the stability pool. All debt and collateral
+             are distributed porportionally between the remaining active troves.
+     */
+    function _liquidateWithoutSP(
+        ITroveManager troveManager,
+        address _borrower
+    ) internal returns (LiquidationValues memory singleLiquidation) {
+        uint pendingDebtReward;
+        uint pendingCollReward;
+
+        (
+            singleLiquidation.entireTroveDebt,
+            singleLiquidation.entireTroveColl,
+            pendingDebtReward,
+            pendingCollReward
+        ) = troveManager.getEntireDebtAndColl(_borrower);
+
+        singleLiquidation.collGasCompensation = _getCollGasCompensation(singleLiquidation.entireTroveColl);
+        singleLiquidation.debtGasCompensation = DEBT_GAS_COMPENSATION;
+        troveManager.movePendingTroveRewardsToActiveBalances(pendingDebtReward, pendingCollReward);
+
+        singleLiquidation.debtToOffset = 0;
+        singleLiquidation.collToSendToSP = 0;
+        singleLiquidation.debtToRedistribute = singleLiquidation.entireTroveDebt;
+        singleLiquidation.collToRedistribute =
+            singleLiquidation.entireTroveColl -
+            singleLiquidation.collGasCompensation;
+
+        troveManager.closeTroveByLiquidation(_borrower);
+
+        return singleLiquidation;
+    }
+
+    /* In a full liquidation, returns the values for a trove's coll and debt to be offset, and coll and debt to be
+     * redistributed to active troves.
+     */
+    function _getOffsetAndRedistributionVals(
+        uint256 _debt,
+        uint256 _coll,
+        uint256 _debtInStabPool,
+        bool sunsetting
+    )
+        internal
+        pure
+        returns (uint256 debtToOffset, uint256 collToSendToSP, uint256 debtToRedistribute, uint256 collToRedistribute)
+    {
+        if (_debtInStabPool > 0 && !sunsetting) {
+            /*
+             * Offset as much debt & collateral as possible against the Stability Pool, and redistribute the remainder
+             * between all active troves.
+             *
+             *  If the trove's debt is larger than the deposited Debt in the Stability Pool:
+             *
+             *  - Offset an amount of the trove's debt equal to the Debt in the Stability Pool
+             *  - Send a fraction of the trove's collateral to the Stability Pool, equal to the fraction of its offset debt
+             *
+             */
+            debtToOffset = PrismaMath._min(_debt, _debtInStabPool);
+            collToSendToSP = (_coll * debtToOffset) / _debt;
+            debtToRedistribute = _debt - debtToOffset;
+            collToRedistribute = _coll - collToSendToSP;
+        } else {
+            debtToOffset = 0;
+            collToSendToSP = 0;
+            debtToRedistribute = _debt;
+            collToRedistribute = _coll;
+        }
+    }
+
+    /**
+        @dev Adds values from `singleLiquidation` to `totals`
+             Calling this function mutates `totals`, the change is done in-place
+             to avoid needless expansion of memory
+     */
+    function _applyLiquidationValuesToTotals(
+        LiquidationTotals memory totals,
+        LiquidationValues memory singleLiquidation
+    ) internal pure {
+        // Tally all the values with their respective running totals
+        totals.totalCollGasCompensation = totals.totalCollGasCompensation + singleLiquidation.collGasCompensation;
+        totals.totalDebtGasCompensation = totals.totalDebtGasCompensation + singleLiquidation.debtGasCompensation;
+        totals.totalDebtInSequence = totals.totalDebtInSequence + singleLiquidation.entireTroveDebt;
+        totals.totalCollInSequence = totals.totalCollInSequence + singleLiquidation.entireTroveColl;
+        totals.totalDebtToOffset = totals.totalDebtToOffset + singleLiquidation.debtToOffset;
+        totals.totalCollToSendToSP = totals.totalCollToSendToSP + singleLiquidation.collToSendToSP;
+        totals.totalDebtToRedistribute = totals.totalDebtToRedistribute + singleLiquidation.debtToRedistribute;
+        totals.totalCollToRedistribute = totals.totalCollToRedistribute + singleLiquidation.collToRedistribute;
+        totals.totalCollSurplus = totals.totalCollSurplus + singleLiquidation.collSurplus;
+    }
+}
+
+
+// File: contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+
+// File: contracts/interfaces/IStabilityPool.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IStabilityPool {
+    event CollateralGainWithdrawn(address indexed _depositor, uint256[] _collateral);
+    event CollateralOverwritten(address oldCollateral, address newCollateral);
+    event DepositSnapshotUpdated(address indexed _depositor, uint256 _P, uint256 _G);
+    event EpochUpdated(uint128 _currentEpoch);
+    event G_Updated(uint256 _G, uint128 _epoch, uint128 _scale);
+    event P_Updated(uint256 _P);
+    event RewardClaimed(address indexed account, address indexed recipient, uint256 claimed);
+    event S_Updated(uint256 idx, uint256 _S, uint128 _epoch, uint128 _scale);
+    event ScaleUpdated(uint128 _currentScale);
+    event StabilityPoolDebtBalanceUpdated(uint256 _newBalance);
+    event UserDepositChanged(address indexed _depositor, uint256 _newDeposit);
+
+    function claimCollateralGains(address recipient, uint256[] calldata collateralIndexes) external;
+
+    function claimReward(address recipient) external returns (uint256 amount);
+
+    function enableCollateral(address _collateral) external;
+
+    function offset(address collateral, uint256 _debtToOffset, uint256 _collToAdd) external;
+
+    function provideToSP(uint256 _amount) external;
+
+    function startCollateralSunset(address collateral) external;
+
+    function vaultClaimReward(address claimant, address) external returns (uint256 amount);
+
+    function withdrawFromSP(uint256 _amount) external;
+
+    function DECIMAL_PRECISION() external view returns (uint256);
+
+    function P() external view returns (uint256);
+
+    function PRISMA_CORE() external view returns (address);
+
+    function SCALE_FACTOR() external view returns (uint256);
+
+    function SUNSET_DURATION() external view returns (uint128);
+
+    function accountDeposits(address) external view returns (uint128 amount, uint128 timestamp);
+
+    function claimableReward(address _depositor) external view returns (uint256);
+
+    function collateralGainsByDepositor(address depositor, uint256) external view returns (uint80 gains);
+
+    function collateralTokens(uint256) external view returns (address);
+
+    function currentEpoch() external view returns (uint128);
+
+    function currentScale() external view returns (uint128);
+
+    function debtToken() external view returns (address);
+
+    function depositSnapshots(address) external view returns (uint256 P, uint256 G, uint128 scale, uint128 epoch);
+
+    function depositSums(address, uint256) external view returns (uint256);
+
+    function emissionId() external view returns (uint256);
+
+    function epochToScaleToG(uint128, uint128) external view returns (uint256);
+
+    function epochToScaleToSums(uint128, uint128, uint256) external view returns (uint256);
+
+    function factory() external view returns (address);
+
+    function getCompoundedDebtDeposit(address _depositor) external view returns (uint256);
+
+    function getDepositorCollateralGain(address _depositor) external view returns (uint256[] memory collateralGains);
+
+    function getTotalDebtTokenDeposits() external view returns (uint256);
+
+    function getWeek() external view returns (uint256 week);
+
+    function guardian() external view returns (address);
+
+    function indexByCollateral(address collateral) external view returns (uint256 index);
+
+    function lastCollateralError_Offset() external view returns (uint256);
+
+    function lastDebtLossError_Offset() external view returns (uint256);
+
+    function lastPrismaError() external view returns (uint256);
+
+    function lastUpdate() external view returns (uint32);
+
+    function liquidationManager() external view returns (address);
+
+    function owner() external view returns (address);
+
+    function periodFinish() external view returns (uint32);
+
+    function rewardRate() external view returns (uint128);
+
+    function vault() external view returns (address);
+}
+
+
+// File: contracts/interfaces/ISortedTroves.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface ISortedTroves {
+    event NodeAdded(address _id, uint256 _NICR);
+    event NodeRemoved(address _id);
+
+    function insert(address _id, uint256 _NICR, address _prevId, address _nextId) external;
+
+    function reInsert(address _id, uint256 _newNICR, address _prevId, address _nextId) external;
+
+    function remove(address _id) external;
+
+    function setAddresses(address _troveManagerAddress) external;
+
+    function contains(address _id) external view returns (bool);
+
+    function data() external view returns (address head, address tail, uint256 size);
+
+    function findInsertPosition(
+        uint256 _NICR,
+        address _prevId,
+        address _nextId
+    ) external view returns (address, address);
+
+    function getFirst() external view returns (address);
+
+    function getLast() external view returns (address);
+
+    function getNext(address _id) external view returns (address);
+
+    function getPrev(address _id) external view returns (address);
+
+    function getSize() external view returns (uint256);
+
+    function isEmpty() external view returns (bool);
+
+    function troveManager() external view returns (address);
+
+    function validInsertPosition(uint256 _NICR, address _prevId, address _nextId) external view returns (bool);
+}
+
+
+// File: contracts/interfaces/IBorrowerOperations.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IBorrowerOperations {
+    struct Balances {
+        uint256[] collaterals;
+        uint256[] debts;
+        uint256[] prices;
+    }
+
+    event BorrowingFeePaid(address indexed borrower, uint256 amount);
+    event CollateralConfigured(address troveManager, address collateralToken);
+    event TroveCreated(address indexed _borrower, uint256 arrayIndex);
+    event TroveManagerRemoved(address troveManager);
+    event TroveUpdated(address indexed _borrower, uint256 _debt, uint256 _coll, uint256 stake, uint8 operation);
+
+    function addColl(
+        address troveManager,
+        address account,
+        uint256 _collateralAmount,
+        address _upperHint,
+        address _lowerHint
+    ) external;
+
+    function adjustTrove(
+        address troveManager,
+        address account,
+        uint256 _maxFeePercentage,
+        uint256 _collDeposit,
+        uint256 _collWithdrawal,
+        uint256 _debtChange,
+        bool _isDebtIncrease,
+        address _upperHint,
+        address _lowerHint
+    ) external;
+
+    function closeTrove(address troveManager, address account) external;
+
+    function configureCollateral(address troveManager, address collateralToken) external;
+
+    function fetchBalances() external returns (Balances memory balances);
+
+    function getGlobalSystemBalances() external returns (uint256 totalPricedCollateral, uint256 totalDebt);
+
+    function getTCR() external returns (uint256 globalTotalCollateralRatio);
+
+    function openTrove(
+        address troveManager,
+        address account,
+        uint256 _maxFeePercentage,
+        uint256 _collateralAmount,
+        uint256 _debtAmount,
+        address _upperHint,
+        address _lowerHint
+    ) external;
+
+    function removeTroveManager(address troveManager) external;
+
+    function repayDebt(
+        address troveManager,
+        address account,
+        uint256 _debtAmount,
+        address _upperHint,
+        address _lowerHint
+    ) external;
+
+    function setDelegateApproval(address _delegate, bool _isApproved) external;
+
+    function setMinNetDebt(uint256 _minNetDebt) external;
+
+    function withdrawColl(
+        address troveManager,
+        address account,
+        uint256 _collWithdrawal,
+        address _upperHint,
+        address _lowerHint
+    ) external;
+
+    function withdrawDebt(
+        address troveManager,
+        address account,
+        uint256 _maxFeePercentage,
+        uint256 _debtAmount,
+        address _upperHint,
+        address _lowerHint
+    ) external;
+
+    function checkRecoveryMode(uint256 TCR) external pure returns (bool);
+
+    function CCR() external view returns (uint256);
+
+    function DEBT_GAS_COMPENSATION() external view returns (uint256);
+
+    function DECIMAL_PRECISION() external view returns (uint256);
+
+    function PERCENT_DIVISOR() external view returns (uint256);
+
+    function PRISMA_CORE() external view returns (address);
+
+    function _100pct() external view returns (uint256);
+
+    function debtToken() external view returns (address);
+
+    function factory() external view returns (address);
+
+    function getCompositeDebt(uint256 _debt) external view returns (uint256);
+
+    function guardian() external view returns (address);
+
+    function isApprovedDelegate(address owner, address caller) external view returns (bool isApproved);
+
+    function minNetDebt() external view returns (uint256);
+
+    function owner() external view returns (address);
+
+    function troveManagersData(address) external view returns (address collateralToken, uint16 index);
+}
+
+
+// File: contracts/interfaces/ITroveManager.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface ITroveManager {
+    event BaseRateUpdated(uint256 _baseRate);
+    event CollateralSent(address _to, uint256 _amount);
+    event LTermsUpdated(uint256 _L_collateral, uint256 _L_debt);
+    event LastFeeOpTimeUpdated(uint256 _lastFeeOpTime);
+    event Redemption(
+        uint256 _attemptedDebtAmount,
+        uint256 _actualDebtAmount,
+        uint256 _collateralSent,
+        uint256 _collateralFee
+    );
+    event RewardClaimed(address indexed account, address indexed recipient, uint256 claimed);
+    event SystemSnapshotsUpdated(uint256 _totalStakesSnapshot, uint256 _totalCollateralSnapshot);
+    event TotalStakesUpdated(uint256 _newTotalStakes);
+    event TroveIndexUpdated(address _borrower, uint256 _newIndex);
+    event TroveSnapshotsUpdated(uint256 _L_collateral, uint256 _L_debt);
+    event TroveUpdated(address indexed _borrower, uint256 _debt, uint256 _coll, uint256 _stake, uint8 _operation);
+
+    function addCollateralSurplus(address borrower, uint256 collSurplus) external;
+
+    function applyPendingRewards(address _borrower) external returns (uint256 coll, uint256 debt);
+
+    function claimCollateral(address _receiver) external;
+
+    function claimReward(address receiver) external returns (uint256);
+
+    function closeTrove(address _borrower, address _receiver, uint256 collAmount, uint256 debtAmount) external;
+
+    function closeTroveByLiquidation(address _borrower) external;
+
+    function collectInterests() external;
+
+    function decayBaseRateAndGetBorrowingFee(uint256 _debt) external returns (uint256);
+
+    function decreaseDebtAndSendCollateral(address account, uint256 debt, uint256 coll) external;
+
+    function fetchPrice() external returns (uint256);
+
+    function finalizeLiquidation(
+        address _liquidator,
+        uint256 _debt,
+        uint256 _coll,
+        uint256 _collSurplus,
+        uint256 _debtGasComp,
+        uint256 _collGasComp
+    ) external;
+
+    function getEntireSystemBalances() external returns (uint256, uint256, uint256);
+
+    function movePendingTroveRewardsToActiveBalances(uint256 _debt, uint256 _collateral) external;
+
+    function notifyRegisteredId(uint256[] calldata _assignedIds) external returns (bool);
+
+    function openTrove(
+        address _borrower,
+        uint256 _collateralAmount,
+        uint256 _compositeDebt,
+        uint256 NICR,
+        address _upperHint,
+        address _lowerHint,
+        bool _isRecoveryMode
+    ) external returns (uint256 stake, uint256 arrayIndex);
+
+    function redeemCollateral(
+        uint256 _debtAmount,
+        address _firstRedemptionHint,
+        address _upperPartialRedemptionHint,
+        address _lowerPartialRedemptionHint,
+        uint256 _partialRedemptionHintNICR,
+        uint256 _maxIterations,
+        uint256 _maxFeePercentage
+    ) external;
+
+    function setAddresses(address _priceFeedAddress, address _sortedTrovesAddress, address _collateralToken) external;
+
+    function setParameters(
+        uint256 _minuteDecayFactor,
+        uint256 _redemptionFeeFloor,
+        uint256 _maxRedemptionFee,
+        uint256 _borrowingFeeFloor,
+        uint256 _maxBorrowingFee,
+        uint256 _interestRateInBPS,
+        uint256 _maxSystemDebt,
+        uint256 _MCR
+    ) external;
+
+    function setPaused(bool _paused) external;
+
+    function setPriceFeed(address _priceFeedAddress) external;
+
+    function startSunset() external;
+
+    function updateBalances() external;
+
+    function updateTroveFromAdjustment(
+        bool _isRecoveryMode,
+        bool _isDebtIncrease,
+        uint256 _debtChange,
+        uint256 _netDebtChange,
+        bool _isCollIncrease,
+        uint256 _collChange,
+        address _upperHint,
+        address _lowerHint,
+        address _borrower,
+        address _receiver
+    ) external returns (uint256, uint256, uint256);
+
+    function vaultClaimReward(address claimant, address) external returns (uint256);
+
+    function BOOTSTRAP_PERIOD() external view returns (uint256);
+
+    function CCR() external view returns (uint256);
+
+    function DEBT_GAS_COMPENSATION() external view returns (uint256);
+
+    function DECIMAL_PRECISION() external view returns (uint256);
+
+    function L_collateral() external view returns (uint256);
+
+    function L_debt() external view returns (uint256);
+
+    function MAX_INTEREST_RATE_IN_BPS() external view returns (uint256);
+
+    function MCR() external view returns (uint256);
+
+    function PERCENT_DIVISOR() external view returns (uint256);
+
+    function PRISMA_CORE() external view returns (address);
+
+    function Troves(
+        address
+    )
+        external
+        view
+        returns (
+            uint256 debt,
+            uint256 coll,
+            uint256 stake,
+            uint8 status,
+            uint128 arrayIndex,
+            uint256 activeInterestIndex
+        );
+
+    function accountLatestMint(address) external view returns (uint32 amount, uint32 week, uint32 day);
+
+    function baseRate() external view returns (uint256);
+
+    function borrowerOperationsAddress() external view returns (address);
+
+    function borrowingFeeFloor() external view returns (uint256);
+
+    function claimableReward(address account) external view returns (uint256);
+
+    function collateralToken() external view returns (address);
+
+    function dailyMintReward(uint256) external view returns (uint256);
+
+    function debtToken() external view returns (address);
+
+    function defaultedCollateral() external view returns (uint256);
+
+    function defaultedDebt() external view returns (uint256);
+
+    function emissionId() external view returns (uint16 debt, uint16 minting);
+
+    function getBorrowingFee(uint256 _debt) external view returns (uint256);
+
+    function getBorrowingFeeWithDecay(uint256 _debt) external view returns (uint256);
+
+    function getBorrowingRate() external view returns (uint256);
+
+    function getBorrowingRateWithDecay() external view returns (uint256);
+
+    function getCurrentICR(address _borrower, uint256 _price) external view returns (uint256);
+
+    function getEntireDebtAndColl(
+        address _borrower
+    ) external view returns (uint256 debt, uint256 coll, uint256 pendingDebtReward, uint256 pendingCollateralReward);
+
+    function getEntireSystemColl() external view returns (uint256);
+
+    function getEntireSystemDebt() external view returns (uint256);
+
+    function getNominalICR(address _borrower) external view returns (uint256);
+
+    function getPendingCollAndDebtRewards(address _borrower) external view returns (uint256, uint256);
+
+    function getRedemptionFeeWithDecay(uint256 _collateralDrawn) external view returns (uint256);
+
+    function getRedemptionRate() external view returns (uint256);
+
+    function getRedemptionRateWithDecay() external view returns (uint256);
+
+    function getTotalActiveCollateral() external view returns (uint256);
+
+    function getTotalActiveDebt() external view returns (uint256);
+
+    function getTotalMints(uint256 week) external view returns (uint32[7] memory);
+
+    function getTroveCollAndDebt(address _borrower) external view returns (uint256 coll, uint256 debt);
+
+    function getTroveFromTroveOwnersArray(uint256 _index) external view returns (address);
+
+    function getTroveOwnersCount() external view returns (uint256);
+
+    function getTroveStake(address _borrower) external view returns (uint256);
+
+    function getTroveStatus(address _borrower) external view returns (uint256);
+
+    function getWeek() external view returns (uint256 week);
+
+    function getWeekAndDay() external view returns (uint256, uint256);
+
+    function guardian() external view returns (address);
+
+    function hasPendingRewards(address _borrower) external view returns (bool);
+
+    function interestPayable() external view returns (uint256);
+
+    function interestRate() external view returns (uint256);
+
+    function lastFeeOperationTime() external view returns (uint256);
+
+    function lastUpdate() external view returns (uint32);
+
+    function liquidationManager() external view returns (address);
+
+    function maxSystemDebt() external view returns (uint256);
+
+    function minuteDecayFactor() external view returns (uint256);
+
+    function owner() external view returns (address);
+
+    function paused() external view returns (bool);
+
+    function periodFinish() external view returns (uint32);
+
+    function priceFeed() external view returns (address);
+
+    function redemptionFeeFloor() external view returns (uint256);
+
+    function rewardIntegral() external view returns (uint256);
+
+    function rewardIntegralFor(address) external view returns (uint256);
+
+    function rewardRate() external view returns (uint128);
+
+    function rewardSnapshots(address) external view returns (uint256 collateral, uint256 debt);
+
+    function sortedTroves() external view returns (address);
+
+    function sunsetting() external view returns (bool);
+
+    function surplusBalances(address) external view returns (uint256);
+
+    function totalCollateralSnapshot() external view returns (uint256);
+
+    function totalStakes() external view returns (uint256);
+
+    function totalStakesSnapshot() external view returns (uint256);
+
+    function vault() external view returns (address);
+}
+
+
+// File: contracts/dependencies/PrismaMath.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+library PrismaMath {
+    uint256 internal constant DECIMAL_PRECISION = 1e18;
+
+    /* Precision for Nominal ICR (independent of price). Rationale for the value:
+     *
+     * - Making it “too high” could lead to overflows.
+     * - Making it “too low” could lead to an ICR equal to zero, due to truncation from Solidity floor division.
+     *
+     * This value of 1e20 is chosen for safety: the NICR will only overflow for numerator > ~1e39,
+     * and will only truncate to 0 if the denominator is at least 1e20 times greater than the numerator.
+     *
+     */
+    uint256 internal constant NICR_PRECISION = 1e20;
+
+    function _min(uint256 _a, uint256 _b) internal pure returns (uint256) {
+        return (_a < _b) ? _a : _b;
+    }
+
+    function _max(uint256 _a, uint256 _b) internal pure returns (uint256) {
+        return (_a >= _b) ? _a : _b;
+    }
+
+    /*
+     * Multiply two decimal numbers and use normal rounding rules:
+     * -round product up if 19'th mantissa digit >= 5
+     * -round product down if 19'th mantissa digit < 5
+     *
+     * Used only inside the exponentiation, _decPow().
+     */
+    function decMul(uint256 x, uint256 y) internal pure returns (uint256 decProd) {
+        uint256 prod_xy = x * y;
+
+        decProd = (prod_xy + (DECIMAL_PRECISION / 2)) / DECIMAL_PRECISION;
+    }
+
+    /*
+     * _decPow: Exponentiation function for 18-digit decimal base, and integer exponent n.
+     *
+     * Uses the efficient "exponentiation by squaring" algorithm. O(log(n)) complexity.
+     *
+     * Called by two functions that represent time in units of minutes:
+     * 1) TroveManager._calcDecayedBaseRate
+     * 2) CommunityIssuance._getCumulativeIssuanceFraction
+     *
+     * The exponent is capped to avoid reverting due to overflow. The cap 525600000 equals
+     * "minutes in 1000 years": 60 * 24 * 365 * 1000
+     *
+     * If a period of > 1000 years is ever used as an exponent in either of the above functions, the result will be
+     * negligibly different from just passing the cap, since:
+     *
+     * In function 1), the decayed base rate will be 0 for 1000 years or > 1000 years
+     * In function 2), the difference in tokens issued at 1000 years and any time > 1000 years, will be negligible
+     */
+    function _decPow(uint256 _base, uint256 _minutes) internal pure returns (uint256) {
+        if (_minutes > 525600000) {
+            _minutes = 525600000;
+        } // cap to avoid overflow
+
+        if (_minutes == 0) {
+            return DECIMAL_PRECISION;
+        }
+
+        uint256 y = DECIMAL_PRECISION;
+        uint256 x = _base;
+        uint256 n = _minutes;
+
+        // Exponentiation-by-squaring
+        while (n > 1) {
+            if (n % 2 == 0) {
+                x = decMul(x, x);
+                n = n / 2;
+            } else {
+                // if (n % 2 != 0)
+                y = decMul(x, y);
+                x = decMul(x, x);
+                n = (n - 1) / 2;
+            }
+        }
+
+        return decMul(x, y);
+    }
+
+    function _getAbsoluteDifference(uint256 _a, uint256 _b) internal pure returns (uint256) {
+        return (_a >= _b) ? _a - _b : _b - _a;
+    }
+
+    function _computeNominalCR(uint256 _coll, uint256 _debt) internal pure returns (uint256) {
+        if (_debt > 0) {
+            return (_coll * NICR_PRECISION) / _debt;
+        }
+        // Return the maximal value for uint256 if the Trove has a debt of 0. Represents "infinite" CR.
+        else {
+            // if (_debt == 0)
+            return 2 ** 256 - 1;
+        }
+    }
+
+    function _computeCR(uint256 _coll, uint256 _debt, uint256 _price) internal pure returns (uint256) {
+        if (_debt > 0) {
+            uint256 newCollRatio = (_coll * _price) / _debt;
+
+            return newCollRatio;
+        }
+        // Return the maximal value for uint256 if the Trove has a debt of 0. Represents "infinite" CR.
+        else {
+            // if (_debt == 0)
+            return 2 ** 256 - 1;
+        }
+    }
+
+    function _computeCR(uint256 _coll, uint256 _debt) internal pure returns (uint256) {
+        if (_debt > 0) {
+            uint256 newCollRatio = (_coll) / _debt;
+
+            return newCollRatio;
+        }
+        // Return the maximal value for uint256 if the Trove has a debt of 0. Represents "infinite" CR.
+        else {
+            // if (_debt == 0)
+            return 2 ** 256 - 1;
+        }
+    }
+}
+
+
+// File: contracts/dependencies/PrismaBase.sol
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+/*
+ * Base contract for TroveManager, BorrowerOperations and StabilityPool. Contains global system constants and
+ * common functions.
+ */
+contract PrismaBase {
+    uint256 public constant DECIMAL_PRECISION = 1e18;
+
+    // Critical system collateral ratio. If the system's total collateral ratio (TCR) falls below the CCR, Recovery Mode is triggered.
+    uint256 public constant CCR = 1500000000000000000; // 150%
+
+    // Amount of debt to be locked in gas pool on opening troves
+    uint256 public immutable DEBT_GAS_COMPENSATION;
+
+    uint256 public constant PERCENT_DIVISOR = 200; // dividing by 200 yields 0.5%
+
+    constructor(uint256 _gasCompensation) {
+        DEBT_GAS_COMPENSATION = _gasCompensation;
+    }
+
+    // --- Gas compensation functions ---
+
+    // Returns the composite debt (drawn debt + gas compensation) of a trove, for the purpose of ICR calculation
+    function _getCompositeDebt(uint256 _debt) internal view returns (uint256) {
+        return _debt + DEBT_GAS_COMPENSATION;
+    }
+
+    function _getNetDebt(uint256 _debt) internal view returns (uint256) {
+        return _debt - DEBT_GAS_COMPENSATION;
+    }
+
+    // Return the amount of collateral to be drawn from a trove's collateral and sent as gas compensation.
+    function _getCollGasCompensation(uint256 _entireColl) internal pure returns (uint256) {
+        return _entireColl / PERCENT_DIVISOR;
+    }
+
+    function _requireUserAcceptsFee(uint256 _fee, uint256 _amount, uint256 _maxFeePercentage) internal pure {
+        uint256 feePercentage = (_fee * DECIMAL_PRECISION) / _amount;
+        require(feePercentage <= _maxFeePercentage, "Fee exceeded provided maximum");
+    }
+}
+

