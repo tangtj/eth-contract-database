@@ -1,0 +1,687 @@
+
+// File: src/QDistributor.sol
+pragma solidity >=0.8.0;
+
+import "./interfaces/IV3Oracle.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./interfaces/IUniswapV2Pair.sol";
+import "./interfaces/IUniswapV2Router02.sol";
+import "./interfaces/IV2Oracle.sol";
+import "./interfaces/ILPGateway.sol";
+import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+
+contract QDistributor {
+    error GotNothing();
+    error NotGovernance();
+    error FailedToSend();
+    error SumNot10000();
+
+    event Received(
+        address from, uint256 ethAmount, uint256 amountToVault, uint256 amountToProtocol, uint256 amountToLP
+    );
+    event SentToProtocol(uint256 amount);
+    event SentToVault(uint256 amount);
+    event AddedLP(uint256 amount);
+    event UpdatedPercentages(uint256 vaultPercentage, uint256 protocolPercentage, uint256 lpPercentage);
+    event UpdatedMaxSlippage(uint256 maxSlippageForETHDXNSwap, uint256 maxSlippageForDXNNXDSwap);
+    event UpdatedLPGateway(address lpGateway);
+    event UpdatedGovernance(address governance);
+
+    uint256 public constant PERCENTAGE_DIVISOR = 10000;
+    address public constant nxdStakingVault = 0xa1B56E42137D06280E34B3E1352d80Ac3BECAF79;
+    address public constant nxdProtocol = 0xE05430D42842C7B757E5633D19ca65350E01aE11;
+
+    uint256 public vaultPercentage = 3334;
+    uint256 public protocolPercentage = 3333;
+    uint256 public lpPercentage = 3333;
+
+    uint256 public pendingAmountVault;
+    uint256 public pendingAmountProtocol;
+    uint256 public pendingAmountLP;
+
+    address public governance;
+
+    ISwapRouter public constant UNISWAP_V3_ROUTER = ISwapRouter(payable(0xE592427A0AEce92De3Edee1F18E0157C05861564));
+
+    address public constant DXN_WETH_POOL = 0x7F808fD904FFA3eb6A6F259e6965Fb1466A05372;
+    address public constant WETH9 = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    IERC20 public constant dxn = IERC20(0x80f0C1c49891dcFDD40b6e0F960F84E6042bcB6F);
+    IERC20 public constant nxd = IERC20(0x70536D44820fE3ddd4A2e3eEdbC937b8B9D566C7);
+
+    IUniswapV2Router02 public constant UNISWAP_V2_ROUTER =
+        IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+
+    IV3Oracle public constant v3Oracle = IV3Oracle(0x21c6e0427fb2bA0E827253f48241aAbDd8051eAa);
+    IUniswapV2Pair constant nxdDXNPair = IUniswapV2Pair(0x98134CDE70ff7280bb4b9f4eBa2154009f2C13aC);
+    IV2Oracle public constant v2Oracle = IV2Oracle(0x14D558267A97c7a61554d7F7b23a594781E04495);
+
+    uint256 public maxSlippageForETHDXNSwap = 300; // 3%
+    uint256 public maxSlippageForDXNNXDSwap = 300; // 3%
+
+    ILPGateway public lpGateway;
+
+    constructor(address _lpGateway) {
+        governance = msg.sender;
+        lpGateway = ILPGateway(_lpGateway);
+    }
+
+    function setLPGateway(address _lpGateway) public {
+        if (msg.sender != governance) {
+            revert NotGovernance();
+        }
+        lpGateway = ILPGateway(_lpGateway);
+        emit UpdatedLPGateway(_lpGateway);
+    }
+
+    function setMaxSlippageForSwap(uint256 _maxSlippageForETHDXNSwap, uint256 _maxSlippageForDXNNXDSwap) public {
+        if (msg.sender != governance) {
+            revert NotGovernance();
+        }
+        maxSlippageForETHDXNSwap = _maxSlippageForETHDXNSwap;
+        maxSlippageForDXNNXDSwap = _maxSlippageForDXNNXDSwap;
+        emit UpdatedMaxSlippage(_maxSlippageForETHDXNSwap, _maxSlippageForDXNNXDSwap);
+    }
+
+    function setGovernance(address _governance) public {
+        if (msg.sender != governance) {
+            revert NotGovernance();
+        }
+        governance = _governance;
+        emit UpdatedGovernance(_governance);
+    }
+
+    function sendToVault() public {
+        uint256 amount = pendingAmountVault;
+        pendingAmountVault = 0;
+        (bool sent,) = nxdStakingVault.call{value: amount}("");
+        if (!sent) {
+            revert FailedToSend();
+        }
+        emit SentToVault(amount);
+    }
+
+    function sendToProtocol(uint256 amount) public {
+        if (amount > pendingAmountProtocol) {
+            amount = pendingAmountProtocol;
+        }
+        pendingAmountProtocol -= amount;
+        (bool sent,) = nxdProtocol.call{value: amount}("");
+        if (!sent) {
+            revert FailedToSend();
+        }
+        emit SentToProtocol(amount);
+    }
+
+    function addLP(uint256 amount) public {
+        if (amount > pendingAmountLP) {
+            amount = pendingAmountLP;
+        }
+        pendingAmountLP -= amount;
+
+        // Sell 50% of the ETH for DXN
+        uint256 quote = v3Oracle.getHumanQuote(DXN_WETH_POOL, 5 minutes, 1 ether, WETH9, address(dxn));
+        uint256 minOut = (amount * quote) / 1e18;
+        // slippage tolerance
+        minOut = (minOut * (10000 - maxSlippageForETHDXNSwap)) / 10000;
+        UNISWAP_V3_ROUTER.exactInputSingle{value: amount}(
+            ISwapRouter.ExactInputSingleParams(
+                WETH9, address(dxn), 10000, address(this), block.timestamp, amount, minOut, 0
+            )
+        );
+
+        uint256 dxnPriceInEth = (1e18 * 1 ether) / quote;
+        uint256 dxnAmountToAdd = (amount / 2) * 1e18 / dxnPriceInEth;
+        uint256 dxnToSwapForNXD = dxn.balanceOf(address(this)) - dxnAmountToAdd;
+
+        if (v2Oracle.canUpdate()) {
+            v2Oracle.update();
+        }
+        // Buy NXD with remaining DXN
+        uint256 amountOutMin = v2Oracle.consult(address(dxn), dxnToSwapForNXD);
+        // slippage tolerance
+        amountOutMin = (amountOutMin * (10000 - maxSlippageForDXNNXDSwap)) / 10000;
+        address[] memory path = new address[](2);
+        path[0] = address(dxn);
+        path[1] = address(nxd);
+
+        dxn.approve(address(UNISWAP_V2_ROUTER), dxnToSwapForNXD);
+
+        uint256[] memory amounts = UNISWAP_V2_ROUTER.swapExactTokensForTokens(
+            dxnToSwapForNXD, amountOutMin, path, address(this), block.timestamp
+        );
+        if (amounts[1] == 0) {
+            revert GotNothing();
+        }
+
+        dxn.approve(address(lpGateway), dxn.balanceOf(address(this)));
+        nxd.approve(address(lpGateway), nxd.balanceOf(address(this)));
+
+        lpGateway.addLiquidity(
+            address(dxn),
+            nxd.balanceOf(address(this)),
+            dxn.balanceOf(address(this)),
+            0,
+            0,
+            address(this),
+            block.timestamp
+        );
+
+        emit AddedLP(amount);
+    }
+
+    function setPercentages(uint256 _vaultPercentage, uint256 _protocolPercentage, uint256 _lpPercentage) public {
+        if (msg.sender != governance) {
+            revert NotGovernance();
+        }
+        if (_vaultPercentage + _protocolPercentage + _lpPercentage != PERCENTAGE_DIVISOR) {
+            revert SumNot10000();
+        }
+        vaultPercentage = _vaultPercentage;
+        protocolPercentage = _protocolPercentage;
+        lpPercentage = _lpPercentage;
+        emit UpdatedPercentages(_vaultPercentage, _protocolPercentage, _lpPercentage);
+    }
+
+    receive() external payable {
+        uint256 amount = address(this).balance;
+
+        uint256 amountToVault = (amount * vaultPercentage) / PERCENTAGE_DIVISOR;
+        uint256 amountToProtocol = (amount * protocolPercentage) / PERCENTAGE_DIVISOR;
+        uint256 amountToLP = (amount * lpPercentage) / PERCENTAGE_DIVISOR;
+
+        pendingAmountVault += amountToVault;
+        pendingAmountProtocol += amountToProtocol;
+        pendingAmountLP += amountToLP;
+        emit Received(msg.sender, amount, amountToVault, amountToProtocol, amountToLP);
+    }
+}
+
+
+// File: src/interfaces/IV3Oracle.sol
+pragma solidity ^0.8.13;
+
+interface IV3Oracle {
+    function getHumanQuote(
+        address uniswapV3Pool,
+        uint32 secondsAgo,
+        uint128 baseAmount,
+        address baseToken,
+        address quoteToken
+    ) external view returns (uint256 quoteAmount);
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC-20 standard as defined in the ERC.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+
+// File: src/interfaces/IUniswapV2Pair.sol
+pragma solidity >=0.5.0;
+
+interface IUniswapV2Pair {
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    function name() external pure returns (string memory);
+
+    function symbol() external pure returns (string memory);
+
+    function decimals() external pure returns (uint8);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address owner) external view returns (uint256);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 value) external returns (bool);
+
+    function transfer(address to, uint256 value) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+
+    function PERMIT_TYPEHASH() external pure returns (bytes32);
+
+    function nonces(address owner) external view returns (uint256);
+
+    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)
+        external;
+
+    event Mint(address indexed sender, uint256 amount0, uint256 amount1);
+    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
+    event Swap(
+        address indexed sender,
+        uint256 amount0In,
+        uint256 amount1In,
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address indexed to
+    );
+    event Sync(uint112 reserve0, uint112 reserve1);
+
+    function MINIMUM_LIQUIDITY() external pure returns (uint256);
+
+    function factory() external view returns (address);
+
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function price0CumulativeLast() external view returns (uint256);
+
+    function price1CumulativeLast() external view returns (uint256);
+
+    function kLast() external view returns (uint256);
+
+    function mint(address to) external returns (uint256 liquidity);
+
+    function burn(address to) external returns (uint256 amount0, uint256 amount1);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+
+    function skim(address to) external;
+
+    function sync() external;
+
+    function initialize(address, address) external;
+}
+
+
+// File: src/interfaces/IUniswapV2Router02.sol
+pragma solidity >=0.6.2;
+
+import "./IUniswapV2Router01.sol";
+
+interface IUniswapV2Router02 is IUniswapV2Router01 {
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountETH);
+
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountETH);
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+
+// File: src/interfaces/IV2Oracle.sol
+pragma solidity ^0.8.13;
+
+interface IV2Oracle {
+    function update() external;
+
+    // note this will always return 0 before update has been called successfully for the first time.
+    function consult(address token, uint256 amountIn) external view returns (uint256 amountOut);
+
+    function canUpdate() external view returns (bool);
+}
+
+
+// File: src/interfaces/ILPGateway.sol
+pragma solidity ^0.8.13;
+
+interface ILPGateway {
+    function addLiquidity(
+        address tokenB,
+        uint256 amountNXDDesired,
+        uint256 amountBDesired,
+        uint256 amountNXDMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
+}
+
+
+// File: lib/v3-periphery/contracts/interfaces/ISwapRouter.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.7.5;
+pragma abicoder v2;
+
+import '@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol';
+
+/// @title Router token swapping functionality
+/// @notice Functions for swapping tokens via Uniswap V3
+interface ISwapRouter is IUniswapV3SwapCallback {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another token
+    /// @param params The parameters necessary for the swap, encoded as `ExactInputSingleParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another along the specified path
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactInputParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another token
+    /// @param params The parameters necessary for the swap, encoded as `ExactOutputSingleParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another along the specified path (reversed)
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactOutputParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutput(ExactOutputParams calldata params) external payable returns (uint256 amountIn);
+}
+
+
+// File: src/interfaces/IUniswapV2Router01.sol
+pragma solidity >=0.6.2;
+
+interface IUniswapV2Router01 {
+    function factory() external returns (address);
+
+    function WETH() external returns (address);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function removeLiquidityETH(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountToken, uint256 amountETH);
+
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external returns (uint256 amountToken, uint256 amountETH);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts);
+
+    function swapTokensForExactETH(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapExactTokensForETH(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapETHForExactTokens(uint256 amountOut, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts);
+
+    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) external pure returns (uint256 amountB);
+
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
+        external
+        pure
+        returns (uint256 amountOut);
+
+    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut)
+        external
+        pure
+        returns (uint256 amountIn);
+
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+}
+
+
+// File: lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.5.0;
+
+/// @title Callback for IUniswapV3PoolActions#swap
+/// @notice Any contract that calls IUniswapV3PoolActions#swap must implement this interface
+interface IUniswapV3SwapCallback {
+    /// @notice Called to `msg.sender` after executing a swap via IUniswapV3Pool#swap.
+    /// @dev In the implementation you must pay the pool tokens owed for the swap.
+    /// The caller of this method must be checked to be a UniswapV3Pool deployed by the canonical UniswapV3Factory.
+    /// amount0Delta and amount1Delta can both be 0 if no tokens were swapped.
+    /// @param amount0Delta The amount of token0 that was sent (negative) or must be received (positive) by the pool by
+    /// the end of the swap. If positive, the callback must send that amount of token0 to the pool.
+    /// @param amount1Delta The amount of token1 that was sent (negative) or must be received (positive) by the pool by
+    /// the end of the swap. If positive, the callback must send that amount of token1 to the pool.
+    /// @param data Any data passed through by the caller via the IUniswapV3PoolActions#swap call
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+}
+

@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+// @openzeppelin/contracts/token/ERC20/IERC20.sol
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+// @uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol
+interface IUniswapV3Pool {
+    function flash(
+        address recipient,
+        uint256 amount0,
+        uint256 amount1,
+        bytes calldata data
+    ) external;
+
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
+
+// @uniswap/v3-core/contracts/interfaces/callback/IUniswapV3FlashCallback.sol
+interface IUniswapV3FlashCallback {
+    function uniswapV3FlashCallback(
+        uint256 fee0,
+        uint256 fee1,
+        bytes calldata data
+    ) external;
+}
+
+// @uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol
+interface IUniswapV2Router02 {
+    function WETH() external pure returns (address);
+    function swapExactETHForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
+
+    function swapExactTokensForETH(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+// FlashArbitrage 合約
+contract FlashArbitrage is IUniswapV3FlashCallback {
+    address public owner;
+    IUniswapV2Router02 public uniRouter;
+    IUniswapV2Router02 public sushiRouter;
+    IUniswapV3Pool public pool;
+    IERC20 public usdt;
+
+    event ArbitrageExecuted(uint amountIn, uint amountOut);
+    event ArbitrageFailed(uint amountIn, uint amountOut);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only the contract owner can call this function");
+        _;
+    }
+
+    constructor(
+        address _uniRouter, 
+        address _sushiRouter,
+        address _pool,
+        address _usdtAddress
+    ) {
+        owner = msg.sender;
+        uniRouter = IUniswapV2Router02(_uniRouter);
+        sushiRouter = IUniswapV2Router02(_sushiRouter);
+        pool = IUniswapV3Pool(_pool);
+        usdt = IERC20(_usdtAddress);
+    }
+
+    function startArbitrage(uint amount0, uint amount1) external onlyOwner {
+        bytes memory data = abi.encode(amount0, amount1);
+        pool.flash(address(this), amount0, amount1, data);
+    }
+
+    function uniswapV3FlashCallback(
+        uint256 fee0,
+        uint256 fee1,
+        bytes calldata data
+    ) external override {
+        require(msg.sender == address(pool), "not authorized");
+
+        (uint256 amount0, uint256 amount1) = abi.decode(data, (uint256, uint256));
+
+        bool success;
+        if (amount0 > 0) {
+            success = arbitrageWithETH(amount0, fee0);
+        } else {
+            success = arbitrageWithUSDT(amount1, fee1);
+        }
+
+        if (!success) {
+            revert("Arbitrage failed, reverting transaction");
+        }
+    }
+
+    function arbitrageWithETH(uint256 amountIn, uint256 fee) internal returns (bool) {
+        address[] memory path = new address[](2);
+        path[0] = uniRouter.WETH();
+        path[1] = address(usdt);
+
+        uint[] memory amountsOutUni = uniRouter.getAmountsOut(amountIn, path);
+        uint[] memory amountsOutSushi = sushiRouter.getAmountsOut(amountIn, path);
+
+        uint gasStart = gasleft();
+        uint potentialProfitUni = amountsOutUni[1] - (amountIn + fee);
+        uint potentialProfitSushi = amountsOutSushi[1] - (amountIn + fee);
+
+        if (potentialProfitUni <= 0 || potentialProfitSushi <= 0) {
+            emit ArbitrageFailed(amountIn, potentialProfitUni < potentialProfitSushi ? amountsOutUni[1] : amountsOutSushi[1]);
+            return false;
+        }
+
+        try uniRouter.swapExactETHForTokens{value: amountIn}(
+            amountsOutUni[1],
+            path,
+            address(this),
+            block.timestamp
+        ) {
+            uint gasUsedUni = gasStart - gasleft();
+            gasStart = gasleft();
+
+            usdt.approve(address(sushiRouter), amountsOutUni[1]);
+            try sushiRouter.swapExactTokensForETH(
+                amountsOutUni[1],
+                amountIn + fee,
+                path,
+                address(this),
+                block.timestamp
+            ) {
+                uint gasUsedSushi = gasStart - gasleft();
+                uint totalGasUsed = gasUsedUni + gasUsedSushi;
+                uint totalGasCost = totalGasUsed * tx.gasprice;
+
+                if (potentialProfitUni > totalGasCost) {
+                    emit ArbitrageExecuted(amountIn, amountsOutUni[1]);
+                    return true;
+                } else {
+                    emit ArbitrageFailed(amountIn, amountsOutUni[1]);
+                    return false;
+                }
+            } catch {
+                emit ArbitrageFailed(amountIn, amountsOutUni[1]);
+                return false;
+            }
+        } catch {
+            emit ArbitrageFailed(amountIn, amountsOutUni[1]);
+            return false;
+        }
+    }
+
+    function arbitrageWithUSDT(uint256 amountIn, uint256 fee) internal returns (bool) {
+        address[] memory path = new address[](2);
+        path[0] = address(usdt);
+        path[1] = uniRouter.WETH();
+
+        uint[] memory amountsOutUni = uniRouter.getAmountsOut(amountIn, path);
+        uint[] memory amountsOutSushi = sushiRouter.getAmountsOut(amountIn, path);
+
+        uint gasStart = gasleft();
+        uint potentialProfitUni = amountsOutUni[1] - (amountIn + fee);
+        uint potentialProfitSushi = amountsOutSushi[1] - (amountIn + fee);
+
+        if (potentialProfitUni <= 0 || potentialProfitSushi <= 0) {
+            emit ArbitrageFailed(amountIn, potentialProfitUni < potentialProfitSushi ? amountsOutUni[1] : amountsOutSushi[1]);
+            return false;
+        }
+
+        usdt.approve(address(uniRouter), amountIn);
+
+        try uniRouter.swapExactTokensForETH(
+            amountIn,
+            amountsOutUni[1],
+            path,
+            address(this),
+            block.timestamp
+        ) {
+            uint gasUsedUni = gasStart - gasleft();
+            gasStart = gasleft();
+
+            try sushiRouter.swapExactETHForTokens{value: amountsOutUni[1]}(
+                amountIn + fee,
+                path,
+                address(this),
+                block.timestamp
+            ) {
+                uint gasUsedSushi = gasStart - gasleft();
+                uint totalGasUsed = gasUsedUni + gasUsedSushi;
+                uint totalGasCost = totalGasUsed * tx.gasprice;
+
+                if (potentialProfitUni > totalGasCost) {
+                    emit ArbitrageExecuted(amountIn, amountsOutUni[1]);
+                    return true;
+                } else {
+                    emit ArbitrageFailed(amountIn, amountsOutUni[1]);
+                    return false;
+                }
+            } catch {
+                emit ArbitrageFailed(amountIn, amountsOutUni[1]);
+                return false;
+            }
+        } catch {
+            emit ArbitrageFailed(amountIn, amountsOutUni[1]);
+            return false;
+        }
+    }
+
+    function withdrawERC20(address token, uint amount) external onlyOwner {
+        IERC20(token).transfer(owner, amount);
+    }
+
+    function withdrawETH(uint amount) external onlyOwner {
+        payable(owner).transfer(amount);
+    }
+
+    receive() external payable {}
+}

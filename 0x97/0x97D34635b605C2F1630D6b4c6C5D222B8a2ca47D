@@ -1,0 +1,2377 @@
+
+// File: src/lib/AuctionLoanLiquidator.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/utils/structs/EnumerableSet.sol";
+import "@solmate/auth/Owned.sol";
+import "@solmate/utils/FixedPointMathLib.sol";
+import "@solmate/utils/ReentrancyGuard.sol";
+import "@solmate/utils/SafeTransferLib.sol";
+import "@solmate/tokens/ERC20.sol";
+import "@solmate/tokens/ERC721.sol";
+
+import "../interfaces/ILiquidationDistributor.sol";
+import "../interfaces/IAuctionLoanLiquidator.sol";
+import "../interfaces/ILoanLiquidator.sol";
+import "../interfaces/loans/IMultiSourceLoan.sol";
+import "./AddressManager.sol";
+import "./InputChecker.sol";
+import "./utils/Hash.sol";
+
+/// @title Auction Loan Liquidator
+/// @author Florida St
+/// @notice Receives an NFT to be auctioned when a loan defaults.
+///         Mainly taking Zora's implementation.
+contract AuctionLoanLiquidator is
+    ERC721TokenReceiver,
+    IAuctionLoanLiquidator,
+    ILoanLiquidator,
+    InputChecker,
+    Owned,
+    ReentrancyGuard
+{
+    using EnumerableSet for EnumerableSet.AddressSet;
+    using FixedPointMathLib for uint256;
+    using Hash for Auction;
+    using SafeTransferLib for ERC20;
+
+    /// @notice The maximum trigger fee expressed in bps.
+    uint256 public constant MAX_TRIGGER_FEE = 500;
+    /// @notice The minimum increment expressed in bps to become highest bid.
+    uint256 public constant MIN_INCREMENT_BPS = 500;
+    /// @notice BPS definition.
+    uint256 private constant _BPS = 10000;
+    /// @notice The minimum time that must pass after the last bid before the auction can be settled.
+    uint96 private constant _MIN_NO_ACTION_MARGIN = 10 minutes;
+    /// @notice The Liquidation Distributor.
+    ILiquidationDistributor private _liquidationDistributor;
+    /// @notice The currency manager.
+    AddressManager private immutable _currencyManager;
+    /// @notice The collection manager.
+    AddressManager private immutable _collectionManager;
+    /// @notice The trigger fee.
+    uint256 private _triggerFee;
+    /// @notice The valid loan contracts.
+    EnumerableSet.AddressSet private _validLoanContracts;
+
+    mapping(address => mapping(uint256 => bytes32)) private _auctions;
+
+    event LoanContractAdded(address loan);
+
+    event LoanContractRemoved(address loan);
+
+    event LiquidationDistributorUpdated(address liquidationDistributor);
+
+    event LoanLiquidationStarted(address collection, uint256 tokenId, Auction auction);
+
+    event BidPlaced(
+        address collection, uint256 tokenId, address newBidder, uint256 bid, address loanAddress, uint256 loanId
+    );
+
+    event AuctionSettled(
+        address loanContract,
+        uint256 loanId,
+        address auctionContract,
+        uint256 tokenId,
+        address asset,
+        uint256 proceeds,
+        address settler,
+        uint256 triggerFee
+    );
+
+    event TriggerFeeUpdated(uint256 triggerFee);
+
+    error InvalidHashAuctionError();
+
+    error NFTNotOwnedError(address _owner);
+
+    error MinBidError(uint256 _minBid);
+
+    error AuctionOverError(uint96 _expiration);
+
+    error AuctionNotOverError(uint96 _expiration);
+
+    error AuctionAlreadyInProgressError();
+
+    error NoBidsError();
+
+    error CurrencyNotWhitelistedError();
+
+    error CollectionNotWhitelistedError();
+
+    error LoanNotAcceptedError(address _loan);
+
+    error ZeroAddressError();
+
+    error InvalidTriggerFee(uint256 triggerFee);
+
+    error CouldNotModifyValidLoansError();
+
+    /// @param liquidationDistributor Contract that distributes the proceeds of an auction.
+    /// @param currencyManager The address manager for currencies (check whitelisting).
+    /// @param collectionManager The address manager for collections (check whitelisting).
+    /// @param triggerFee The trigger fee. Given to the originator/settler of an auction. Expressed in bps.
+    constructor(address liquidationDistributor, address currencyManager, address collectionManager, uint256 triggerFee)
+        Owned(tx.origin)
+    {
+        if (liquidationDistributor == address(0) || currencyManager == address(0) || collectionManager == address(0)) {
+            revert ZeroAddressError();
+        }
+        _liquidationDistributor = ILiquidationDistributor(liquidationDistributor);
+        _currencyManager = AddressManager(currencyManager);
+        _collectionManager = AddressManager(collectionManager);
+        _updateTriggerFee(triggerFee);
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function addLoanContract(address _loanContract) external onlyOwner {
+        if (!_validLoanContracts.add(_loanContract)) {
+            revert CouldNotModifyValidLoansError();
+        }
+
+        emit LoanContractAdded(_loanContract);
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function removeLoanContract(address _loanContract) external onlyOwner {
+        if (!_validLoanContracts.remove(_loanContract)) {
+            revert CouldNotModifyValidLoansError();
+        }
+
+        emit LoanContractRemoved(_loanContract);
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function getValidLoanContracts() external view returns (address[] memory) {
+        return _validLoanContracts.values();
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function updateLiquidationDistributor(address __liquidationDistributor) external onlyOwner {
+        _checkAddressNotZero(__liquidationDistributor);
+
+        _liquidationDistributor = ILiquidationDistributor(__liquidationDistributor);
+
+        emit LiquidationDistributorUpdated(__liquidationDistributor);
+    }
+
+    /// @return The liquidation distributor address.
+    function getLiquidationDistributor() external view returns (address) {
+        return address(_liquidationDistributor);
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function updateTriggerFee(uint256 triggerFee) external onlyOwner {
+        _updateTriggerFee(triggerFee);
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function getTriggerFee() external view returns (uint256) {
+        return _triggerFee;
+    }
+
+    /// @inheritdoc ILoanLiquidator
+    function liquidateLoan(
+        uint256 _loanId,
+        address _contract,
+        uint256 _tokenId,
+        address _asset,
+        uint96 _duration,
+        address _originator
+    ) external override nonReentrant returns (bytes memory) {
+        address _owner = ERC721(_contract).ownerOf(_tokenId);
+        if (_owner != address(this)) {
+            revert NFTNotOwnedError(_owner);
+        }
+
+        if (!_validLoanContracts.contains(msg.sender)) {
+            revert LoanNotAcceptedError(msg.sender);
+        }
+
+        if (!_currencyManager.isWhitelisted(_asset)) {
+            revert CurrencyNotWhitelistedError();
+        }
+
+        if (!_collectionManager.isWhitelisted(_contract)) {
+            revert CollectionNotWhitelistedError();
+        }
+
+        if (_auctions[_contract][_tokenId] != bytes32(0)) {
+            revert AuctionAlreadyInProgressError();
+        }
+
+        uint96 currentTimestamp = uint96(block.timestamp);
+        Auction memory auction = Auction(
+            msg.sender,
+            _loanId,
+            0,
+            _triggerFee,
+            address(0),
+            _duration,
+            _asset,
+            currentTimestamp,
+            _originator,
+            currentTimestamp
+        );
+        _auctions[_contract][_tokenId] = auction.hash();
+        emit LoanLiquidationStarted(_contract, _tokenId, auction);
+
+        return abi.encode(auction);
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function placeBid(address _contract, uint256 _tokenId, Auction memory _auction, uint256 _bid)
+        external
+        nonReentrant
+        returns (Auction memory)
+    {
+        _checkAuction(_contract, _tokenId, _auction);
+
+        uint256 currentHighestBid = _auction.highestBid;
+        if (_bid == 0 || (currentHighestBid.mulDivDown(_BPS + MIN_INCREMENT_BPS, _BPS) >= _bid)) {
+            revert MinBidError(_bid);
+        }
+
+        uint256 currentTime = block.timestamp;
+        uint96 expiration = _auction.startTime + _auction.duration;
+        uint96 withMargin = _auction.lastBidTime + _MIN_NO_ACTION_MARGIN;
+        uint96 max = withMargin > expiration ? withMargin : expiration;
+        if (max < currentTime && currentHighestBid > 0) {
+            revert AuctionOverError(max);
+        }
+
+        ERC20 token = ERC20(_auction.asset);
+        if (currentHighestBid > 0) {
+            token.safeTransfer(_auction.highestBidder, currentHighestBid);
+        }
+
+        address newBidder = msg.sender;
+        token.safeTransferFrom(newBidder, address(this), _bid);
+
+        _auction.highestBidder = newBidder;
+        _auction.highestBid = _bid;
+        _auction.lastBidTime = uint96(currentTime);
+
+        _auctions[_contract][_tokenId] = _auction.hash();
+
+        emit BidPlaced(_contract, _tokenId, newBidder, _bid, _auction.loanAddress, _auction.loanId);
+        return _auction;
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function settleAuction(Auction calldata _auction, IMultiSourceLoan.Loan calldata _loan) external nonReentrant {
+        address collateralAddress = _loan.nftCollateralAddress;
+        uint256 tokenId = _loan.nftCollateralTokenId;
+        _checkAuction(collateralAddress, tokenId, _auction);
+
+        if (_auction.highestBidder == address(0)) {
+            revert NoBidsError();
+        }
+
+        uint256 currentTime = block.timestamp;
+        uint96 expiration = _auction.startTime + _auction.duration;
+        uint96 withMargin = _auction.lastBidTime + _MIN_NO_ACTION_MARGIN;
+        if ((withMargin > currentTime) || (currentTime < expiration)) {
+            uint96 max = withMargin > expiration ? withMargin : expiration;
+            revert AuctionNotOverError(max);
+        }
+
+        ERC721(collateralAddress).transferFrom(address(this), _auction.highestBidder, tokenId);
+
+        uint256 highestBid = _auction.highestBid;
+        uint256 triggerFee = highestBid.mulDivDown(_auction.triggerFee, _BPS);
+        uint256 proceeds = highestBid - 2 * triggerFee;
+        ERC20 asset = ERC20(_auction.asset);
+
+        asset.safeTransfer(_auction.originator, triggerFee);
+        asset.safeTransfer(msg.sender, triggerFee);
+        asset.approve(address(_liquidationDistributor), proceeds);
+        _liquidationDistributor.distribute(proceeds, _loan);
+        IMultiSourceLoan(_auction.loanAddress).loanLiquidated(_auction.loanId, _loan);
+        emit AuctionSettled(
+            _auction.loanAddress,
+            _auction.loanId,
+            collateralAddress,
+            tokenId,
+            _auction.asset,
+            proceeds,
+            msg.sender,
+            triggerFee
+        );
+
+        /// @dev Save gas + allow for future auctions for the same NFT
+        delete _auctions[collateralAddress][tokenId];
+    }
+
+    /// @inheritdoc IAuctionLoanLiquidator
+    function getAuctionHash(address _contract, uint256 _tokenId) external view returns (bytes32) {
+        return _auctions[_contract][_tokenId];
+    }
+
+    function _updateTriggerFee(uint256 triggerFee) private {
+        if (triggerFee > MAX_TRIGGER_FEE) {
+            revert InvalidTriggerFee(triggerFee);
+        }
+        _triggerFee = triggerFee;
+
+        emit TriggerFeeUpdated(triggerFee);
+    }
+
+    /// @dev check it the auction provided matches the one saved (using hashes)
+    function _checkAuction(address _contract, uint256 _tokenId, Auction memory _auction) private view {
+        if (_auctions[_contract][_tokenId] != _auction.hash()) {
+            revert InvalidHashAuctionError();
+        }
+    }
+}
+
+
+// File: lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.0.0) (utils/structs/EnumerableSet.sol)
+// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Library for managing
+ * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive
+ * types.
+ *
+ * Sets have the following properties:
+ *
+ * - Elements are added, removed, and checked for existence in constant time
+ * (O(1)).
+ * - Elements are enumerated in O(n). No guarantees are made on the ordering.
+ *
+ * ```solidity
+ * contract Example {
+ *     // Add the library methods
+ *     using EnumerableSet for EnumerableSet.AddressSet;
+ *
+ *     // Declare a set state variable
+ *     EnumerableSet.AddressSet private mySet;
+ * }
+ * ```
+ *
+ * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)
+ * and `uint256` (`UintSet`) are supported.
+ *
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+ */
+library EnumerableSet {
+    // To implement this library for multiple types with as little code
+    // repetition as possible, we write it in terms of a generic Set type with
+    // bytes32 values.
+    // The Set implementation uses private functions, and user-facing
+    // implementations (such as AddressSet) are just wrappers around the
+    // underlying Set.
+    // This means that we can only create new EnumerableSets for types that fit
+    // in bytes32.
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position is the index of the value in the `values` array plus 1.
+        // Position 0 is used to mean a value is not in the set.
+        mapping(bytes32 value => uint256) _positions;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function _add(Set storage set, bytes32 value) private returns (bool) {
+        if (!_contains(set, value)) {
+            set._values.push(value);
+            // The value is stored at length-1, but we add 1 to all indexes
+            // and use 0 as a sentinel value
+            set._positions[value] = set._values.length;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function _remove(Set storage set, bytes32 value) private returns (bool) {
+        // We cache the value's position to prevent multiple reads from the same storage slot
+        uint256 position = set._positions[value];
+
+        if (position != 0) {
+            // Equivalent to contains(set, value)
+            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in
+            // the array, and then remove the last element (sometimes called as 'swap and pop').
+            // This modifies the order of the array, as noted in {at}.
+
+            uint256 valueIndex = position - 1;
+            uint256 lastIndex = set._values.length - 1;
+
+            if (valueIndex != lastIndex) {
+                bytes32 lastValue = set._values[lastIndex];
+
+                // Move the lastValue to the index where the value to delete is
+                set._values[valueIndex] = lastValue;
+                // Update the tracked position of the lastValue (that was just moved)
+                set._positions[lastValue] = position;
+            }
+
+            // Delete the slot where the moved value was stored
+            set._values.pop();
+
+            // Delete the tracked position for the deleted slot
+            delete set._positions[value];
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._positions[value] != 0;
+    }
+
+    /**
+     * @dev Returns the number of values on the set. O(1).
+     */
+    function _length(Set storage set) private view returns (uint256) {
+        return set._values.length;
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function _at(Set storage set, uint256 index) private view returns (bytes32) {
+        return set._values[index];
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function _values(Set storage set) private view returns (bytes32[] memory) {
+        return set._values;
+    }
+
+    // Bytes32Set
+
+    struct Bytes32Set {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _add(set._inner, value);
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {
+        return _remove(set._inner, value);
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {
+        return _contains(set._inner, value);
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(Bytes32Set storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {
+        return _at(set._inner, index);
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        bytes32[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // AddressSet
+
+    struct AddressSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(AddressSet storage set, address value) internal returns (bool) {
+        return _add(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(AddressSet storage set, address value) internal returns (bool) {
+        return _remove(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(AddressSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(AddressSet storage set, uint256 index) internal view returns (address) {
+        return address(uint160(uint256(_at(set._inner, index))));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(AddressSet storage set) internal view returns (address[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        address[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+
+    // UintSet
+
+    struct UintSet {
+        Set _inner;
+    }
+
+    /**
+     * @dev Add a value to a set. O(1).
+     *
+     * Returns true if the value was added to the set, that is if it was not
+     * already present.
+     */
+    function add(UintSet storage set, uint256 value) internal returns (bool) {
+        return _add(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Removes a value from a set. O(1).
+     *
+     * Returns true if the value was removed from the set, that is if it was
+     * present.
+     */
+    function remove(UintSet storage set, uint256 value) internal returns (bool) {
+        return _remove(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns true if the value is in the set. O(1).
+     */
+    function contains(UintSet storage set, uint256 value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(value));
+    }
+
+    /**
+     * @dev Returns the number of values in the set. O(1).
+     */
+    function length(UintSet storage set) internal view returns (uint256) {
+        return _length(set._inner);
+    }
+
+    /**
+     * @dev Returns the value stored at position `index` in the set. O(1).
+     *
+     * Note that there are no guarantees on the ordering of values inside the
+     * array, and it may change when more values are added or removed.
+     *
+     * Requirements:
+     *
+     * - `index` must be strictly less than {length}.
+     */
+    function at(UintSet storage set, uint256 index) internal view returns (uint256) {
+        return uint256(_at(set._inner, index));
+    }
+
+    /**
+     * @dev Return the entire set in an array
+     *
+     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed
+     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that
+     * this function has an unbounded cost, and using it as part of a state-changing function may render the function
+     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.
+     */
+    function values(UintSet storage set) internal view returns (uint256[] memory) {
+        bytes32[] memory store = _values(set._inner);
+        uint256[] memory result;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := store
+        }
+
+        return result;
+    }
+}
+
+
+// File: lib/solmate/src/auth/Owned.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/auth/Owned.sol)
+abstract contract Owned {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event OwnershipTransferred(address indexed user, address indexed newOwner);
+
+    /*//////////////////////////////////////////////////////////////
+                            OWNERSHIP STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    address public owner;
+
+    modifier onlyOwner() virtual {
+        require(msg.sender == owner, "UNAUTHORIZED");
+
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(address _owner) {
+        owner = _owner;
+
+        emit OwnershipTransferred(address(0), _owner);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             OWNERSHIP LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        owner = newOwner;
+
+        emit OwnershipTransferred(msg.sender, newOwner);
+    }
+}
+
+
+// File: lib/solmate/src/utils/FixedPointMathLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Arithmetic library with operations for fixed-point numbers.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/FixedPointMathLib.sol)
+/// @author Inspired by USM (https://github.com/usmfum/USM/blob/master/contracts/WadMath.sol)
+library FixedPointMathLib {
+    /*//////////////////////////////////////////////////////////////
+                    SIMPLIFIED FIXED POINT OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal constant MAX_UINT256 = 2**256 - 1;
+
+    uint256 internal constant WAD = 1e18; // The scalar of ETH and most ERC20s.
+
+    function mulWadDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, y, WAD); // Equivalent to (x * y) / WAD rounded down.
+    }
+
+    function mulWadUp(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivUp(x, y, WAD); // Equivalent to (x * y) / WAD rounded up.
+    }
+
+    function divWadDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, WAD, y); // Equivalent to (x * WAD) / y rounded down.
+    }
+
+    function divWadUp(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivUp(x, WAD, y); // Equivalent to (x * WAD) / y rounded up.
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    LOW LEVEL FIXED POINT OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function mulDivDown(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Equivalent to require(denominator != 0 && (y == 0 || x <= type(uint256).max / y))
+            if iszero(mul(denominator, iszero(mul(y, gt(x, div(MAX_UINT256, y)))))) {
+                revert(0, 0)
+            }
+
+            // Divide x * y by the denominator.
+            z := div(mul(x, y), denominator)
+        }
+    }
+
+    function mulDivUp(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Equivalent to require(denominator != 0 && (y == 0 || x <= type(uint256).max / y))
+            if iszero(mul(denominator, iszero(mul(y, gt(x, div(MAX_UINT256, y)))))) {
+                revert(0, 0)
+            }
+
+            // If x * y modulo the denominator is strictly greater than 0,
+            // 1 is added to round up the division of x * y by the denominator.
+            z := add(gt(mod(mul(x, y), denominator), 0), div(mul(x, y), denominator))
+        }
+    }
+
+    function rpow(
+        uint256 x,
+        uint256 n,
+        uint256 scalar
+    ) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            switch x
+            case 0 {
+                switch n
+                case 0 {
+                    // 0 ** 0 = 1
+                    z := scalar
+                }
+                default {
+                    // 0 ** n = 0
+                    z := 0
+                }
+            }
+            default {
+                switch mod(n, 2)
+                case 0 {
+                    // If n is even, store scalar in z for now.
+                    z := scalar
+                }
+                default {
+                    // If n is odd, store x in z for now.
+                    z := x
+                }
+
+                // Shifting right by 1 is like dividing by 2.
+                let half := shr(1, scalar)
+
+                for {
+                    // Shift n right by 1 before looping to halve it.
+                    n := shr(1, n)
+                } n {
+                    // Shift n right by 1 each iteration to halve it.
+                    n := shr(1, n)
+                } {
+                    // Revert immediately if x ** 2 would overflow.
+                    // Equivalent to iszero(eq(div(xx, x), x)) here.
+                    if shr(128, x) {
+                        revert(0, 0)
+                    }
+
+                    // Store x squared.
+                    let xx := mul(x, x)
+
+                    // Round to the nearest number.
+                    let xxRound := add(xx, half)
+
+                    // Revert if xx + half overflowed.
+                    if lt(xxRound, xx) {
+                        revert(0, 0)
+                    }
+
+                    // Set x to scaled xxRound.
+                    x := div(xxRound, scalar)
+
+                    // If n is even:
+                    if mod(n, 2) {
+                        // Compute z * x.
+                        let zx := mul(z, x)
+
+                        // If z * x overflowed:
+                        if iszero(eq(div(zx, x), z)) {
+                            // Revert if x is non-zero.
+                            if iszero(iszero(x)) {
+                                revert(0, 0)
+                            }
+                        }
+
+                        // Round to the nearest number.
+                        let zxRound := add(zx, half)
+
+                        // Revert if zx + half overflowed.
+                        if lt(zxRound, zx) {
+                            revert(0, 0)
+                        }
+
+                        // Return properly scaled zxRound.
+                        z := div(zxRound, scalar)
+                    }
+                }
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        GENERAL NUMBER UTILITIES
+    //////////////////////////////////////////////////////////////*/
+
+    function sqrt(uint256 x) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let y := x // We start y at x, which will help us make our initial estimate.
+
+            z := 181 // The "correct" value is 1, but this saves a multiplication later.
+
+            // This segment is to get a reasonable initial estimate for the Babylonian method. With a bad
+            // start, the correct # of bits increases ~linearly each iteration instead of ~quadratically.
+
+            // We check y >= 2^(k + 8) but shift right by k bits
+            // each branch to ensure that if x >= 256, then y >= 256.
+            if iszero(lt(y, 0x10000000000000000000000000000000000)) {
+                y := shr(128, y)
+                z := shl(64, z)
+            }
+            if iszero(lt(y, 0x1000000000000000000)) {
+                y := shr(64, y)
+                z := shl(32, z)
+            }
+            if iszero(lt(y, 0x10000000000)) {
+                y := shr(32, y)
+                z := shl(16, z)
+            }
+            if iszero(lt(y, 0x1000000)) {
+                y := shr(16, y)
+                z := shl(8, z)
+            }
+
+            // Goal was to get z*z*y within a small factor of x. More iterations could
+            // get y in a tighter range. Currently, we will have y in [256, 256*2^16).
+            // We ensured y >= 256 so that the relative difference between y and y+1 is small.
+            // That's not possible if x < 256 but we can just verify those cases exhaustively.
+
+            // Now, z*z*y <= x < z*z*(y+1), and y <= 2^(16+8), and either y >= 256, or x < 256.
+            // Correctness can be checked exhaustively for x < 256, so we assume y >= 256.
+            // Then z*sqrt(y) is within sqrt(257)/sqrt(256) of sqrt(x), or about 20bps.
+
+            // For s in the range [1/256, 256], the estimate f(s) = (181/1024) * (s+1) is in the range
+            // (1/2.84 * sqrt(s), 2.84 * sqrt(s)), with largest error when s = 1 and when s = 256 or 1/256.
+
+            // Since y is in [256, 256*2^16), let a = y/65536, so that a is in [1/256, 256). Then we can estimate
+            // sqrt(y) using sqrt(65536) * 181/1024 * (a + 1) = 181/4 * (y + 65536)/65536 = 181 * (y + 65536)/2^18.
+
+            // There is no overflow risk here since y < 2^136 after the first branch above.
+            z := shr(18, mul(z, add(y, 65536))) // A mul() is saved from starting z at 181.
+
+            // Given the worst case multiplicative error of 2.84 above, 7 iterations should be enough.
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+            z := shr(1, add(z, div(x, z)))
+
+            // If x+1 is a perfect square, the Babylonian method cycles between
+            // floor(sqrt(x)) and ceil(sqrt(x)). This statement ensures we return floor.
+            // See: https://en.wikipedia.org/wiki/Integer_square_root#Using_only_integer_division
+            // Since the ceil is rare, we save gas on the assignment and repeat division in the rare case.
+            // If you don't care whether the floor or ceil square root is returned, you can remove this statement.
+            z := sub(z, lt(div(x, z), z))
+        }
+    }
+
+    function unsafeMod(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Mod x by y. Note this will return
+            // 0 instead of reverting if y is zero.
+            z := mod(x, y)
+        }
+    }
+
+    function unsafeDiv(uint256 x, uint256 y) internal pure returns (uint256 r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Divide x by y. Note this will return
+            // 0 instead of reverting if y is zero.
+            r := div(x, y)
+        }
+    }
+
+    function unsafeDivUp(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Add 1 to x * y if x % y > 0. Note this will
+            // return 0 instead of reverting if y is zero.
+            z := add(gt(mod(x, y), 0), div(x, y))
+        }
+    }
+}
+
+
+// File: lib/solmate/src/utils/ReentrancyGuard.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Gas optimized reentrancy protection for smart contracts.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/ReentrancyGuard.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/security/ReentrancyGuard.sol)
+abstract contract ReentrancyGuard {
+    uint256 private locked = 1;
+
+    modifier nonReentrant() virtual {
+        require(locked == 1, "REENTRANCY");
+
+        locked = 2;
+
+        _;
+
+        locked = 1;
+    }
+}
+
+
+// File: lib/solmate/src/utils/SafeTransferLib.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+import {ERC20} from "../tokens/ERC20.sol";
+
+/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)
+/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.
+/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.
+library SafeTransferLib {
+    /*//////////////////////////////////////////////////////////////
+                             ETH OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferETH(address to, uint256 amount) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer the ETH and store if it succeeded or not.
+            success := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC20 OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function safeTransferFrom(
+        ERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "from" argument.
+            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 68), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FROM_FAILED");
+    }
+
+    function safeTransfer(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "TRANSFER_FAILED");
+    }
+
+    function safeApprove(
+        ERC20 token,
+        address to,
+        uint256 amount
+    ) internal {
+        bool success;
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Get a pointer to some free memory.
+            let freeMemoryPointer := mload(0x40)
+
+            // Write the abi-encoded calldata into memory, beginning with the function selector.
+            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the "to" argument.
+            mstore(add(freeMemoryPointer, 36), amount) // Append the "amount" argument. Masking not required as it's a full 32 byte type.
+
+            success := and(
+                // Set success to whether the call reverted, if not we check it either
+                // returned exactly 1 (can't just be non-zero data), or had no return data.
+                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),
+                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.
+                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.
+                // Counterintuitively, this call must be positioned second to the or() call in the
+                // surrounding and() call or else returndatasize() will be zero during the computation.
+                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)
+            )
+        }
+
+        require(success, "APPROVE_FAILED");
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC20.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)
+/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)
+/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.
+abstract contract ERC20 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                            METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    uint8 public immutable decimals;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC20 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    /*//////////////////////////////////////////////////////////////
+                            EIP-2612 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal immutable INITIAL_CHAIN_ID;
+
+    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) public nonces;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals
+    ) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+
+        INITIAL_CHAIN_ID = block.chainid;
+        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               ERC20 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 amount) public virtual returns (bool) {
+        allowance[msg.sender][spender] = amount;
+
+        emit Approval(msg.sender, spender, amount);
+
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public virtual returns (bool) {
+        balanceOf[msg.sender] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(msg.sender, to, amount);
+
+        return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual returns (bool) {
+        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
+
+        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+
+        balanceOf[from] -= amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             EIP-2612 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual {
+        require(deadline >= block.timestamp, "PERMIT_DEADLINE_EXPIRED");
+
+        // Unchecked because the only math done is incrementing
+        // the owner's nonce which cannot realistically overflow.
+        unchecked {
+            address recoveredAddress = ecrecover(
+                keccak256(
+                    abi.encodePacked(
+                        "\x19\x01",
+                        DOMAIN_SEPARATOR(),
+                        keccak256(
+                            abi.encode(
+                                keccak256(
+                                    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                                ),
+                                owner,
+                                spender,
+                                value,
+                                nonces[owner]++,
+                                deadline
+                            )
+                        )
+                    )
+                ),
+                v,
+                r,
+                s
+            );
+
+            require(recoveredAddress != address(0) && recoveredAddress == owner, "INVALID_SIGNER");
+
+            allowance[recoveredAddress][spender] = value;
+        }
+
+        emit Approval(owner, spender, value);
+    }
+
+    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();
+    }
+
+    function computeDomainSeparator() internal view virtual returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    keccak256(bytes(name)),
+                    keccak256("1"),
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 amount) internal virtual {
+        totalSupply += amount;
+
+        // Cannot overflow because the sum of all user
+        // balances can't exceed the max uint256 value.
+        unchecked {
+            balanceOf[to] += amount;
+        }
+
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual {
+        balanceOf[from] -= amount;
+
+        // Cannot underflow because a user's balance
+        // will never be larger than the total supply.
+        unchecked {
+            totalSupply -= amount;
+        }
+
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+
+// File: lib/solmate/src/tokens/ERC721.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Modern, minimalist, and gas efficient ERC-721 implementation.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol)
+abstract contract ERC721 {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event Transfer(address indexed from, address indexed to, uint256 indexed id);
+
+    event Approval(address indexed owner, address indexed spender, uint256 indexed id);
+
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /*//////////////////////////////////////////////////////////////
+                         METADATA STORAGE/LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    string public name;
+
+    string public symbol;
+
+    function tokenURI(uint256 id) public view virtual returns (string memory);
+
+    /*//////////////////////////////////////////////////////////////
+                      ERC721 BALANCE/OWNER STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(uint256 => address) internal _ownerOf;
+
+    mapping(address => uint256) internal _balanceOf;
+
+    function ownerOf(uint256 id) public view virtual returns (address owner) {
+        require((owner = _ownerOf[id]) != address(0), "NOT_MINTED");
+    }
+
+    function balanceOf(address owner) public view virtual returns (uint256) {
+        require(owner != address(0), "ZERO_ADDRESS");
+
+        return _balanceOf[owner];
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         ERC721 APPROVAL STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    mapping(uint256 => address) public getApproved;
+
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(string memory _name, string memory _symbol) {
+        name = _name;
+        symbol = _symbol;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC721 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function approve(address spender, uint256 id) public virtual {
+        address owner = _ownerOf[id];
+
+        require(msg.sender == owner || isApprovedForAll[owner][msg.sender], "NOT_AUTHORIZED");
+
+        getApproved[id] = spender;
+
+        emit Approval(owner, spender, id);
+    }
+
+    function setApprovalForAll(address operator, bool approved) public virtual {
+        isApprovedForAll[msg.sender][operator] = approved;
+
+        emit ApprovalForAll(msg.sender, operator, approved);
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 id
+    ) public virtual {
+        require(from == _ownerOf[id], "WRONG_FROM");
+
+        require(to != address(0), "INVALID_RECIPIENT");
+
+        require(
+            msg.sender == from || isApprovedForAll[from][msg.sender] || msg.sender == getApproved[id],
+            "NOT_AUTHORIZED"
+        );
+
+        // Underflow of the sender's balance is impossible because we check for
+        // ownership above and the recipient's balance can't realistically overflow.
+        unchecked {
+            _balanceOf[from]--;
+
+            _balanceOf[to]++;
+        }
+
+        _ownerOf[id] = to;
+
+        delete getApproved[id];
+
+        emit Transfer(from, to, id);
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id
+    ) public virtual {
+        transferFrom(from, to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, from, id, "") ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        bytes calldata data
+    ) public virtual {
+        transferFrom(from, to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, from, id, data) ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC165 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return
+            interfaceId == 0x01ffc9a7 || // ERC165 Interface ID for ERC165
+            interfaceId == 0x80ac58cd || // ERC165 Interface ID for ERC721
+            interfaceId == 0x5b5e139f; // ERC165 Interface ID for ERC721Metadata
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL MINT/BURN LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _mint(address to, uint256 id) internal virtual {
+        require(to != address(0), "INVALID_RECIPIENT");
+
+        require(_ownerOf[id] == address(0), "ALREADY_MINTED");
+
+        // Counter overflow is incredibly unrealistic.
+        unchecked {
+            _balanceOf[to]++;
+        }
+
+        _ownerOf[id] = to;
+
+        emit Transfer(address(0), to, id);
+    }
+
+    function _burn(uint256 id) internal virtual {
+        address owner = _ownerOf[id];
+
+        require(owner != address(0), "NOT_MINTED");
+
+        // Ownership check above ensures no underflow.
+        unchecked {
+            _balanceOf[owner]--;
+        }
+
+        delete _ownerOf[id];
+
+        delete getApproved[id];
+
+        emit Transfer(owner, address(0), id);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL SAFE MINT LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function _safeMint(address to, uint256 id) internal virtual {
+        _mint(to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, address(0), id, "") ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+
+    function _safeMint(
+        address to,
+        uint256 id,
+        bytes memory data
+    ) internal virtual {
+        _mint(to, id);
+
+        require(
+            to.code.length == 0 ||
+                ERC721TokenReceiver(to).onERC721Received(msg.sender, address(0), id, data) ==
+                ERC721TokenReceiver.onERC721Received.selector,
+            "UNSAFE_RECIPIENT"
+        );
+    }
+}
+
+/// @notice A generic interface for a contract which properly accepts ERC721 tokens.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol)
+abstract contract ERC721TokenReceiver {
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external virtual returns (bytes4) {
+        return ERC721TokenReceiver.onERC721Received.selector;
+    }
+}
+
+
+// File: src/interfaces/ILiquidationDistributor.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "./loans/IMultiSourceLoan.sol";
+
+/// @title Liquidation Distributor
+/// @author Florida St
+/// @notice Given a liquidation. It distributes proceeds accordingly.
+interface ILiquidationDistributor {
+    /// @notice Called by the liquidator for accounting purposes.
+    /// @param _repayment The highest bid of the auction.
+    /// @param _loan The loan object.
+    function distribute(uint256 _repayment, IMultiSourceLoan.Loan calldata _loan) external;
+}
+
+
+// File: src/interfaces/IAuctionLoanLiquidator.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "./loans/IMultiSourceLoan.sol";
+
+/// @title Liquidates Collateral for Defaulted Loans using English Auctions.
+/// @author Florida St
+/// @notice It liquidates collateral corresponding to defaulted loans
+///         and sends back the proceeds to the loan contract for distribution.
+interface IAuctionLoanLiquidator {
+    /// @notice The auction struct.
+    /// @param loanAddress The loan contract address.
+    /// @param loanId The loan id.
+    /// @param highestBid The highest bid.
+    /// @param highestBidder The highest bidder.
+    /// @param duration The auction duration.
+    /// @param asset The asset address.
+    /// @param startTime The auction start time.
+    /// @param originator The address that triggered the liquidation.
+    /// @param lastBidTime The last bid time.
+    struct Auction {
+        address loanAddress;
+        uint256 loanId;
+        uint256 highestBid;
+        uint256 triggerFee;
+        address highestBidder;
+        uint96 duration;
+        address asset;
+        uint96 startTime;
+        address originator;
+        uint96 lastBidTime;
+    }
+
+    /// @notice Add a loan contract to the list of accepted contracts.
+    /// @param _loanContract The loan contract to be added.
+    function addLoanContract(address _loanContract) external;
+
+    /// @notice Remove a loan contract from the list of accepted contracts.
+    /// @param _loanContract The loan contract to be removed.
+    function removeLoanContract(address _loanContract) external;
+
+    /// @return The loan contracts that are accepted by this liquidator.
+    function getValidLoanContracts() external view returns (address[] memory);
+
+    /// @notice Update liquidation distributor.
+    /// @param _liquidationDistributor The new liquidation distributor.
+    function updateLiquidationDistributor(address _liquidationDistributor) external;
+
+    /// @return liquidationDistributor The liquidation distributor address.
+    function getLiquidationDistributor() external view returns (address);
+
+    /// @notice Called by the owner to update the trigger fee.
+    /// @param triggerFee The new trigger fee.
+    function updateTriggerFee(uint256 triggerFee) external;
+
+    /// @return triggerFee The trigger fee.
+    function getTriggerFee() external view returns (uint256);
+
+    /// @notice When a bid is placed, the contract takes possesion of the bid, and
+    ///         if there was a previous bid, it returns that capital to the original
+    ///         bidder.
+    /// @param _contract The nft contract address.
+    /// @param _tokenId The nft id.
+    /// @param _auction The auction struct.
+    /// @param _bid The bid amount.
+    /// @return auction The updated auction struct.
+    function placeBid(address _contract, uint256 _tokenId, Auction memory _auction, uint256 _bid)
+        external
+        returns (Auction memory);
+
+    /// @notice On settlement, the NFT is sent to the highest bidder.
+    ///         Calls loan liquidated for accounting purposes.
+    /// @param _auction The auction struct.
+    /// @param _loan The loan struct.
+    function settleAuction(Auction calldata _auction, IMultiSourceLoan.Loan calldata _loan) external;
+
+    /// @notice The contract has hashes of all auctions to save space (not the actual struct)
+    /// @param _contract The nft contract address.
+    /// @param _tokenId The nft id.
+    /// @return auctionHash The auction hash.
+    function getAuctionHash(address _contract, uint256 _tokenId) external view returns (bytes32);
+}
+
+
+// File: src/interfaces/ILoanLiquidator.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+/// @title Liquidates Collateral for Defaulted Loans
+/// @author Florida St
+/// @notice It liquidates collateral corresponding to defaulted loans
+///         and sends back the proceeds to the loan contract for distribution.
+interface ILoanLiquidator {
+    /// @notice Given a loan, it takes posession of the NFT and liquidates it.
+    /// @param _loanId The loan id.
+    /// @param _contract The loan contract address.
+    /// @param _tokenId The NFT id.
+    /// @param _asset The asset address.
+    /// @param _duration The liquidation duration.
+    /// @param _originator The address that trigger the liquidation.
+    /// @return encodedAuction Encoded struct.
+    function liquidateLoan(
+        uint256 _loanId,
+        address _contract,
+        uint256 _tokenId,
+        address _asset,
+        uint96 _duration,
+        address _originator
+    ) external returns (bytes memory);
+}
+
+
+// File: src/interfaces/loans/IMultiSourceLoan.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "./IBaseLoan.sol";
+
+interface IMultiSourceLoan {
+    /// @param executionData Execution data.
+    /// @param lender Lender address.
+    /// @param borrower Address that owns the NFT and will take over the loan.
+    /// @param lenderOfferSignature Signature of the offer (signed by lender).
+    /// @param borrowerOfferSignature Signature of the offer (signed by borrower).
+    /// @param callbackData Whether to call the afterPrincipalTransfer callback
+    struct LoanExecutionData {
+        IBaseLoan.ExecutionData executionData;
+        address lender;
+        address borrower;
+        bytes lenderOfferSignature;
+        bytes borrowerOfferSignature;
+    }
+
+    /// @param loanId Loan ID.
+    /// @param callbackData Whether to call the afterNFTTransfer callback
+    /// @param shouldDelegate Whether to delegate ownership of the NFT (avoid seaport flags).
+    struct SignableRepaymentData {
+        uint256 loanId;
+        bytes callbackData;
+        bool shouldDelegate;
+    }
+
+    /// @param loan Loan.
+    /// @param borrowerLoanSignature Signature of the loan (signed by borrower).
+    struct LoanRepaymentData {
+        SignableRepaymentData data;
+        Loan loan;
+        bytes borrowerSignature;
+    }
+
+    /// @notice When a loan is initiated, there's one source, the original lender. After each refinance,
+    /// a new source is created to represent the new lender, and potentially others dissapear (if a tranche
+    /// is fully refinanced)
+    /// @dev No need to have principal address here since it's the same across all, so it can live in the Loan.
+    /// @param loanId Loan ID.
+    /// @param lender Lender for this given source.
+    /// @param principalAmount Principal Amount.
+    /// @param accruedInterest Accrued Interest.
+    /// @param startTime Start Time. Either the time at which the loan initiated / was refinanced.
+    /// @param aprBps APR in basis points.
+    struct Source {
+        uint256 loanId;
+        address lender;
+        uint256 principalAmount;
+        uint256 accruedInterest;
+        uint256 startTime;
+        uint256 aprBps;
+    }
+
+    /// @dev Principal Amount is equal to the sum of all sources principalAmount.
+    /// We keep it for caching purposes. Since we are not saving this on chain but the hash,
+    /// it does not have a huge impact on gas.
+    /// @param borrower Borrower.
+    /// @param nftCollateralTokenId NFT Collateral Token ID.
+    /// @param nftCollateralAddress NFT Collateral Address.
+    /// @param principalAddress Principal Address.
+    /// @param principalAmount Principal Amount.
+    /// @param startTime Start Time.
+    /// @param duration Duration.
+    /// @param source Sources
+    struct Loan {
+        address borrower;
+        uint256 nftCollateralTokenId;
+        address nftCollateralAddress;
+        address principalAddress;
+        uint256 principalAmount;
+        uint256 startTime;
+        uint256 duration;
+        Source[] source;
+    }
+
+    struct RenegotiationOffer {
+        uint256 renegotiationId;
+        uint256 loanId;
+        address lender;
+        uint256 fee;
+        uint256[] targetPrincipal;
+        uint256 principalAmount;
+        uint256 aprBps;
+        uint256 expirationTime;
+        uint256 duration;
+    }
+
+    /// @notice Call by the borrower when emiting a new loan.
+    /// @param _executionData Loan execution data.
+    /// @return loanId Loan ID.
+    /// @return loan Loan.
+    function emitLoan(LoanExecutionData calldata _executionData) external returns (uint256, Loan memory);
+
+    /// @notice Refinance whole loan (leaving just one source).
+    /// @param _renegotiationOffer Offer to refinance a loan.
+    /// @param _loan Current loan.
+    /// @param _renegotiationOfferSignature Signature of the offer.
+    /// @return loanId New Loan Id, New Loan.
+    function refinanceFull(
+        RenegotiationOffer calldata _renegotiationOffer,
+        Loan memory _loan,
+        bytes calldata _renegotiationOfferSignature
+    ) external returns (uint256, Loan memory);
+
+    /// @notice Refinance a loan partially. It can only be called by the new lender
+    /// (they are always a strict improvement on apr).
+    /// @param _renegotiationOffer Offer to refinance a loan partially.
+    /// @param _loan Current loan.
+    /// @return loanId New Loan Id, New Loan.
+    function refinancePartial(RenegotiationOffer calldata _renegotiationOffer, Loan memory _loan)
+        external
+        returns (uint256, Loan memory);
+
+    /// @notice Repay loan. Interest is calculated pro-rata based on time. Lender is defined by nft ownership.
+    /// @param _repaymentData Repayment data.
+    function repayLoan(LoanRepaymentData calldata _repaymentData) external;
+
+    /// @notice Call when a loan is past its due date.
+    /// @param _loanId Loan ID.
+    /// @param _loan Loan.
+    /// @return Liquidation Struct of the liquidation.
+    function liquidateLoan(uint256 _loanId, Loan calldata _loan) external returns (bytes memory);
+
+    /// @return maxSources Max sources per loan.
+    function getMaxSources() external view returns (uint256);
+
+    /// @notice Update the maximum number of sources per loan.
+    /// @param maxSources Maximum number of sources.
+    function setMaxSources(uint256 maxSources) external;
+
+    /// @notice Set min lock period (in BPS).
+    /// @param _minLockPeriod Min lock period.
+    function setMinLockPeriod(uint256 _minLockPeriod) external;
+
+    /// @notice Get min lock period (in BPS).
+    /// @return minLockPeriod Min lock period.
+    function getMinLockPeriod() external view returns (uint256);
+
+    /// @notice Get delegation registry.
+    /// @return delegateRegistry Delegate registry.
+    function getDelegateRegistry() external view returns (address);
+
+    /// @notice Update delegation registry.
+    /// @param _newDelegationRegistry Delegation registry.
+    function setDelegateRegistry(address _newDelegationRegistry) external;
+
+    /// @notice Delegate ownership.
+    /// @param _loanId Loan ID.
+    /// @param _loan Loan.
+    /// @param _rights Delegation Rights. Empty for all.
+    /// @param _delegate Delegate address.
+    /// @param _value True if delegate, false if undelegate.
+    function delegate(uint256 _loanId, Loan calldata _loan, address _delegate, bytes32 _rights, bool _value) external;
+
+    /// @notice Anyone can reveke a delegation on an NFT that's no longer in escrow.
+    /// @param _delegate Delegate address.
+    /// @param _collection Collection address.
+    /// @param _tokenId Token ID.
+    function revokeDelegate(address _delegate, address _collection, uint256 _tokenId) external;
+
+    /// @notice Get Flash Action Contract.
+    /// @return flashActionContract Flash Action Contract.
+    function getFlashActionContract() external view returns (address);
+
+    /// @notice Update Flash Action Contract.
+    /// @param _newFlashActionContract Flash Action Contract.
+    function setFlashActionContract(address _newFlashActionContract) external;
+
+    /// @notice Get Loan Hash.
+    /// @param _loanId Loan ID.
+    /// @return loanHash Loan Hash.
+    function getLoanHash(uint256 _loanId) external view returns (bytes32);
+
+    /// @notice Transfer NFT to the flash action contract (expected use cases here are for airdrops and similar scenarios).
+    /// The flash action contract would implement specific interactions with given contracts.
+    /// Only the the borrower can call this function for a given loan. By the end of the transaction, the NFT must have
+    /// been returned to escrow.
+    /// @param _loanId Loan ID.
+    /// @param _loan Loan.
+    /// @param _target Target address for the flash action contract to interact with.
+    /// @param _data Data to be passed to be passed to the ultimate contract.
+    function executeFlashAction(uint256 _loanId, Loan calldata _loan, address _target, bytes calldata _data) external;
+
+    /// @notice Extend loan duration. Can only be called by the lender on loans that have just one source.
+    /// @param _loanId Loan ID.
+    /// @param _loan Loan.
+    /// @param _extension Extension in seconds.
+    /// @return newLoanId New Loan Id
+    /// @return newLoan New Loan.
+    function extendLoan(uint256 _loanId, Loan memory _loan, uint256 _extension)
+        external
+        returns (uint256, Loan memory);
+
+    /// @notice Called by the liquidator for accounting purposes.
+    /// @param _loanId The id of the loan.
+    /// @param _loan The loan object.
+    function loanLiquidated(uint256 _loanId, Loan calldata _loan) external;
+}
+
+
+// File: src/lib/AddressManager.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "@solmate/auth/Owned.sol";
+import "@solmate/utils/ReentrancyGuard.sol";
+
+import "./InputChecker.sol";
+
+/// @title AddressManager
+/// @notice A contract that handles a whitelist of addresses and their indexes.
+/// @dev We assume no more than 65535 addresses will be added to the directory.
+contract AddressManager is InputChecker, Owned, ReentrancyGuard {
+    event AddressAdded(address address_added);
+
+    event AddressRemovedFromWhitelist(address address_removed);
+
+    event AddressWhitelisted(address address_whitelisted);
+
+    error AddressAlreadyAddedError(address _address);
+
+    error AddressNotAddedError(address _address);
+
+    mapping(address => uint16) private _directory;
+
+    mapping(uint16 => address) private _inverseDirectory;
+
+    mapping(address => bool) private _whitelist;
+
+    uint16 private _lastAdded;
+
+    constructor(address[] memory _original) Owned(tx.origin) {
+        uint256 total = _original.length;
+        for (uint256 i; i < total;) {
+            _add(_original[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice Adds an address to the directory. If it already exists,
+    ///        reverts. It assumes it's whitelisted.
+    function add(address _entry) external onlyOwner returns (uint16) {
+        return _add(_entry);
+    }
+
+    /// @notice Whitelist an address that's already part of the directory.
+    function addToWhitelist(address _entry) external onlyOwner {
+        if (_directory[_entry] == 0) {
+            revert AddressNotAddedError(_entry);
+        }
+        _whitelist[_entry] = true;
+
+        emit AddressWhitelisted(_entry);
+    }
+
+    /// @notice Removes an address from the whitelist. We still keep it
+    ///         in the directory since this mapping is relevant across time.
+    /// @param _entry The address to remove from the whitelist.
+    function removeFromWhitelist(address _entry) external onlyOwner {
+        _whitelist[_entry] = false;
+
+        emit AddressRemovedFromWhitelist(_entry);
+    }
+
+    /// @param _address The address to get the index for.
+    /// @return The index for a given address.
+    function addressToIndex(address _address) external view returns (uint16) {
+        return _directory[_address];
+    }
+
+    /// @param _index The index to get the address for.
+    /// @return The address for a given index.
+    function indexToAddress(uint16 _index) external view returns (address) {
+        return _inverseDirectory[_index];
+    }
+
+    /// @param _entry The address to check if it's whitelisted.
+    /// @return Whether the address is whitelisted or not.
+    function isWhitelisted(address _entry) external view returns (bool) {
+        return _whitelist[_entry];
+    }
+
+    function _add(address _entry) private returns (uint16) {
+        _checkAddressNotZero(_entry);
+        if (_directory[_entry] != 0) {
+            revert AddressAlreadyAddedError(_entry);
+        }
+        unchecked {
+            ++_lastAdded;
+        }
+        _directory[_entry] = _lastAdded;
+        _inverseDirectory[_lastAdded] = _entry;
+        _whitelist[_entry] = true;
+
+        emit AddressAdded(_entry);
+
+        return _lastAdded;
+    }
+}
+
+
+// File: src/lib/InputChecker.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+/// @title InputChecker
+/// @author Florida St
+/// @notice Some basic input checks.
+abstract contract InputChecker {
+    error AddressZeroError();
+
+    function _checkAddressNotZero(address _address) internal pure {
+        if (_address == address(0)) {
+            revert AddressZeroError();
+        }
+    }
+}
+
+
+// File: src/lib/utils/Hash.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "../../interfaces/loans/IMultiSourceLoan.sol";
+import "../../interfaces/loans/IBaseLoan.sol";
+import "../../interfaces/IAuctionLoanLiquidator.sol";
+
+library Hash {
+    // keccak256("OfferValidator(address validator,bytes arguments)")
+    bytes32 private constant _VALIDATOR_HASH = 0x4def3e04bd42194484d5f8a5b268ec0df03b9d9d0402606fe3100023c5d79ac4;
+
+    // keccak256("LoanOffer(uint256 offerId,address lender,uint256 fee,address borrower,uint256 capacity,address nftCollateralAddress,uint256 nftCollateralTokenId,address principalAddress,uint256 principalAmount,uint256 aprBps,uint256 expirationTime,uint256 duration,OfferValidator[] validators)OfferValidator(address validator,bytes arguments)")
+    bytes32 private constant _LOAN_OFFER_HASH = 0x891e530ed2768a9decac48f4b7beec447f755ce23feeeeb952e429145b44ba91;
+
+    /// keccak256("ExecutionData(LoanOffer offer,uint256 tokenId,uint256 amount,uint256 expirationTime,bytes callbackData)LoanOffer(uint256 offerId,address lender,uint256 fee,address borrower,uint256 capacity,address nftCollateralAddress,uint256 nftCollateralTokenId,address principalAddress,uint256 principalAmount,uint256 aprBps,uint256 expirationTime,uint256 duration,OfferValidator[] validators)OfferValidator(address validator,bytes arguments)")
+    bytes32 private constant _EXECUTION_DATA_HASH = 0x7e90717662b6dd110797922ef6d6701d92bfd4164783966933e092ea21a74c5a;
+
+    /// keccak256("SignableRepaymentData(uint256 loanId,bytes callbackData,bool shouldDelegate)")
+    bytes32 private constant _SIGNABLE_REPAYMENT_DATA_HASH =
+        0x41277b3c1cbe08ea7bbdd10a13f24dc956f3936bf46526f904c73697d9958e0c;
+
+    // keccak256("Loan(address borrower,uint256 nftCollateralTokenId,address nftCollateralAddress,address principalAddress,uint256 principalAmount,uint256 startTime,uint256 duration,Source[] source)Source(uint256 loanId,address lender,uint256 principalAmount,uint256 accruedInterest,uint256 startTime,uint256 aprBps)")
+    bytes32 private constant _MULTI_SOURCE_LOAN_HASH =
+        0x35f73c5cb07b3fa605378d4f576769166fed212ec3813ac1f1d73ef1c537eb0e;
+
+    // keccak256("Source(uint256 loanId,address lender,uint256 principalAmount,uint256 accruedInterest,uint256 startTime,uint256 aprBps)")
+    bytes32 private constant _SOURCE_HASH = 0x8ca047c2f10359bf4a27bd2c623674be3801153b6b2646ba08593dc96ad7bb44;
+
+    /// keccak256("RenegotiationOffer(uint256 renegotiationId,uint256 loanId,address lender,uint256 fee,uint256[] targetPrincipal,uint256 principalAmount,uint256 aprBps,uint256 expirationTime,uint256 duration)")
+    bytes32 private constant _MULTI_RENEGOTIATION_OFFER_HASH =
+        0xdb613ea3383336cd787d929ccfc21ab7cd87bf1d588780c80ce5f970dd79c348;
+
+    /// keccak256("Auction(address loanAddress,uint256 loanId,uint256 highestBid,uint256 triggerFee,address highestBidder,uint96 duration,address asset,uint96 startTime,address originator,uint96 lastBidTime)")
+    bytes32 private constant _AUCTION_HASH = 0xd1912299766a3d3ca1ad2e2135d884e08d798009860146382d22f8c389905b34;
+
+    function hash(IBaseLoan.LoanOffer memory _loanOffer) internal pure returns (bytes32) {
+        bytes memory encodedValidators;
+        for (uint256 i = 0; i < _loanOffer.validators.length;) {
+            encodedValidators = abi.encodePacked(encodedValidators, _hashValidator(_loanOffer.validators[i]));
+
+            unchecked {
+                ++i;
+            }
+        }
+        return keccak256(
+            abi.encode(
+                _LOAN_OFFER_HASH,
+                _loanOffer.offerId,
+                _loanOffer.lender,
+                _loanOffer.fee,
+                _loanOffer.borrower,
+                _loanOffer.capacity,
+                _loanOffer.nftCollateralAddress,
+                _loanOffer.nftCollateralTokenId,
+                _loanOffer.principalAddress,
+                _loanOffer.principalAmount,
+                _loanOffer.aprBps,
+                _loanOffer.expirationTime,
+                _loanOffer.duration,
+                keccak256(encodedValidators)
+            )
+        );
+    }
+
+    function hash(IBaseLoan.ExecutionData memory _executionData) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                _EXECUTION_DATA_HASH,
+                hash(_executionData.offer),
+                _executionData.tokenId,
+                _executionData.amount,
+                _executionData.expirationTime,
+                keccak256(_executionData.callbackData)
+            )
+        );
+    }
+
+    function hash(IMultiSourceLoan.SignableRepaymentData memory _repaymentData) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                _SIGNABLE_REPAYMENT_DATA_HASH,
+                _repaymentData.loanId,
+                keccak256(_repaymentData.callbackData),
+                _repaymentData.shouldDelegate
+            )
+        );
+    }
+
+    function hash(IMultiSourceLoan.Loan memory _loan) internal pure returns (bytes32) {
+        bytes memory sourceHashes;
+        for (uint256 i = 0; i < _loan.source.length;) {
+            sourceHashes = abi.encodePacked(sourceHashes, _hashSource(_loan.source[i]));
+            unchecked {
+                ++i;
+            }
+        }
+        return keccak256(
+            abi.encode(
+                _MULTI_SOURCE_LOAN_HASH,
+                _loan.borrower,
+                _loan.nftCollateralTokenId,
+                _loan.nftCollateralAddress,
+                _loan.principalAddress,
+                _loan.principalAmount,
+                _loan.startTime,
+                _loan.duration,
+                keccak256(sourceHashes)
+            )
+        );
+    }
+
+    function hash(IMultiSourceLoan.RenegotiationOffer memory _refinanceOffer) internal pure returns (bytes32) {
+        bytes memory encodedPrincipals;
+        for (uint256 i = 0; i < _refinanceOffer.targetPrincipal.length;) {
+            encodedPrincipals = abi.encodePacked(encodedPrincipals, _refinanceOffer.targetPrincipal[i]);
+            unchecked {
+                ++i;
+            }
+        }
+        return keccak256(
+            abi.encode(
+                _MULTI_RENEGOTIATION_OFFER_HASH,
+                _refinanceOffer.renegotiationId,
+                _refinanceOffer.loanId,
+                _refinanceOffer.lender,
+                _refinanceOffer.fee,
+                keccak256(encodedPrincipals),
+                _refinanceOffer.principalAmount,
+                _refinanceOffer.aprBps,
+                _refinanceOffer.expirationTime,
+                _refinanceOffer.duration
+            )
+        );
+    }
+
+    function hash(IAuctionLoanLiquidator.Auction memory _auction) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                _AUCTION_HASH,
+                _auction.loanAddress,
+                _auction.loanId,
+                _auction.highestBid,
+                _auction.triggerFee,
+                _auction.highestBidder,
+                _auction.duration,
+                _auction.asset,
+                _auction.startTime,
+                _auction.originator,
+                _auction.lastBidTime
+            )
+        );
+    }
+
+    function _hashSource(IMultiSourceLoan.Source memory _source) private pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                _SOURCE_HASH,
+                _source.lender,
+                _source.principalAmount,
+                _source.accruedInterest,
+                _source.startTime,
+                _source.aprBps
+            )
+        );
+    }
+
+    function _hashValidator(IBaseLoan.OfferValidator memory _validator) private pure returns (bytes32) {
+        return keccak256(abi.encode(_VALIDATOR_HASH, _validator.validator, keccak256(_validator.arguments)));
+    }
+}
+
+
+// File: src/interfaces/loans/IBaseLoan.sol
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity ^0.8.20;
+
+import "../../interfaces/ILoanLiquidator.sol";
+
+/// @title Interface for Loans.
+/// @author Florida St
+/// @notice Basic Loan
+interface IBaseLoan {
+    /// @notice Minimum improvement (in BPS) required for a strict improvement.
+    /// @param principalAmount Minimum delta of principal amount.
+    /// @param interest Minimum delta of interest.
+    /// @param duration Minimum delta of duration.
+    struct ImprovementMinimum {
+        uint256 principalAmount;
+        uint256 interest;
+        uint256 duration;
+    }
+
+    /// @notice Arbitrary contract to validate offers implementing `IBaseOfferValidator`.
+    /// @param validator Address of the validator contract.
+    /// @param arguments Arguments to pass to the validator.
+    struct OfferValidator {
+        address validator;
+        bytes arguments;
+    }
+
+    /// @notice Borrowers receive offers that are then validated.
+    /// @dev Setting the nftCollateralTokenId to 0 triggers validation through `validators`.
+    /// @param offerId Offer ID. Used for canceling/setting as executed.
+    /// @param lender Lender of the offer.
+    /// @param fee Origination fee.
+    /// @param borrower Borrower of the offer. Can be set to 0 (any borrower).
+    /// @param capacity Capacity of the offer.
+    /// @param nftCollateralAddress Address of the NFT collateral.
+    /// @param nftCollateralTokenId NFT collateral token ID.
+    /// @param principalAddress Address of the principal.
+    /// @param principalAmount Principal amount of the loan.
+    /// @param aprBps APR in BPS.
+    /// @param expirationTime Expiration time of the offer.
+    /// @param duration Duration of the loan in seconds.
+    /// @param validators Arbitrary contract to validate offers implementing `IBaseOfferValidator`.
+    struct LoanOffer {
+        uint256 offerId;
+        address lender;
+        uint256 fee;
+        address borrower;
+        uint256 capacity;
+        address nftCollateralAddress;
+        uint256 nftCollateralTokenId;
+        address principalAddress;
+        uint256 principalAmount;
+        uint256 aprBps;
+        uint256 expirationTime;
+        uint256 duration;
+        OfferValidator[] validators;
+    }
+
+    /// @notice Offer + necessary fields to execute a specific loan. This has a separate expirationTime to avoid
+    /// someone holding an offer and executing much later, without the borrower's awareness.
+    /// @param offer Loan offer. It can be executed potentially for multiple ids / amounts < principalAmount.
+    /// @param tokenId NFT collateral token ID.
+    /// @param amount The amount the borrower is willing to take (must be <= _loanOffer principalAmount)
+    /// @param expirationTime Expiration time of the signed offer by the borrower.
+    /// @param callbackData Data to pass to the callback.
+    struct ExecutionData {
+        LoanOffer offer;
+        uint256 tokenId;
+        uint256 amount;
+        uint256 expirationTime;
+        bytes callbackData;
+    }
+
+    /// @notice Recipient address and fraction of gains charged by the protocol.
+    struct ProtocolFee {
+        address recipient;
+        uint256 fraction;
+    }
+
+    /// @notice Total number of loans issued by this contract.
+    function getTotalLoansIssued() external view returns (uint256);
+
+    /// @notice Cancel offer for `msg.sender`. Each lender has unique offerIds.
+    /// @param _offerId Offer ID.
+    function cancelOffer(uint256 _offerId) external;
+
+    /// @notice Cancel multiple offers.
+    /// @param _offerIds Offer IDs.
+    function cancelOffers(uint256[] calldata _offerIds) external;
+
+    /// @notice Cancell all offers with offerId < _minOfferId
+    /// @param _minOfferId Minimum offer ID.
+    function cancelAllOffers(uint256 _minOfferId) external;
+
+    /// @notice Cancel renegotiation offer. Similar to offers.
+    /// @param _renegotiationId Renegotiation offer ID.
+    function cancelRenegotiationOffer(uint256 _renegotiationId) external;
+
+    /// @notice Cancel multiple renegotiation offers.
+    /// @param _renegotiationIds Renegotiation offer IDs.
+    function cancelRenegotiationOffers(uint256[] calldata _renegotiationIds) external;
+
+    /// @notice Cancell all renegotiation offers with renegotiationId < _minRenegotiationId
+    /// @param _minRenegotiationId Minimum renegotiation offer ID.
+    function cancelAllRenegotiationOffers(uint256 _minRenegotiationId) external;
+
+    /// @return protocolFee The Protocol fee.
+    function getProtocolFee() external view returns (ProtocolFee memory);
+
+    /// @return pendingProtocolFee The pending protocol fee.
+    function getPendingProtocolFee() external view returns (ProtocolFee memory);
+
+    /// @return protocolFeeSetTime Time when the protocol fee was set to be changed.
+    function getPendingProtocolFeeSetTime() external view returns (uint256);
+
+    /// @notice Kicks off the process to update the protocol fee.
+    /// @param _newProtocolFee New protocol fee.
+    function updateProtocolFee(ProtocolFee calldata _newProtocolFee) external;
+
+    /// @notice Set the protocol fee if enough notice has been given.
+    function setProtocolFee() external;
+
+    /// @return Liquidator contract address
+    function getLiquidator() external returns (address);
+
+    /// @notice Updates the liquidation contract.
+    /// @param loanLiquidator New liquidation contract.
+    function updateLiquidationContract(ILoanLiquidator loanLiquidator) external;
+
+    /// @notice Updates the auction duration for liquidations.
+    /// @param _newDuration New auction duration.
+    function updateLiquidationAuctionDuration(uint48 _newDuration) external;
+
+    /// @return auctionDuration Returns the auction's duration for liquidations.
+    function getLiquidationAuctionDuration() external returns (uint48);
+}
+
