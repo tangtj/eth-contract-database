@@ -1,0 +1,149 @@
+/**
+ *Submitted for verification at Etherscan.io on 2024-01-18
+*/
+
+// ooooo  oooo oooooooooo  ooooooooo             oooooooo8 ooooooooooo   o      oooo   oooo ooooo oooo   oooo  ooooooo8  
+//  888    88   888    888  888    88o          888        88  888  88  888      888  o88    888   8888o  88 o888    88  
+//   888  88    888oooo88   888    888 ooooooooo 888oooooo     888     8  88     888888      888   88 888o88 888    oooo 
+//    88888     888  88o    888    888                  888    888    8oooo88    888  88o    888   88   8888 888o    88  
+//     888     o888o  88o8 o888ooo88            o88oooo888    o888o o88o  o888o o888o o888o o888o o88o    88  888ooo888                                                                                                    
+
+// File: @openzeppelin/contracts/token/ERC20/IERC20.sol
+// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the value of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the value of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves a `value` amount of tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 value) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the
+     * caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 value) external returns (bool);
+
+    /**
+     * @dev Moves a `value` amount of tokens from `from` to `to` using the
+     * allowance mechanism. `value` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+// File: contracts/VRDStaking.sol
+pragma solidity ^0.8.20;
+
+
+contract VRDStaking {
+    IERC20 public vrdToken;
+
+    struct Stake {
+        uint256 amountStaked;
+        address stakerAddress;
+        uint256 unstakeRequestTimestamp; // Timestamp when the unstake request was made
+        bool isStaked;
+    }
+
+    event Staked(uint256 amount,address staker,uint256 timestamp);
+    event UnStaked(address staker,uint256 timestamp);
+    event RequestUnstake(address staker,uint256 timestamp);
+
+    mapping(address => Stake) public stakes;
+    constructor(address _vrdTokenAddress) {
+        vrdToken = IERC20(_vrdTokenAddress);
+    }
+
+    function stake(uint256 _amount) external {
+        require(_amount > 0, "Amount must be greater than 0");
+        require(vrdToken.transferFrom(msg.sender, address(this), _amount), "VRD Transfer failed");
+   
+        Stake storage stake = stakes[msg.sender];
+
+        stake.amountStaked += _amount;
+        stake.stakerAddress = msg.sender;
+        stake.isStaked = true;
+        stake.unstakeRequestTimestamp = 0; // Resetting the unstake request timestamp
+        emit Staked(_amount,msg.sender,block.timestamp);
+    }
+
+    function requestUnstake() external {
+        Stake storage stake = stakes[msg.sender];
+        require(stake.amountStaked > 0, "No tokens to unstake");
+        require(stake.amountStaked > 0, "Nothing staked");
+        require(stake.unstakeRequestTimestamp == 0, "Unstake request already made");
+
+        stake.isStaked = false;
+        stake.unstakeRequestTimestamp = block.timestamp;
+        emit RequestUnstake(msg.sender,block.timestamp);
+    }
+
+    function unstake() external {
+        Stake storage stake = stakes[msg.sender];
+        require(stake.amountStaked > 0, "Nothing staked");
+        require(block.timestamp >= stake.unstakeRequestTimestamp + 14 days, "Unstake request is still in the notice period");
+        
+        require(vrdToken.transfer(msg.sender, stake.amountStaked), "Transfer failed");
+        
+        stake.amountStaked = 0;
+        stake.unstakeRequestTimestamp = 0; // Resetting the unstake request timestamp
+        emit UnStaked(msg.sender,block.timestamp);
+    }
+}

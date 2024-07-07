@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+interface IUniswapV3Pool {
+    function flash(address recipient, uint256 amount0, uint256 amount1, bytes calldata data) external;
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
+
+interface IUniswapV3FlashCallback {
+    function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external;
+}
+
+interface IUniswapV2Router02 {
+    function WETH() external pure returns (address);
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts);
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts);
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+contract FlashArbitrage is IUniswapV3FlashCallback {
+    address public owner;
+    IUniswapV2Router02 public uniRouter;
+    IUniswapV2Router02 public sushiRouter;
+    IUniswapV3Pool public pool;
+    IERC20 public usdt;
+
+    event ArbitrageExecuted(uint amountIn, uint amountOut, uint timestamp);
+    event ArbitrageFailed(uint amountIn, uint amountOut, uint fee, uint gasCost, uint timestamp, string reason);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only the contract owner can call this function");
+        _;
+    }
+
+    constructor(
+        address _uniRouter,
+        address _sushiRouter,
+        address _pool,
+        address _usdtAddress
+    ) {
+        require(_uniRouter != address(0), "Uniswap Router address cannot be zero address");
+        require(_sushiRouter != address(0), "SushiSwap Router address cannot be zero address");
+        require(_usdtAddress != address(0), "USDT address cannot be zero address");
+        
+        owner = msg.sender;
+        uniRouter = IUniswapV2Router02(_uniRouter);
+        sushiRouter = IUniswapV2Router02(_sushiRouter);
+        pool = IUniswapV3Pool(_pool);
+        usdt = IERC20(_usdtAddress);
+    }
+
+    function startArbitrage(uint amount0, uint amount1) external onlyOwner {
+        bytes memory data = abi.encode(amount0, amount1);
+        pool.flash(address(this), amount0, amount1, data);
+    }
+
+    function uniswapV3FlashCallback(
+        uint256 fee0,
+        uint256 fee1,
+        bytes calldata data
+    ) external override {
+        require(msg.sender == address(pool), "not authorized");
+
+        (uint256 amount0, uint256 amount1) = abi.decode(data, (uint256, uint256));
+        uint256 amountIn = amount0 > 0 ? amount0 : amount1;
+        uint256 fee = amount0 > 0 ? fee0 : fee1;
+        address[] memory path = new address[](2);
+        path[0] = amount0 > 0 ? uniRouter.WETH() : address(usdt);
+        path[1] = amount0 > 0 ? address(usdt) : uniRouter.WETH();
+
+        bool success = executeSwap(amountIn, fee, path, amount0 > 0);
+        if (!success) {
+            emit ArbitrageFailed(amountIn, 0, fee, 0, block.timestamp, "Potential profit is lower than cost");
+            revert("Arbitrage failed, reverting transaction");
+        }
+    }
+
+    function executeSwap(
+        uint256 amountIn,
+        uint256 fee,
+        address[] memory path,
+        bool isEthToToken
+    ) internal returns (bool) {
+        IUniswapV2Router02 router = isEthToToken ? uniRouter : sushiRouter;
+        uint[] memory amountsOut = router.getAmountsOut(amountIn, path);
+        uint gasStart = gasleft();
+        uint potentialProfit = amountsOut[1] - (amountIn + fee);
+
+        if (potentialProfit <= 0) {
+            emit ArbitrageFailed(amountIn, amountsOut[1], fee, 0, block.timestamp, "Potential profit is lower than cost");
+            return false;
+        }
+
+        try router.swapExactETHForTokens{value: isEthToToken ? amountIn : 0}(
+            amountsOut[1],
+            path,
+            address(this),
+            block.timestamp
+        ) {
+            uint gasUsed = gasStart - gasleft();
+            uint totalGasCost = gasUsed * tx.gasprice;
+
+            if (potentialProfit > totalGasCost) {
+                emit ArbitrageExecuted(amountIn, amountsOut[1], block.timestamp);
+                return true;
+            } else {
+                emit ArbitrageFailed(amountIn, amountsOut[1], fee, totalGasCost, block.timestamp, "Total gas cost exceeds potential profit");
+                return false;
+            }
+        } catch {
+            emit ArbitrageFailed(amountIn, amountsOut[1], fee, 0, block.timestamp, "Swap failed on the specified router");
+            return false;
+        }
+    }
+
+    function withdrawERC20(address token, uint amount) external onlyOwner {
+        IERC20(token).transfer(owner, amount);
+    }
+
+    function withdrawETH(uint amount) external onlyOwner {
+        payable(owner).transfer(amount);
+    }
+
+    receive() external payable {}
+}

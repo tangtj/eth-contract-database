@@ -1,0 +1,757 @@
+
+// File: src/beanbagfrens/BBFLootBoxMinter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC1155Mintable} from "../interfaces/IERC1155Mintable.sol";
+import {IERC1155Burnable} from "../interfaces/IERC1155Burnable.sol";
+import {IERC721Transfer} from "../interfaces/IERC721Transfer.sol";
+import {ECDSA} from "solady/src/utils/ECDSA.sol";
+import {Ownable} from "solady/src/auth/Ownable.sol";
+
+contract BBFLootBoxMinter is Ownable {
+    error ArrayLengthMismatch();
+    error InvalidAmount();
+    error InvalidSignature();
+    error Paused();
+
+    address private constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
+    uint256 public constant SCISSORS_TOKEN_ID = 5;
+    IERC721Transfer public constant BBF =
+        IERC721Transfer(0x68Bd8b7C45633de6d7AFD0B1F7B86b37B8a3C02A);
+    IERC1155Burnable public constant NEXTENSIONS =
+        IERC1155Burnable(0x232765be70a5f0B49E2D72Eee9765813894C1Fc4);
+    IERC1155Mintable public immutable lootBox;
+
+    bool public cuttingEnabled;
+    address public signer;
+
+    constructor(address lootBox_, address signer_) {
+        lootBox = IERC1155Mintable(lootBox_);
+
+        _initializeOwner(tx.origin);
+        signer = signer_;
+    }
+
+    function burn2Mint(
+        uint256[] calldata bbfIds,
+        uint256[] calldata lootBoxIds,
+        uint256[] calldata lootBoxAmounts,
+        bytes calldata signature
+    ) external {
+        if (!cuttingEnabled) {
+            revert Paused();
+        }
+        uint256 lootBoxLength = lootBoxAmounts.length;
+        if (lootBoxIds.length != lootBoxLength) {
+            revert ArrayLengthMismatch();
+        }
+
+        bytes memory mintData = abi.encode(bbfIds, lootBoxIds, lootBoxAmounts);
+        checkValidity(signature, mintData);
+
+        uint256 bbfLength = bbfIds.length;
+        for (uint256 j; j < bbfLength;) {
+            uint256 tokenId = bbfIds[j];
+            BBF.transferFrom(msg.sender, DEAD_ADDRESS, tokenId);
+
+            unchecked {
+                ++j;
+            }
+        }
+        NEXTENSIONS.burn(msg.sender, SCISSORS_TOKEN_ID, bbfLength);
+        lootBox.batchMint(msg.sender, lootBoxIds, lootBoxAmounts);
+    }
+
+    function setSigner(address signer_) external onlyOwner {
+        signer = signer_;
+    }
+
+    function setEnabled(bool enabled) external onlyOwner {
+        cuttingEnabled = enabled;
+    }
+
+    function checkValidity(bytes calldata signature, bytes memory data) private view {
+        if (
+            ECDSA.recoverCalldata(ECDSA.toEthSignedMessageHash(keccak256(data)), signature)
+                != signer
+        ) {
+            revert InvalidSignature();
+        }
+    }
+}
+
+
+// File: src/interfaces/IERC1155Mintable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC1155Mintable {
+    function mint(address to, uint256 id, uint256 amount) external;
+    function batchMint(address to, uint256[] memory ids, uint256[] memory amounts) external;
+}
+
+
+// File: src/interfaces/IERC1155Burnable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC1155Burnable {
+    function burn(address from, uint256 id, uint256 amount) external;
+    function batchBurn(address from, uint256[] memory ids, uint256[] memory amounts) external;
+}
+
+
+// File: src/interfaces/IERC721Transfer.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+interface IERC721Transfer {
+    function transferFrom(address, address, uint256) external;
+}
+
+
+// File: lib/solady/src/utils/ECDSA.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Gas optimized ECDSA wrapper.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/utils/ECDSA.sol)
+/// @author Modified from Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/ECDSA.sol)
+/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/ECDSA.sol)
+library ECDSA {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                        CUSTOM ERRORS                       */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The signature is invalid.
+    error InvalidSignature();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         CONSTANTS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The number which `s` must be less than in order for
+    /// the signature to be non-malleable.
+    bytes32 private constant _MALLEABILITY_THRESHOLD_PLUS_ONE =
+        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                    RECOVERY OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // Note: as of Solady version 0.0.68, these functions will
+    // revert upon recovery failure for more safety by default.
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function recover(bytes32 hash, bytes memory signature) internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, byte(0, mload(add(signature, 0x60)))) // `v`.
+            mstore(0x40, mload(add(signature, 0x20))) // `r`.
+            mstore(0x60, mload(add(signature, 0x40))) // `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    and(
+                        // If the signature is exactly 65 bytes in length.
+                        eq(mload(signature), 65),
+                        // If `s` in lower half order, such that the signature is not malleable.
+                        lt(mload(0x60), _MALLEABILITY_THRESHOLD_PLUS_ONE)
+                    ), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function recoverCalldata(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40)))) // `v`.
+            calldatacopy(0x40, signature.offset, 0x40) // Copy `r` and `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    and(
+                        // If the signature is exactly 65 bytes in length.
+                        eq(signature.length, 65),
+                        // If `s` in lower half order, such that the signature is not malleable.
+                        lt(mload(0x60), _MALLEABILITY_THRESHOLD_PLUS_ONE)
+                    ), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the EIP-2098 short form signature defined by `r` and `vs`.
+    ///
+    /// This function only accepts EIP-2098 short form signatures.
+    /// See: https://eips.ethereum.org/EIPS/eip-2098
+    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal view returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, add(shr(255, vs), 27)) // `v`.
+            mstore(0x40, r)
+            mstore(0x60, shr(1, shl(1, vs))) // `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    // If `s` in lower half order, such that the signature is not malleable.
+                    lt(mload(0x60), _MALLEABILITY_THRESHOLD_PLUS_ONE), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the signature defined by `v`, `r`, `s`.
+    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, and(v, 0xff))
+            mstore(0x40, r)
+            mstore(0x60, s)
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    // If `s` in lower half order, such that the signature is not malleable.
+                    lt(s, _MALLEABILITY_THRESHOLD_PLUS_ONE), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x00, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            result := mload(0x00)
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            if iszero(returndatasize()) {
+                mstore(0x00, 0x8baa579f) // `InvalidSignature()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   TRY-RECOVER OPERATIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    // WARNING!
+    // These functions will NOT revert upon recovery failure.
+    // Instead, they will return the zero address upon recovery failure.
+    // It is critical that the returned address is NEVER compared against
+    // a zero address (e.g. an uninitialized address variable).
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function tryRecover(bytes32 hash, bytes memory signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, byte(0, mload(add(signature, 0x60)))) // `v`.
+            mstore(0x40, mload(add(signature, 0x20))) // `r`.
+            mstore(0x60, mload(add(signature, 0x40))) // `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    and(
+                        // If the signature is exactly 65 bytes in length.
+                        eq(mload(signature), 65),
+                        // If `s` in lower half order, such that the signature is not malleable.
+                        lt(mload(0x60), _MALLEABILITY_THRESHOLD_PLUS_ONE)
+                    ), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the `signature`.
+    ///
+    /// This function does NOT accept EIP-2098 short form signatures.
+    /// Use `recover(bytes32 hash, bytes32 r, bytes32 vs)` for EIP-2098
+    /// short form signatures instead.
+    function tryRecoverCalldata(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, byte(0, calldataload(add(signature.offset, 0x40)))) // `v`.
+            calldatacopy(0x40, signature.offset, 0x40) // Copy `r` and `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    and(
+                        // If the signature is exactly 65 bytes in length.
+                        eq(signature.length, 65),
+                        // If `s` in lower half order, such that the signature is not malleable.
+                        lt(mload(0x60), _MALLEABILITY_THRESHOLD_PLUS_ONE)
+                    ), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the EIP-2098 short form signature defined by `r` and `vs`.
+    ///
+    /// This function only accepts EIP-2098 short form signatures.
+    /// See: https://eips.ethereum.org/EIPS/eip-2098
+    function tryRecover(bytes32 hash, bytes32 r, bytes32 vs)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, add(shr(255, vs), 27)) // `v`.
+            mstore(0x40, r)
+            mstore(0x60, shr(1, shl(1, vs))) // `s`.
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    // If `s` in lower half order, such that the signature is not malleable.
+                    lt(mload(0x60), _MALLEABILITY_THRESHOLD_PLUS_ONE), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /// @dev Recovers the signer's address from a message digest `hash`,
+    /// and the signature defined by `v`, `r`, `s`.
+    function tryRecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)
+        internal
+        view
+        returns (address result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x00, hash)
+            mstore(0x20, and(v, 0xff))
+            mstore(0x40, r)
+            mstore(0x60, s)
+            pop(
+                staticcall(
+                    gas(), // Amount of gas left for the transaction.
+                    // If `s` in lower half order, such that the signature is not malleable.
+                    lt(s, _MALLEABILITY_THRESHOLD_PLUS_ONE), // Address of `ecrecover`.
+                    0x00, // Start of input.
+                    0x80, // Size of input.
+                    0x40, // Start of output.
+                    0x20 // Size of output.
+                )
+            )
+            mstore(0x60, 0) // Restore the zero slot.
+            // `returndatasize()` will be `0x20` upon success, and `0x00` otherwise.
+            result := mload(xor(0x60, returndatasize()))
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     HASHING OPERATIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an Ethereum Signed Message, created from a `hash`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x20, hash) // Store into scratch space for keccak256.
+            mstore(0x00, "\x00\x00\x00\x00\x19Ethereum Signed Message:\n32") // 28 bytes.
+            result := keccak256(0x04, 0x3c) // `32 * 2 - (32 - 28) = 60 = 0x3c`.
+        }
+    }
+
+    /// @dev Returns an Ethereum Signed Message, created from `s`.
+    /// This produces a hash corresponding to the one signed with the
+    /// [`eth_sign`](https://eth.wiki/json-rpc/API#eth_sign)
+    /// JSON-RPC method as part of EIP-191.
+    /// Note: Supports lengths of `s` up to 999999 bytes.
+    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let sLength := mload(s)
+            let o := 0x20
+            mstore(o, "\x19Ethereum Signed Message:\n") // 26 bytes, zero-right-padded.
+            mstore(0x00, 0x00)
+            // Convert the `s.length` to ASCII decimal representation: `base10(s.length)`.
+            for { let temp := sLength } 1 {} {
+                o := sub(o, 1)
+                mstore8(o, add(48, mod(temp, 10)))
+                temp := div(temp, 10)
+                if iszero(temp) { break }
+            }
+            let n := sub(0x3a, o) // Header length: `26 + 32 - o`.
+            // Throw an out-of-offset error (consumes all gas) if the header exceeds 32 bytes.
+            returndatacopy(returndatasize(), returndatasize(), gt(n, 0x20))
+            mstore(s, or(mload(0x00), mload(n))) // Temporarily store the header.
+            result := keccak256(add(s, sub(0x20, n)), add(n, sLength))
+            mstore(s, sLength) // Restore the length.
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   EMPTY CALLDATA HELPERS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns an empty calldata bytes.
+    function emptySignature() internal pure returns (bytes calldata signature) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            signature.length := 0
+        }
+    }
+}
+
+
+// File: lib/solady/src/auth/Ownable.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)
+///
+/// @dev Note:
+/// This implementation does NOT auto-initialize the owner to `msg.sender`.
+/// You MUST call the `_initializeOwner` in the constructor / initializer.
+///
+/// While the ownable portion follows
+/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,
+/// the nomenclature for the 2-step ownership handover may be unique to this codebase.
+abstract contract Ownable {
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                       CUSTOM ERRORS                        */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The caller is not authorized to call the function.
+    error Unauthorized();
+
+    /// @dev The `newOwner` cannot be the zero address.
+    error NewOwnerIsZeroAddress();
+
+    /// @dev The `pendingOwner` does not have a valid handover request.
+    error NoHandoverRequest();
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                           EVENTS                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.
+    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be
+    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),
+    /// despite it not being as lightweight as a single argument event.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @dev An ownership handover to `pendingOwner` has been requested.
+    event OwnershipHandoverRequested(address indexed pendingOwner);
+
+    /// @dev The ownership handover to `pendingOwner` has been canceled.
+    event OwnershipHandoverCanceled(address indexed pendingOwner);
+
+    /// @dev `keccak256(bytes("OwnershipTransferred(address,address)"))`.
+    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =
+        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverRequested(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =
+        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;
+
+    /// @dev `keccak256(bytes("OwnershipHandoverCanceled(address)"))`.
+    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =
+        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                          STORAGE                           */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev The owner slot is given by: `not(_OWNER_SLOT_NOT)`.
+    /// It is intentionally chosen to be a high value
+    /// to avoid collision with lower slots.
+    /// The choice of manual storage layout is to enable compatibility
+    /// with both regular and upgradeable contracts.
+    uint256 private constant _OWNER_SLOT_NOT = 0x8b78c6d8;
+
+    /// The ownership handover slot of `newOwner` is given by:
+    /// ```
+    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))
+    ///     let handoverSlot := keccak256(0x00, 0x20)
+    /// ```
+    /// It stores the expiry timestamp of the two-step ownership handover.
+    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                     INTERNAL FUNCTIONS                     */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Initializes the owner directly without authorization guard.
+    /// This function must be called upon initialization,
+    /// regardless of whether the contract is upgradeable or not.
+    /// This is to enable generalization to both regular and upgradeable contracts,
+    /// and to save gas in case the initial owner is not the caller.
+    /// For performance reasons, this function will not check if there
+    /// is an existing owner.
+    function _initializeOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Store the new value.
+            sstore(not(_OWNER_SLOT_NOT), newOwner)
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)
+        }
+    }
+
+    /// @dev Sets the owner directly without authorization guard.
+    function _setOwner(address newOwner) internal virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ownerSlot := not(_OWNER_SLOT_NOT)
+            // Clean the upper 96 bits.
+            newOwner := shr(96, shl(96, newOwner))
+            // Emit the {OwnershipTransferred} event.
+            log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)
+            // Store the new value.
+            sstore(ownerSlot, newOwner)
+        }
+    }
+
+    /// @dev Throws if the sender is not the owner.
+    function _checkOwner() internal view virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If the caller is not the stored owner, revert.
+            if iszero(eq(caller(), sload(not(_OWNER_SLOT_NOT)))) {
+                mstore(0x00, 0x82b42900) // `Unauthorized()`.
+                revert(0x1c, 0x04)
+            }
+        }
+    }
+
+    /// @dev Returns how long a two-step ownership handover is valid for in seconds.
+    /// Override to return a different value if needed.
+    /// Made internal to conserve bytecode. Wrap it in a public function if needed.
+    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {
+        return 48 * 3600;
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                  PUBLIC UPDATE FUNCTIONS                   */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Allows the owner to transfer the ownership to `newOwner`.
+    function transferOwnership(address newOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            if iszero(shl(96, newOwner)) {
+                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.
+                revert(0x1c, 0x04)
+            }
+        }
+        _setOwner(newOwner);
+    }
+
+    /// @dev Allows the owner to renounce their ownership.
+    function renounceOwnership() public payable virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /// @dev Request a two-step ownership handover to the caller.
+    /// The request will automatically expire in 48 hours (172800 seconds) by default.
+    function requestOwnershipHandover() public payable virtual {
+        unchecked {
+            uint256 expires = block.timestamp + _ownershipHandoverValidFor();
+            /// @solidity memory-safe-assembly
+            assembly {
+                // Compute and set the handover slot to `expires`.
+                mstore(0x0c, _HANDOVER_SLOT_SEED)
+                mstore(0x00, caller())
+                sstore(keccak256(0x0c, 0x20), expires)
+                // Emit the {OwnershipHandoverRequested} event.
+                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())
+            }
+        }
+    }
+
+    /// @dev Cancels the two-step ownership handover to the caller, if any.
+    function cancelOwnershipHandover() public payable virtual {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, caller())
+            sstore(keccak256(0x0c, 0x20), 0)
+            // Emit the {OwnershipHandoverCanceled} event.
+            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())
+        }
+    }
+
+    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.
+    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.
+    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute and set the handover slot to 0.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            let handoverSlot := keccak256(0x0c, 0x20)
+            // If the handover does not exist, or has expired.
+            if gt(timestamp(), sload(handoverSlot)) {
+                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.
+                revert(0x1c, 0x04)
+            }
+            // Set the handover slot to 0.
+            sstore(handoverSlot, 0)
+        }
+        _setOwner(pendingOwner);
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                   PUBLIC READ FUNCTIONS                    */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Returns the owner of the contract.
+    function owner() public view virtual returns (address result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := sload(not(_OWNER_SLOT_NOT))
+        }
+    }
+
+    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.
+    function ownershipHandoverExpiresAt(address pendingOwner)
+        public
+        view
+        virtual
+        returns (uint256 result)
+    {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Compute the handover slot.
+            mstore(0x0c, _HANDOVER_SLOT_SEED)
+            mstore(0x00, pendingOwner)
+            // Load the handover slot.
+            result := sload(keccak256(0x0c, 0x20))
+        }
+    }
+
+    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
+    /*                         MODIFIERS                          */
+    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
+
+    /// @dev Marks a function as only callable by the owner.
+    modifier onlyOwner() virtual {
+        _checkOwner();
+        _;
+    }
+}
+

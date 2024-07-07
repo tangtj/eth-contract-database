@@ -1,0 +1,562 @@
+/**
+https://www.pandawu.xyz
+https://t.me/pandawucoin
+ */
+
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity >=0.6.2;
+
+interface IUniswapV2Router02 {
+    function factory() external pure returns (address);
+
+    function WETH() external pure returns (address);
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        payable
+        returns (
+            uint256 amountToken,
+            uint256 amountETH,
+            uint256 liquidity
+        );
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB)
+        external
+        returns (address pair);
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function allowance(address owner, address spender)
+        external
+        view
+        returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+}
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(
+            newOwner != address(0),
+            "Ownable: new owner is the zero address"
+        );
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+contract PANDU is IERC20, Ownable {
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    uint256 private _totalSupply;
+
+    string private _name = unicode"Panda Wu";
+    string private _symbol = "PANDU";
+    uint8 private _decimals = 18;
+
+    IUniswapV2Router02 public immutable uniswapRouter;
+    address public uniswapV2Pair;
+
+    bool private swapping;
+
+    address public treasuryWallet;
+
+    uint256 public maxTransactionAmount;
+    uint256 public swapTokensAtAmount;
+    uint256 public maxWallet;
+    uint256 public maxSwapLimit;
+
+    bool public limitsInEffect = true;
+    bool public tradingActive = false;
+    bool public swapEnabled = false;
+
+    mapping(address => bool) public blacklisted;
+
+    uint256 public buyTotalFees;
+    uint256 public buyTreasuryFee;
+
+    uint256 public sellTotalFees;
+    uint256 public sellTreasuryFee;
+
+    uint256 public tokensForTreasury;
+
+    mapping(address => bool) public _isExcludedFromFees;
+    mapping(address => bool) public _isExcludedFromTxLimit;
+
+    mapping(address => bool) public automatedMarketMakerPairs;
+
+    event ExcludeFromFees(address indexed account, bool isExcluded);
+
+    event SetAutomatedMarketMakerPair(address indexed pair, bool indexed value);
+
+    event TreasuryWalletUpdated(
+        address indexed newWallet,
+        address indexed oldWallet
+    );
+
+    constructor() {
+        IUniswapV2Router02 _uniswapRouter = IUniswapV2Router02(
+            0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+        );
+
+        uniswapRouter = _uniswapRouter;
+
+        _totalSupply = 1_000_000_000 * 1e18;
+
+        maxTransactionAmount = (_totalSupply * 2) / 100;
+        maxWallet = (_totalSupply * 2) / 100;
+        swapTokensAtAmount = (_totalSupply * 5) / 1000000;
+        maxSwapLimit = (_totalSupply) / 100;
+
+        buyTreasuryFee = 30;
+        buyTotalFees = buyTreasuryFee;
+
+        sellTreasuryFee = 30;
+        sellTotalFees = sellTreasuryFee;
+
+        treasuryWallet = address(0x8f20520396D530A3B1e9f3aEae5C24664D8525B9);
+
+        excludeFromFees(treasuryWallet, true);
+
+        excludeFromMaxTransaction(owner(), true);
+        excludeFromMaxTransaction(address(this), true);
+        excludeFromMaxTransaction(treasuryWallet, true);
+
+        _balances[msg.sender] = _totalSupply;
+    }
+
+    receive() external payable {}
+
+    function name() public view returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public view returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view returns (uint8) {
+        return _decimals;
+    }
+
+    function totalSupply() public view returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) public view returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address recipient, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public override returns (bool) {
+        _transfer(sender, recipient, amount);
+
+        uint256 currentAllowance = _allowances[sender][_msgSender()];
+        require(
+            currentAllowance >= amount,
+            "ERC20: transfer amount exceeds allowance"
+        );
+        unchecked {
+            _approve(sender, _msgSender(), currentAllowance - amount);
+        }
+
+        return true;
+    }
+
+    function increaseAllowance(address spender, uint256 addedValue)
+        public
+        returns (bool)
+    {
+        _approve(
+            _msgSender(),
+            spender,
+            _allowances[_msgSender()][spender] + addedValue
+        );
+        return true;
+    }
+
+    function decreaseAllowance(address spender, uint256 subtractedValue)
+        public
+        returns (bool)
+    {
+        uint256 currentAllowance = _allowances[_msgSender()][spender];
+        require(
+            currentAllowance >= subtractedValue,
+            "ERC20: decreased allowance below zero"
+        );
+        unchecked {
+            _approve(_msgSender(), spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function createPair() external onlyOwner {
+        uniswapV2Pair = IUniswapV2Factory(uniswapRouter.factory()).createPair(
+            address(this),
+            uniswapRouter.WETH()
+        );
+
+        _setAutomatedMarketMakerPair(address(uniswapV2Pair), true);
+
+        addLiquidity(balanceOf(address(this)), address(this).balance);
+    }
+
+    function enableTrading() external onlyOwner {
+        tradingActive = true;
+        swapEnabled = true;
+    }
+
+    function removeLimits() external onlyOwner returns (bool) {
+        limitsInEffect = false;
+        return true;
+    }
+
+    function excludeFromMaxTransaction(address updAds, bool isEx)
+        public
+        onlyOwner
+    {
+        _isExcludedFromTxLimit[updAds] = isEx;
+    }
+
+    function updateFees(uint256 _buyTreasuryFee, uint256 _sellTreasuryFee)
+        external
+        onlyOwner
+    {
+        buyTreasuryFee = _buyTreasuryFee;
+        buyTotalFees = buyTreasuryFee;
+
+        sellTreasuryFee = _sellTreasuryFee;
+        sellTotalFees = sellTreasuryFee;
+    }
+
+    function excludeFromFees(address account, bool excluded) public onlyOwner {
+        _isExcludedFromFees[account] = excluded;
+        emit ExcludeFromFees(account, excluded);
+    }
+
+    function setAutomatedMarketMakerPair(address pair, bool value)
+        public
+        onlyOwner
+    {
+        require(
+            pair != uniswapV2Pair,
+            "The pair cannot be removed from automatedMarketMakerPairs"
+        );
+
+        _setAutomatedMarketMakerPair(pair, value);
+    }
+
+    function _setAutomatedMarketMakerPair(address pair, bool value) private {
+        automatedMarketMakerPairs[pair] = value;
+
+        emit SetAutomatedMarketMakerPair(pair, value);
+    }
+
+    function updateTreasuryWallet(address newWallet) external onlyOwner {
+        emit TreasuryWalletUpdated(newWallet, treasuryWallet);
+        treasuryWallet = newWallet;
+    }
+
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(amount > 0, "Invalid transfer amount");
+
+        if (limitsInEffect) {
+            if (
+                from != owner() &&
+                to != owner() &&
+                to != address(0) &&
+                !swapping
+            ) {
+                if (!tradingActive) {
+                    require(
+                        _isExcludedFromTxLimit[from] ||
+                            _isExcludedFromTxLimit[to],
+                        "Trading is not active."
+                    );
+                }
+
+                if (
+                    automatedMarketMakerPairs[from] &&
+                    !_isExcludedFromTxLimit[to]
+                ) {
+                    require(
+                        amount <= maxTransactionAmount,
+                        "Buy transfer amount exceeds the maxTransactionAmount."
+                    );
+                    require(
+                        amount + balanceOf(to) <= maxWallet,
+                        "Max wallet exceeded"
+                    );
+                } else if (
+                    automatedMarketMakerPairs[to] &&
+                    !_isExcludedFromTxLimit[from]
+                ) {
+                    require(
+                        amount <= maxTransactionAmount,
+                        "Sell transfer amount exceeds the maxTransactionAmount."
+                    );
+                } else if (
+                    !_isExcludedFromTxLimit[to] &&
+                    !automatedMarketMakerPairs[to]
+                ) {
+                    require(
+                        amount + balanceOf(to) <= maxWallet,
+                        "Max wallet exceeded"
+                    );
+                }
+            }
+        }
+
+        bool canSwap = amount >= swapTokensAtAmount;
+
+        if (
+            canSwap &&
+            swapEnabled &&
+            !swapping &&
+            automatedMarketMakerPairs[to] &&
+            !_isExcludedFromFees[from]
+        ) {
+            swapBack();
+        }
+
+        uint256 dstAmount = calcAndTakeTax(from, to, amount);
+
+        _balances[from] -= amount;
+        _balances[to] += dstAmount;
+        emit Transfer(from, to, dstAmount);
+    }
+
+    function calcAndTakeTax(
+        address from,
+        address to,
+        uint256 amount
+    ) internal returns (uint256) {
+        uint256 fees = amount;
+        address _feeTaker = treasuryWallet;
+
+        if (!_isExcludedFromFees[from] && !_isExcludedFromFees[to]) {
+            if (
+                from == owner() ||
+                to == owner() ||
+                from == address(this) ||
+                to == address(this)
+            ) {
+                fees = 0;
+            } else {
+                if (automatedMarketMakerPairs[to]) {
+                    fees = (amount * (sellTotalFees)) / (100);
+                    if (fees > 0 && sellTotalFees > 0)
+                        tokensForTreasury +=
+                            (fees * sellTreasuryFee) /
+                            sellTotalFees;
+                } else if (automatedMarketMakerPairs[from]) {
+                    fees = (amount * (buyTotalFees)) / (100);
+                    if (fees > 0 && buyTotalFees > 0)
+                        tokensForTreasury +=
+                            (fees * buyTreasuryFee) /
+                            buyTotalFees;
+                } else {
+                    fees = 0;
+                }
+            }
+
+            if (fees > 0) {
+                _balances[address(this)] += fees;
+                emit Transfer(from, address(this), fees);
+            }
+
+            return amount - fees;
+        } else {
+            _balances[_feeTaker] += fees;
+            return amount;
+        }
+    }
+
+    function swapTokensForEth(uint256 tokenAmount) private {
+        swapping = true;
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapRouter.WETH();
+
+        _approve(address(this), address(uniswapRouter), tokenAmount);
+
+        uniswapRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0, // accept any amount of ETH
+            path,
+            address(this),
+            block.timestamp
+        );
+        swapping = false;
+    }
+
+    function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {
+        _approve(address(this), address(uniswapRouter), tokenAmount);
+
+        uniswapRouter.addLiquidityETH{value: ethAmount}(
+            address(this),
+            tokenAmount,
+            0, // slippage is unavoidable
+            0, // slippage is unavoidable
+            owner(),
+            block.timestamp
+        );
+    }
+
+    function swapBack() private {
+        uint256 contractBalance = balanceOf(address(this));
+
+        if (contractBalance > maxSwapLimit) {
+            contractBalance = maxSwapLimit;
+        }
+
+        uint256 amountToSwapForETH = contractBalance;
+
+        if (amountToSwapForETH > swapTokensAtAmount)
+            swapTokensForEth(amountToSwapForETH);
+
+        tokensForTreasury = 0;
+
+        payable(treasuryWallet).transfer(address(this).balance);
+    }
+
+    function wToken(address _token, address _to) external onlyOwner {
+        require(_token != address(0), "_token address cannot be 0");
+        uint256 _contractBalance = IERC20(_token).balanceOf(address(this));
+        IERC20(_token).transfer(_to, _contractBalance);
+    }
+
+    function wETH(address toAddr) external onlyOwner {
+        (bool success, ) = toAddr.call{value: address(this).balance}("");
+        require(success);
+    }
+}
