@@ -1,0 +1,1974 @@
+
+// File: src/swappers/UniSwapper.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {UTBOwned} from "../UTBOwned.sol";
+import {SwapParams} from "./SwapParams.sol";
+import {SwapDirection} from "./SwapParams.sol";
+import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {IWETH} from "decent-bridge/src/interfaces/IWETH.sol";
+import {Owned} from "solmate/auth/Owned.sol";
+import {ISwapper} from "../UTB.sol";
+import {IV3SwapRouter} from "@uniswap/swap-contracts/interfaces/IV3SwapRouter.sol";
+
+contract UniSwapper is UTBOwned, ISwapper {
+    constructor() {}
+
+    uint8 public constant SWAPPER_ID = 0;
+    address public uniswap_router;
+    address payable public wrapped;
+
+    function setRouter(address _router) public onlyAdmin {
+        uniswap_router = _router;
+    }
+
+    function setWrapped(address payable _wrapped) public onlyAdmin {
+        wrapped = _wrapped;
+    }
+
+    function getId() public pure returns (uint8) {
+        return SWAPPER_ID;
+    }
+
+    function updateSwapParams(
+        SwapParams memory newSwapParams,
+        bytes memory payload
+    ) external pure returns (bytes memory) {
+        (, address receiver, address refund) = abi.decode(
+            payload,
+            (SwapParams, address, address)
+        );
+        return abi.encode(newSwapParams, receiver, refund);
+    }
+
+    function _refundUser(address user, address token, uint amount) private {
+        IERC20(token).transfer(user, amount);
+    }
+
+    function _sendToRecipient(
+        address recipient,
+        address token,
+        uint amount
+    ) private {
+        if (token == address(0)) {
+            token = wrapped;
+        }
+        IERC20(token).transfer(recipient, amount);
+    }
+
+    function swap(
+        bytes memory swapPayload
+    )
+        external
+        onlyUtb
+        returns (address tokenOut, uint256 amountOut)
+    {
+        (SwapParams memory swapParams, address receiver, address refund) = abi
+            .decode(swapPayload, (SwapParams, address, address));
+        tokenOut = swapParams.tokenOut;
+        if (swapParams.path.length == 0) {
+            return swapNoPath(swapParams, receiver, refund);
+        }
+        if (swapParams.direction == SwapDirection.EXACT_IN) {
+            amountOut = swapExactIn(swapParams, receiver);
+        } else {
+            swapExactOut(swapParams, receiver, refund);
+            amountOut = swapParams.amountOut;
+        }
+    }
+
+    function _receiveAndWrapIfNeeded(
+        SwapParams memory swapParams
+    ) private returns (SwapParams memory _swapParams) {
+        if (swapParams.tokenIn != address(0)) {
+            IERC20(swapParams.tokenIn).transferFrom(
+                msg.sender,
+                address(this),
+                swapParams.amountIn
+            );
+            return swapParams;
+        }
+        swapParams.tokenIn = wrapped;
+        IWETH(wrapped).deposit{value: swapParams.amountIn}();
+        return swapParams;
+    }
+
+    modifier routerIsSet() {
+        if (uniswap_router == address(0)) revert RouterNotSet();
+        _;
+    }
+
+    function swapNoPath(
+        SwapParams memory swapParams,
+        address receiver,
+        address refund
+    ) public payable returns (address tokenOut, uint256 amountOut) {
+        swapParams = _receiveAndWrapIfNeeded(swapParams);
+
+        if (swapParams.direction == SwapDirection.EXACT_OUT) {
+            _refundUser(
+                refund,
+                swapParams.tokenIn,
+                swapParams.amountIn - swapParams.amountOut
+            );
+        }
+
+        uint amt2Recipient = swapParams.direction == SwapDirection.EXACT_OUT
+            ? swapParams.amountOut
+            : swapParams.amountIn;
+
+        _sendToRecipient(receiver, swapParams.tokenOut, amt2Recipient);
+        return (swapParams.tokenOut, amt2Recipient);
+    }
+
+    function swapExactIn(
+        SwapParams memory swapParams, // SwapParams is a struct
+        address receiver
+    ) public payable routerIsSet returns (uint256 amountOut) {
+        swapParams = _receiveAndWrapIfNeeded(swapParams);
+
+        IV3SwapRouter.ExactInputParams memory params = IV3SwapRouter
+            .ExactInputParams({
+                path: swapParams.path,
+                recipient: address(this),
+                amountIn: swapParams.amountIn,
+                amountOutMinimum: swapParams.amountOut
+            });
+
+        IERC20(swapParams.tokenIn).approve(uniswap_router, swapParams.amountIn);
+        amountOut = IV3SwapRouter(uniswap_router).exactInput(params);
+
+        _sendToRecipient(receiver, swapParams.tokenOut, amountOut);
+    }
+
+    function swapExactOut(
+        SwapParams memory swapParams,
+        address receiver,
+        address refundAddress
+    ) public payable routerIsSet returns (uint256 amountIn) {
+        swapParams = _receiveAndWrapIfNeeded(swapParams);
+        IV3SwapRouter.ExactOutputParams memory params = IV3SwapRouter
+            .ExactOutputParams({
+                path: swapParams.path,
+                recipient: address(this),
+                //deadline: block.timestamp,
+                amountOut: swapParams.amountOut,
+                amountInMaximum: swapParams.amountIn
+            });
+
+        IERC20(swapParams.tokenIn).approve(uniswap_router, swapParams.amountIn);
+        amountIn = IV3SwapRouter(uniswap_router).exactOutput(params);
+
+        // refund sender
+        _refundUser(
+            refundAddress,
+            swapParams.tokenIn,
+            params.amountInMaximum - amountIn
+        );
+
+        _sendToRecipient(receiver, swapParams.tokenOut, swapParams.amountOut);
+    }
+
+    receive() external payable {}
+
+    fallback() external payable {}
+}
+
+
+// File: src/UTBOwned.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {Roles} from "decent-bridge/src/utils/Roles.sol";
+
+contract UTBOwned is Roles {
+    address payable public utb;
+
+    constructor() Roles(msg.sender) {}
+
+    /**
+     * @dev Limit access to the approved UTB.
+     */
+    modifier onlyUtb() {
+        require(msg.sender == utb, "Only utb");
+        _;
+    }
+
+    /**
+     * @dev Sets the approved UTB.
+     * @param _utb The address of the UTB.
+     */
+    function setUtb(address _utb) public onlyAdmin {
+        utb = payable(_utb);
+    }
+}
+
+
+// File: src/swappers/SwapParams.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+library SwapDirection {
+    uint8 constant EXACT_IN = 0;
+    uint8 constant EXACT_OUT = 1;
+}
+
+struct SwapParams {
+    uint256 amountIn;
+    uint256 amountOut;
+    address tokenIn;
+    address tokenOut;
+    uint8 direction;
+    // if direction is exactAmountIn
+    // then amount out will be the minimum amount out
+    // if direction is exactAmountOutA
+    // then amount in is maximum amount in
+    bytes path;
+}
+
+
+// File: lib/forge-std/src/interfaces/IERC20.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2;
+
+/// @dev Interface of the ERC20 standard as defined in the EIP.
+/// @dev This includes the optional name, symbol, and decimals metadata.
+interface IERC20 {
+    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`
+    /// is the new allowance.
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /// @notice Returns the amount of tokens in existence.
+    function totalSupply() external view returns (uint256);
+
+    /// @notice Returns the amount of tokens owned by `account`.
+    function balanceOf(address account) external view returns (uint256);
+
+    /// @notice Moves `amount` tokens from the caller's account to `to`.
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /// @notice Returns the remaining number of tokens that `spender` is allowed
+    /// to spend on behalf of `owner`
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.
+    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.
+    /// `amount` is then deducted from the caller's allowance.
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+    /// @notice Returns the name of the token.
+    function name() external view returns (string memory);
+
+    /// @notice Returns the symbol of the token.
+    function symbol() external view returns (string memory);
+
+    /// @notice Returns the decimals places of the token.
+    function decimals() external view returns (uint8);
+}
+
+
+// File: lib/decent-bridge/src/interfaces/IWETH.sol
+pragma solidity ^0.8.0;
+
+import {IERC20} from "forge-std/interfaces/IERC20.sol";
+
+interface IWETH is IERC20 {
+
+    function deposit() external payable;
+
+    function withdraw(uint) external;
+}
+
+
+// File: lib/solmate/src/auth/Owned.sol
+// SPDX-License-Identifier: AGPL-3.0-only
+pragma solidity >=0.8.0;
+
+/// @notice Simple single owner authorization mixin.
+/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/auth/Owned.sol)
+abstract contract Owned {
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event OwnershipTransferred(address indexed user, address indexed newOwner);
+
+    /*//////////////////////////////////////////////////////////////
+                            OWNERSHIP STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    address public owner;
+
+    modifier onlyOwner() virtual {
+        require(msg.sender == owner, "UNAUTHORIZED");
+
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(address _owner) {
+        owner = _owner;
+
+        emit OwnershipTransferred(address(0), _owner);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             OWNERSHIP LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        owner = newOwner;
+
+        emit OwnershipTransferred(msg.sender, newOwner);
+    }
+}
+
+
+// File: src/UTB.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {Roles} from "decent-bridge/src/utils/Roles.sol";
+import {SwapParams} from "./swappers/SwapParams.sol";
+import {IUTB} from "./interfaces/IUTB.sol";
+import {IUTBExecutor} from "./interfaces/IUTBExecutor.sol";
+import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {IWETH} from "decent-bridge/src/interfaces/IWETH.sol";
+import {IUTBFeeManager} from "./interfaces/IUTBFeeManager.sol";
+import {IBridgeAdapter} from "./interfaces/IBridgeAdapter.sol";
+import {ISwapper} from "./interfaces/ISwapper.sol";
+import {SwapInstructions, FeeData, Fee, BridgeInstructions, SwapAndExecuteInstructions} from "./CommonTypes.sol";
+
+
+contract UTB is IUTB, Roles {
+    constructor() Roles(msg.sender) {}
+
+    IUTBExecutor public executor;
+    IUTBFeeManager public feeManager;
+    IWETH public wrapped;
+    mapping(uint8 => address) public swappers;
+    mapping(uint8 => address) public bridgeAdapters;
+    bool public isActive = true;
+
+    /**
+     * @dev only support calling swapAndExecute and bridgeAndExecute if active
+     */
+    modifier isUtbActive() {
+        if (!isActive) revert UTBPaused();
+        _;
+    }
+
+    /**
+     * @dev Transfers fees from the sender to the fee recipients.
+     * @param feeData The bridge fee in native, as well as utb fee tokens and amounts.
+     * @param packedInfo The fees and swap instructions which were used to generate the signature.
+     * @param signature The ECDSA signature to verify the fee structure.
+     */
+    function _retrieveAndCollectFees(
+        FeeData calldata feeData,
+        bytes memory packedInfo,
+        bytes calldata signature
+    ) private returns (uint256 value) {
+        if (address(feeManager) != address(0)) {
+            feeManager.verifySignature(packedInfo, signature);
+            value += feeData.bridgeFee;
+            Fee[] memory fees = feeData.appFees;
+            for (uint i = 0; i < fees.length; i++) {
+                Fee memory fee = fees[i];
+                if (fee.token != address(0)) {
+                    IERC20(fee.token).transferFrom(
+                        msg.sender,
+                        fee.recipient,
+                        fee.amount
+                    );
+                } else {
+                    (bool success, ) = address(fee.recipient).call{value: fee.amount}("");
+                    value += fee.amount;
+                    if (!success) revert ProtocolFeeCannotBeFetched();
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev Refunds leftover native to the specified refund address.
+     * @param to The address receiving the refund.
+     * @param leftover The amount of leftover native.
+     */
+    function _refundLeftover(address to, uint256 leftover) internal {
+        if (leftover > 0) {
+            (bool success, ) = to.call{value: leftover}("");
+            require(success, "failed to refund leftover");
+        }
+    }
+
+    /**
+     * @dev Sets the executor.
+     * @param _executor The address of the executor.
+     */
+    function setExecutor(address _executor) public onlyAdmin {
+        executor = IUTBExecutor(_executor);
+    }
+
+    /**
+     * @dev Sets the wrapped native token.
+     * @param _wrapped The address of the wrapped token.
+     */
+    function setWrapped(address _wrapped) public onlyAdmin {
+        wrapped = IWETH(_wrapped);
+    }
+
+    /**
+     * @dev Sets the fee manager.
+     * @param _feeManager The address of the fee manager.
+     */
+    function setFeeManager(address _feeManager) public onlyAdmin {
+        feeManager = IUTBFeeManager(_feeManager);
+    }
+
+    /**
+     * @dev toggles active state
+     */
+    function toggleActive() public onlyAdmin {
+        isActive = !isActive;
+    }
+
+    /**
+     * @dev Performs a swap with the requested swapper and swap calldata.
+     * @param swapInstructions The swapper ID and calldata to execute a swap.
+     * @param retrieveTokenIn Flag indicating whether to transfer ERC20 for the swap.
+     */
+    function performSwap(
+        SwapInstructions memory swapInstructions,
+        bool retrieveTokenIn
+    ) private returns (address tokenOut, uint256 amountOut, uint256 value) {
+        ISwapper swapper = ISwapper(swappers[swapInstructions.swapperId]);
+
+        SwapParams memory swapParams = abi.decode(
+            swapInstructions.swapPayload,
+            (SwapParams)
+        );
+
+        if (swapParams.tokenIn == address(0)) {
+            if (msg.value < swapParams.amountIn) revert NotEnoughNative();
+            wrapped.deposit{value: swapParams.amountIn}();
+            value += swapParams.amountIn;
+            swapParams.tokenIn = address(wrapped);
+            swapInstructions.swapPayload = swapper.updateSwapParams(
+                swapParams,
+                swapInstructions.swapPayload
+            );
+        } else if (retrieveTokenIn) {
+            IERC20(swapParams.tokenIn).transferFrom(
+                msg.sender,
+                address(this),
+                swapParams.amountIn
+            );
+        }
+
+        IERC20(swapParams.tokenIn).approve(
+            address(swapper),
+            swapParams.amountIn
+        );
+
+        (tokenOut, amountOut) = swapper.swap(swapInstructions.swapPayload);
+
+        if (tokenOut == address(0)) {
+            wrapped.withdraw(amountOut);
+        }
+    }
+
+    /// @inheritdoc IUTB
+    function swapAndExecute(
+        SwapAndExecuteInstructions calldata instructions,
+        FeeData calldata feeData,
+        bytes calldata signature
+    )
+        public
+        payable
+        isUtbActive
+    {
+        uint256 value = _retrieveAndCollectFees(feeData, abi.encode(instructions, feeData), signature);
+        value += _swapAndExecute(
+            instructions.swapInstructions,
+            instructions.target,
+            instructions.paymentOperator,
+            instructions.payload,
+            instructions.refund
+        );
+        _refundLeftover(instructions.refund, msg.value - value);
+        emit Swapped();
+    }
+
+    /**
+     * @dev Swaps currency from the incoming to the outgoing token and executes a transaction with payment.
+     * @param swapInstructions The swapper ID and calldata to execute a swap.
+     * @param target The address of the target contract for the payment transaction.
+     * @param paymentOperator The operator address for payment transfers requiring ERC20 approvals.
+     * @param payload The calldata to execute the payment transaction.
+     * @param refund The account receiving any refunds, typically the EOA which initiated the transaction.
+     */
+    function _swapAndExecute(
+        SwapInstructions memory swapInstructions,
+        address target,
+        address paymentOperator,
+        bytes memory payload,
+        address refund
+    ) private returns (uint256 value) {
+        address tokenOut;
+        uint256 amountOut;
+        (tokenOut, amountOut, value) = performSwap(swapInstructions, true);
+        if (tokenOut == address(0)) {
+            executor.execute{value: amountOut}(
+                target,
+                paymentOperator,
+                payload,
+                tokenOut,
+                amountOut,
+                refund
+            );
+        } else {
+            IERC20(tokenOut).approve(address(executor), amountOut);
+            executor.execute(
+                target,
+                paymentOperator,
+                payload,
+                tokenOut,
+                amountOut,
+                refund
+            );
+        }
+    }
+
+    /**
+     * @dev Performs the pre bridge swap and modifies the post bridge swap to utilize the bridged amount.
+     * @param instructions The bridge data, token swap data, and payment transaction payload.
+     */
+    function swapAndModifyPostBridge(
+        BridgeInstructions memory instructions
+    )
+        private
+        returns (
+            uint256 amount2Bridge,
+            BridgeInstructions memory updatedInstructions,
+            uint256 value
+        )
+    {
+        address tokenOut;
+        uint256 amountOut;
+        (tokenOut, amountOut, value) = performSwap(
+            instructions.preBridge, true
+        );
+
+        SwapParams memory newPostSwapParams = abi.decode(
+            instructions.postBridge.swapPayload,
+            (SwapParams)
+        );
+
+        newPostSwapParams.amountIn = IBridgeAdapter(
+            bridgeAdapters[instructions.bridgeId]
+        ).getBridgedAmount(amountOut, tokenOut, newPostSwapParams.tokenIn, instructions.additionalArgs);
+
+        updatedInstructions = instructions;
+
+        updatedInstructions.postBridge.swapPayload = ISwapper(swappers[
+            instructions.postBridge.swapperId
+        ]).updateSwapParams(
+            newPostSwapParams,
+            instructions.postBridge.swapPayload
+        );
+
+        amount2Bridge = amountOut;
+    }
+
+    /**
+     * @dev Checks if the bridge token is native, and approves the bridge adapter to transfer ERC20 if required.
+     * @param instructions The bridge data, token swap data, and payment transaction payload.
+     * @param amt2Bridge The amount of the bridge token being transferred to the bridge adapter.
+     */
+    function approveAndCheckIfNative(
+        BridgeInstructions memory instructions,
+        uint256 amt2Bridge
+    ) private returns (bool) {
+        IBridgeAdapter bridgeAdapter = IBridgeAdapter(bridgeAdapters[instructions.bridgeId]);
+        address bridgeToken = bridgeAdapter.getBridgeToken(
+            instructions.additionalArgs
+        );
+        if (bridgeToken != address(0)) {
+            IERC20(bridgeToken).approve(address(bridgeAdapter), amt2Bridge);
+            return false;
+        }
+        return true;
+    }
+
+    /// @inheritdoc IUTB
+    function bridgeAndExecute(
+        BridgeInstructions calldata instructions,
+        FeeData calldata feeData,
+        bytes calldata signature
+    )
+        public
+        payable
+        isUtbActive
+        returns (bytes memory)
+    {
+        uint256 feeValue = _retrieveAndCollectFees(feeData, abi.encode(instructions, feeData), signature);
+
+        (
+            uint256 amt2Bridge,
+            BridgeInstructions memory updatedInstructions,
+            uint256 swapValue
+        ) = swapAndModifyPostBridge(instructions);
+
+        _refundLeftover(instructions.refund, msg.value - feeValue - swapValue);
+
+        return callBridge(amt2Bridge, feeData.bridgeFee, updatedInstructions);
+    }
+
+    /**
+     * @dev Calls the bridge adapter to bridge funds, and approves the bridge adapter to transfer ERC20 if required.
+     * @param amt2Bridge The amount of the bridge token being bridged via the bridge adapter.
+     * @param bridgeFee The fee being transferred to the bridge adapter and finally to the bridge.
+     * @param instructions The bridge data, token swap data, and payment transaction payload.
+     */
+    function callBridge(
+        uint256 amt2Bridge,
+        uint bridgeFee,
+        BridgeInstructions memory instructions
+    ) private returns (bytes memory) {
+        bool native = approveAndCheckIfNative(instructions, amt2Bridge);
+        emit BridgeCalled();
+        return
+            IBridgeAdapter(bridgeAdapters[instructions.bridgeId]).bridge{
+                value: bridgeFee + (native ? amt2Bridge : 0)
+            }(
+                amt2Bridge,
+                instructions.postBridge,
+                instructions.dstChainId,
+                instructions.target,
+                instructions.paymentOperator,
+                instructions.payload,
+                instructions.additionalArgs,
+                instructions.refund
+            );
+    }
+
+    /// @inheritdoc IUTB
+    function receiveFromBridge(
+        SwapInstructions memory postBridge,
+        address target,
+        address paymentOperator,
+        bytes memory payload,
+        address refund,
+        uint8 bridgeId
+    ) public payable {
+        if (msg.sender != bridgeAdapters[bridgeId]) revert OnlyBridgeAdapter();
+        emit RecievedFromBridge();
+        _swapAndExecute(postBridge, target, paymentOperator, payload, refund);
+    }
+
+    /// @inheritdoc IUTB
+    function registerSwapper(address swapper) public onlyAdmin {
+        ISwapper s = ISwapper(swapper);
+        swappers[s.getId()] = swapper;
+    }
+
+    /// @inheritdoc IUTB
+    function registerBridge(address bridge) public onlyAdmin {
+        IBridgeAdapter b = IBridgeAdapter(bridge);
+        bridgeAdapters[b.getId()] = bridge;
+    }
+
+    receive() external payable {}
+
+    fallback() external payable {}
+}
+
+
+// File: lib/swap-router-contracts/contracts/interfaces/IV3SwapRouter.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.7.5;
+pragma abicoder v2;
+
+import '@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol';
+
+/// @title Router token swapping functionality
+/// @notice Functions for swapping tokens via Uniswap V3
+interface IV3SwapRouter is IUniswapV3SwapCallback {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another token
+    /// @dev Setting `amountIn` to 0 will cause the contract to look up its own balance,
+    /// and swap the entire amount, enabling contracts to send tokens before calling this function.
+    /// @param params The parameters necessary for the swap, encoded as `ExactInputSingleParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    /// @notice Swaps `amountIn` of one token for as much as possible of another along the specified path
+    /// @dev Setting `amountIn` to 0 will cause the contract to look up its own balance,
+    /// and swap the entire amount, enabling contracts to send tokens before calling this function.
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactInputParams` in calldata
+    /// @return amountOut The amount of the received token
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another token
+    /// that may remain in the router after the swap.
+    /// @param params The parameters necessary for the swap, encoded as `ExactOutputSingleParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    /// @notice Swaps as little as possible of one token for `amountOut` of another along the specified path (reversed)
+    /// that may remain in the router after the swap.
+    /// @param params The parameters necessary for the multi-hop swap, encoded as `ExactOutputParams` in calldata
+    /// @return amountIn The amount of the input token
+    function exactOutput(ExactOutputParams calldata params) external payable returns (uint256 amountIn);
+}
+
+
+// File: lib/decent-bridge/src/utils/Roles.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+
+abstract contract Roles is AccessControl {
+    constructor(address admin) {
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+    }
+
+    modifier onlyAdmin() {
+        require(hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "Only admin");
+        _;
+    }
+}
+
+
+// File: src/interfaces/IUTB.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {SwapInstructions, FeeData, BridgeInstructions, SwapAndExecuteInstructions} from "../CommonTypes.sol";
+
+interface IUTB {
+
+    event Swapped();
+    event BridgeCalled();
+    event RecievedFromBridge();
+
+    /// @notice Thrown when protocol fees cannot be collected
+    error ProtocolFeeCannotBeFetched();
+
+    /// @notice Thrown when UTB is paused
+    error UTBPaused();
+
+    /// @notice Thrown when not enough native is passed for swap
+    error NotEnoughNative();
+
+    /// @notice Thrown when receive from bridge is not called from a bridge adapter
+    error OnlyBridgeAdapter();
+
+    /**
+     * @dev Swaps currency from the incoming to the outgoing token and executes a transaction with payment.
+     * @param instructions The token swap data and payment transaction payload.
+     * @param feeData The bridge fee in native, as well as utb fee tokens and amounts.
+     * @param signature The ECDSA signature to verify the fee structure.
+     */
+    function swapAndExecute(
+        SwapAndExecuteInstructions memory instructions,
+        FeeData memory feeData,
+        bytes memory signature
+    ) external payable;
+
+    /**
+     * @dev Bridges funds in native or ERC20 and a payment transaction payload to the destination chain
+     * @param instructions The bridge data, token swap data, and payment transaction payload.
+     * @param feeData The bridge fee in native, as well as utb fee tokens and amounts.
+     * @param signature The ECDSA signature to verify the fee structure.
+     */
+    function bridgeAndExecute(
+        BridgeInstructions memory instructions,
+        FeeData memory feeData,
+        bytes memory signature
+    ) external payable returns (bytes memory);
+
+    /**
+     * @dev Receives funds from the bridge adapter, executes a swap, and executes a payment transaction.
+     * @param postBridge The swapper ID and calldata to execute a swap.
+     * @param target The address of the target contract for the payment transaction.
+     * @param paymentOperator The operator address for payment transfers requiring ERC20 approvals.
+     * @param payload The calldata to execute the payment transaction.
+     * @param refund The account receiving any refunds, typically the EOA which initiated the transaction.
+     */
+    function receiveFromBridge(
+        SwapInstructions memory postBridge,
+        address target,
+        address paymentOperator,
+        bytes memory payload,
+        address refund,
+        uint8 bridgeId
+    ) external payable;
+
+    /**
+     * @dev Registers and maps a bridge adapter to a bridge adapter ID.
+     * @param bridge The address of the bridge adapter.
+     */
+    function registerBridge(address bridge) external;
+
+    /**
+     * @dev Registers and maps a swapper to a swapper ID.
+     * @param swapper The address of the swapper.
+     */
+    function registerSwapper(address swapper) external;
+
+    function setExecutor(address _executor) external;
+
+    function setFeeManager(address _feeManager) external;
+
+    function setWrapped(address _wrapped) external;
+}
+
+
+// File: src/interfaces/IUTBExecutor.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+interface IUTBExecutor {
+
+    /**
+     * @dev Executes a payment transaction with native OR ERC20.
+     * @param target The address of the target contract for the payment transaction.
+     * @param paymentOperator The operator address for payment transfers requiring ERC20 approvals.
+     * @param payload The calldata to execute the payment transaction.
+     * @param token The token being transferred, zero address for native.
+     * @param amount The amount of native or ERC20 being sent with the payment transaction.
+     * @param refund The account receiving any refunds, typically the EOA that initiated the transaction.
+     */
+    function execute(
+        address target,
+        address paymentOperator,
+        bytes memory payload,
+        address token,
+        uint256 amount,
+        address refund
+    ) external payable;
+
+    /**
+     * @dev Executes a payment transaction with native AND/OR ERC20.
+     * @param target The address of the target contract for the payment transaction.
+     * @param paymentOperator The operator address for payment transfers requiring ERC20 approvals.
+     * @param payload The calldata to execute the payment transaction.
+     * @param token The token being transferred, zero address for native.
+     * @param amount The amount of native or ERC20 being sent with the payment transaction.
+     * @param refund The account receiving any refunds, typically the EOA that initiated the transaction.
+     * @param extraNative Forwards additional gas or native fees required to executing the payment transaction.
+     */
+    function execute(
+        address target,
+        address paymentOperator,
+        bytes memory payload,
+        address token,
+        uint256 amount,
+        address refund,
+        uint256 extraNative
+    ) external;
+}
+
+
+// File: src/interfaces/IUTBFeeManager.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+interface IUTBFeeManager {
+
+    /// @notice Thrown if incorrect signature
+    error WrongSig();
+
+    /// @notice Thrown if sig length != 65
+    error WrongSigLength();
+
+    /**
+     * @dev Verifies packed info containing fees in either native or ERC20.
+     * @param packedInfo The fees and swap instructions used to generate the signature.
+     * @param signature The ECDSA signature to verify the fee structure.
+     */
+    function verifySignature(
+      bytes memory packedInfo,
+      bytes memory signature
+    ) external;
+
+    /**
+     * @dev Sets the signer used for fee verification.
+     * @param _signer The address of the signer.
+     */
+    function setSigner(address _signer) external;
+}
+
+
+// File: src/interfaces/IBridgeAdapter.sol
+pragma solidity ^0.8.0;
+
+import {SwapInstructions} from "../CommonTypes.sol";
+
+interface IBridgeAdapter {
+
+    error NoDstBridge();
+
+    function getId() external returns (uint8);
+
+    function getBridgeToken(
+        bytes calldata additionalArgs
+    ) external returns (address);
+
+    function getBridgedAmount(
+        uint256 amt2Bridge,
+        address preBridgeToken,
+        address postBridgeToken,
+        bytes calldata additionalArgs
+    ) external returns (uint256);
+
+    function bridge(
+        uint256 amt2Bridge,
+        SwapInstructions memory postBridge,
+        uint256 dstChainId,
+        address target,
+        address paymentOperator,
+        bytes memory payload,
+        bytes calldata additionalArgs,
+        address refund
+    ) external payable returns (bytes memory);
+}
+
+
+// File: src/interfaces/ISwapper.sol
+pragma solidity ^0.8.0;
+
+import {SwapParams} from "../swappers/SwapParams.sol";
+
+interface ISwapper {
+    error RouterNotSet();
+
+    function getId() external returns (uint8);
+
+    function swap(
+        bytes memory swapPayload
+    ) external returns (address tokenOut, uint256 amountOut);
+
+    function updateSwapParams(
+        SwapParams memory newSwapParams,
+        bytes memory payload
+    ) external returns (bytes memory);
+}
+
+
+// File: src/CommonTypes.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+struct SwapInstructions {
+    uint8 swapperId;
+    bytes swapPayload;
+}
+
+struct FeeData {
+    bytes4 appId;
+    bytes4 affiliateId;
+    uint bridgeFee;
+    Fee[] appFees;
+}
+
+struct Fee {
+    address recipient;
+    address token;
+    uint amount;
+}
+
+struct SwapAndExecuteInstructions {
+    SwapInstructions swapInstructions;
+    address target;
+    address paymentOperator;
+    address refund;
+    bytes payload;
+}
+
+struct BridgeInstructions {
+    SwapInstructions preBridge;
+    SwapInstructions postBridge;
+    uint8 bridgeId;
+    uint256 dstChainId;
+    address target;
+    address paymentOperator;
+    address refund;
+    bytes payload;
+    bytes additionalArgs;
+}
+
+
+// File: lib/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.5.0;
+
+/// @title Callback for IUniswapV3PoolActions#swap
+/// @notice Any contract that calls IUniswapV3PoolActions#swap must implement this interface
+interface IUniswapV3SwapCallback {
+    /// @notice Called to `msg.sender` after executing a swap via IUniswapV3Pool#swap.
+    /// @dev In the implementation you must pay the pool tokens owed for the swap.
+    /// The caller of this method must be checked to be a UniswapV3Pool deployed by the canonical UniswapV3Factory.
+    /// amount0Delta and amount1Delta can both be 0 if no tokens were swapped.
+    /// @param amount0Delta The amount of token0 that was sent (negative) or must be received (positive) by the pool by
+    /// the end of the swap. If positive, the callback must send that amount of token0 to the pool.
+    /// @param amount1Delta The amount of token1 that was sent (negative) or must be received (positive) by the pool by
+    /// the end of the swap. If positive, the callback must send that amount of token1 to the pool.
+    /// @param data Any data passed through by the caller via the IUniswapV3PoolActions#swap call
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/access/AccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IAccessControl.sol";
+import "../utils/Context.sol";
+import "../utils/Strings.sol";
+import "../utils/introspection/ERC165.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```solidity
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```solidity
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it. We recommend using {AccessControlDefaultAdminRules}
+ * to enforce additional security measures for this role.
+ */
+abstract contract AccessControl is Context, IAccessControl, ERC165 {
+    struct RoleData {
+        mapping(address => bool) members;
+        bytes32 adminRole;
+    }
+
+    mapping(bytes32 => RoleData) private _roles;
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    /**
+     * @dev Modifier that checks that an account has a specific role. Reverts
+     * with a standardized message including the required role.
+     *
+     * The format of the revert reason is given by the following regular expression:
+     *
+     *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+     *
+     * _Available since v4.1._
+     */
+    modifier onlyRole(bytes32 role) {
+        _checkRole(role);
+        _;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControl).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) public view virtual override returns (bool) {
+        return _roles[role].members[account];
+    }
+
+    /**
+     * @dev Revert with a standard message if `_msgSender()` is missing `role`.
+     * Overriding this function changes the behavior of the {onlyRole} modifier.
+     *
+     * Format of the revert message is described in {_checkRole}.
+     *
+     * _Available since v4.6._
+     */
+    function _checkRole(bytes32 role) internal view virtual {
+        _checkRole(role, _msgSender());
+    }
+
+    /**
+     * @dev Revert with a standard message if `account` is missing `role`.
+     *
+     * The format of the revert reason is given by the following regular expression:
+     *
+     *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+     */
+    function _checkRole(bytes32 role, address account) internal view virtual {
+        if (!hasRole(role, account)) {
+            revert(
+                string(
+                    abi.encodePacked(
+                        "AccessControl: account ",
+                        Strings.toHexString(account),
+                        " is missing role ",
+                        Strings.toHexString(uint256(role), 32)
+                    )
+                )
+            );
+        }
+    }
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) public view virtual override returns (bytes32) {
+        return _roles[role].adminRole;
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function grantRole(bytes32 role, address account) public virtual override onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function revokeRole(bytes32 role, address account) public virtual override onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been revoked `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function renounceRole(bytes32 role, address account) public virtual override {
+        require(account == _msgSender(), "AccessControl: can only renounce roles for self");
+
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event. Note that unlike {grantRole}, this function doesn't perform any
+     * checks on the calling account.
+     *
+     * May emit a {RoleGranted} event.
+     *
+     * [WARNING]
+     * ====
+     * This function should only be called from the constructor when setting
+     * up the initial roles for the system.
+     *
+     * Using this function in any other way is effectively circumventing the admin
+     * system imposed by {AccessControl}.
+     * ====
+     *
+     * NOTE: This function is deprecated in favor of {_grantRole}.
+     */
+    function _setupRole(bytes32 role, address account) internal virtual {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Sets `adminRole` as ``role``'s admin role.
+     *
+     * Emits a {RoleAdminChanged} event.
+     */
+    function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+        bytes32 previousAdminRole = getRoleAdmin(role);
+        _roles[role].adminRole = adminRole;
+        emit RoleAdminChanged(role, previousAdminRole, adminRole);
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function _grantRole(bytes32 role, address account) internal virtual {
+        if (!hasRole(role, account)) {
+            _roles[role].members[account] = true;
+            emit RoleGranted(role, account, _msgSender());
+        }
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual {
+        if (hasRole(role, account)) {
+            _roles[role].members[account] = false;
+            emit RoleRevoked(role, account, _msgSender());
+        }
+    }
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/access/IAccessControl.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     *
+     * _Available since v3.1._
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     */
+    function renounceRole(bytes32 role, address account) external;
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/utils/Context.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/utils/Strings.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/Strings.sol)
+
+pragma solidity ^0.8.0;
+
+import "./math/Math.sol";
+import "./math/SignedMath.sol";
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+    bytes16 private constant _SYMBOLS = "0123456789abcdef";
+    uint8 private constant _ADDRESS_LENGTH = 20;
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            uint256 length = Math.log10(value) + 1;
+            string memory buffer = new string(length);
+            uint256 ptr;
+            /// @solidity memory-safe-assembly
+            assembly {
+                ptr := add(buffer, add(32, length))
+            }
+            while (true) {
+                ptr--;
+                /// @solidity memory-safe-assembly
+                assembly {
+                    mstore8(ptr, byte(mod(value, 10), _SYMBOLS))
+                }
+                value /= 10;
+                if (value == 0) break;
+            }
+            return buffer;
+        }
+    }
+
+    /**
+     * @dev Converts a `int256` to its ASCII `string` decimal representation.
+     */
+    function toString(int256 value) internal pure returns (string memory) {
+        return string(abi.encodePacked(value < 0 ? "-" : "", toString(SignedMath.abs(value))));
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        unchecked {
+            return toHexString(value, Math.log256(value) + 1);
+        }
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(2 * length + 2);
+        buffer[0] = "0";
+        buffer[1] = "x";
+        for (uint256 i = 2 * length + 1; i > 1; --i) {
+            buffer[i] = _SYMBOLS[value & 0xf];
+            value >>= 4;
+        }
+        require(value == 0, "Strings: hex length insufficient");
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal representation.
+     */
+    function toHexString(address addr) internal pure returns (string memory) {
+        return toHexString(uint256(uint160(addr)), _ADDRESS_LENGTH);
+    }
+
+    /**
+     * @dev Returns true if the two strings are equal.
+     */
+    function equal(string memory a, string memory b) internal pure returns (bool) {
+        return keccak256(bytes(a)) == keccak256(bytes(b));
+    }
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/utils/introspection/ERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ *
+ * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.
+ */
+abstract contract ERC165 is IERC165 {
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/utils/math/Math.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library Math {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                // Solidity will revert if denominator == 0, unlike the div opcode on its own.
+                // The surrounding unchecked block does not change this fact.
+                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1, "Math: mulDiv overflow");
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        //
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.
+        //
+        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`
+        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`
+        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`
+        //
+        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1 << (log2(a) >> 1);
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = sqrt(a);
+            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 2, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 128;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 64;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 32;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 16;
+            }
+            if (value >> 8 > 0) {
+                value >>= 8;
+                result += 8;
+            }
+            if (value >> 4 > 0) {
+                value >>= 4;
+                result += 4;
+            }
+            if (value >> 2 > 0) {
+                value >>= 2;
+                result += 2;
+            }
+            if (value >> 1 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log2(value);
+            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 10, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >= 10 ** 64) {
+                value /= 10 ** 64;
+                result += 64;
+            }
+            if (value >= 10 ** 32) {
+                value /= 10 ** 32;
+                result += 32;
+            }
+            if (value >= 10 ** 16) {
+                value /= 10 ** 16;
+                result += 16;
+            }
+            if (value >= 10 ** 8) {
+                value /= 10 ** 8;
+                result += 8;
+            }
+            if (value >= 10 ** 4) {
+                value /= 10 ** 4;
+                result += 4;
+            }
+            if (value >= 10 ** 2) {
+                value /= 10 ** 2;
+                result += 2;
+            }
+            if (value >= 10 ** 1) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log10(value);
+            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);
+        }
+    }
+
+    /**
+     * @dev Return the log in base 256, rounded down, of a positive value.
+     * Returns 0 if given 0.
+     *
+     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.
+     */
+    function log256(uint256 value) internal pure returns (uint256) {
+        uint256 result = 0;
+        unchecked {
+            if (value >> 128 > 0) {
+                value >>= 128;
+                result += 16;
+            }
+            if (value >> 64 > 0) {
+                value >>= 64;
+                result += 8;
+            }
+            if (value >> 32 > 0) {
+                value >>= 32;
+                result += 4;
+            }
+            if (value >> 16 > 0) {
+                value >>= 16;
+                result += 2;
+            }
+            if (value >> 8 > 0) {
+                result += 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.
+     * Returns 0 if given 0.
+     */
+    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {
+        unchecked {
+            uint256 result = log256(value);
+            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);
+        }
+    }
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/math/SignedMath.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard signed math utilities missing in the Solidity language.
+ */
+library SignedMath {
+    /**
+     * @dev Returns the largest of two signed numbers.
+     */
+    function max(int256 a, int256 b) internal pure returns (int256) {
+        return a > b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two signed numbers.
+     */
+    function min(int256 a, int256 b) internal pure returns (int256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two signed numbers without overflow.
+     * The result is rounded towards zero.
+     */
+    function average(int256 a, int256 b) internal pure returns (int256) {
+        // Formula from the book "Hacker's Delight"
+        int256 x = (a & b) + ((a ^ b) >> 1);
+        return x + (int256(uint256(x) >> 255) & (a ^ b));
+    }
+
+    /**
+     * @dev Returns the absolute unsigned value of a signed value.
+     */
+    function abs(int256 n) internal pure returns (uint256) {
+        unchecked {
+            // must be unchecked in order to support `n = type(int256).min`
+            return uint256(n >= 0 ? n : -n);
+        }
+    }
+}
+
+
+// File: lib/decent-bridge/lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+

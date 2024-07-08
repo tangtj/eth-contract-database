@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: MIT
+// PRED token is used for Predictify(TM) platform as a ruling community token.
+// Rev.: 1.0
+// Date: July, 2024
+// by Kyogoku Mitsukata
+pragma solidity ^0.8.0;
+
+contract PREDtoken {
+    string public name = "Predictify";
+    string public symbol = "PRED";
+    uint8 public decimals = 18;
+    uint256 public maxSupply = 100000000;
+    uint256 public totalSupply;
+    address public owner;
+    bool public exchangeActive = true;
+
+    mapping(address => uint256) public balanceOf;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Withdrawal(address indexed owner, uint256 amount);
+    event ExchangeStatusChanged(bool isActive);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Caller is not the owner");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+        _mint(address(this), maxSupply * 10 ** uint256(decimals));
+    }
+
+    function _mint(address _to, uint256 _value) internal {
+        totalSupply += _value;
+        balanceOf[_to] += _value;
+        emit Transfer(address(0), _to, _value);
+    }
+
+    function transfer(address _to, uint256 _value) public returns (bool success) {
+        require(balanceOf[msg.sender] >= _value, "Insufficient balance");
+        balanceOf[msg.sender] -= _value;
+        balanceOf[_to] += _value;
+        emit Transfer(msg.sender, _to, _value);
+        return true;
+    }
+
+    function withdraw() public onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to withdraw");
+        payable(owner).transfer(balance);
+        emit Withdrawal(owner, balance);
+    }
+
+    function toggleExchangeStatus() public onlyOwner {
+        exchangeActive = !exchangeActive;
+        emit ExchangeStatusChanged(exchangeActive);
+    }
+
+    receive() external payable {
+        require(exchangeActive, "Token exchange is currently disabled");
+        require(msg.value >= 0.01 ether, "Minimum ETH amount is 0.01");
+
+        uint256 rate = block.timestamp < 1735689600 ? 3300 : 3000; // 2025-01-01 00:00:00 GMT timestamp
+        uint256 tokensToTransfer = msg.value * rate;
+
+        require(balanceOf[address(this)] >= tokensToTransfer, "Not enough tokens in the contract");
+        
+        balanceOf[address(this)] -= tokensToTransfer;
+        balanceOf[msg.sender] += tokensToTransfer;
+
+        emit Transfer(address(this), msg.sender, tokensToTransfer);
+    }
+}
