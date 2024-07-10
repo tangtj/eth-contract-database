@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.1;
+
+contract HowMuchYouLikeYourPUP {
+        
+    event HowMuchYouLikeYourPup(uint8 ANumberFrom0To255);
+
+    function howMuchYouLikeYourPup(uint8 ANumberFrom0to255) public {
+        emit HowMuchYouLikeYourPup(ANumberFrom0to255);
+    }
+
+
+}

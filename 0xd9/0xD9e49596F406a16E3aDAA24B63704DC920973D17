@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+pragma solidity ^0.8.9;
+
+contract ISyouABitCoiner {
+        
+    event IsYouABitCoiner(bool TrueFor1orFalseFor0);
+
+    function isYouABitCoiner(bool _trueFor1orFalseFor0) public {
+        emit IsYouABitCoiner(_trueFor1orFalseFor0);
+    }
+
+
+}

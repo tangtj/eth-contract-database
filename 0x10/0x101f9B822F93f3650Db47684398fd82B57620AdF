@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.0;
+
+contract ALuckCode {
+
+    event MyLuckCode(uint code);
+
+    function myLuckCode(uint _code) public {
+        emit MyLuckCode(_code);
+    }
+
+}
